@@ -20,4 +20,4 @@ make clean && make
 
 ## Usage
 
-refer to `./RabbitBAM -h`
+refer to `./rabbitbam -h`
