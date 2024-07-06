@@ -13,7 +13,7 @@ An ultra-fast I/O framework for BAM files.
 ```bash
 git clone https://github.com/RabbitBio/RabbitBAM
 cd RabbitBAM
-bash configure.sh <path-to-htslib-installation-directory>
+bash configure.sh <path-to-htslib-installation-directory> <path-to-libdeflate-installation-directory>
 source env.sh
 make clean && make
 ```
