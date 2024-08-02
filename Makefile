@@ -6,8 +6,8 @@ SO_OBJECT = $(BUILD_PATH)/librabbitbamtools.so $(BUILD_PATH)/librabbitbamread.so
 TARGET = $(BUILD_PATH)/rabbitbam
 INCLUDE = ./htslib 
 LIB = 
-HTSLIB_INSTALL_PATH = /home/user_home/ylf/someGit/bam_deps/htslib-1.20-install
-LIBDEFLATE_INSTALL_PATH = /home/user_home/ylf/someGit/bam_deps/libdeflate-1.20-install
+HTSLIB_INSTALL_PATH = /home/user_home/ylf/someGit/rbam_deps/htslib-1.20-install
+LIBDEFLATE_INSTALL_PATH = /home/user_home/ylf/someGit/rbam_deps/libdeflate-1.20-install
 
 LIB += $(HTSLIB_INSTALL_PATH)/lib
 LIB += $(HTSLIB_INSTALL_PATH)/lib64
