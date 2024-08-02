@@ -21,10 +21,34 @@
 #include <libdeflate.h>
 #include <thread>
 #include <atomic>
+#include <condition_variable>
+#include <vector>
+#include <omp.h>
+#include <cmath>
 #define BLOCK_HEADER_LENGTH 18
 #define BLOCK_FOOTER_LENGTH 8
 //#define BGZF_MAX_BLOCK_SIZE 0x10000
-#define BGZF_MAX_BLOCK_COMPLETE_SIZE 0x40000
+//#define BGZF_MAX_BLOCK_COMPLETE_SIZE 0x40000
+#define BGZF_MAX_BLOCK_COMPLETE_SIZE 0x10000
+#define THREAD_NUM_P 6
+
+#define use_parallel_read
+#define use_parallel_write
+
+#include <sys/time.h>
+
+
+inline double GetTime() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double) tv.tv_sec + (double) tv.tv_usec / 1000000;
+}
+
+inline uint64_t GetCycle() {
+    unsigned int lo, hi;
+    asm volatile ("rdtsc" : "=a" (lo), "=d" (hi));
+    return ((uint64_t)hi << 32) | lo;
+}
 
 typedef struct {
     int size;

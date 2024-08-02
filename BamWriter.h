@@ -63,9 +63,11 @@ public:
     void hdr_write(sam_hdr_t* hdr);
 
     void write(bam1_t* b);
+    void write_parallel(std::vector<bam1_t *> b_vec);
 
     void over();
 
+    void over_parallel();
 
 private:
 
@@ -78,11 +80,14 @@ private:
 
     bam_write_block *write_block;
 
+    bam_write_block *blocks[THREAD_NUM_P];
+
     samFile *output;
 
     int n_thread_write;
 
     int write_num=0;
+
 
 };
 

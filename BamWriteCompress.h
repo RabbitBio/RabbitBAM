@@ -84,6 +84,8 @@ private:
      *  空白内存的管理部分
      */
     bam_write_block** compress_data;
+    //std::atomic<int> compress_bg;
+    //std::atomic<int> compress_ed;
     int compress_bg;
     int compress_ed;
     int compress_size;
@@ -94,8 +96,12 @@ private:
      * 需要压缩处理处理的数据队列
      */
     int blockInputNum; // 根据插入时间增加时间戳
+    //std::atomic<int> blockInputNum;
     std::atomic<int> blockInputPos;
     bam_write_block** need_compress_data;
+
+    //std::atomic<int> need_compress_bg;
+    //std::atomic<int> need_compress_ed;
     int need_compress_bg;
     int need_compress_ed;
     int need_compress_size;
@@ -105,6 +111,8 @@ private:
      *  输出队列的管理部分
      */
     bam_write_block** consumer_data;
+    //std::atomic<int> consumer_bg;
+    //std::atomic<int> consumer_ed;
     int consumer_bg;
     int consumer_ed;
     int consumer_size;
@@ -120,6 +128,7 @@ private:
      * 检测需要输出的文件是否已经完全进入队列
      */
     bool isWriteComplete=false;
+    //std::atomic<bool> isWriteComplete;
 
 };
 

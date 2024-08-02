@@ -21,7 +21,7 @@ INCLUDE += $(LIBDEFLATE_INSTALL_PATH)/include
 SHARE = -fPIC -shared
 
 INC_FLAGS = $(addprefix -I,$(INCLUDE)) 
-LIB_FLAGS = $(addprefix -L,$(LIB)) -lpthread -lz -lhts -ldeflate
+LIB_FLAGS = $(addprefix -L,$(LIB)) -fopenmp -lpthread -lz -lhts -ldeflate
 
 $(TARGET): $(OBJECT) block_mul.cpp
 	$(CXX) $(CPPFLAGS) $(INC_FLAGS) block_mul.cpp -o $@ $(OBJECT) $(LIB_FLAGS)

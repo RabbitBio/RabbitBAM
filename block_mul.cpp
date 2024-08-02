@@ -54,6 +54,169 @@ typedef std::chrono::high_resolution_clock Clock;
 //uint8_t Base[16] = {0, 65, 67, 0, 71, 0, 0, 0, 84, 0, 0, 0, 0, 0, 0, 78};
 //uint8_t BaseRever[16] = {0, 84, 71, 0, 67, 0, 0, 0, 65, 0, 0, 0, 0, 0, 0, 78};
 
+
+
+#include <iostream>
+#include <thread>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+
+
+
+const size_t PACK_SIZE = 1024;
+
+const size_t QUEUE_SIZE = 1024 * 1024 * 1024;
+
+// 定义 bam_pack 结构体，用于存储打包的 bam1_t 对象
+struct bam_pack {
+    std::vector<bam1_t*> bams;
+
+    bam_pack() {
+        bams.reserve(PACK_SIZE);
+    }
+
+    ~bam_pack() {
+        for (auto& bam : bams) {
+            bam_destroy1(bam);
+        }
+    }
+};
+
+std::queue<bam_pack*> bam_queue;
+std::mutex queue_mutex;
+std::condition_variable not_full;
+std::condition_variable not_empty;
+
+void read_thread_task(BamReader* reader) {
+    long num = 0;
+    bam_pack* pack = new bam_pack();
+    for (size_t i = 0; i < PACK_SIZE; ++i) {
+        bam1_t* b = bam_init1();
+        if (b == NULL) {
+            std::cerr << "[E::" << __func__ << "] Out of memory allocating BAM struct.\n";
+            return;
+        }
+        pack->bams.push_back(b);
+    }
+    while (true) {
+        int cnt = 0;
+        for (size_t i = 0; i < PACK_SIZE; ++i) {
+            if (!reader->getBam1_t(pack->bams[i])) {
+                break;
+            }
+            num++;
+            cnt++;
+        }
+
+        if (cnt == 0) {
+            //delete pack;
+            break;
+        }
+
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        not_full.wait(lock, [] { return bam_queue.size() < QUEUE_SIZE; });
+
+        bam_queue.push(pack);
+        not_empty.notify_one();
+    }
+    printf("num is %lld\n", num);
+
+    // 通知写线程不再有新数据
+    std::unique_lock<std::mutex> lock(queue_mutex);
+    bam_queue.push(nullptr);
+    not_empty.notify_one();
+}
+
+void read_thread_task2(BamReader* reader) {
+    long num = 0;
+	while (true) {
+        bam_pack* pack = new bam_pack();
+        for (size_t i = 0; i < PACK_SIZE; ++i) {
+            bam1_t* b = bam_init1();
+            if (b == NULL) {
+                std::cerr << "[E::" << __func__ << "] Out of memory allocating BAM struct.\n";
+                delete pack;
+                return;
+            }
+
+            if (!reader->getBam1_t(b)) {
+                bam_destroy1(b);
+                delete pack;
+                break;
+            }
+            pack->bams.push_back(b);
+        }
+
+        if (pack->bams.empty()) {
+            delete pack;
+            break;
+        }
+
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        not_full.wait(lock, [] { return bam_queue.size() < PACK_SIZE; });
+
+        bam_queue.push(pack);
+        not_empty.notify_one();
+    }
+
+    // 通知写线程不再有新数据
+    std::unique_lock<std::mutex> lock(queue_mutex);
+    bam_queue.push(nullptr);
+    not_empty.notify_one();
+	printf("num is %d\n", num);
+}
+
+void write_thread_task(BamWriter* writer) {
+    printf("queue size %lld\n", bam_queue.size());
+    double t0 = GetTime();
+    while (true) {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        not_empty.wait(lock, [] { return !bam_queue.empty(); });
+
+        bam_pack* pack = bam_queue.front();
+        bam_queue.pop();
+        //printf("queue size %lld\n", bam_queue.size());
+
+        not_full.notify_one();
+
+        if (pack == nullptr) {
+            break;
+        }
+
+        for (auto& b : pack->bams) {
+            writer->write(b);
+        }
+        //delete pack;
+    }
+    printf("main write part cost %lf\n", GetTime() - t0);
+    writer->over();
+}
+
+void write_thread_task2(BamWriter* writer) {
+    double t0 = GetTime();
+	while (true) {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        not_empty.wait(lock, [] { return !bam_queue.empty(); });
+
+        bam_pack* pack = bam_queue.front();
+        bam_queue.pop();
+
+        not_full.notify_one();
+
+        if (pack == nullptr) {
+            break;
+        }
+
+        for (auto& b : pack->bams) {
+            writer->write(b);
+        }
+        delete pack;
+    }
+    printf("main write part cost %lf\n", GetTime() - t0);
+    writer->over();
+}
+
 int InputBlockNum=0;
 
 long long NUM_N[100]={0};
@@ -1441,20 +1604,357 @@ int main(int argc,char* argv[]){
         /*
          * 开始创建BamRead 和 BamWriter
          */
+#define init_test 
+//#define debug_test 
+//#define queue_test
+//#define parallel_test
+//#define merge_parallel_test
+//tagg
 
+#ifdef queue_test
+
+        long long num=0;
+        int big_size = 256;
+        //int big_size = 100 << 10;
+        //int big_size = 800 << 10;
+        double t0 = GetTime();
+		BamReader *reader = new BamReader(inputfile, n_thread);
+        printf("new reader cost %lf\n", GetTime() - t0);
+        
+        t0 = GetTime();
+		std::thread reader_t(read_thread_task, reader);
+		reader_t.join();
+        printf("read cost %lf\n", GetTime() - t0);
+
+        printf("============\n");
+
+        t0 = GetTime();
+        BamWriter *writer = new BamWriter(outputfile, reader->getHeader(), n_thread_write, level, big_size);
+        printf("new writer cost %lf\n", GetTime() - t0);
+
+
+        
+        t0 = GetTime();
+		std::thread writer_t(write_thread_task, writer);
+		writer_t.join();
+        printf("write cost %lf\n", GetTime() - t0);
+
+#endif
+
+#ifdef debug_test
+
+        double t0 = GetTime();
         BamReader *reader = new BamReader(inputfile,n_thread);
-        BamWriter *writer = new BamWriter(outputfile,reader->getHeader(),n_thread_write,level,256);
+        printf("new reader cost %lf\n", GetTime() - t0);
+
+        const int NN = 1000;
+
+        t0 = GetTime();
+        bam1_t **b = new bam1_t*[NN];
+        for(int i = 0; i < NN; i++) {
+            if ((b[i] = bam_init1()) == NULL) {
+                fprintf(stderr, "[E::%s] Out of memory allocating BAM struct.\n", __func__);
+            }
+        }
+        printf("init items cost %lf\n", GetTime() - t0);
+
+        t0 = GetTime();
+        long long num=0;
+        while (reader->getBam1_t(b[num % NN])){
+            num++;
+        }
+        printf("read items cost %lf\n", GetTime() - t0);
+
+
+        t0 = GetTime();
+        //int big_size = 4 << 20;
+        int big_size = 8 << 10;
+        BamWriter *writer = new BamWriter(outputfile,reader->getHeader(),n_thread_write,level, big_size);
+        printf("new writer cost %lf\n", GetTime() - t0);
+
+        //sleep(5);
+        double t1 = GetTime();
+        t0 = GetTime();
+        for(long long i = 0; i < num; i++) {
+            writer->write(b[i % NN]);
+        }
+        printf("writer cost %lf\n", GetTime() - t0);
+        t0 = GetTime();
+        writer->over();
+        printf("laste consumer cost %lf\n", GetTime() - t0);
+        printf("consumer cost %lf\n", GetTime() - t1);
+
+#endif
+
+
+#ifdef debug_read
+
+        double t0 = GetTime();
+        BamReader *reader = new BamReader(inputfile,n_thread);
+        printf("new reader cost %lf\n", GetTime() - t0);
+
+        const int NN = 1000;
+
+        t0 = GetTime();
+        bam1_t **b = new bam1_t*[NN];
+        for(int i = 0; i < NN; i++) {
+            if ((b[i] = bam_init1()) == NULL) {
+                fprintf(stderr, "[E::%s] Out of memory allocating BAM struct.\n", __func__);
+            }
+        }
+        printf("init items cost %lf\n", GetTime() - t0);
+
+        t0 = GetTime();
+        //int big_size = 4 << 20;
+        //int big_size = 256;
+        //BamWriter *writer = new BamWriter(outputfile,reader->getHeader(),n_thread_write,level, big_size);
+        //printf("new writer cost %lf\n", GetTime() - t0);
+
+        double t1 = GetTime();
+        t0 = GetTime();
+        long long num=0;
+        while (reader->getBam1_t(b[num % NN])){
+            num++;
+            //writer->write(b[num % NN]);
+        }
+        printf("new producer cost %lf\n", GetTime() - t0);
+        t0 = GetTime();
+        //writer->over();
+        printf("new laste consumer cost %lf\n", GetTime() - t0);
+        printf("new consumer cost %lf\n", GetTime() - t1);
+
+
+#endif
+
+
+#ifdef debug_test_all
+
+        double t0 = GetTime();
+        BamReader *reader = new BamReader(inputfile,n_thread);
+        printf("new reader cost %lf\n", GetTime() - t0);
+
+        const int NN = 1000;
+
+        t0 = GetTime();
+        bam1_t **b = new bam1_t*[NN];
+        for(int i = 0; i < NN; i++) {
+            if ((b[i] = bam_init1()) == NULL) {
+                fprintf(stderr, "[E::%s] Out of memory allocating BAM struct.\n", __func__);
+            }
+        }
+        printf("init items cost %lf\n", GetTime() - t0);
+
+        t0 = GetTime();
+        //int big_size = 4 << 20;
+        int big_size = 256;
+        BamWriter *writer = new BamWriter(outputfile,reader->getHeader(),n_thread_write,level, big_size);
+        printf("new writer cost %lf\n", GetTime() - t0);
+
+        double t1 = GetTime();
+        t0 = GetTime();
+        long long num=0;
+        double t_read_bam = 0;
+        double t_write_bam = 0;
+        double t2;
+        while (true) {
+            t2 = GetTime();
+            int res = reader->getBam1_t(b[num % NN]);
+            t_read_bam += GetTime() - t2;
+
+            if(res == 0) break;
+            num++;
+            t2 = GetTime();
+            writer->write(b[num % NN]);
+            t_write_bam += GetTime() - t2;
+        }
+        printf("read: %lf; write: %lf\n", t_read_bam, t_write_bam);
+        printf("total producer cost %lf\n", GetTime() - t0);
+        t0 = GetTime();
+        writer->over();
+        printf("total laste consumer cost %lf\n", GetTime() - t0);
+        printf("total consumer cost %lf\n", GetTime() - t1);
+
+
+#endif
+
+#ifdef init_test
+
+        //int big_size = 800 << 10;
+        int big_size = 256;
+        //int big_size = 32 << 10;
+        double t0 = GetTime();
+		BamReader *reader = new BamReader(inputfile, n_thread);
+        printf("new reader cost %lf\n", GetTime() - t0);
+
+        t0 = GetTime();
+        BamWriter *writer = new BamWriter(outputfile, reader->getHeader(), n_thread_write, level, big_size);
+        printf("new writer cost %lf\n", GetTime() - t0);
+
         bam1_t *b;
         if ((b = bam_init1()) == NULL) {
             fprintf(stderr, "[E::%s] Out of memory allocating BAM struct.\n", __func__);
         }
-        long long num=0;
-        while (reader->getBam1_t(b)){
+        long long num = 0;
+        t0 = GetTime();
+        double t1 = GetTime();
+        while (reader->getBam1_t(b)) {
             num++;
             writer->write(b);
 //            if (num%1000 == 0) printf("Bam1_t Num is %d\n",num);
         }
+        printf("new process 1+2 cost %lf\n", GetTime() - t0);
+
         writer->over();
+        printf("new total process cost %lf\n", GetTime() - t1);
+#endif
+
+
+#ifdef merge_parallel_test 
+
+        //int big_size = 800 << 10;
+        int big_size = 256;
+        //int big_size = 32 << 10;
+        double write_time = 0;
+
+        double t0, t1;
+
+        t0 = GetTime();
+		BamReader *reader = new BamReader(inputfile, n_thread);
+        printf("new reader cost %lf\n", GetTime() - t0);
+
+        t0 = GetTime();
+        BamWriter *writer = new BamWriter(outputfile, reader->getHeader(), n_thread_write, level, big_size);
+        printf("new writer cost %lf\n", GetTime() - t0);
+
+        const int vec_N = 32 << 10;
+
+        t0 = GetTime();
+        std::vector<bam1_t *> b_vec(vec_N);
+        for(int i = 0; i < b_vec.size(); i++) {
+            if ((b_vec[i] = bam_init1()) == NULL) {
+                fprintf(stderr, "[E::%s] Out of memory allocating BAM struct.\n", __func__);
+            }
+        }
+        printf("init bams cost %lf\n", GetTime() - t0);
+
+        long long num = 0;
+
+        t0 = GetTime();
+        while (reader->getBam1_t(b_vec[num % vec_N])) {
+            num++;
+        }
+        printf("tot read cost %lf\n", GetTime() - t0);
+
+        t0 = GetTime();
+        int vec_size = 0;
+        for(int i = 0; i < num; i++) {
+            vec_size++;
+            if(vec_size == vec_N) {
+                t1 = GetTime();
+                writer->write_parallel(b_vec);
+                vec_size = 0;
+                write_time += GetTime() - t1;
+            }
+        }
+
+        t1 = GetTime();
+        if(vec_size) {
+            b_vec.resize(vec_size);
+            writer->write_parallel(b_vec);
+        }
+        write_time += GetTime() - t1;
+
+        printf("new process cost %lf\n", GetTime() - t0);
+
+        t0 = GetTime();
+        writer->over();
+        printf("new last process cost %lf\n", GetTime() - t0);
+        printf("tot write cost %lf\n", write_time);
+#endif
+
+
+#ifdef parallel_test 
+
+        //int big_size = 800 << 10;
+        int big_size = 4 << 10;
+        //int big_size = 32 << 10;
+        double write_time = 0;
+        double read_time = 0;
+
+        double t0, t1;
+
+        t0 = GetTime();
+		//BamReader *reader = new BamReader(inputfile, 800 << 10, 800 << 10, 800 << 10, n_thread);
+		BamReader *reader = new BamReader(inputfile, n_thread);
+        printf("new reader cost %lf\n", GetTime() - t0);
+
+        t0 = GetTime();
+        BamWriter *writer = new BamWriter(outputfile, reader->getHeader(), n_thread_write, level, big_size);
+        printf("new writer cost %lf\n", GetTime() - t0);
+
+        const int vec_N = 40 << 10;
+
+        t0 = GetTime();
+        std::vector<bam1_t*> b_vec[THREAD_NUM_P];
+//#pragma omp parallel for num_threads(THREAD_NUM_P) schedule(static)
+        for(int i = 0; i < THREAD_NUM_P; i++) {
+            for(int j = 0; j < vec_N; j++) {
+                bam1_t* item = bam_init1();
+                if(item == NULL) {
+                    fprintf(stderr, "[E::%s] Out of memory allocating BAM struct.\n", __func__);
+                }
+                b_vec[i].push_back(item);
+            }
+        }
+        printf("init bams cost %lf\n", GetTime() - t0);
+
+        long long num = 0;
+
+        t0 = GetTime();
+
+        //bam1_t* AAA = bam_init1();
+        
+        bool done = 0;
+        while (done == 0) {
+            t1 = GetTime();
+            auto res_vec = reader->getBam1_t_parallel(b_vec);
+            int res_vec_size = res_vec.size();
+            //printf("reader get vec size %d\n", res_vec_size);
+            num += res_vec_size;
+            //int r_res = reader->getBam1_t(AAA);
+            read_time += GetTime() - t1;
+
+            if(res_vec_size == 0) break;
+            //if(r_res == 0) break;
+
+            t1 = GetTime();
+#ifdef use_parallel_write
+            writer->write_parallel(res_vec);
+#else
+            for(int i = 0; i < res_vec_size; i++) {
+                writer->write(res_vec[i]);
+            }
+#endif
+            write_time += GetTime() - t1;
+            
+        }
+
+        //for(auto item : mp) {
+        //    printf(" == %d %lld\n", item.first, item.second);
+        //}
+
+        printf("tot cost %lf\n", GetTime() - t0);
+        printf("tot read cost %lf\n", read_time);
+        printf("tot write cost %lf\n", write_time);
+
+        t0 = GetTime();
+#ifdef use_parallel_write
+        writer->over_parallel();
+#else
+        writer->over();
+#endif
+        printf("new last process cost %lf\n", GetTime() - t0);
+#endif
 
         cout << "Bam1_t Num : "<< num << endl;
 

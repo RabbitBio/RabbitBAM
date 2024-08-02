@@ -73,6 +73,7 @@ public:
 
     bool getBam1_t(bam1_t* b);
 
+    std::vector<bam1_t*> getBam1_t_parallel(std::vector<bam1_t*> b_vec[THREAD_NUM_P]);
 
     /*
      * 获取Bam——Complete——Clock

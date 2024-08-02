@@ -307,7 +307,10 @@ BamReader::BamReader(std::string file_name,int n_thread){
 //        thread *consumer_thread = new thread(&benchmark_pack,&completeBlock);
 
 
+#ifdef use_parallel_read
+#else
     un_comp = completeBlock->getCompleteBlock();
+#endif
 
 
 }
@@ -358,7 +361,10 @@ BamReader::BamReader(std::string file_name,int read_block,int compress_block,int
 //        thread *consumer_thread = new thread(&benchmark_pack,&completeBlock);
 
 
+#ifdef use_parallel_read
+#else
     un_comp = completeBlock->getCompleteBlock();
+#endif
 }
 
 
@@ -369,6 +375,53 @@ BamReader::BamReader(std::string file_name,int read_block,int compress_block,int
 sam_hdr_t* BamReader::getHeader(){
     return hdr;
 }
+
+std::vector<bam1_t*> BamReader::getBam1_t_parallel(std::vector<bam1_t*> b_vec[THREAD_NUM_P]) {
+#define THREAD_NUM_PR 4
+
+    std::vector<bam1_t*> res_vec;
+
+    bam_complete_block* blocks[THREAD_NUM_PR];
+    
+    int pre_vec_pos[THREAD_NUM_PR] = {0};
+    int bam_num[THREAD_NUM_PR];
+
+    for(int k = 0; k < 16; k++) {
+        for(int i = 0; i < THREAD_NUM_PR; i++) {
+            blocks[i] = completeBlock->getCompleteBlock();
+        }
+
+
+#pragma omp parallel for num_threads(THREAD_NUM_PR) schedule(static)
+        for(int i = 0; i < THREAD_NUM_PR; i++) {
+            bam_num[i] = 0;
+            if(blocks[i] == nullptr) continue;
+            int now_num = pre_vec_pos[i];
+            while(read_bam(blocks[i], b_vec[i][now_num], 0) >= 0) {
+                now_num++;
+                //printf("read == %d %d\n", blocks[i]->pos, now_num);
+                if(now_num >= b_vec[i].size()) {
+                    printf("%d > %d, pre set b_vec size is not big enough\n");
+                    exit(0);
+                }
+            }
+            bam_num[i] = now_num - pre_vec_pos[i];
+        }
+
+        for(int i = 0; i < THREAD_NUM_PR; i++) {
+            if(blocks[i] != nullptr) completeBlock->backEmpty(blocks[i]);
+        }
+
+        for(int i = 0; i < THREAD_NUM_PR; i++) {
+            res_vec.insert(res_vec.end(), b_vec[i].begin() + pre_vec_pos[i], b_vec[i].begin() + pre_vec_pos[i] + bam_num[i]);
+            pre_vec_pos[i] += bam_num[i];
+        }
+    }
+    
+    return res_vec;
+}
+
+
 
 /*
  *  获取 BAM1t
