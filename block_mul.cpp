@@ -973,10 +973,10 @@ int main(int argc, char *argv[]) {
         printf("BGZF_MAX_BLOCK_COMPLETE_SIZE is %d\n", BGZF_MAX_BLOCK_COMPLETE_SIZE);
         printf("output File Name is %s\n", outputfile.c_str());
 
-#define init_test
+//#define init_test
 //#define debug_test 
 //#define queue_test
-//#define parallel_test
+#define parallel_test
 //#define merge_parallel_test
 //tagg
 

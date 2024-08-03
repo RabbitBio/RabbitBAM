@@ -218,7 +218,6 @@ BamReader::BamReader(std::string file_name, int n_thread) {
 
 
     if(is_tgs) {
-        printf("==== is tgs %d\n", is_tgs);
         un_comp = completeBlock->getCompleteBlock();
     }
 //
@@ -256,7 +255,6 @@ BamReader::BamReader(std::string file_name, int read_block, int compress_block, 
     thread *assign_thread = new thread(&assign_pack, compress, completeBlock);
 
     if(is_tgs) {
-        printf("==== is tgs %d\n", is_tgs);
         un_comp = completeBlock->getCompleteBlock();
     }
 

@@ -582,7 +582,6 @@ BamWriter::BamWriter(std::string filename, int threadNumber, int level, int Buff
     output->fp.bgzf->compress_level = level;
 
     if(is_tgs) {
-        printf("==== is tgs %d\n", is_tgs);
         write_block=bam_write_compress->getEmpty();
     }
 
@@ -621,7 +620,6 @@ BamWriter::BamWriter(std::string filename, sam_hdr_t *hdr, int threadNumber, int
 
 
     if(is_tgs) {
-        printf("==== is tgs %d\n", is_tgs);
         write_block=bam_write_compress->getEmpty();
     }
 
@@ -656,7 +654,6 @@ void BamWriter::set_output(samFile *output) {
     output->fp.bgzf->compress_level = 6;
 
     if(is_tgs) {
-        printf("==== is tgs %d\n", is_tgs);
         write_block=bam_write_compress->getEmpty();
     }
 
