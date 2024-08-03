@@ -1,105 +1,102 @@
-//
-// Created by 赵展 on 2021/3/24.
-//
-
-
 #include <iostream>
 #include "BamStatus.h"
-BamStatus::BamStatus(){
-    this->filename="no input file name";
-    this->ContentLen=MAXLEN;
-    this->QulityLen=70;
-    this->LengthSequence=new int[MAXLEN];
-    memset(this->LengthSequence,0x00,MAXLEN*sizeof(int));
-    this->QualitySequence=new int[ContentLen];
-    memset(this->QualitySequence,0x00,ContentLen*sizeof(int));
-    this->NumberList=new int*[MAXLEN];
-    this->Qualitylist=new int*[MAXLEN];
-    this->QualityPositonList=new int*[MAXLEN];
-    this->Content=new int*[ContentLen];
-    this->DoubleContent=new double*[ContentLen];
-    for (int i=0;i<MAXLEN;i++){
-        this->NumberList[i]=new int[8];
-        memset(this->NumberList[i],0x00,8*sizeof(int));
-        this->Qualitylist[i]=new int[8];
-        memset(this->Qualitylist[i],0x00,8*sizeof(int));
-        this->QualityPositonList[i]=new int[QulityLen];
-        memset(this->QualityPositonList[i],0x00,QulityLen*sizeof(int));
+
+BamStatus::BamStatus() {
+    this->filename = "no input file name";
+    this->ContentLen = MAXLEN;
+    this->QulityLen = 70;
+    this->LengthSequence = new int[MAXLEN];
+    memset(this->LengthSequence, 0x00, MAXLEN * sizeof(int));
+    this->QualitySequence = new int[ContentLen];
+    memset(this->QualitySequence, 0x00, ContentLen * sizeof(int));
+    this->NumberList = new int *[MAXLEN];
+    this->Qualitylist = new int *[MAXLEN];
+    this->QualityPositonList = new int *[MAXLEN];
+    this->Content = new int *[ContentLen];
+    this->DoubleContent = new double *[ContentLen];
+    for (int i = 0; i < MAXLEN; i++) {
+        this->NumberList[i] = new int[8];
+        memset(this->NumberList[i], 0x00, 8 * sizeof(int));
+        this->Qualitylist[i] = new int[8];
+        memset(this->Qualitylist[i], 0x00, 8 * sizeof(int));
+        this->QualityPositonList[i] = new int[QulityLen];
+        memset(this->QualityPositonList[i], 0x00, QulityLen * sizeof(int));
     }
-    for (int i=0;i<ContentLen;i++){
-        this->Content[i]=new int[8];
-        memset(this->Content[i],0x00,8*sizeof(int));
-        this->DoubleContent[i]=new double[8];
-        memset(this->DoubleContent[i],0x00,8*sizeof(double));
+    for (int i = 0; i < ContentLen; i++) {
+        this->Content[i] = new int[8];
+        memset(this->Content[i], 0x00, 8 * sizeof(int));
+        this->DoubleContent[i] = new double[8];
+        memset(this->DoubleContent[i], 0x00, 8 * sizeof(double));
     }
-    this->KmerBit=1<<(2*this->KmerBase);
-    this->Kmer=new int*[this->KmerBit];
-    for (int i=0;i<this->KmerBit;i++){
-        this->Kmer[i]=new int[MAXLEN];
-        memset(this->Kmer[i],0x00,MAXLEN*sizeof(int));
+    this->KmerBit = 1 << (2 * this->KmerBase);
+    this->Kmer = new int *[this->KmerBit];
+    for (int i = 0; i < this->KmerBit; i++) {
+        this->Kmer[i] = new int[MAXLEN];
+        memset(this->Kmer[i], 0x00, MAXLEN * sizeof(int));
     }
-    this->ChooseKmerNum=6;
-    this->ChooseKmerPos=new int[this->ChooseKmerNum];
-    this->ChooseKmerKey=new int[this->ChooseKmerNum];
-    memset(this->ChooseKmerKey,0xFFFF,this->ChooseKmerNum*sizeof(int));
-    this->Chromosome=new int[this->ChromosomeNumber];
+    this->ChooseKmerNum = 6;
+    this->ChooseKmerPos = new int[this->ChooseKmerNum];
+    this->ChooseKmerKey = new int[this->ChooseKmerNum];
+    memset(this->ChooseKmerKey, 0xFFFF, this->ChooseKmerNum * sizeof(int));
+    this->Chromosome = new int[this->ChromosomeNumber];
     memset(this->Chromosome, 0x00, this->ChromosomeNumber * sizeof(int));
-    this->total_number=0;
-    this->total_aligen_number=0;
-    this->max_len=0;
-    this->min_len=-1;
-}
-BamStatus::BamStatus(string filename){
-    this->filename=filename;
-    this->ContentLen=MAXLEN;
-    this->QulityLen=70;
-    this->LengthSequence=new int[MAXLEN];
-    memset(this->LengthSequence,0x00,MAXLEN*sizeof(int));
-    this->QualitySequence=new int[ContentLen];
-    memset(this->QualitySequence,0x00,ContentLen*sizeof(int));
-    this->NumberList=new int*[MAXLEN];
-    this->Qualitylist=new int*[MAXLEN];
-    this->QualityPositonList=new int*[MAXLEN];
-    this->Content=new int*[ContentLen];
-    this->DoubleContent=new double*[ContentLen];
-    for (int i=0;i<MAXLEN;i++){
-        this->NumberList[i]=new int[8];
-        memset(this->NumberList[i],0x00,8*sizeof(int));
-        this->Qualitylist[i]=new int[8];
-        memset(this->Qualitylist[i],0x00,8*sizeof(int));
-        this->QualityPositonList[i]=new int[QulityLen];
-        memset(this->QualityPositonList[i],0x00,QulityLen*sizeof(int));
-    }
-    for (int i=0;i<ContentLen;i++){
-        this->Content[i]=new int[8];
-        memset(this->Content[i],0x00,8*sizeof(int));
-        this->DoubleContent[i]=new double[8];
-        memset(this->DoubleContent[i],0x00,8*sizeof(double));
-    }
-    this->KmerBit=1<<(2*this->KmerBase);
-    this->Kmer=new int*[this->KmerBit];
-    for (int i=0;i<this->KmerBit;i++){
-        this->Kmer[i]=new int[MAXLEN];
-        memset(this->Kmer[i],0x00,MAXLEN*sizeof(int));
-    }
-    this->ChooseKmerNum=6;
-    this->ChooseKmerPos=new int[this->ChooseKmerNum];
-    this->ChooseKmerKey=new int[this->ChooseKmerNum];
-    memset(this->ChooseKmerKey,0xFFFF,this->ChooseKmerNum*sizeof(int));
-    this->Chromosome=new int[this->ChromosomeNumber];
-    memset(this->Chromosome, 0x00, this->ChromosomeNumber * sizeof(int));
-    this->total_number=0;
-    this->total_aligen_number=0;
-    this->max_len=0;
-    this->min_len=-1;
+    this->total_number = 0;
+    this->total_aligen_number = 0;
+    this->max_len = 0;
+    this->min_len = -1;
 }
 
-BamStatus::~BamStatus(){
-    for (int i=0;i<MAXLEN;i++){
+BamStatus::BamStatus(string filename) {
+    this->filename = filename;
+    this->ContentLen = MAXLEN;
+    this->QulityLen = 70;
+    this->LengthSequence = new int[MAXLEN];
+    memset(this->LengthSequence, 0x00, MAXLEN * sizeof(int));
+    this->QualitySequence = new int[ContentLen];
+    memset(this->QualitySequence, 0x00, ContentLen * sizeof(int));
+    this->NumberList = new int *[MAXLEN];
+    this->Qualitylist = new int *[MAXLEN];
+    this->QualityPositonList = new int *[MAXLEN];
+    this->Content = new int *[ContentLen];
+    this->DoubleContent = new double *[ContentLen];
+    for (int i = 0; i < MAXLEN; i++) {
+        this->NumberList[i] = new int[8];
+        memset(this->NumberList[i], 0x00, 8 * sizeof(int));
+        this->Qualitylist[i] = new int[8];
+        memset(this->Qualitylist[i], 0x00, 8 * sizeof(int));
+        this->QualityPositonList[i] = new int[QulityLen];
+        memset(this->QualityPositonList[i], 0x00, QulityLen * sizeof(int));
+    }
+    for (int i = 0; i < ContentLen; i++) {
+        this->Content[i] = new int[8];
+        memset(this->Content[i], 0x00, 8 * sizeof(int));
+        this->DoubleContent[i] = new double[8];
+        memset(this->DoubleContent[i], 0x00, 8 * sizeof(double));
+    }
+    this->KmerBit = 1 << (2 * this->KmerBase);
+    this->Kmer = new int *[this->KmerBit];
+    for (int i = 0; i < this->KmerBit; i++) {
+        this->Kmer[i] = new int[MAXLEN];
+        memset(this->Kmer[i], 0x00, MAXLEN * sizeof(int));
+    }
+    this->ChooseKmerNum = 6;
+    this->ChooseKmerPos = new int[this->ChooseKmerNum];
+    this->ChooseKmerKey = new int[this->ChooseKmerNum];
+    memset(this->ChooseKmerKey, 0xFFFF, this->ChooseKmerNum * sizeof(int));
+    this->Chromosome = new int[this->ChromosomeNumber];
+    memset(this->Chromosome, 0x00, this->ChromosomeNumber * sizeof(int));
+    this->total_number = 0;
+    this->total_aligen_number = 0;
+    this->max_len = 0;
+    this->min_len = -1;
+}
+
+BamStatus::~BamStatus() {
+    for (int i = 0; i < MAXLEN; i++) {
         delete this->NumberList[i];
         delete this->Qualitylist[i];
     }
-    for (int i=0;i<ContentLen;i++){
+    for (int i = 0; i < ContentLen; i++) {
         delete this->Content[i];
         delete this->DoubleContent[i];
     }
@@ -109,220 +106,209 @@ BamStatus::~BamStatus(){
 
 void BamStatus::statusbam(bam1_t *b) {
     total_number++;
-    max_len=max_len>b->core.l_qseq?max_len:b->core.l_qseq;
-    min_len=min_len==-1?b->core.l_qseq:min(min_len,b->core.l_qseq);
+    max_len = max_len > b->core.l_qseq ? max_len : b->core.l_qseq;
+    min_len = min_len == -1 ? b->core.l_qseq : min(min_len, b->core.l_qseq);
     LengthSequence[b->core.l_qseq]++;
     this->Chr.insert(b->core.tid);
-    if (b->core.flag&2048) return;
+    if (b->core.flag & 2048) return;
     total_aligen_number++;
 
-    if (b->core.l_qseq >= MAXLEN || b->core.l_qseq < 0){
+    if (b->core.l_qseq >= MAXLEN || b->core.l_qseq < 0) {
         std::cout << "It is Wrong !" << endl;
     }
-    /*
-     *  序列内部信息
-     */
-    uint8_t* quality;
+
+    uint8_t *quality;
     uint8_t *seq;
-    uint8_t* qname;
-    seq=bam_get_seq(b);
-    int number[8];memset(number,0x00,8*sizeof(int));
-//    printf("this is number before\n");
-//    for (int i=0;i<8;i++){
-//        printf("%d %d\n",i,number[i]);
-//    }
-    int total_qual=0;
+    uint8_t *qname;
+    seq = bam_get_seq(b);
+    int number[8];
+    memset(number, 0x00, 8 * sizeof(int));
+
+    int total_qual = 0;
     long long len = strlen(bam_get_qname(b));
-//    Chromosome[b->core.tid]++;
-    if (b->core.flag&16){
-        int kmer=0;
-        int last_n=-1;
-//        printf("%d\n",b->core.l_qseq);
-        for (int i=0;i<b->core.l_qseq;i++) {
-            if (b->core.l_qseq-i-1<0 || b->core.l_qseq-i-1>=MAXLEN) printf("!!!!%d\n",b->core.l_qseq-i-1);
-            NumberList[b->core.l_qseq-i-1][StatusBaseRever[bam_seqi(seq,i)]&0x07]++;
-            number[StatusBaseRever[bam_seqi(seq,i)]&0x07]++;
-            kmer<<=2;kmer+=DupvalAGCT[StatusBaseRever[bam_seqi(seq,i)]&0x07];kmer&=0x03FF;
-            if ((DupvalAGCT[StatusBaseRever[bam_seqi(seq,i)]&0x07])==-1) {
-                kmer=0;
-                last_n=i;
+    if (b->core.flag & 16) {
+        int kmer = 0;
+        int last_n = -1;
+        for (int i = 0; i < b->core.l_qseq; i++) {
+            if (b->core.l_qseq - i - 1 < 0 || b->core.l_qseq - i - 1 >= MAXLEN)
+                printf("!!!!%d\n", b->core.l_qseq - i - 1);
+            NumberList[b->core.l_qseq - i - 1][StatusBaseRever[bam_seqi(seq, i)] & 0x07]++;
+            number[StatusBaseRever[bam_seqi(seq, i)] & 0x07]++;
+            kmer <<= 2;
+            kmer += DupvalAGCT[StatusBaseRever[bam_seqi(seq, i)] & 0x07];
+            kmer &= 0x03FF;
+            if ((DupvalAGCT[StatusBaseRever[bam_seqi(seq, i)] & 0x07]) == -1) {
+                kmer = 0;
+                last_n = i;
             }
-            if (i-last_n>=kmer) Kmer[kmer][i]++;
+            if (i - last_n >= kmer) Kmer[kmer][i]++;
         }
-        quality=bam_get_qual(b);
-        for (int i=0;i<b->core.l_qseq;i++)  {
-            Qualitylist[b->core.l_qseq-i-1][StatusBaseRever[bam_seqi(seq,i)]&0x07]+=quality[b->core.l_qseq-i-1];
-            QualityPositonList[b->core.l_qseq-i-1][quality[b->core.l_qseq-i-1]]++;
-            total_qual+=quality[b->core.l_qseq-i-1];
+        quality = bam_get_qual(b);
+        for (int i = 0; i < b->core.l_qseq; i++) {
+            Qualitylist[b->core.l_qseq - i - 1][StatusBaseRever[bam_seqi(seq, i)] & 0x07] += quality[b->core.l_qseq -
+                                                                                                     i - 1];
+            QualityPositonList[b->core.l_qseq - i - 1][quality[b->core.l_qseq - i - 1]]++;
+            total_qual += quality[b->core.l_qseq - i - 1];
         }
-    }else{
-        int kmer=0;
-        int last_n=-1;
-        for (int i=0;i<b->core.l_qseq;i++)  {
-            if (i>=MAXLEN) printf("!!!%d\n",i);
-            NumberList[i][StatusBase[bam_seqi(seq,i)]&0x07]++;
-            number[StatusBaseRever[bam_seqi(seq,i)]&0x07]++;
-            kmer<<=2;kmer+=DupvalAGCT[StatusBaseRever[bam_seqi(seq,i)]&0x07];kmer&=0x03FF;
-            if ((DupvalAGCT[StatusBaseRever[bam_seqi(seq,i)]&0x07])==-1) {
-                kmer=0;
-                last_n=i;
+    } else {
+        int kmer = 0;
+        int last_n = -1;
+        for (int i = 0; i < b->core.l_qseq; i++) {
+            if (i >= MAXLEN) printf("!!!%d\n", i);
+            NumberList[i][StatusBase[bam_seqi(seq, i)] & 0x07]++;
+            number[StatusBaseRever[bam_seqi(seq, i)] & 0x07]++;
+            kmer <<= 2;
+            kmer += DupvalAGCT[StatusBaseRever[bam_seqi(seq, i)] & 0x07];
+            kmer &= 0x03FF;
+            if ((DupvalAGCT[StatusBaseRever[bam_seqi(seq, i)] & 0x07]) == -1) {
+                kmer = 0;
+                last_n = i;
             }
-            if (i-last_n>=kmer) Kmer[kmer][i]++;
+            if (i - last_n >= kmer) Kmer[kmer][i]++;
         }
-        quality=bam_get_qual(b);
-        for (int i=0;i<b->core.l_qseq;i++)  {
-            Qualitylist[i][StatusBaseRever[bam_seqi(seq,i)]&0x07]+=quality[i];
+        quality = bam_get_qual(b);
+        for (int i = 0; i < b->core.l_qseq; i++) {
+            Qualitylist[i][StatusBaseRever[bam_seqi(seq, i)] & 0x07] += quality[i];
             QualityPositonList[i][quality[i]]++;
-            total_qual+=quality[i];
+            total_qual += quality[i];
         }
     }
-    int total=0;
-    for (int i=0;i<8;i++) total+=number[i];
-    Content[((ContentLen-1)*number['A'&0x07])/total]['A'&0x07]++;
-    Content[((ContentLen-1)*number['G'&0x07])/total]['G'&0x07]++;
-    Content[((ContentLen-1)*number['C'&0x07])/total]['C'&0x07]++;
-    Content[((ContentLen-1)*number['T'&0x07])/total]['T'&0x07]++;
-    Content[((ContentLen-1)*number['N'&0x07])/total]['N'&0x07]++;
-    Content[((ContentLen-1)*(number['G'&0x07]+number['C'&0x07]))/total][('C'+'G')&0x07]++;
+    int total = 0;
+    for (int i = 0; i < 8; i++) total += number[i];
+    Content[((ContentLen - 1) * number['A' & 0x07]) / total]['A' & 0x07]++;
+    Content[((ContentLen - 1) * number['G' & 0x07]) / total]['G' & 0x07]++;
+    Content[((ContentLen - 1) * number['C' & 0x07]) / total]['C' & 0x07]++;
+    Content[((ContentLen - 1) * number['T' & 0x07]) / total]['T' & 0x07]++;
+    Content[((ContentLen - 1) * number['N' & 0x07]) / total]['N' & 0x07]++;
+    Content[((ContentLen - 1) * (number['G' & 0x07] + number['C' & 0x07])) / total][('C' + 'G') & 0x07]++;
 
 
-    /*
-     * 序列本身信息
-     */
-    QualitySequence[total_qual/b->core.l_qseq]++;
+    QualitySequence[total_qual / b->core.l_qseq]++;
 
-    //printf("%d is %d\n",b->core.l_qseq,LengthList[b->core.l_qseq]);
 }
 
-void BamStatus::add(BamStatus *b){
-    for (set<int>::iterator i=b->Chr.begin();i!=b->Chr.end();i++){
+void BamStatus::add(BamStatus *b) {
+    for (set<int>::iterator i = b->Chr.begin(); i != b->Chr.end(); i++) {
         this->Chr.insert(*i);
     }
-    for (int i=0;i<MAXLEN;i++){
-        for (int j=0;j<8;j++){
-            this->NumberList[i][j]+=b->NumberList[i][j];
-            this->Qualitylist[i][j]+=b->Qualitylist[i][j];
+    for (int i = 0; i < MAXLEN; i++) {
+        for (int j = 0; j < 8; j++) {
+            this->NumberList[i][j] += b->NumberList[i][j];
+            this->Qualitylist[i][j] += b->Qualitylist[i][j];
         }
-        for (int j=0;j<QulityLen;j++){
-            this->QualityPositonList[i][j]+=b->QualityPositonList[i][j];
-        }
-    }
-    for (int i=0;i<ContentLen;i++){
-        for (int j=0;j<8;j++){
-            this->Content[i][j]+=b->Content[i][j];
+        for (int j = 0; j < QulityLen; j++) {
+            this->QualityPositonList[i][j] += b->QualityPositonList[i][j];
         }
     }
-    for (int i=0;i<MAXLEN;i++){
-        this->LengthSequence[i]+=b->LengthSequence[i];
-    }
-    for (int i=0;i<KmerBit;i++){
-        for (int j=0;j<MAXLEN;j++){
-            this->Kmer[i][j]+=b->Kmer[i][j];
+    for (int i = 0; i < ContentLen; i++) {
+        for (int j = 0; j < 8; j++) {
+            this->Content[i][j] += b->Content[i][j];
         }
     }
-    this->total_number+=b->total_number;
-    this->total_aligen_number+=b->total_aligen_number;
-    this->max_len=this->max_len>b->max_len?this->max_len:b->max_len;
-    this->min_len=this->min_len==1?b->min_len:min(this->min_len,b->min_len);
-    for (int i=0;i<this->ChromosomeNumber;i++){
-        this->Chromosome[i]+=b->Chromosome[i];
+    for (int i = 0; i < MAXLEN; i++) {
+        this->LengthSequence[i] += b->LengthSequence[i];
+    }
+    for (int i = 0; i < KmerBit; i++) {
+        for (int j = 0; j < MAXLEN; j++) {
+            this->Kmer[i][j] += b->Kmer[i][j];
+        }
+    }
+    this->total_number += b->total_number;
+    this->total_aligen_number += b->total_aligen_number;
+    this->max_len = this->max_len > b->max_len ? this->max_len : b->max_len;
+    this->min_len = this->min_len == 1 ? b->min_len : min(this->min_len, b->min_len);
+    for (int i = 0; i < this->ChromosomeNumber; i++) {
+        this->Chromosome[i] += b->Chromosome[i];
     }
 }
+
 void BamStatus::statusAll() {
-    /*
-     * 这次先采用MAX-MIN的方法进行测试
-     */
-    for (int k=0;k<KmerBit;k++){
-        int _min=-1,_max=-1;
-        for (int i=0;i<MAXLEN;i++){
-            _min=_min==-1?Kmer[k][i]:min(_min,Kmer[k][i]);
-            _max=_max==-1?Kmer[k][i]:max(_max,Kmer[k][i]);
+
+    for (int k = 0; k < KmerBit; k++) {
+        int _min = -1, _max = -1;
+        for (int i = 0; i < MAXLEN; i++) {
+            _min = _min == -1 ? Kmer[k][i] : min(_min, Kmer[k][i]);
+            _max = _max == -1 ? Kmer[k][i] : max(_max, Kmer[k][i]);
         }
-        for (int i=0;i<ChooseKmerNum;i++){
-            if (_max-_min>ChooseKmerKey[i]){
-                for (int j=ChooseKmerNum-1;j>i;j--){
-                    ChooseKmerPos[j]=ChooseKmerPos[j-1];
-                    ChooseKmerKey[j]=ChooseKmerKey[j-1];
+        for (int i = 0; i < ChooseKmerNum; i++) {
+            if (_max - _min > ChooseKmerKey[i]) {
+                for (int j = ChooseKmerNum - 1; j > i; j--) {
+                    ChooseKmerPos[j] = ChooseKmerPos[j - 1];
+                    ChooseKmerKey[j] = ChooseKmerKey[j - 1];
                 }
-                ChooseKmerKey[i]=_max-_min;
-                ChooseKmerPos[i]=k;
+                ChooseKmerKey[i] = _max - _min;
+                ChooseKmerPos[i] = k;
                 break;
             }
         }
 
     }
 }
+
 void BamStatus::contentstatus() {
-    for (int i=0;i<101;i++){
+    for (int i = 0; i < 101; i++) {
         double total = 0.0;
-        for (int j=0;j<8;j++) total+=Content[j][i];
+        for (int j = 0; j < 8; j++) total += Content[j][i];
     }
 }
-void BamStatus::print(){
-    /*
-     *  每个位置上的AGCTN的比例
-     */
+
+void BamStatus::print() {
+
     {
-        for (int i=0;i<max_len;i++){
-            int num=0;
-            for (int j=0;j<8;j++) num+=NumberList[i][j];
-            printf("the Number postion %d\n",i);
-            printf("A is %lf\n",NumberList[i]['A'&0x07]/(num+0.0));
-            printf("G is %lf\n",NumberList[i]['G'&0x07]/(num+0.0));
-            printf("C is %lf\n",NumberList[i]['C'&0x07]/(num+0.0));
-            printf("T is %lf\n",NumberList[i]['T'&0x07]/(num+0.0));
-            printf("N is %lf\n",NumberList[i]['N'&0x07]/(num+0.0));
+        for (int i = 0; i < max_len; i++) {
+            int num = 0;
+            for (int j = 0; j < 8; j++) num += NumberList[i][j];
+            printf("the Number postion %d\n", i);
+            printf("A is %lf\n", NumberList[i]['A' & 0x07] / (num + 0.0));
+            printf("G is %lf\n", NumberList[i]['G' & 0x07] / (num + 0.0));
+            printf("C is %lf\n", NumberList[i]['C' & 0x07] / (num + 0.0));
+            printf("T is %lf\n", NumberList[i]['T' & 0x07] / (num + 0.0));
+            printf("N is %lf\n", NumberList[i]['N' & 0x07] / (num + 0.0));
         }
     }
 
 
-    /*
-     * AGCTN在整个序列上的比例
-     */
     {
-        int mod=1;
-        for (int i=0;i<ContentLen;i++){
-            printf("the Content postion %d\n",i);
-            printf("A Content is %d\n",Content[i]['A'&0x07]*mod);
-            printf("G Content is %d\n",Content[i]['G'&0x07]*mod);
-            printf("C Content is %d\n",Content[i]['C'&0x07]*mod);
-            printf("T Content is %d\n",Content[i]['T'&0x07]*mod);
-            printf("N Content is %d\n",Content[i]['N'&0x07]*mod);
-            printf("GC Content is %d\n",Content[i][('G'+'C')&0x07]*mod);
+        int mod = 1;
+        for (int i = 0; i < ContentLen; i++) {
+            printf("the Content postion %d\n", i);
+            printf("A Content is %d\n", Content[i]['A' & 0x07] * mod);
+            printf("G Content is %d\n", Content[i]['G' & 0x07] * mod);
+            printf("C Content is %d\n", Content[i]['C' & 0x07] * mod);
+            printf("T Content is %d\n", Content[i]['T' & 0x07] * mod);
+            printf("N Content is %d\n", Content[i]['N' & 0x07] * mod);
+            printf("GC Content is %d\n", Content[i][('G' + 'C') & 0x07] * mod);
         }
     }
 
 
-    /*
-     * 序列长度的数量 或 比例
-     */
-
     {
-        int total_length_number=0;
-        for (int i=0;i<this->max_len;i++) total_length_number+=LengthSequence[i];
-        printf("total_length_number is %d\n",total_length_number);
-        for (int i=0;i<this->max_len;i++){
-            printf("%d length content is %d\n",i,LengthSequence[i]);
+        int total_length_number = 0;
+        for (int i = 0; i < this->max_len; i++) total_length_number += LengthSequence[i];
+        printf("total_length_number is %d\n", total_length_number);
+        for (int i = 0; i < this->max_len; i++) {
+            printf("%d length content is %d\n", i, LengthSequence[i]);
         }
     }
 
     {
-        for (int i=0;i<41;i++){
-            printf("%d  Mean Qulity number is  %d\n",i,QualitySequence[i]);
+        for (int i = 0; i < 41; i++) {
+            printf("%d  Mean Qulity number is  %d\n", i, QualitySequence[i]);
         }
     }
 
 }
-string HTMLHeader(){
+
+string HTMLHeader() {
     return string("<!DOCTYPE html>\n"
-                       "<html lang=\"en\">\n"
-                       "<head>\n"
-                       "    <meta charset=\"UTF-8\">\n"
-                       "    <title>Title</title>\n"
-                       "    <script src=\"https://cdn.jsdelivr.net/npm/echarts@5.0.2/dist/echarts.min.js\"></script>\n"
-                       "</head>\n"
-                       "<body>\n"
-                       "<script>\n"
+                  "<html lang=\"en\">\n"
+                  "<head>\n"
+                  "    <meta charset=\"UTF-8\">\n"
+                  "    <title>Title</title>\n"
+                  "    <script src=\"https://cdn.jsdelivr.net/npm/echarts@5.0.2/dist/echarts.min.js\"></script>\n"
+                  "</head>\n"
+                  "<body>\n"
+                  "<script>\n"
                   "\n"
                   "    /*\n"
                   "    * Licensed to the Apache Software Foundation (ASF) under one\n"
@@ -371,7 +357,8 @@ string HTMLHeader(){
                   "\n"
                   "</script>");
 }
-string HTMLCss(){
+
+string HTMLCss() {
     return "<style type=\"text/css\">\n"
            " @media screen {\n"
            "  div.summary {\n"
@@ -560,10 +547,12 @@ string HTMLCss(){
            "  }\n"
            "</style>\n";
 }
-string insertDiv(string id){
-    return "<div id=\""+id+"\" style=\"width: 800px;height:600px;\"></div>\n";
+
+string insertDiv(string id) {
+    return "<div id=\"" + id + "\" style=\"width: 800px;height:600px;\"></div>\n";
 }
-string insertTooltip(){
+
+string insertTooltip() {
     return "tooltip: {\n"
            "        trigger: 'axis',\n"
            "        axisPointer: {\n"
@@ -574,155 +563,176 @@ string insertTooltip(){
            "        }\n"
            "    },\n";
 }
-string insertChart(string id){
-    return "\nvar "+id+"Chart = echarts.init(document.getElementById(\'"+id+"\'));\n";
+
+string insertChart(string id) {
+    return "\nvar " + id + "Chart = echarts.init(document.getElementById(\'" + id + "\'));\n";
 }
-string insertChartOption(string id){
-    return id+"Chart.setOption("+id+"Option);\n";
+
+string insertChartOption(string id) {
+    return id + "Chart.setOption(" + id + "Option);\n";
 }
-string insertOptionBegin(string id){
-    return "\nvar "+id+"Option = {\n";
+
+string insertOptionBegin(string id) {
+    return "\nvar " + id + "Option = {\n";
 }
-string insertOptionEnd(){
+
+string insertOptionEnd() {
     return "}\n";
 }
-string insertTitle(string text){
+
+string insertTitle(string text) {
     return "title: {\n"
-           "            text: \'"+text+"\',\n"
-           "            left:\'center\',\n"
-           "        },\n";
+           "            text: \'" + text + "\',\n"
+                                           "            left:\'center\',\n"
+                                           "        },\n";
 }
-string insertxAxis(int len,int interval=1){
+
+string insertxAxis(int len, int interval = 1) {
     string out("xAxis: {\n"
                "            type: 'category',\n"
                "            data: [");
-    for (int i=0;i<len;i+=interval){
-        out.append(to_string(i)+',');
+    for (int i = 0; i < len; i += interval) {
+        out.append(to_string(i) + ',');
     }
     out.append("]\n},\n");
     return out;
 }
-string insertxAxis(string name,int len,int interval=1){
+
+string insertxAxis(string name, int len, int interval = 1) {
     string out("xAxis: {\n"
                "            type: 'category',\n"
-               "            name: \'"+name+"\',\n"
-               "            nameLocation:'center',\n"
-               "nameTextStyle: {\n"
-               "                lineHeight: 50,\n"
-               "                fontSize: 13,\n"
-               "                fontFamily: \"monospace\",\n"
-               "                fontWeight: \"bold\"\n"
-               "            },\n"
-               "            data: [");
-    for (int i=0;i<len;i+=interval){
-        out.append(to_string(i)+',');
+               "            name: \'" + name + "\',\n"
+                                               "            nameLocation:'center',\n"
+                                               "nameTextStyle: {\n"
+                                               "                lineHeight: 50,\n"
+                                               "                fontSize: 13,\n"
+                                               "                fontFamily: \"monospace\",\n"
+                                               "                fontWeight: \"bold\"\n"
+                                               "            },\n"
+                                               "            data: [");
+    for (int i = 0; i < len; i += interval) {
+        out.append(to_string(i) + ',');
     }
     out.append("]\n},\n");
     return out;
 }
-string insertyAxis(string type,string _min,string _max){
+
+string insertyAxis(string type, string _min, string _max) {
     return "yAxis: {\n"
-           "            type: \'"+type+"\',\n"
-           "            min:"+_min+",\n"
-           "            max:"+_max+"\n"
-           "        },\n";
+           "            type: \'" + type + "\',\n"
+                                           "            min:" + _min + ",\n"
+                                                                       "            max:" + _max + "\n"
+                                                                                                   "        },\n";
 }
-string insertyAxis(string type){
+
+string insertyAxis(string type) {
     return "yAxis: {\n"
-           "            type: \'"+type+"\',\n"
-           "            axisLabel: {\n"
-           "                formatter: function (value) {\n"
-           "                    if (value < 100000) return value;\n"
-           "                    var len=0;\n"
-           "                    var last=value;\n"
-           "                    while (value>9){\n"
-           "                        value=value/10;\n"
-           "                        len++;\n"
-           "                    }\n"
-           "                    return last/Math.pow(10,len)+'E+'+len;\n"
-           "              },\n"
-           "           },\n"
-           "        },\n";
+           "            type: \'" + type + "\',\n"
+                                           "            axisLabel: {\n"
+                                           "                formatter: function (value) {\n"
+                                           "                    if (value < 100000) return value;\n"
+                                           "                    var len=0;\n"
+                                           "                    var last=value;\n"
+                                           "                    while (value>9){\n"
+                                           "                        value=value/10;\n"
+                                           "                        len++;\n"
+                                           "                    }\n"
+                                           "                    return last/Math.pow(10,len)+'E+'+len;\n"
+                                           "              },\n"
+                                           "           },\n"
+                                           "        },\n";
 }
-string insertSeriesBegin(){
+
+string insertSeriesBegin() {
     return "series: [\n";
 }
-string insertSeriesEnd(){
+
+string insertSeriesEnd() {
     return "],\n";
 }
-string insertSeriesData(string type,int *data,int len,int interval=1){
+
+string insertSeriesData(string type, int *data, int len, int interval = 1) {
     string out("{\n"
-               "            type: \'"+type+"\',\n"
-               "            data: [\n");
-    for(int i=0;i<len;i+=interval){
-        out.append(to_string(data[i])+',');
+               "            type: \'" + type + "\',\n"
+                                               "            data: [\n");
+    for (int i = 0; i < len; i += interval) {
+        out.append(to_string(data[i]) + ',');
     }
     out.append("\n]},\n");
     return out;
 }
-string insertSeriesData(string type,string name,int *data,int len,int interval=1){
+
+string insertSeriesData(string type, string name, int *data, int len, int interval = 1) {
     string out("{\n"
-               "            type: \'"+type+"\',\n"
-               "            name: \'"+name+"\',\n"
-               "            data: [\n             ");
-    for(int i=0;i<len;i+=interval){
-        out.append(to_string(data[i])+',');
+               "            type: \'" + type + "\',\n"
+                                               "            name: \'" + name + "\',\n"
+                                                                               "            data: [\n             ");
+    for (int i = 0; i < len; i += interval) {
+        out.append(to_string(data[i]) + ',');
     }
     out.append("\n]},\n");
     return out;
 }
-string insertSeriesData(string type,double *data,int len,int interval=1){
+
+string insertSeriesData(string type, double *data, int len, int interval = 1) {
     string out("{\n"
-               "            type: \'"+type+"\',\n"
-               "            data: [\n            ");
-    for(int i=0;i<len;i+=interval){
-        out.append(to_string(data[i])+',');
+               "            type: \'" + type + "\',\n"
+                                               "            data: [\n            ");
+    for (int i = 0; i < len; i += interval) {
+        out.append(to_string(data[i]) + ',');
     }
     out.append("\n]},\n");
     return out;
 }
-string insertSeriesData(string type,string name,double *data,int len,int interval=1){
+
+string insertSeriesData(string type, string name, double *data, int len, int interval = 1) {
     string out("{\n"
-               "            type: \'"+type+"\',\n"
-               "            name: \'"+name+"\',\n"
-               "            data: [\n");
-    for(int i=0;i<len;i+=interval){
-        out.append(to_string(data[i])+',');
+               "            type: \'" + type + "\',\n"
+                                               "            name: \'" + name + "\',\n"
+                                                                               "            data: [\n");
+    for (int i = 0; i < len; i += interval) {
+        out.append(to_string(data[i]) + ',');
     }
     out.append("\n]},\n");
     return out;
 }
-string insertSeriesMultiDataBegin(string type,string name){
+
+string insertSeriesMultiDataBegin(string type, string name) {
     return "{\n"
-           "            type: \'"+type+"\',\n"
-           "            name:\'"+name+"\'"
-           "            data: [\n";
+           "            type: \'" + type + "\',\n"
+                                           "            name:\'" + name + "\'"
+                                                                          "            data: [\n";
 }
-string insertSeriesPieData(string val,string name){
-    return "{value:"+val+",name:\""+name+"\"},\n";
+
+string insertSeriesPieData(string val, string name) {
+    return "{value:" + val + ",name:\"" + name + "\"},\n";
 }
-string insertSeriesMultiDataBegin(string type){
+
+string insertSeriesMultiDataBegin(string type) {
     return "{\n"
-           "            type: \'"+type+"\',\n"
-           "            data: [\n";
+           "            type: \'" + type + "\',\n"
+                                           "            data: [\n";
 }
-string insertSeriesMultiDataEnd(){
+
+string insertSeriesMultiDataEnd() {
     return "],\nitemStyle: {\n"
            "        color: \"#d7ab82\"\n"
            "    },\n},\n";
 }
+
 /*
  *
  */
-string insertSeriesOneData(int *data,int len){
+string insertSeriesOneData(int *data, int len) {
     string out("[");
-    for (int i=0;i<len;i++){
-        out.append(to_string(data[i])+',');
+    for (int i = 0; i < len; i++) {
+        out.append(to_string(data[i]) + ',');
     }
     out.append("],\n");
     return out;
 }
-string insertDataZoom(){
+
+string insertDataZoom() {
     return "dataZoom: [\n"
            "        {\n"
            "            id: 'dataZoomX',\n"
@@ -742,43 +752,51 @@ string insertDataZoom(){
            "        }\n"
            "    ],\n";
 }
-string insertLegend(string data){
+
+string insertLegend(string data) {
     return "legend: {\n"
-           "        data: ["+data+"],\n"
-           "        left:\'85%\',\n"
-           "    },\n";
+           "        data: [" + data + "],\n"
+                                      "        left:\'85%\',\n"
+                                      "    },\n";
 }
-string insertTableBegin(){
+
+string insertTableBegin() {
     return "<table>\n";
 }
-string insertTableEnd(){
+
+string insertTableEnd() {
     return "</table>\n";
 }
-string insertTableTitle(string str1,string str2){
+
+string insertTableTitle(string str1, string str2) {
     return "<thead>\n"
            "    <tr>\n"
-           "        <th>"+str1+"</th>\n"
-           "        <th>"+str2+"</th>\n"
-           "    </tr>\n"
-           "</thead>\n";
+           "        <th>" + str1 + "</th>\n"
+                                   "        <th>" + str2 + "</th>\n"
+                                                           "    </tr>\n"
+                                                           "</thead>\n";
 }
-string insertTableTbobyBegin(){
+
+string insertTableTbobyBegin() {
     return "<tboby>\n";
 }
-string insertTableTbobyEnd(){
+
+string insertTableTbobyEnd() {
     return "</tboby>\n";
 }
-string insertTableTr(string str1,string str2){
+
+string insertTableTr(string str1, string str2) {
     return "    <tr>\n"
-           "        <td>"+str1+"</td>\n"
-           "        <td>"+str2+"</td>\n"
-           "    </tr>\n";
+           "        <td>" + str1 + "</td>\n"
+                                   "        <td>" + str2 + "</td>\n"
+                                                           "    </tr>\n";
 }
-void BamStatus::reportHTML(ofstream *fout){
+
+void BamStatus::reportHTML(ofstream *fout) {
     string outhtml;
 
-    int *tmp_int=new int[MAXLEN];
-    double *tmp_double=new double[MAXLEN];
+    int *tmp_int = new int[MAXLEN];
+    double *tmp_double = new double[MAXLEN];
 
     string QualityScore("QualityScore");
     string LengthList("LengthList");
@@ -787,28 +805,27 @@ void BamStatus::reportHTML(ofstream *fout){
     string GCContent("GCContent");
     string NContent("NContent");
     string Overkmer("Overkmer");
-    /*
-     * 添加元素
-     */
+
     outhtml.append(HTMLHeader());
     outhtml.append(HTMLCss());
     //Basic Status
     outhtml.append(insertTableBegin());
-    outhtml.append(insertTableTitle("Measure","Value"));
+    outhtml.append(insertTableTitle("Measure", "Value"));
     outhtml.append(insertTableTbobyBegin());
-    outhtml.append(insertTableTr("FileName",filename));
-    outhtml.append(insertTableTr("File Type","Conventional base calls"));
-    outhtml.append(insertTableTr("Encoding","Sanger / Illumina 1.9"));
-    outhtml.append(insertTableTr("Total Sequence",to_string(this->total_number)));
-    outhtml.append(insertTableTr("Sequence flagged as poor quality","0"));
-    outhtml.append(insertTableTr("Sequence Length",to_string(min_len)+"-"+to_string(max_len)));
-    long long total_AGCT=0;long long total_GC=0;
-    for (int i=0;i<max_len;i++){
-        for (int j=0;j<8;j++) total_AGCT+=NumberList[i][j];
-        total_GC+=NumberList[i]['G'&0x07];
-        total_GC+=NumberList[i]['C'&0x07];
+    outhtml.append(insertTableTr("FileName", filename));
+    outhtml.append(insertTableTr("File Type", "Conventional base calls"));
+    outhtml.append(insertTableTr("Encoding", "Sanger / Illumina 1.9"));
+    outhtml.append(insertTableTr("Total Sequence", to_string(this->total_number)));
+    outhtml.append(insertTableTr("Sequence flagged as poor quality", "0"));
+    outhtml.append(insertTableTr("Sequence Length", to_string(min_len) + "-" + to_string(max_len)));
+    long long total_AGCT = 0;
+    long long total_GC = 0;
+    for (int i = 0; i < max_len; i++) {
+        for (int j = 0; j < 8; j++) total_AGCT += NumberList[i][j];
+        total_GC += NumberList[i]['G' & 0x07];
+        total_GC += NumberList[i]['C' & 0x07];
     }
-    outhtml.append(insertTableTr("%GC",to_string((100*total_GC)/total_AGCT)));
+    outhtml.append(insertTableTr("%GC", to_string((100 * total_GC) / total_AGCT)));
     outhtml.append(insertTableTbobyEnd());
     outhtml.append(insertTableEnd());
 
@@ -835,9 +852,7 @@ void BamStatus::reportHTML(ofstream *fout){
 
     outhtml.append("</body>\n");
 
-    /*
-     *  添加JS
-     */
+
     outhtml.append("<script type=\"text/javascript\">\n");
 
     // Quality Scores cross all bases
@@ -847,46 +862,46 @@ void BamStatus::reportHTML(ofstream *fout){
     outhtml.append(insertTitle("Quality Scores cross all bases"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Position in read(bp)",max_len));
-    outhtml.append(insertyAxis("value",to_string(0),to_string(41)));
+    outhtml.append(insertxAxis("Position in read(bp)", max_len));
+    outhtml.append(insertyAxis("value", to_string(0), to_string(41)));
     outhtml.append(insertSeriesBegin());
-    for (int i=0;i<max_len;i++){
-        long long total_q=0;
-        long long total_n=0;
-        for (int j=0;j<8;j++) total_n+=NumberList[i][j];
-        for (int j=0;j<QulityLen;j++) total_q+=(long long)j*QualityPositonList[i][j];
+    for (int i = 0; i < max_len; i++) {
+        long long total_q = 0;
+        long long total_n = 0;
+        for (int j = 0; j < 8; j++) total_n += NumberList[i][j];
+        for (int j = 0; j < QulityLen; j++) total_q += (long long) j * QualityPositonList[i][j];
 
-        tmp_double[i]=(total_q+0.0)/total_n;
+        tmp_double[i] = (total_q + 0.0) / total_n;
         //printf("%lld %lld\n",total_q,total_n);
     }
-    outhtml.append(insertSeriesData("line",tmp_double,max_len));
+    outhtml.append(insertSeriesData("line", tmp_double, max_len));
 
     outhtml.append(insertSeriesMultiDataBegin("boxplot"));
-    for (int i=0;i<max_len;i++){
-        int max_q=0;
-        int min_q=50;
-        int q_25=0;
-        int q_50=0;
-        int q_75=0;
-        long long total_n=0;
-        long long total_now=0;
-        for (int j=0;j<8;j++) total_n+=NumberList[i][j];
-        for (int j=0;j<QulityLen;j++){
-            if (QualityPositonList[i][j]){
-                min_q=min(min_q,j);
-                max_q=max(max_q,j);
-                total_now+=QualityPositonList[i][j];
-                if (!q_25 && total_now*4>=total_n) q_25=j;
-                if (!q_50 && total_now*2>=total_n) q_50=j;
-                if (!q_75 && total_now*4>=3*total_n) q_75=j;
+    for (int i = 0; i < max_len; i++) {
+        int max_q = 0;
+        int min_q = 50;
+        int q_25 = 0;
+        int q_50 = 0;
+        int q_75 = 0;
+        long long total_n = 0;
+        long long total_now = 0;
+        for (int j = 0; j < 8; j++) total_n += NumberList[i][j];
+        for (int j = 0; j < QulityLen; j++) {
+            if (QualityPositonList[i][j]) {
+                min_q = min(min_q, j);
+                max_q = max(max_q, j);
+                total_now += QualityPositonList[i][j];
+                if (!q_25 && total_now * 4 >= total_n) q_25 = j;
+                if (!q_50 && total_now * 2 >= total_n) q_50 = j;
+                if (!q_75 && total_now * 4 >= 3 * total_n) q_75 = j;
             }
         }
-        tmp_int[0]=min_q;
-        tmp_int[1]=q_25;
-        tmp_int[2]=q_50;
-        tmp_int[3]=q_75;
-        tmp_int[4]=max_q;
-        outhtml.append(insertSeriesOneData(tmp_int,5));
+        tmp_int[0] = min_q;
+        tmp_int[1] = q_25;
+        tmp_int[2] = q_50;
+        tmp_int[3] = q_75;
+        tmp_int[4] = max_q;
+        outhtml.append(insertSeriesOneData(tmp_int, 5));
     }
     outhtml.append(insertSeriesMultiDataEnd());
     outhtml.append(insertSeriesEnd());
@@ -894,21 +909,16 @@ void BamStatus::reportHTML(ofstream *fout){
     outhtml.append(insertChartOption(QualityScore));
 
 
-
-
-
-
-    //lengthlist
     outhtml.append(insertChart(LengthList));
     //option
     outhtml.append(insertOptionBegin(LengthList));
     outhtml.append(insertTitle("Seqence Length List"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Sequence Length(bp)",max_len+1));
+    outhtml.append(insertxAxis("Sequence Length(bp)", max_len + 1));
     outhtml.append(insertyAxis("value"));
     outhtml.append(insertSeriesBegin());
-    outhtml.append(insertSeriesData("line",LengthSequence,max_len+1));
+    outhtml.append(insertSeriesData("line", LengthSequence, max_len + 1));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(LengthList));
@@ -921,10 +931,10 @@ void BamStatus::reportHTML(ofstream *fout){
     outhtml.append(insertTitle("Mean Quanlity List"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Mean Sequence Quality(Phred Score)",42));
+    outhtml.append(insertxAxis("Mean Sequence Quality(Phred Score)", 42));
     outhtml.append(insertyAxis("value"));
     outhtml.append(insertSeriesBegin());
-    outhtml.append(insertSeriesData("line",QualitySequence,42));
+    outhtml.append(insertSeriesData("line", QualitySequence, 42));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(MeanQuality));
@@ -938,36 +948,36 @@ void BamStatus::reportHTML(ofstream *fout){
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
     outhtml.append(insertLegend("\'A\',\'G\',\'C\',\'T\'"));
-    outhtml.append(insertxAxis("Position in read(bp)",max_len));
-    outhtml.append(insertyAxis("value",to_string(0),to_string(1)));
+    outhtml.append(insertxAxis("Position in read(bp)", max_len));
+    outhtml.append(insertyAxis("value", to_string(0), to_string(1)));
     outhtml.append(insertSeriesBegin());
 
 
-    for (int i=0;i<max_len;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['A'&0x07]/total;
+    for (int i = 0; i < max_len; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['A' & 0x07] / total;
     }
-    outhtml.append(insertSeriesData("line","A",tmp_double,max_len));
-    for (int i=0;i<max_len;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['G'&0x07]/total;
+    outhtml.append(insertSeriesData("line", "A", tmp_double, max_len));
+    for (int i = 0; i < max_len; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['G' & 0x07] / total;
     }
-    outhtml.append(insertSeriesData("line","G",tmp_double,max_len));
-    for (int i=0;i<max_len;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['C'&0x07]/total;
+    outhtml.append(insertSeriesData("line", "G", tmp_double, max_len));
+    for (int i = 0; i < max_len; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['C' & 0x07] / total;
     }
-    outhtml.append(insertSeriesData("line","C",tmp_double,max_len));
-    for (int i=0;i<max_len;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['T'&0x07]/total;
+    outhtml.append(insertSeriesData("line", "C", tmp_double, max_len));
+    for (int i = 0; i < max_len; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['T' & 0x07] / total;
     }
 
-    outhtml.append(insertSeriesData("line","T",tmp_double,max_len));
+    outhtml.append(insertSeriesData("line", "T", tmp_double, max_len));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(AGCTContent));
@@ -975,36 +985,36 @@ void BamStatus::reportHTML(ofstream *fout){
     //GC Content
     outhtml.append(insertChart(GCContent));
     //option
-    int GCinterval=10;
+    int GCinterval = 10;
     outhtml.append(insertOptionBegin(GCContent));
     outhtml.append(insertTitle("Per Sequence GC content"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Mean GC content(%)",101,1));
+    outhtml.append(insertxAxis("Mean GC content(%)", 101, 1));
     outhtml.append(insertyAxis("value"));
     outhtml.append(insertSeriesBegin());
-    memset(tmp_int,0x00,MAXLEN*sizeof(int));
-    int last=0;
-    int lastpos=-1;
-    for (int i=0;i<ContentLen;i+=1){
-        if (Content[i][('G'+'C')&0x07]){
-            tmp_int[i]=Content[i][('G'+'C')&0x07];
-            if (lastpos+1!=i){
-                for (int k=lastpos+1;k<i;k++){
-                    tmp_int[k]=last+(tmp_int[i]-last)*(k-lastpos)/(i-lastpos);
+    memset(tmp_int, 0x00, MAXLEN * sizeof(int));
+    int last = 0;
+    int lastpos = -1;
+    for (int i = 0; i < ContentLen; i += 1) {
+        if (Content[i][('G' + 'C') & 0x07]) {
+            tmp_int[i] = Content[i][('G' + 'C') & 0x07];
+            if (lastpos + 1 != i) {
+                for (int k = lastpos + 1; k < i; k++) {
+                    tmp_int[k] = last + (tmp_int[i] - last) * (k - lastpos) / (i - lastpos);
                 }
             }
-            lastpos=i;
-            last=tmp_int[i];
-        }else{
-            if (i==ContentLen-1){
-                for (int k=lastpos+1;k<i;k++){
-                    tmp_int[k]=last+(tmp_int[i]-last)*(k-lastpos)/(k-lastpos);
+            lastpos = i;
+            last = tmp_int[i];
+        } else {
+            if (i == ContentLen - 1) {
+                for (int k = lastpos + 1; k < i; k++) {
+                    tmp_int[k] = last + (tmp_int[i] - last) * (k - lastpos) / (k - lastpos);
                 }
             }
         }
     }
-    outhtml.append(insertSeriesData("line",tmp_int,ContentLen,GCinterval));
+    outhtml.append(insertSeriesData("line", tmp_int, ContentLen, GCinterval));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(GCContent));
@@ -1016,15 +1026,15 @@ void BamStatus::reportHTML(ofstream *fout){
     outhtml.append(insertTitle("Per Sequence N content"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("position in read(%)",max_len));
-    outhtml.append(insertyAxis("value",to_string(0),to_string(1)));
+    outhtml.append(insertxAxis("position in read(%)", max_len));
+    outhtml.append(insertyAxis("value", to_string(0), to_string(1)));
     outhtml.append(insertSeriesBegin());
-    for (int i=0;i<max_len+1;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['N'&0x07]/total;
+    for (int i = 0; i < max_len + 1; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['N' & 0x07] / total;
     }
-    outhtml.append(insertSeriesData("line",tmp_double,max_len));
+    outhtml.append(insertSeriesData("line", tmp_double, max_len));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(NContent));
@@ -1036,26 +1046,26 @@ void BamStatus::reportHTML(ofstream *fout){
     outhtml.append(insertTitle("Kmer"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Position in read(bp)",max_len));
+    outhtml.append(insertxAxis("Position in read(bp)", max_len));
     outhtml.append(insertyAxis("value"));
     outhtml.append(insertSeriesBegin());
-    outhtml.append(insertSeriesData("line",Kmer[0],max_len));
+    outhtml.append(insertSeriesData("line", Kmer[0], max_len));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(Overkmer));
 
 
-
     outhtml.append("</script>");
     outhtml.append("</html>");
-    fout->write(outhtml.c_str(),outhtml.length());
+    fout->write(outhtml.c_str(), outhtml.length());
 }
-void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *overrepresent){
+
+void BamStatus::reportHTML(ofstream *fout, Duplicate *duplicate, Overrepresent *overrepresent) {
     string outhtml;
 
-    int *tmp_int=new int[MAXLEN];
-    double *tmp_double=new double[MAXLEN];
-    char *tmp_char=new char[MAXLEN];
+    int *tmp_int = new int[MAXLEN];
+    double *tmp_double = new double[MAXLEN];
+    char *tmp_char = new char[MAXLEN];
 
     string QualityScore("QualityScore");
     string LengthList("LengthList");
@@ -1065,29 +1075,28 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     string NContent("NContent");
     string DuplicatePercent("DuplicatePercent");
     string Overkmer("Overkmer");
-    /*
-     * 添加元素
-     */
+
     outhtml.append(HTMLHeader());
     outhtml.append(HTMLCss());
     //Basic Status
     outhtml.append(insertTableBegin());
-    outhtml.append(insertTableTitle("Measure","Value"));
+    outhtml.append(insertTableTitle("Measure", "Value"));
     outhtml.append(insertTableTbobyBegin());
-    outhtml.append(insertTableTr("FileName",filename));
-    outhtml.append(insertTableTr("File Type","Conventional base calls"));
-    outhtml.append(insertTableTr("Encoding","Sanger / Illumina 1.9"));
-    outhtml.append(insertTableTr("Total Sequence",to_string(this->total_number)));
-    outhtml.append(insertTableTr("Sequence flagged as poor quality","0"));
-    outhtml.append(insertTableTr("Sequence Length",to_string(min_len)+"-"+to_string(max_len)));
-    long long total_AGCT=0;long long total_GC=0;
-    for (int i=0;i<max_len;i++){
-        for (int j=0;j<8;j++) total_AGCT+=NumberList[i][j];
-        total_GC+=NumberList[i]['G'&0x07];
-        total_GC+=NumberList[i]['C'&0x07];
+    outhtml.append(insertTableTr("FileName", filename));
+    outhtml.append(insertTableTr("File Type", "Conventional base calls"));
+    outhtml.append(insertTableTr("Encoding", "Sanger / Illumina 1.9"));
+    outhtml.append(insertTableTr("Total Sequence", to_string(this->total_number)));
+    outhtml.append(insertTableTr("Sequence flagged as poor quality", "0"));
+    outhtml.append(insertTableTr("Sequence Length", to_string(min_len) + "-" + to_string(max_len)));
+    long long total_AGCT = 0;
+    long long total_GC = 0;
+    for (int i = 0; i < max_len; i++) {
+        for (int j = 0; j < 8; j++) total_AGCT += NumberList[i][j];
+        total_GC += NumberList[i]['G' & 0x07];
+        total_GC += NumberList[i]['C' & 0x07];
     }
-    outhtml.append(insertTableTr("%GC",to_string((100*total_GC)/total_AGCT)));
-    outhtml.append(insertTableTr("Over Represent Date",to_string(overrepresent->OverrepresentDate*100)+"%"));
+    outhtml.append(insertTableTr("%GC", to_string((100 * total_GC) / total_AGCT)));
+    outhtml.append(insertTableTr("Over Represent Date", to_string(overrepresent->OverrepresentDate * 100) + "%"));
     outhtml.append(insertTableTbobyEnd());
     outhtml.append(insertTableEnd());
 
@@ -1116,12 +1125,9 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertDiv(Overkmer));
 
 
-
     outhtml.append("</body>\n");
 
-    /*
-     *  添加JS
-     */
+
     outhtml.append("<script type=\"text/javascript\">\n");
 
     // Quality Scores cross all bases
@@ -1131,46 +1137,46 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertTitle("Quality Scores cross all bases"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Position in read(bp)",max_len));
-    outhtml.append(insertyAxis("value",to_string(0),to_string(41)));
+    outhtml.append(insertxAxis("Position in read(bp)", max_len));
+    outhtml.append(insertyAxis("value", to_string(0), to_string(41)));
     outhtml.append(insertSeriesBegin());
-    for (int i=0;i<max_len;i++){
-        long long total_q=0;
-        long long total_n=0;
-        for (int j=0;j<8;j++) total_n+=NumberList[i][j];
-        for (int j=0;j<QulityLen;j++) total_q+=(long long)j*QualityPositonList[i][j];
+    for (int i = 0; i < max_len; i++) {
+        long long total_q = 0;
+        long long total_n = 0;
+        for (int j = 0; j < 8; j++) total_n += NumberList[i][j];
+        for (int j = 0; j < QulityLen; j++) total_q += (long long) j * QualityPositonList[i][j];
 
-        tmp_double[i]=(total_q+0.0)/total_n;
+        tmp_double[i] = (total_q + 0.0) / total_n;
         //printf("%lld %lld\n",total_q,total_n);
     }
-    outhtml.append(insertSeriesData("line",tmp_double,max_len));
+    outhtml.append(insertSeriesData("line", tmp_double, max_len));
 
     outhtml.append(insertSeriesMultiDataBegin("boxplot"));
-    for (int i=0;i<max_len;i++){
-        int max_q=0;
-        int min_q=50;
-        int q_25=0;
-        int q_50=0;
-        int q_75=0;
-        long long total_n=0;
-        long long total_now=0;
-        for (int j=0;j<8;j++) total_n+=NumberList[i][j];
-        for (int j=0;j<QulityLen;j++){
-            if (QualityPositonList[i][j]){
-                min_q=min(min_q,j);
-                max_q=max(max_q,j);
-                total_now+=QualityPositonList[i][j];
-                if (!q_25 && total_now*4>=total_n) q_25=j;
-                if (!q_50 && total_now*2>=total_n) q_50=j;
-                if (!q_75 && total_now*4>=3*total_n) q_75=j;
+    for (int i = 0; i < max_len; i++) {
+        int max_q = 0;
+        int min_q = 50;
+        int q_25 = 0;
+        int q_50 = 0;
+        int q_75 = 0;
+        long long total_n = 0;
+        long long total_now = 0;
+        for (int j = 0; j < 8; j++) total_n += NumberList[i][j];
+        for (int j = 0; j < QulityLen; j++) {
+            if (QualityPositonList[i][j]) {
+                min_q = min(min_q, j);
+                max_q = max(max_q, j);
+                total_now += QualityPositonList[i][j];
+                if (!q_25 && total_now * 4 >= total_n) q_25 = j;
+                if (!q_50 && total_now * 2 >= total_n) q_50 = j;
+                if (!q_75 && total_now * 4 >= 3 * total_n) q_75 = j;
             }
         }
-        tmp_int[0]=min_q;
-        tmp_int[1]=q_25;
-        tmp_int[2]=q_50;
-        tmp_int[3]=q_75;
-        tmp_int[4]=max_q;
-        outhtml.append(insertSeriesOneData(tmp_int,5));
+        tmp_int[0] = min_q;
+        tmp_int[1] = q_25;
+        tmp_int[2] = q_50;
+        tmp_int[3] = q_75;
+        tmp_int[4] = max_q;
+        outhtml.append(insertSeriesOneData(tmp_int, 5));
     }
     outhtml.append(insertSeriesMultiDataEnd());
     outhtml.append(insertSeriesEnd());
@@ -1178,21 +1184,16 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertChartOption(QualityScore));
 
 
-
-
-
-
-    //lengthlist
     outhtml.append(insertChart(LengthList));
     //option
     outhtml.append(insertOptionBegin(LengthList));
     outhtml.append(insertTitle("Seqence Length List"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Sequence Length(bp)",max_len+1));
+    outhtml.append(insertxAxis("Sequence Length(bp)", max_len + 1));
     outhtml.append(insertyAxis("value"));
     outhtml.append(insertSeriesBegin());
-    outhtml.append(insertSeriesData("line",LengthSequence,max_len+1));
+    outhtml.append(insertSeriesData("line", LengthSequence, max_len + 1));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(LengthList));
@@ -1205,10 +1206,10 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertTitle("Mean Quanlity List"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Mean Sequence Quality(Phred Score)",42));
+    outhtml.append(insertxAxis("Mean Sequence Quality(Phred Score)", 42));
     outhtml.append(insertyAxis("value"));
     outhtml.append(insertSeriesBegin());
-    outhtml.append(insertSeriesData("line",QualitySequence,42));
+    outhtml.append(insertSeriesData("line", QualitySequence, 42));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(MeanQuality));
@@ -1222,36 +1223,36 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
     outhtml.append(insertLegend("\'A\',\'G\',\'C\',\'T\'"));
-    outhtml.append(insertxAxis("Position in read(bp)",max_len));
-    outhtml.append(insertyAxis("value",to_string(0),to_string(1)));
+    outhtml.append(insertxAxis("Position in read(bp)", max_len));
+    outhtml.append(insertyAxis("value", to_string(0), to_string(1)));
     outhtml.append(insertSeriesBegin());
 
 
-    for (int i=0;i<max_len;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['A'&0x07]/total;
+    for (int i = 0; i < max_len; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['A' & 0x07] / total;
     }
-    outhtml.append(insertSeriesData("line","A",tmp_double,max_len));
-    for (int i=0;i<max_len;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['G'&0x07]/total;
+    outhtml.append(insertSeriesData("line", "A", tmp_double, max_len));
+    for (int i = 0; i < max_len; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['G' & 0x07] / total;
     }
-    outhtml.append(insertSeriesData("line","G",tmp_double,max_len));
-    for (int i=0;i<max_len;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['C'&0x07]/total;
+    outhtml.append(insertSeriesData("line", "G", tmp_double, max_len));
+    for (int i = 0; i < max_len; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['C' & 0x07] / total;
     }
-    outhtml.append(insertSeriesData("line","C",tmp_double,max_len));
-    for (int i=0;i<max_len;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['T'&0x07]/total;
+    outhtml.append(insertSeriesData("line", "C", tmp_double, max_len));
+    for (int i = 0; i < max_len; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['T' & 0x07] / total;
     }
 
-    outhtml.append(insertSeriesData("line","T",tmp_double,max_len));
+    outhtml.append(insertSeriesData("line", "T", tmp_double, max_len));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(AGCTContent));
@@ -1259,36 +1260,36 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     //GC Content
     outhtml.append(insertChart(GCContent));
     //option
-    int GCinterval=10;
+    int GCinterval = 10;
     outhtml.append(insertOptionBegin(GCContent));
     outhtml.append(insertTitle("Per Sequence GC content"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Mean GC content(%)",101,1));
+    outhtml.append(insertxAxis("Mean GC content(%)", 101, 1));
     outhtml.append(insertyAxis("value"));
     outhtml.append(insertSeriesBegin());
-    memset(tmp_int,0x00,MAXLEN*sizeof(int));
-    int last=0;
-    int lastpos=-1;
-    for (int i=0;i<ContentLen;i+=1){
-        if (Content[i][('G'+'C')&0x07]){
-            tmp_int[i]=Content[i][('G'+'C')&0x07];
-            if (lastpos+1!=i){
-                for (int k=lastpos+1;k<i;k++){
-                    tmp_int[k]=last+(tmp_int[i]-last)*(k-lastpos)/(i-lastpos);
+    memset(tmp_int, 0x00, MAXLEN * sizeof(int));
+    int last = 0;
+    int lastpos = -1;
+    for (int i = 0; i < ContentLen; i += 1) {
+        if (Content[i][('G' + 'C') & 0x07]) {
+            tmp_int[i] = Content[i][('G' + 'C') & 0x07];
+            if (lastpos + 1 != i) {
+                for (int k = lastpos + 1; k < i; k++) {
+                    tmp_int[k] = last + (tmp_int[i] - last) * (k - lastpos) / (i - lastpos);
                 }
             }
-            lastpos=i;
-            last=tmp_int[i];
-        }else{
-            if (i==ContentLen-1){
-                for (int k=lastpos+1;k<i;k++){
-                    tmp_int[k]=last+(tmp_int[i]-last)*(k-lastpos)/(k-lastpos);
+            lastpos = i;
+            last = tmp_int[i];
+        } else {
+            if (i == ContentLen - 1) {
+                for (int k = lastpos + 1; k < i; k++) {
+                    tmp_int[k] = last + (tmp_int[i] - last) * (k - lastpos) / (k - lastpos);
                 }
             }
         }
     }
-    outhtml.append(insertSeriesData("line",tmp_int,ContentLen,GCinterval));
+    outhtml.append(insertSeriesData("line", tmp_int, ContentLen, GCinterval));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(GCContent));
@@ -1300,15 +1301,15 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertTitle("Per Sequence N content"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("position in read(%)",max_len));
-    outhtml.append(insertyAxis("value",to_string(0),to_string(1)));
+    outhtml.append(insertxAxis("position in read(%)", max_len));
+    outhtml.append(insertyAxis("value", to_string(0), to_string(1)));
     outhtml.append(insertSeriesBegin());
-    for (int i=0;i<max_len+1;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['N'&0x07]/total;
+    for (int i = 0; i < max_len + 1; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['N' & 0x07] / total;
     }
-    outhtml.append(insertSeriesData("line",tmp_double,max_len));
+    outhtml.append(insertSeriesData("line", tmp_double, max_len));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(NContent));
@@ -1317,30 +1318,30 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertChart(DuplicatePercent));
     //option
     outhtml.append(insertOptionBegin(DuplicatePercent));
-    int* dupHist = NULL;
-    double* dupMeanTlen = NULL;
-    double* dupMeanGC = NULL;
+    int *dupHist = NULL;
+    double *dupMeanTlen = NULL;
+    double *dupMeanGC = NULL;
     double dupRate = 0.0;
-    int histSize=32;
+    int histSize = 32;
     dupHist = new int[histSize];
     memset(dupHist, 0, sizeof(int) * histSize);
     dupMeanGC = new double[histSize];
     memset(dupMeanGC, 0, sizeof(double) * histSize);
     dupRate = duplicate->statAll(dupHist, dupMeanGC, histSize);
-    outhtml.append(insertTitle("duplicate rate "+to_string(dupRate*100.0)+ "%"));
+    outhtml.append(insertTitle("duplicate rate " + to_string(dupRate * 100.0) + "%"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Sequence Duplication level",histSize));
-    outhtml.append(insertyAxis("value",to_string(0),to_string(1)));
+    outhtml.append(insertxAxis("Sequence Duplication level", histSize));
+    outhtml.append(insertyAxis("value", to_string(0), to_string(1)));
     outhtml.append(insertSeriesBegin());
-    double dup_total=0.0;
-    for (int i=0;i<histSize;i++) {
-        dup_total+=dupHist[i];
+    double dup_total = 0.0;
+    for (int i = 0; i < histSize; i++) {
+        dup_total += dupHist[i];
     }
-    for (int i=0;i<histSize;i++){
-        tmp_double[i]=(dupHist[i]+0.0)/dup_total;
+    for (int i = 0; i < histSize; i++) {
+        tmp_double[i] = (dupHist[i] + 0.0) / dup_total;
     }
-    outhtml.append(insertSeriesData("bar",tmp_double,histSize));
+    outhtml.append(insertSeriesData("bar", tmp_double, histSize));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(DuplicatePercent));
@@ -1351,29 +1352,29 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertOptionBegin(Overkmer));
     outhtml.append(insertTitle("Relative enrichment over read length"));
     outhtml.append(insertTooltip());
-    int tmp_char_pos=0;
-    for (int i=0;i<ChooseKmerNum;i++) {
-        tmp_char[tmp_char_pos++]='\'';
+    int tmp_char_pos = 0;
+    for (int i = 0; i < ChooseKmerNum; i++) {
+        tmp_char[tmp_char_pos++] = '\'';
         for (int k = 0, x = ChooseKmerPos[i]; k < KmerBase; k++) {
-            tmp_char[tmp_char_pos++]=charAGCTN[x&0x03];
+            tmp_char[tmp_char_pos++] = charAGCTN[x & 0x03];
             x >>= 2;
         }
         tmp_char[tmp_char_pos++] = '\'';
         tmp_char[tmp_char_pos++] = ',';
     }
-    tmp_char[tmp_char_pos++]='\0';
+    tmp_char[tmp_char_pos++] = '\0';
     outhtml.append(insertLegend(string(tmp_char)));
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Position in read(bp)",max_len));
+    outhtml.append(insertxAxis("Position in read(bp)", max_len));
     outhtml.append(insertyAxis("value"));
     outhtml.append(insertSeriesBegin());
-    for (int i=0;i<ChooseKmerNum;i++){
-        for(int k=0,x=ChooseKmerPos[i];k<KmerBase;k++){
-            tmp_char[k]=charAGCTN[x&0x03];
-            x>>=2;
+    for (int i = 0; i < ChooseKmerNum; i++) {
+        for (int k = 0, x = ChooseKmerPos[i]; k < KmerBase; k++) {
+            tmp_char[k] = charAGCTN[x & 0x03];
+            x >>= 2;
         }
-        tmp_char[KmerBase]='\0';
-        outhtml.append(insertSeriesData("line",string(tmp_char),Kmer[ChooseKmerPos[i]],max_len));
+        tmp_char[KmerBase] = '\0';
+        outhtml.append(insertSeriesData("line", string(tmp_char), Kmer[ChooseKmerPos[i]], max_len));
     }
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
@@ -1382,14 +1383,15 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
 
     outhtml.append("</script>");
     outhtml.append("</html>");
-    fout->write(outhtml.c_str(),outhtml.length());
+    fout->write(outhtml.c_str(), outhtml.length());
 }
-void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *overrepresent,sam_hdr_t *hdr){
+
+void BamStatus::reportHTML(ofstream *fout, Duplicate *duplicate, Overrepresent *overrepresent, sam_hdr_t *hdr) {
     string outhtml;
 
-    int *tmp_int=new int[MAXLEN];
-    double *tmp_double=new double[MAXLEN];
-    char *tmp_char=new char[MAXLEN];
+    int *tmp_int = new int[MAXLEN];
+    double *tmp_double = new double[MAXLEN];
+    char *tmp_char = new char[MAXLEN];
 
     string QualityScore("QualityScore");
     string LengthList("LengthList");
@@ -1400,29 +1402,28 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     string DuplicatePercent("DuplicatePercent");
     string Overkmer("Overkmer");
     string Chr("Chromosome");
-    /*
-     * 添加元素
-     */
+
     outhtml.append(HTMLHeader());
     outhtml.append(HTMLCss());
     //Basic Status
     outhtml.append(insertTableBegin());
-    outhtml.append(insertTableTitle("Measure","Value"));
+    outhtml.append(insertTableTitle("Measure", "Value"));
     outhtml.append(insertTableTbobyBegin());
-    outhtml.append(insertTableTr("FileName",filename));
-    outhtml.append(insertTableTr("File Type","Conventional base calls"));
-    outhtml.append(insertTableTr("Encoding","Sanger / Illumina 1.9"));
-    outhtml.append(insertTableTr("Total Sequence",to_string(this->total_number)));
-    outhtml.append(insertTableTr("Sequence flagged as poor quality","0"));
-    outhtml.append(insertTableTr("Sequence Length",to_string(min_len)+"-"+to_string(max_len)));
-    long long total_AGCT=0;long long total_GC=0;
-    for (int i=0;i<max_len;i++){
-        for (int j=0;j<8;j++) total_AGCT+=NumberList[i][j];
-        total_GC+=NumberList[i]['G'&0x07];
-        total_GC+=NumberList[i]['C'&0x07];
+    outhtml.append(insertTableTr("FileName", filename));
+    outhtml.append(insertTableTr("File Type", "Conventional base calls"));
+    outhtml.append(insertTableTr("Encoding", "Sanger / Illumina 1.9"));
+    outhtml.append(insertTableTr("Total Sequence", to_string(this->total_number)));
+    outhtml.append(insertTableTr("Sequence flagged as poor quality", "0"));
+    outhtml.append(insertTableTr("Sequence Length", to_string(min_len) + "-" + to_string(max_len)));
+    long long total_AGCT = 0;
+    long long total_GC = 0;
+    for (int i = 0; i < max_len; i++) {
+        for (int j = 0; j < 8; j++) total_AGCT += NumberList[i][j];
+        total_GC += NumberList[i]['G' & 0x07];
+        total_GC += NumberList[i]['C' & 0x07];
     }
-    outhtml.append(insertTableTr("%GC",to_string((100*total_GC)/total_AGCT)));
-    outhtml.append(insertTableTr("Over Represent Date",to_string(overrepresent->OverrepresentDate*100)+"%"));
+    outhtml.append(insertTableTr("%GC", to_string((100 * total_GC) / total_AGCT)));
+    outhtml.append(insertTableTr("Over Represent Date", to_string(overrepresent->OverrepresentDate * 100) + "%"));
     outhtml.append(insertTableTbobyEnd());
     outhtml.append(insertTableEnd());
 
@@ -1456,9 +1457,6 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
 
     outhtml.append("</body>\n");
 
-    /*
-     *  添加JS
-     */
     outhtml.append("<script type=\"text/javascript\">\n");
 
     // Quality Scores cross all bases
@@ -1468,46 +1466,46 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertTitle("Quality Scores cross all bases"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Position in read(bp)",max_len));
-    outhtml.append(insertyAxis("value",to_string(0),to_string(41)));
+    outhtml.append(insertxAxis("Position in read(bp)", max_len));
+    outhtml.append(insertyAxis("value", to_string(0), to_string(41)));
     outhtml.append(insertSeriesBegin());
-    for (int i=0;i<max_len;i++){
-        long long total_q=0;
-        long long total_n=0;
-        for (int j=0;j<8;j++) total_n+=NumberList[i][j];
-        for (int j=0;j<QulityLen;j++) total_q+=(long long)j*QualityPositonList[i][j];
+    for (int i = 0; i < max_len; i++) {
+        long long total_q = 0;
+        long long total_n = 0;
+        for (int j = 0; j < 8; j++) total_n += NumberList[i][j];
+        for (int j = 0; j < QulityLen; j++) total_q += (long long) j * QualityPositonList[i][j];
 
-        tmp_double[i]=(total_q+0.0)/total_n;
+        tmp_double[i] = (total_q + 0.0) / total_n;
         //printf("%lld %lld\n",total_q,total_n);
     }
-    outhtml.append(insertSeriesData("line",tmp_double,max_len));
+    outhtml.append(insertSeriesData("line", tmp_double, max_len));
 
     outhtml.append(insertSeriesMultiDataBegin("boxplot"));
-    for (int i=0;i<max_len;i++){
-        int max_q=0;
-        int min_q=50;
-        int q_25=0;
-        int q_50=0;
-        int q_75=0;
-        long long total_n=0;
-        long long total_now=0;
-        for (int j=0;j<8;j++) total_n+=NumberList[i][j];
-        for (int j=0;j<QulityLen;j++){
-            if (QualityPositonList[i][j]){
-                min_q=min(min_q,j);
-                max_q=max(max_q,j);
-                total_now+=QualityPositonList[i][j];
-                if (!q_25 && total_now*4>=total_n) q_25=j;
-                if (!q_50 && total_now*2>=total_n) q_50=j;
-                if (!q_75 && total_now*4>=3*total_n) q_75=j;
+    for (int i = 0; i < max_len; i++) {
+        int max_q = 0;
+        int min_q = 50;
+        int q_25 = 0;
+        int q_50 = 0;
+        int q_75 = 0;
+        long long total_n = 0;
+        long long total_now = 0;
+        for (int j = 0; j < 8; j++) total_n += NumberList[i][j];
+        for (int j = 0; j < QulityLen; j++) {
+            if (QualityPositonList[i][j]) {
+                min_q = min(min_q, j);
+                max_q = max(max_q, j);
+                total_now += QualityPositonList[i][j];
+                if (!q_25 && total_now * 4 >= total_n) q_25 = j;
+                if (!q_50 && total_now * 2 >= total_n) q_50 = j;
+                if (!q_75 && total_now * 4 >= 3 * total_n) q_75 = j;
             }
         }
-        tmp_int[0]=min_q;
-        tmp_int[1]=q_25;
-        tmp_int[2]=q_50;
-        tmp_int[3]=q_75;
-        tmp_int[4]=max_q;
-        outhtml.append(insertSeriesOneData(tmp_int,5));
+        tmp_int[0] = min_q;
+        tmp_int[1] = q_25;
+        tmp_int[2] = q_50;
+        tmp_int[3] = q_75;
+        tmp_int[4] = max_q;
+        outhtml.append(insertSeriesOneData(tmp_int, 5));
     }
     outhtml.append(insertSeriesMultiDataEnd());
     outhtml.append(insertSeriesEnd());
@@ -1515,21 +1513,16 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertChartOption(QualityScore));
 
 
-
-
-
-
-    //lengthlist
     outhtml.append(insertChart(LengthList));
     //option
     outhtml.append(insertOptionBegin(LengthList));
     outhtml.append(insertTitle("Seqence Length List"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Sequence Length(bp)",max_len+1));
+    outhtml.append(insertxAxis("Sequence Length(bp)", max_len + 1));
     outhtml.append(insertyAxis("value"));
     outhtml.append(insertSeriesBegin());
-    outhtml.append(insertSeriesData("line",LengthSequence,max_len+1));
+    outhtml.append(insertSeriesData("line", LengthSequence, max_len + 1));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(LengthList));
@@ -1542,10 +1535,10 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertTitle("Mean Quanlity List"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Mean Sequence Quality(Phred Score)",42));
+    outhtml.append(insertxAxis("Mean Sequence Quality(Phred Score)", 42));
     outhtml.append(insertyAxis("value"));
     outhtml.append(insertSeriesBegin());
-    outhtml.append(insertSeriesData("line",QualitySequence,42));
+    outhtml.append(insertSeriesData("line", QualitySequence, 42));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(MeanQuality));
@@ -1559,36 +1552,36 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
     outhtml.append(insertLegend("\'A\',\'G\',\'C\',\'T\'"));
-    outhtml.append(insertxAxis("Position in read(bp)",max_len));
-    outhtml.append(insertyAxis("value",to_string(0),to_string(1)));
+    outhtml.append(insertxAxis("Position in read(bp)", max_len));
+    outhtml.append(insertyAxis("value", to_string(0), to_string(1)));
     outhtml.append(insertSeriesBegin());
 
 
-    for (int i=0;i<max_len;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['A'&0x07]/total;
+    for (int i = 0; i < max_len; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['A' & 0x07] / total;
     }
-    outhtml.append(insertSeriesData("line","A",tmp_double,max_len));
-    for (int i=0;i<max_len;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['G'&0x07]/total;
+    outhtml.append(insertSeriesData("line", "A", tmp_double, max_len));
+    for (int i = 0; i < max_len; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['G' & 0x07] / total;
     }
-    outhtml.append(insertSeriesData("line","G",tmp_double,max_len));
-    for (int i=0;i<max_len;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['C'&0x07]/total;
+    outhtml.append(insertSeriesData("line", "G", tmp_double, max_len));
+    for (int i = 0; i < max_len; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['C' & 0x07] / total;
     }
-    outhtml.append(insertSeriesData("line","C",tmp_double,max_len));
-    for (int i=0;i<max_len;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['T'&0x07]/total;
+    outhtml.append(insertSeriesData("line", "C", tmp_double, max_len));
+    for (int i = 0; i < max_len; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['T' & 0x07] / total;
     }
 
-    outhtml.append(insertSeriesData("line","T",tmp_double,max_len));
+    outhtml.append(insertSeriesData("line", "T", tmp_double, max_len));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(AGCTContent));
@@ -1596,36 +1589,36 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     //GC Content
     outhtml.append(insertChart(GCContent));
     //option
-    int GCinterval=10;
+    int GCinterval = 10;
     outhtml.append(insertOptionBegin(GCContent));
     outhtml.append(insertTitle("Per Sequence GC content"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Mean GC content(%)",101,1));
+    outhtml.append(insertxAxis("Mean GC content(%)", 101, 1));
     outhtml.append(insertyAxis("value"));
     outhtml.append(insertSeriesBegin());
-    memset(tmp_int,0x00,MAXLEN*sizeof(int));
-    int last=0;
-    int lastpos=-1;
-    for (int i=0;i<ContentLen;i+=1){
-        if (Content[i][('G'+'C')&0x07]){
-            tmp_int[i]=Content[i][('G'+'C')&0x07];
-            if (lastpos+1!=i){
-                for (int k=lastpos+1;k<i;k++){
-                    tmp_int[k]=last+(tmp_int[i]-last)*(k-lastpos)/(i-lastpos);
+    memset(tmp_int, 0x00, MAXLEN * sizeof(int));
+    int last = 0;
+    int lastpos = -1;
+    for (int i = 0; i < ContentLen; i += 1) {
+        if (Content[i][('G' + 'C') & 0x07]) {
+            tmp_int[i] = Content[i][('G' + 'C') & 0x07];
+            if (lastpos + 1 != i) {
+                for (int k = lastpos + 1; k < i; k++) {
+                    tmp_int[k] = last + (tmp_int[i] - last) * (k - lastpos) / (i - lastpos);
                 }
             }
-            lastpos=i;
-            last=tmp_int[i];
-        }else{
-            if (i==ContentLen-1){
-                for (int k=lastpos+1;k<i;k++){
-                    tmp_int[k]=last+(tmp_int[i]-last)*(k-lastpos)/(k-lastpos);
+            lastpos = i;
+            last = tmp_int[i];
+        } else {
+            if (i == ContentLen - 1) {
+                for (int k = lastpos + 1; k < i; k++) {
+                    tmp_int[k] = last + (tmp_int[i] - last) * (k - lastpos) / (k - lastpos);
                 }
             }
         }
     }
-    outhtml.append(insertSeriesData("line",tmp_int,ContentLen,GCinterval));
+    outhtml.append(insertSeriesData("line", tmp_int, ContentLen, GCinterval));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(GCContent));
@@ -1637,15 +1630,15 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertTitle("Per Sequence N content"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("position in read(%)",max_len));
-    outhtml.append(insertyAxis("value",to_string(0),to_string(1)));
+    outhtml.append(insertxAxis("position in read(%)", max_len));
+    outhtml.append(insertyAxis("value", to_string(0), to_string(1)));
     outhtml.append(insertSeriesBegin());
-    for (int i=0;i<max_len+1;i++){
-        double total=0.0;
-        for (int j=0;j<8;j++) total+=NumberList[i][j];
-        tmp_double[i]=NumberList[i]['N'&0x07]/total;
+    for (int i = 0; i < max_len + 1; i++) {
+        double total = 0.0;
+        for (int j = 0; j < 8; j++) total += NumberList[i][j];
+        tmp_double[i] = NumberList[i]['N' & 0x07] / total;
     }
-    outhtml.append(insertSeriesData("line",tmp_double,max_len));
+    outhtml.append(insertSeriesData("line", tmp_double, max_len));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(NContent));
@@ -1654,30 +1647,30 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertChart(DuplicatePercent));
     //option
     outhtml.append(insertOptionBegin(DuplicatePercent));
-    int* dupHist = NULL;
-    double* dupMeanTlen = NULL;
-    double* dupMeanGC = NULL;
+    int *dupHist = NULL;
+    double *dupMeanTlen = NULL;
+    double *dupMeanGC = NULL;
     double dupRate = 0.0;
-    int histSize=32;
+    int histSize = 32;
     dupHist = new int[histSize];
     memset(dupHist, 0, sizeof(int) * histSize);
     dupMeanGC = new double[histSize];
     memset(dupMeanGC, 0, sizeof(double) * histSize);
     dupRate = duplicate->statAll(dupHist, dupMeanGC, histSize);
-    outhtml.append(insertTitle("duplicate rate "+to_string(dupRate*100.0)+ "%"));
+    outhtml.append(insertTitle("duplicate rate " + to_string(dupRate * 100.0) + "%"));
     outhtml.append(insertTooltip());
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Sequence Duplication level",histSize));
-    outhtml.append(insertyAxis("value",to_string(0),to_string(1)));
+    outhtml.append(insertxAxis("Sequence Duplication level", histSize));
+    outhtml.append(insertyAxis("value", to_string(0), to_string(1)));
     outhtml.append(insertSeriesBegin());
-    double dup_total=0.0;
-    for (int i=0;i<histSize;i++) {
-        dup_total+=dupHist[i];
+    double dup_total = 0.0;
+    for (int i = 0; i < histSize; i++) {
+        dup_total += dupHist[i];
     }
-    for (int i=0;i<histSize;i++){
-        tmp_double[i]=(dupHist[i]+0.0)/dup_total;
+    for (int i = 0; i < histSize; i++) {
+        tmp_double[i] = (dupHist[i] + 0.0) / dup_total;
     }
-    outhtml.append(insertSeriesData("bar",tmp_double,histSize));
+    outhtml.append(insertSeriesData("bar", tmp_double, histSize));
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
     outhtml.append(insertChartOption(DuplicatePercent));
@@ -1688,29 +1681,29 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertOptionBegin(Overkmer));
     outhtml.append(insertTitle("Relative enrichment over read length"));
     outhtml.append(insertTooltip());
-    int tmp_char_pos=0;
-    for (int i=0;i<ChooseKmerNum;i++) {
-        tmp_char[tmp_char_pos++]='\'';
+    int tmp_char_pos = 0;
+    for (int i = 0; i < ChooseKmerNum; i++) {
+        tmp_char[tmp_char_pos++] = '\'';
         for (int k = 0, x = ChooseKmerPos[i]; k < KmerBase; k++) {
-            tmp_char[tmp_char_pos++]=charAGCTN[x&0x03];
+            tmp_char[tmp_char_pos++] = charAGCTN[x & 0x03];
             x >>= 2;
         }
         tmp_char[tmp_char_pos++] = '\'';
         tmp_char[tmp_char_pos++] = ',';
     }
-    tmp_char[tmp_char_pos++]='\0';
+    tmp_char[tmp_char_pos++] = '\0';
     outhtml.append(insertLegend(string(tmp_char)));
     outhtml.append(insertDataZoom());
-    outhtml.append(insertxAxis("Position in read(bp)",max_len));
+    outhtml.append(insertxAxis("Position in read(bp)", max_len));
     outhtml.append(insertyAxis("value"));
     outhtml.append(insertSeriesBegin());
-    for (int i=0;i<ChooseKmerNum;i++){
-        for(int k=0,x=ChooseKmerPos[i];k<KmerBase;k++){
-            tmp_char[k]=charAGCTN[x&0x03];
-            x>>=2;
+    for (int i = 0; i < ChooseKmerNum; i++) {
+        for (int k = 0, x = ChooseKmerPos[i]; k < KmerBase; k++) {
+            tmp_char[k] = charAGCTN[x & 0x03];
+            x >>= 2;
         }
-        tmp_char[KmerBase]='\0';
-        outhtml.append(insertSeriesData("line",string(tmp_char),Kmer[ChooseKmerPos[i]],max_len));
+        tmp_char[KmerBase] = '\0';
+        outhtml.append(insertSeriesData("line", string(tmp_char), Kmer[ChooseKmerPos[i]], max_len));
     }
     outhtml.append(insertSeriesEnd());
     outhtml.append(insertOptionEnd());
@@ -1725,9 +1718,9 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
     outhtml.append(insertDataZoom());
     outhtml.append(insertSeriesBegin());
     outhtml.append(insertSeriesMultiDataBegin("pie"));
-    for (int i=0;i<hdr->n_targets;i++){
-        if (strlen(sam_hdr_tid2name(hdr,i))<8){
-            outhtml.append(insertSeriesPieData(to_string(this->Chromosome[i]),sam_hdr_tid2name(hdr,i)));
+    for (int i = 0; i < hdr->n_targets; i++) {
+        if (strlen(sam_hdr_tid2name(hdr, i)) < 8) {
+            outhtml.append(insertSeriesPieData(to_string(this->Chromosome[i]), sam_hdr_tid2name(hdr, i)));
         }
     }
     outhtml.append("]},\n");
@@ -1737,5 +1730,5 @@ void BamStatus::reportHTML(ofstream *fout,Duplicate *duplicate,Overrepresent *ov
 
     outhtml.append("</script>");
     outhtml.append("</html>");
-    fout->write(outhtml.c_str(),outhtml.length());
+    fout->write(outhtml.c_str(), outhtml.length());
 }
