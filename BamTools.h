@@ -34,7 +34,6 @@
 
 #include <sys/time.h>
 
-extern int is_tgs;
 
 inline double GetTime() {
     struct timeval tv;

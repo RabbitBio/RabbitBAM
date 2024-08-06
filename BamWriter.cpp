@@ -561,7 +561,7 @@ BamWriter::BamWriter(int threadNumber, int level, int BufferSize) {
 }
 
 
-BamWriter::BamWriter(std::string filename, int threadNumber, int level, int BufferSize) {
+BamWriter::BamWriter(std::string filename, int threadNumber, int level, int BufferSize, bool is_tgs) {
 
     if ((output = sam_open(filename.c_str(), "wb")) == NULL) {
         printf("Can`t open this file!\n");
@@ -595,7 +595,7 @@ BamWriter::BamWriter(std::string filename, int threadNumber, int level, int Buff
 
 }
 
-BamWriter::BamWriter(std::string filename, sam_hdr_t *hdr, int threadNumber, int level, int BufferSize) {
+BamWriter::BamWriter(std::string filename, sam_hdr_t *hdr, int threadNumber, int level, int BufferSize, bool is_tgs) {
 
     if ((output = sam_open(filename.c_str(), "wb")) == NULL) {
         printf("Can`t open this file!\n");
@@ -641,7 +641,7 @@ void BamWriter::hdr_write(sam_hdr_t *hdr) {
 }
 
 
-void BamWriter::set_output(samFile *output) {
+void BamWriter::set_output(samFile *output, bool is_tgs) {
     this->output = output;
     write_compress_thread = new std::thread *[n_thread_write];
     for (int i = 0; i < n_thread_write; i++)

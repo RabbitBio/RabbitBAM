@@ -44,15 +44,15 @@ class BamWriter {
 public:
     BamWriter(int threadNumber = 1, int level = 6, int BufferSize = 200);
 
-    BamWriter(std::string file_name, int threadNumber = 1, int level = 6, int BufferSize = 200);
+    BamWriter(std::string file_name, int threadNumber = 1, int level = 6, int BufferSize = 200, bool is_tgs = false);
 
-    BamWriter(std::string file_name, sam_hdr_t *hdr, int threadNumber = 1, int level = 6, int BufferSize = 200);
+    BamWriter(std::string file_name, sam_hdr_t *hdr, int threadNumber = 1, int level = 6, int BufferSize = 200, bool is_tgs = false);
 
     ~BamWriter();
 
     void bam_write(bam1_t *b);
 
-    void set_output(samFile *output);
+    void set_output(samFile *output, bool is_tgs = false);
 
     void hdr_write(sam_hdr_t *hdr);
 

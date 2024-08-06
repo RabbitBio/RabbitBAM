@@ -13,9 +13,9 @@ class BamReader {
 
 public:
 
-    BamReader(std::string file_name, int n_thread = 8);
+    BamReader(std::string file_name, int n_thread = 8, bool is_tgs = false);
 
-    BamReader(std::string file_name, int read_block, int compress_block, int compress_complete_block, int n_thread = 8);
+    BamReader(std::string file_name, int read_block, int compress_block, int compress_complete_block, int n_thread = 8, bool is_tgs = false);
 
     ~BamReader() {
         read_thread->join();

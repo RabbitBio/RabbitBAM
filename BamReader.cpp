@@ -189,7 +189,7 @@ void compress_test_pack(BamCompress *compress) {
 }
 
 
-BamReader::BamReader(std::string file_name, int n_thread) {
+BamReader::BamReader(std::string file_name, int n_thread, bool is_tgs) {
 
 
     if ((sin = sam_open(file_name.c_str(), "r")) == NULL) {
@@ -231,7 +231,7 @@ BamReader::BamReader(std::string file_name, int n_thread) {
 
 
 BamReader::BamReader(std::string file_name, int read_block, int compress_block, int compress_complete_block,
-                     int n_thread) {
+                     int n_thread, bool is_tgs) {
 
     if ((sin = sam_open(file_name.c_str(), "r")) == NULL) {
         printf("Can`t open this file!\n");
