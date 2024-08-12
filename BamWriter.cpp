@@ -679,6 +679,12 @@ void BamWriter::over_parallel() {
     bam_write_compress->WriteComplete();
     for (int i = 0; i < n_thread_write; i++) write_compress_thread[i]->join();
     write_output_thread->join();
+    int ret = sam_close(output);
+    if (ret < 0) {
+        fprintf(stderr, "Error closing output.\n");
+        //exit_code = EXIT_FAILURE;
+    }
+
 }
 
 
@@ -691,5 +697,10 @@ void BamWriter::over() {
     bam_write_compress->WriteComplete();
     for (int i = 0; i < n_thread_write; i++) write_compress_thread[i]->join();
     write_output_thread->join();
+    int ret = sam_close(output);
+    if (ret < 0) {
+        fprintf(stderr, "Error closing output.\n");
+        //exit_code = EXIT_FAILURE;
+    }
 }
 

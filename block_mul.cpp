@@ -438,7 +438,7 @@ void benchmark_pack(BamCompress *compress, BamCompleteBlock *completeBlock) {
             completeBlock->backEmpty(assign_block);
             assign_block = completeBlock->getEmpty();
         }
-        if (0) {
+        if (ret != un_comp->length) {
             memcpy(assign_block->data + assign_block->length, un_comp->data, ret * sizeof(char));
             assign_block->length += ret;
             completeBlock->backEmpty(assign_block);
@@ -545,64 +545,64 @@ int main(int argc, char *argv[]) {
 
     bool is_tgs = false;
 
-    CLI::App *bam2fq = app.add_subcommand("bam2fq", "BAM format turn to FastQ format");
-    bam2fq->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
-    bam2fq->add_option("-o", outputfile, "output File name");
-    bam2fq->add_option("-w,-@,-n,--threads", n_thread, "thread number");
+    //CLI::App *bam2fq = app.add_subcommand("bam2fq", "BAM format turn to FastQ format");
+    //bam2fq->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
+    //bam2fq->add_option("-o", outputfile, "output File name");
+    //bam2fq->add_option("-w,-@,-n,--threads", n_thread, "thread number");
 
 
-    CLI::App *bamstatus = app.add_subcommand("bamstatus", "Analyze BAM files");
-    bamstatus->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
-    bamstatus->add_option("-o", outputfile, "output File name");
-    bamstatus->add_flag("--tgs", is_tgs, "Process TGS data");
-    bamstatus->add_option("-w,-@,-n,--threads", n_thread, "thread number");
+    //CLI::App *bamstatus = app.add_subcommand("bamstatus", "Analyze BAM files");
+    //bamstatus->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
+    //bamstatus->add_option("-o", outputfile, "output File name");
+    //bamstatus->add_flag("--tgs", is_tgs, "Process TGS data");
+    //bamstatus->add_option("-w,-@,-n,--threads", n_thread, "thread number");
 
 
-    CLI::App *benchmark = app.add_subcommand("benchmark", "Performance Testing");
-    benchmark->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
-    benchmark->add_option("-o", outputfile, "output File name");
-    benchmark->add_option("-w,-@,-n,--threads", n_thread, "thread number");
+    //CLI::App *benchmark = app.add_subcommand("benchmark", "Performance Testing");
+    //benchmark->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
+    //benchmark->add_option("-o", outputfile, "output File name");
+    //benchmark->add_option("-w,-@,-n,--threads", n_thread, "thread number");
 
 
-    CLI::App *htslib_test = app.add_subcommand("htslib_test", "Htslib sam_read API Performance Testing");
-    htslib_test->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
-    htslib_test->add_option("-o", outputfile, "output File name");
-    htslib_test->add_option("-w,-@,-n,--threads", n_thread, "thread number");
+    //CLI::App *htslib_test = app.add_subcommand("htslib_test", "Htslib sam_read API Performance Testing");
+    //htslib_test->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
+    //htslib_test->add_option("-o", outputfile, "output File name");
+    //htslib_test->add_option("-w,-@,-n,--threads", n_thread, "thread number");
 
 
-    CLI::App *benchmark_count = app.add_subcommand("benchmark_count", "Banchmark Count Performance Testing");
+    CLI::App *benchmark_count = app.add_subcommand("benchmark_count", "read banchmark: count line");
     benchmark_count->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
     benchmark_count->add_option("-o", outputfile, "output File name");
     benchmark_count->add_flag("--tgs", is_tgs, "Process TGS data");
     benchmark_count->add_option("-w,-@,-n,--threads", n_thread, "thread number");
 
 
-    CLI::App *compress_test = app.add_subcommand("compress_test", "Compress Performance Testing");
-    compress_test->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
-    compress_test->add_option("-o", outputfile, "output File name");
-    compress_test->add_option("-w,-@,-n,--threads", n_thread, "thread number");
+    //CLI::App *compress_test = app.add_subcommand("compress_test", "Compress Performance Testing");
+    //compress_test->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
+    //compress_test->add_option("-o", outputfile, "output File name");
+    //compress_test->add_option("-w,-@,-n,--threads", n_thread, "thread number");
 
 
-    CLI::App *write_test = app.add_subcommand("write_test", "Write Testing One thread");
-    write_test->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
-    write_test->add_option("-o", outputfile, "output File name");
-    write_test->add_option("-w,-@,-n,--threads", n_thread, "thread number");
-    write_test->add_option("-l,--level", level, "zip level");
+    //CLI::App *write_test = app.add_subcommand("write_test", "Write Testing One thread");
+    //write_test->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
+    //write_test->add_option("-o", outputfile, "output File name");
+    //write_test->add_option("-w,-@,-n,--threads", n_thread, "thread number");
+    //write_test->add_option("-l,--level", level, "zip level");
 
 
-    CLI::App *write_mul_test = app.add_subcommand("write_mul_test", "Write Testing with multi thread");
-    write_mul_test->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
-    write_mul_test->add_option("-o", outputfile, "output File name");
-    write_mul_test->add_option("--nr", n_thread, "Read thread number");
-    write_mul_test->add_option("--nw", n_thread_write, "Write thread number");
-    write_mul_test->add_option("-l,--level", level, "zip level");
+    //CLI::App *write_mul_test = app.add_subcommand("write_mul_test", "Write Testing with multi thread");
+    //write_mul_test->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
+    //write_mul_test->add_option("-o", outputfile, "output File name");
+    //write_mul_test->add_option("--nr", n_thread, "Read thread number");
+    //write_mul_test->add_option("--nw", n_thread_write, "Write thread number");
+    //write_mul_test->add_option("-l,--level", level, "zip level");
 
 
     CLI::App *api_test = app.add_subcommand("api_test", "use api to read and write");
     api_test->add_option("-i", inputfile, "input File name")->required()->check(CLI::ExistingFile);
     api_test->add_option("-o", outputfile, "output File name");
     api_test->add_option("--nr", n_thread, "Read thread number");
-    api_test->add_option("--nw", n_thread_write, "Write thread number");
+    api_test->add_option("--nw", n_thread_write, "Write thread number, we suggest nr:nw = 1:4");
     api_test->add_flag("--tgs", is_tgs, "Process TGS data");
     api_test->add_option("-l,--level", level, "zip level");
 
@@ -634,6 +634,9 @@ int main(int argc, char *argv[]) {
         BamStatus **status = new BamStatus *[n_thread];
         thread **Bam = new thread *[n_thread];
 
+        TDEF(ttt)
+        TSTART(ttt)
+
         thread *read_thread = new thread(&read_pack, sin->fp.bgzf, &read);
         thread **compress_thread = new thread *[n_thread];
         for (int i = 0; i < n_thread; i++) {
@@ -654,6 +657,10 @@ int main(int argc, char *argv[]) {
         assign_thread->join();
 
         for (int i = 0; i < n_thread; i++) Bam[i]->join();
+
+        TEND(ttt)
+        TPRINT(ttt, "ttt is ")
+
         for (int i = 1; i < n_thread; i++) {
             status[0]->add(status[i]);
         }

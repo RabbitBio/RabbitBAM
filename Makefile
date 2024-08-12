@@ -9,8 +9,8 @@ TARGET = $(BUILD_PATH)/rabbitbam
 
 LIB =
 INCLUDE = ./htslib 
-HTSLIB_INSTALL_PATH = /home/user_home/ylf/someGit/rbam-1.20/htslib-1.20-install
-LIBDEFLATE_INSTALL_PATH = /home/user_home/ylf/someGit/rbam-1.20/libdeflate-1.20-install
+HTSLIB_INSTALL_PATH = 
+LIBDEFLATE_INSTALL_PATH = 
 
 LIB += $(HTSLIB_INSTALL_PATH)/lib
 LIB += $(HTSLIB_INSTALL_PATH)/lib64

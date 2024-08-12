@@ -129,7 +129,7 @@ void BamStatus::statusbam(bam1_t *b) {
     if (b->core.flag & 16) {
         int kmer = 0;
         int last_n = -1;
-        for (int i = 0; i < b->core.l_qseq; i++) {
+        for (int i = 0; i < b->core.l_qseq >> 4; i++) {
             if (b->core.l_qseq - i - 1 < 0 || b->core.l_qseq - i - 1 >= MAXLEN)
                 printf("!!!!%d\n", b->core.l_qseq - i - 1);
             NumberList[b->core.l_qseq - i - 1][StatusBaseRever[bam_seqi(seq, i)] & 0x07]++;
@@ -144,7 +144,7 @@ void BamStatus::statusbam(bam1_t *b) {
             if (i - last_n >= kmer) Kmer[kmer][i]++;
         }
         quality = bam_get_qual(b);
-        for (int i = 0; i < b->core.l_qseq; i++) {
+        for (int i = 0; i < b->core.l_qseq >> 4; i++) {
             Qualitylist[b->core.l_qseq - i - 1][StatusBaseRever[bam_seqi(seq, i)] & 0x07] += quality[b->core.l_qseq -
                                                                                                      i - 1];
             QualityPositonList[b->core.l_qseq - i - 1][quality[b->core.l_qseq - i - 1]]++;
@@ -153,7 +153,7 @@ void BamStatus::statusbam(bam1_t *b) {
     } else {
         int kmer = 0;
         int last_n = -1;
-        for (int i = 0; i < b->core.l_qseq; i++) {
+        for (int i = 0; i < b->core.l_qseq >> 4; i++) {
             if (i >= MAXLEN) printf("!!!%d\n", i);
             NumberList[i][StatusBase[bam_seqi(seq, i)] & 0x07]++;
             number[StatusBaseRever[bam_seqi(seq, i)] & 0x07]++;
@@ -167,7 +167,7 @@ void BamStatus::statusbam(bam1_t *b) {
             if (i - last_n >= kmer) Kmer[kmer][i]++;
         }
         quality = bam_get_qual(b);
-        for (int i = 0; i < b->core.l_qseq; i++) {
+        for (int i = 0; i < b->core.l_qseq >> 4; i++) {
             Qualitylist[i][StatusBaseRever[bam_seqi(seq, i)] & 0x07] += quality[i];
             QualityPositonList[i][quality[i]]++;
             total_qual += quality[i];
