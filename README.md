@@ -26,7 +26,7 @@ refer to `./rabbitbam -h`
 
 To use RabbitBAM in other software, you need to first compile RabbitBAM according to the [Installation](#installation) instructions, then link it to your new software and include the appropriate header files. 
 
-Here is an example:
+Here is an example of file reading and writing (see [RabbitBAM-QC](https://github.com/RabbitBio/RabbitBAM-QC) and [RabbitBAM-SORT](https://github.com/RabbitBio/RabbitBAM-SORT) for more examples):
 
 ### Source:
 
@@ -107,9 +107,9 @@ int main(int argc, char* argv[]) {
 ### Compile:
 
 ```bash
-export HTSLIB_INSTALL_PATH=/home/user_home/ylf/someGit/rbam-1.20/htslib-1.20-install
-export RABBITBAM_INSTALL_PATH=/home/user_home/ylf/RabbitBAM
-export LIBDEFLATE_INSTALL_PATH=/home/user_home/ylf/someGit/rbam-1.20/libdeflate-1.20-install
+export HTSLIB_INSTALL_PATH=<path-to-htslib-installation-directory>
+export RABBITBAM_INSTALL_PATH=<path-to-RabbitBAM-installation-directory>
+export LIBDEFLATE_INSTALL_PATH=<path-to-libdeflate-installation-directory>
 
 g++ -o main main.cpp -I$HTSLIB_INSTALL_PATH/include -I$RABBITBAM_INSTALL_PATH/htslib -I$RABBITBAM_INSTALL_PATH -I$LIBDEFLATE_INSTALL_PATH/include -L$HTSLIB_INSTALL_PATH/lib -L$RABBITBAM_INSTALL_PATH -L$LIBDEFLATE_INSTALL_PATH/lib -lhts -lz -fopenmp -lpthread -lrabbitbamtools -lrabbitbamread -lrabbitbamwrite
 ```
