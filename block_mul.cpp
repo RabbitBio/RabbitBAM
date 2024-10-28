@@ -608,6 +608,8 @@ int main(int argc, char *argv[]) {
 
 
     CLI11_PARSE(app, argc, argv);
+
+    int total_threads = std::thread::hardware_concurrency();
     if (app.get_subcommands().size() > 1) {
         printf("you should input one command!!!\n");
         return 0;
@@ -764,6 +766,7 @@ int main(int argc, char *argv[]) {
         TPRINT(fq, "time is : ");
     }
     if (strcmp(app.get_subcommands()[0]->get_name().c_str(), "benchmark_count") == 0) {
+        if(n_thread > total_threads - 4) n_thread = max(1, total_threads - 4);
         TDEF(fq)
         TSTART(fq)
         printf("Starting Running Benchmark Count\n");
@@ -976,6 +979,11 @@ int main(int argc, char *argv[]) {
         TPRINT(fq, "time is : ");
     }
     if (strcmp(app.get_subcommands()[0]->get_name().c_str(), "api_test") == 0) {
+        if(n_thread + n_thread_write > total_threads - 6) {
+            n_thread = max(1, (total_threads - 6) / 5);
+            n_thread_write = max(1, total_threads - 6 - n_thread);
+            printf("adjust read thread num to %d, write thread num to %d\n", n_thread, n_thread_write);
+        }
         TDEF(fq)
         TSTART(fq)
 
