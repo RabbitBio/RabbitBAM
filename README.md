@@ -110,6 +110,7 @@ int main(int argc, char* argv[]) {
 export HTSLIB_INSTALL_PATH=<path-to-htslib-installation-directory>
 export RABBITBAM_INSTALL_PATH=<path-to-RabbitBAM-installation-directory>
 export LIBDEFLATE_INSTALL_PATH=<path-to-libdeflate-installation-directory>
+export LD_LIBRARY_PATH=$RABBITBAM_INSTALL_PATH:$LD_LIBRARY_PATH
 
 g++ -o main main.cpp -I$HTSLIB_INSTALL_PATH/include -I$RABBITBAM_INSTALL_PATH/htslib -I$RABBITBAM_INSTALL_PATH -I$LIBDEFLATE_INSTALL_PATH/include -L$HTSLIB_INSTALL_PATH/lib -L$RABBITBAM_INSTALL_PATH -L$LIBDEFLATE_INSTALL_PATH/lib -lhts -lz -fopenmp -lpthread -lrabbitbamtools -lrabbitbamread -lrabbitbamwrite
 ```
