@@ -26,6 +26,8 @@ refer to `./rabbitbam -h`
 
 To use RabbitBAM in other software, you need to first compile RabbitBAM according to the [Installation](#installation) instructions, then link it to your new software and include the appropriate header files. 
 
+For detailed usage instructions, please refer to: https://rabbitbam.readthedocs.io/en/latest.
+
 Here is an example of file reading and writing (see [RabbitBAM-QC](https://github.com/RabbitBio/RabbitBAM-QC) and [RabbitBAM-SORT](https://github.com/RabbitBio/RabbitBAM-SORT) for more examples):
 
 ### Source:
