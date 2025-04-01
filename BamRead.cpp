@@ -79,5 +79,6 @@ void BamRead::backBlock(bam_block *block) {
 }
 
 void BamRead::ReadComplete() {
+    std::atomic_thread_fence(std::memory_order_release);
     read_complete = true;
 }
