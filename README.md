@@ -1,4 +1,4 @@
-# RabbitBAM
+## ![logo](./docs/source/_static/RabbitBAM.jpg)
 
 An ultra-fast I/O framework for BAM files.
 

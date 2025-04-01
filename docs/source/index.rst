@@ -1,7 +1,7 @@
 
 |
 
-.. image:: _static/RabbitBAM.png
+.. image:: _static/RabbitBAM.jpg
 
 |
 
