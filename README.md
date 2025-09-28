@@ -124,3 +124,7 @@ time ./main -i in.bam -o out.bam -t 40
 ```
 
 Note: This is for the single parser case. If you need multiple parsers, please refer to the example `parallel_test` in `block_mul.cpp`.
+
+
+## Cite
+Yan, L., Zhao, Z., Yin, Z., Zhang, T., Yang, Y., Zhu, F., ... & Liu, W. (2025). RabbitBAM: Accelerating BAM File Manipulation on Multi-Core Platforms. IEEE Transactions on Computational Biology and Bioinformatics.
