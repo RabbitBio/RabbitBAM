@@ -1,0 +1,8 @@
+cd bam-code
+mkdir build
+cd build
+
+cmake -DPLATFORM=sunway ..
+make -j 
+
+./rabbitbam_x86 ...
