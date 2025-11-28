@@ -1,6 +1,5 @@
 
 #include "swbam.h"
-#include "BamTools.h"
 
 using namespace std;
 
@@ -20,6 +19,7 @@ SwBam::SwBam(CmdInfo *cmd_info1) {
 
 SwBam::~SwBam() {
     printf("SwBam::~SwBam()\n");
+   
 
 }
 
@@ -85,7 +85,7 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
 
         for (int i = 0; i < 64; i++) {
             if(tmp_chunks[i] == NULL) {
-                degz_paras[i].input_block = NULL
+                degz_paras[i].input_block = NULL ;
                 degz_paras[i].decompress_size = 0;
                 degz_paras[i].n_records = 0;
                 degz_paras[i].status = -1; //标记为空块
@@ -138,38 +138,19 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
 
 }
 
-// void SwBam::WriteSwBamTask() {
-//     printf("void SwBam::WriteSwBamTask()\n");
-
-// }
 
 int writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b) {
-    //TODO
-    switch (fp->format.format) {
-        case sam:
-            if (sam_write1_sw(fp, h, b) < 0) {
+    if (sam_write1_sw(fp, h, b) < 0) {
                 fprintf(stderr, "Error writing SAM record\n");
                 return -1;
-            }
-            break;
-        // case bam:
-        //     if (bam_write1(fp->fp.bgzf, b) < 0) {
-        //         fprintf(stderr, "Error writing BAM record\n");
-        //         return -1;
-        //     }
-        //     break;
-        default:
-            fprintf(stderr, "Unknown file format\n");
-            return -2;
     }
-
     return 0;
 }
 
 
 //---------------------------------------------------------------------------------------------------------------------
 
-void ProducerSwBamTask2(samFile *fp, BamWrite *write){
+void SwBam:: ProducerSwBamTask2(samFile *fp, BamWrite *write){
     printf("void SwBam::ProducerSwBamTask2()\n");
 
     // 当前块和当前组的缓存
@@ -224,7 +205,7 @@ void ProducerSwBamTask2(samFile *fp, BamWrite *write){
 }
 
 
-void ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
+void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
     printf("void SwBam::ConsumerSwBamTask2()\n");
 
     athread_init();
@@ -258,7 +239,7 @@ void ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
             comp_paras[i].block_id = i;
             comp_paras[i].input_records = group[i].data();   
             comp_paras[i].n_records = group[i].size();      
-            comp_paras[i].output_block = complete->getEmptyBlock(i);
+            comp_paras[i].output_block = complete->getEmpty();
             comp_paras[i].un_comp_block = complete->getBuffer(i);
             comp_paras[i].output_size = 0;
             comp_paras[i].status = 0;
@@ -290,19 +271,19 @@ void ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
 }
 
 //一块bgzf写入文件中
-int writeBlockTobam(BGZF *fp, bam_block *block) {
+int SwBam:: writeBlockTobam(BGZF *fp, bam_block *block) {
     int block_offset = block->pos;
-    if (block->block_length < 0) {
-        hts_log_debug("Deflate block operation failed: %s", bgzf_zerr(block->block_length, NULL));
+    if (block->length < 0) {
+        hts_log_debug("Deflate block operation failed: %s", bgzf_zerr(block->length, NULL));
         return -1;
     }
-    if (hwrite(fp->fp, block->compressed_data, block->block_length) != block->block_length) {
+    if (hwrite(fp->fp, block->data, block->length) != block->length) {
         hts_log_error("File write failed (wrong size)");
         fp->errcode |= BGZF_ERR_IO; // possibly truncated file
         return -1;
     }
     block->pos = 0;
-    fp->block_address += block->block_length;    
+    fp->block_address += block->length;    
     return 0;
 }
 
@@ -334,7 +315,7 @@ void SwBam::ProcessSwBam() {
     }
 
     switch (sin->format.format) {
-        case bam:
+        case bam:{
             //开辟多线程处理 
             //进行队列等的初始化
             read = new BamRead(50);
@@ -362,8 +343,10 @@ void SwBam::ProcessSwBam() {
             printf("num %lld\n", num);
 
             break;
+        }
+            
 
-        case sam:
+        case sam:{
             write = new BamWrite(50);
             writeComplete = new BamWriteComplete(50);
             //生产者线程---
@@ -385,6 +368,8 @@ void SwBam::ProcessSwBam() {
             printf("num2 %lld\n", num2);
 
             break;
+        }
+            
 
         default:
             fprintf(stderr, "Unknown file format\n");

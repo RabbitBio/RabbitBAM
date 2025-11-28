@@ -1,5 +1,4 @@
 #include "BamRead.h"
-#include <unistd.h>
 
 BamRead::BamRead(int queue_size) {
 
@@ -45,7 +44,7 @@ std::vector<bam_block*> BamRead::getBlock64() {
     //等待直到有可用组
     while ((con_ed + 1) % con_queueSizeLim == con_bg) {
         usleep(10); 
-        if (read_complete && (con_ed + 1) % con_queueSizeLim == con_bg) return nullptr;
+        if (read_complete && (con_ed + 1) % con_queueSizeLim == con_bg) return std::vector<bam_block*>();
     }
     //先取再+1
     int num = con_bg;

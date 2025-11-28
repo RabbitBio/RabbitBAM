@@ -1,6 +1,6 @@
-#include "CLI11.hpp"
-#include "CmdInfo.h"
-#include "Globals.h"
+#include "sunway/CLI11.hpp"
+#include "sunway/CmdInfo.h"
+#include "sunway/Globals.h"
 #include "swbam.h"
 
 int main(int argc, char **argv) {

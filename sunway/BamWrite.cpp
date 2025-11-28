@@ -1,8 +1,7 @@
 #include "BamWrite.h"
-#include <cstdio>
 
 BamWrite::BamWrite(int queue_size) {
-    total_bams = 4096; //需要合适的大小
+    int total_bams = 4096; //需要合适的大小
     pool_size = total_bams + 1 ; // 多申请一个，防止边界问题
     bamPool = new bam1_t*[pool_size];
     pool_bg = 0;

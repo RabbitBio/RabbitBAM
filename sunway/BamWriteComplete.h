@@ -2,6 +2,10 @@
 #define BAM_WRITE_COMPLETE_H
 
 #include <unistd.h>
+#include <vector>
+#include <cstdio>
+
+#include <sunway/BamTools.h>
 
 class BamWriteComplete {
 public:

@@ -2,8 +2,9 @@
 #define BAMWRITE_H
 
 #include <vector>
-#include <htslib/sam.h>
+#include <htslib/sam.h>   //bam_init1();  bam_destroy1();
 #include <unistd.h>
+#include <cstdio>
 
 class BamWrite {
 public:

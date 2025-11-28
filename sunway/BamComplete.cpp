@@ -1,6 +1,4 @@
 #include "BamComplete.h"
-#include <cstring>
-#include <thread>
 
 BamComplete::BamComplete(int queue_size)
 {
@@ -19,9 +17,10 @@ BamComplete::BamComplete(int queue_size)
 
     for (int i = 0; i < 64; ++i) {
         buffer_pool_[i] = new bam_block;
-        result_pool_[i] = new bam1_t[max_records_per_block_];
-        for(int j = 0; j < max_records_per_block_; j++) {
-            result_pool_[i][j] = bam_init1();
+
+        result_pool_[i].resize(max_records_per_block_);
+        for (int j = 0; j < max_records_per_block_; ++j) {
+            result_pool_[i][j] = bam_init1();  // 指针赋值没问题
         }
     }
 
@@ -34,7 +33,12 @@ BamComplete::BamComplete(int queue_size)
 
 BamComplete::~BamComplete() {
     for (auto buf : buffer_pool_) delete buf;
-    for (auto res : result_pool_) bam_destroy1(res);
+    // 释放 result_pool_ 中每个 bam1_t*
+    for (auto& row : result_pool_) {
+        for (auto ptr : row) {
+            bam_destroy1(ptr);
+        }
+    }
 
     for (int i = 0; i < queue_size_; ++i) {
         bam_destroy1(p_out_queue_[i]);
@@ -46,26 +50,30 @@ bam_block* BamComplete::getBuffer(int idx) {
     return buffer_pool_[idx];
 }
 
-bam1_t* BamComplete::getResultBuf(int idx) {
+std::vector<bam1_t*>& BamComplete::getResultBuf(int idx) {
     return result_pool_[idx];
 }
 
-void BamComplete::pushBlockResults(const bam1_t* records, int n) {
-    if (!records || n <= 0) return;
+void BamComplete::pushBlockResults(const std::vector<bam1_t*>& records, int n) {
+    if (records.empty() || n <= 0) return;
 
     for (int i = 0; i < n; ++i) {
+        bam1_t* src = records[i];
+        if (!src) continue;
+
         // 等待队列有空间
         while (p_queueNumNow >= p_queueSizeLim) {
             usleep(10);
         }
 
         bam1_t* dst = p_out_queue_[p_queueP2];
-        bam_copy1(dst, &records[i]);
+        bam_copy1(dst, src);
         p_queueP2 = (p_queueP2 + 1) % p_queueSizeLim;
         p_queueNumNow++;
         p_queueCanRead++;
     }
 }
+
 
 bam1_t* BamComplete::popRecord() {
     while (p_queueCanRead <= 0 ) {

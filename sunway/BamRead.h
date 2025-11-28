@@ -1,16 +1,18 @@
 #ifndef BAMREAD_H
 #define BAMREADER_H
 
-#include "BamTools.h"
 #include <vector> 
+#include <unistd.h>
 #include <atomic>
+
+#include "sunway/BamTools.h"
 
 class BamRead {
 public:
     BamRead(int queue_size );  
     ~BamRead() {
-        for (auto block : readBlock) {  //这里会多delete一个nullptr，但无妨
-            delete block;
+        for (int i = 0; i < readBlockSize; ++i) {
+            delete readBlock[i];
         }
         delete[] readBlock;
         delete[] consumer_queue_;

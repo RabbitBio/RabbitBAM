@@ -1,4 +1,24 @@
-// 进行标准的解压缩 TODO
+
+ #include <stdint.h>
+ #include <cstdlib>
+// #include <mutex>
+//#include <libdeflate.h>
+// #include <thread>
+// #include <atomic>
+// #include <condition_variable>
+ #include <vector>
+// #include <omp.h>
+ #include <cmath>
+ #include <zlib.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+
+ #include <sunway/BamTools.h>
+
+
+ //----------------------------------------------------------------------------------------------
+ //bam to sam
+// 进行标准的解压缩
 int bgzf_uncompress(uint8_t *dst, size_t *dlen,
                     const uint8_t *src, size_t slen,
                     uint32_t expected_crc) {
@@ -26,18 +46,18 @@ int bgzf_uncompress(uint8_t *dst, size_t *dlen,
     return 0;
 }
 
-// 处理一个 BGZF 块的头尾 TODO
+// 进行一个BGZF块的解压缩,处理一个 BGZF 块的头尾
 int block_decode_func(struct bam_block *comp, struct bam_block *un_comp) {
     un_comp->pos = 0;
     un_comp->length = BGZF_MAX_BLOCK_SIZE;
-    uint32_t crc = le_to_u32((uint8_t *) comp->data + comp->length - 8);
+    uint32_t crc = le_to_u32((uint8_t *) comp->data + comp->length - 8);                             //le_to_u32  hts_endian.h
     int ret = bgzf_uncompress(un_comp->data, reinterpret_cast<size_t *>(&un_comp->length),
                               comp->data + 18, comp->length - 18, crc);
     if (ret != 0) un_comp->errcode |= BGZF_ERR_ZLIB;
     return ret;
 }
 
-// 从解压缩后的块中解析一个 bam1_t 记录   缓存机制要研究一下TODO
+// 从解压缩后的块中解析出一个 bam1_t 记录
 int read_bam(struct bam_block *fq, bam1_t *b, int is_be) {
     if (fq->pos >= fq->length) return -1;
     bam1_core_t *c = &b->core;
@@ -113,6 +133,7 @@ int Rabbit_bgzf_read(struct bam_block *fq, void *data, unsigned int length) {
     return length;
 }
 
+//-------------------------------------------------------------------------------------------------------------------------------------------------
 extern "C" void decompressfunc(Para paras[64]) {
 
     int id = _PEN;             // 从核号（0~63）
@@ -125,7 +146,7 @@ extern "C" void decompressfunc(Para paras[64]) {
         return;
     }
 
-    // 2. 解压缩该块 TODO
+    // 2. 解压缩该块
     block_decode_func(comp,un_comp);
 
     // 3. 解析解压后的SAM/BAM记录
@@ -140,7 +161,7 @@ extern "C" void decompressfunc(Para paras[64]) {
         b = para->output_records[count];
     }
 
-    bam_destroy1(b);
+    //bam_destroy1(b);
 
     para->n_records = count;
     para->status = 0;
@@ -168,6 +189,7 @@ extern "C" void copyfunc(Para paras[64]) {
 
 
 //--------------------------------------------------------------------------------------------------------------
+//sam to bam
 
 //数据的实际写入函数
 int rabbit_bgzf_mul_write(bam_block *&write_block, const void *data, size_t length) {
@@ -388,5 +410,11 @@ extern "C" void slave_compressfunc(Comp_Para paras[64]) {
     para->status = 0; // success
 
 }
+
+
+
+//-------------------------------------------------------------------------------------------------------------------------------------------
+//BamTools-slave
+
 
 

@@ -1,11 +1,17 @@
 #ifndef BAMCOMPLETE_H
 #define BAMCOMPLETE_H
 
-#include "BamTools.h"
 #include <vector>
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
+#include <cstring>
+#include <thread>
+#include <unistd.h>
+
+#include "sunway/BamTools.h"
+#include <htslib/sam.h>  //bam_init1();  bam_destroy1();
+#include <htslib/hts.h>
 
 class BamComplete {
 public:
@@ -15,15 +21,16 @@ public:
     // 从核缓冲区（解压用）
     bam_block* getBuffer(int idx);
     // 从核解析bam1_t缓冲区
-    bam1_t* getResultBuf(int idx);
+    std::vector<bam1_t*>& BamComplete::getResultBuf(int idx);
 
     // 从核完成一块，放入结果队列（按顺序）
-    void pushBlockResults(const bam1_t* records, int n);
+    void pushBlockResults(const std::vector<bam1_t*>& records, int n);
+
 
     // 主线程逐条读取bam1_t
-    bool popRecord(bam1_t& out);
+    bam1_t* BamComplete::popRecord();
 
-    bam1_t* BamComplete::backRecord();
+    bool BamComplete::backRecord(bam1_t* record);
 
     void markComplete();
     bool isComplete() const;
@@ -35,7 +42,8 @@ private:
     // 解压用缓冲区
     std::vector<bam_block*> buffer_pool_;
     //内存池
-    std::vector<bam1_t*> result_pool_;
+    //std::vector<bam1_t*> result_pool_;
+    std::vector<std::vector<bam1_t*>> result_pool_;
 
     bam1_t** p_out_queue_;  
     std::atomic_int p_queueP2;     // 写指针

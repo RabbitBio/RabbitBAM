@@ -2,7 +2,6 @@
 #ifndef SWBAM_H
 #define SWBAM_H
 
-#include "CmdInfo.h"
 #include <string>
 #include <vector>
 #include <thread>
@@ -10,8 +9,17 @@
 #include <condition_variable>
 #include <queue>
 #include <atomic>
+#include <functional>
+
+
 // #include <htslib/sam.h>
 // #include <htslib/hts.h>
+#include "BamRead.h"
+#include "BamComplete.h"
+#include "BamWrite.h"
+#include "BamWriteComplete.h"
+#include "sunway/BamTools.h"
+#include "sunway/CmdInfo.h"
 
 class SwBam {
 public:
@@ -31,6 +39,7 @@ private:
 
     void ConsumerSwBamTask2(BamWrite *write, BamWriteComplete *complete);
     void ProducerSwBamTask2(samFile *fp, BamWrite *write);
+    int SwBam:: writeBlockTobam(BGZF *fp, bam_block *block);
 
 private:
     CmdInfo *cmd_info_;
