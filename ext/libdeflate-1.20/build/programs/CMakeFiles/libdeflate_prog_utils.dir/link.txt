@@ -1,2 +1,0 @@
-/usr/bin/ar qc libdeflate_prog_utils.a CMakeFiles/libdeflate_prog_utils.dir/prog_util.c.o CMakeFiles/libdeflate_prog_utils.dir/tgetopt.c.o
-/usr/bin/ranlib libdeflate_prog_utils.a
