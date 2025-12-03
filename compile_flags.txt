@@ -1,0 +1,10 @@
+-xc++
+-std=c++11
+-g
+-O3
+-ffast-math
+-DTIMING
+-DPLATFORM_SUNWAY
+-I./include
+-I./ext/htslib-1.20
+-I./ext/libdeflate-1.20

@@ -1,0 +1,20 @@
+CMakeFiles/libdeflate_static.dir/lib/adler32.c.o: \
+ /home/export/online1/mdt00/shisuan/swls-CFD/guoshi/wzs/code/RabbitBAM/ext/libdeflate-1.20/lib/adler32.c \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/include/stdc-predef.h \
+ /home/export/online1/mdt00/shisuan/swls-CFD/guoshi/wzs/code/RabbitBAM/ext/libdeflate-1.20/lib/lib_common.h \
+ /home/export/online1/mdt00/shisuan/swls-CFD/guoshi/wzs/code/RabbitBAM/ext/libdeflate-1.20/lib/../common_defs.h \
+ /home/export/online1/mdt00/shisuan/swls-CFD/guoshi/wzs/code/RabbitBAM/ext/libdeflate-1.20/lib/../libdeflate.h \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/lib/gcc/sw_64sw6a-sunway-linux-gnu/7.1.0/include/stddef.h \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/lib/gcc/sw_64sw6a-sunway-linux-gnu/7.1.0/include/stdint.h \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/include/stdint.h \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/include/features.h \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/include/sys/cdefs.h \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/include/bits/wordsize.h \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/include/gnu/stubs.h \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/include/bits/wchar.h \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/lib/gcc/sw_64sw6a-sunway-linux-gnu/7.1.0/include/stdbool.h \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/include/string.h \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/include/xlocale.h \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/include/bits/string.h \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/include/bits/string2.h \
+ /usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/include/stdlib.h
