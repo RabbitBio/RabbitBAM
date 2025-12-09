@@ -8,11 +8,12 @@
 #include <atomic>
 #include <condition_variable>
 #include <vector>
-#include <omp.h>
 #include <cmath>
 #include <zlib.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <inttypes.h>
+
 
 #include <htslib/sam.h>
 #include <htslib/bgzf.h>
@@ -39,6 +40,9 @@ struct bgzf_cache_t {
     khash_t(cache) *h;
     khint_t last_pos;
 };
+
+
+typedef struct bam_block bam_block;
 
 struct Para {
     int block_id;              // 当前块号
@@ -98,13 +102,13 @@ int sam_write1_sw(samFile *fp, const sam_hdr_t *h, const bam1_t *b);
 
 int sam_realloc_bam_data(bam1_t *b, size_t desired);
 
-inline int realloc_bam_data(bam1_t *b, size_t desired);
+int realloc_bam_data(bam1_t *b, size_t desired);
 
 
 //sam to bam
 const char *bgzf_zerr(int errnum, z_stream *zs);
 
-int sam_read1_sw(samFile *fp, const sam_hdr_t *h, const bam1_t *b);
+int sam_read1_sw(samFile *fp, sam_hdr_t *h, bam1_t *b);
 
 
 //从核使用的
@@ -112,6 +116,8 @@ void swap_data(const bam1_core_t *c, int l_data, uint8_t *data, int is_host);
 
 void bam_cigar2rqlens(int n_cigar, const uint32_t *cigar,
                       hts_pos_t *rlen, hts_pos_t *qlen);
+
+inline int possibly_expand_bam_data(bam1_t *b, size_t bytes);
 
 int bam_tag2cigar(bam1_t *b, int recal_bin,
                   int give_warning); // return 0 if CIGAR is untouched; 1 if CIGAR is updated with CG

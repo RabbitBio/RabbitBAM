@@ -9,7 +9,7 @@
 #include <thread>
 #include <unistd.h>
 
-#include "sunway/BamTools.h"
+#include "BamTools.h"
 #include <htslib/sam.h>  //bam_init1();  bam_destroy1();
 #include <htslib/hts.h>
 
@@ -21,16 +21,16 @@ public:
     // 从核缓冲区（解压用）
     bam_block* getBuffer(int idx);
     // 从核解析bam1_t缓冲区
-    std::vector<bam1_t*>& BamComplete::getResultBuf(int idx);
+    std::vector<bam1_t*>& getResultBuf(int idx);
 
     // 从核完成一块，放入结果队列（按顺序）
     void pushBlockResults(const std::vector<bam1_t*>& records, int n);
 
 
     // 主线程逐条读取bam1_t
-    bam1_t* BamComplete::popRecord();
+    bam1_t* popRecord();
 
-    bool BamComplete::backRecord(bam1_t* record);
+    bool backRecord(bam1_t* record);
 
     void markComplete();
     bool isComplete() const;

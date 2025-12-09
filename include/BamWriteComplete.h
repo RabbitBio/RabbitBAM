@@ -5,7 +5,7 @@
 #include <vector>
 #include <cstdio>
 
-#include <sunway/BamTools.h>
+#include <BamTools.h>
 
 class BamWriteComplete {
 public:

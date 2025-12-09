@@ -67,7 +67,7 @@ void BamComplete::pushBlockResults(const std::vector<bam1_t*>& records, int n) {
         }
 
         bam1_t* dst = p_out_queue_[p_queueP2];
-        bam_copy1(dst, src);
+        (void)bam_copy1(dst, src); //显式丢弃返回值
         p_queueP2 = (p_queueP2 + 1) % p_queueSizeLim;
         p_queueNumNow++;
         p_queueCanRead++;

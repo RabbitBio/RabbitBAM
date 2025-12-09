@@ -5,7 +5,7 @@
 #include <unistd.h>
 #include <atomic>
 
-#include "sunway/BamTools.h"
+#include "BamTools.h"
 
 class BamRead {
 public:

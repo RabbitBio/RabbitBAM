@@ -29,7 +29,7 @@ int sam_realloc_bam_data(bam1_t *b, size_t desired) {
     return 0;
 }
 
-inline int realloc_bam_data(bam1_t *b, size_t desired) {
+int realloc_bam_data(bam1_t *b, size_t desired) {
     if (desired <= b->m_data) return 0;
     return sam_realloc_bam_data(b, desired);
 }
@@ -181,7 +181,6 @@ int sam_read1_sw(samFile *fp, sam_hdr_t *h,  bam1_t *b){
 
 
 
-
 //--------------------------------------------------------------------------------------------------------------
 //从核使用的函数
 void swap_data(const bam1_core_t *c, int l_data, uint8_t *data, int is_host) {
@@ -200,6 +199,17 @@ void bam_cigar2rqlens(int n_cigar, const uint32_t *cigar,
         if (type & 1) *qlen += len;
         if (type & 2) *rlen += len;
     }
+}
+
+inline int possibly_expand_bam_data(bam1_t *b, size_t bytes) {
+    size_t new_len = (size_t) b->l_data + bytes;
+
+    if (new_len > INT32_MAX || new_len < bytes) { // Too big or overflow
+        errno = ENOMEM;
+        return -1;
+    }
+    if (new_len <= b->m_data) return 0;
+    return sam_realloc_bam_data(b, new_len);
 }
 
 int bam_tag2cigar(bam1_t *b, int recal_bin,
@@ -268,13 +278,3 @@ int fixup_missing_qname_nul(bam1_t *b) {
 }
 
 
-inline int possibly_expand_bam_data(bam1_t *b, size_t bytes) {
-    size_t new_len = (size_t) b->l_data + bytes;
-
-    if (new_len > INT32_MAX || new_len < bytes) { // Too big or overflow
-        errno = ENOMEM;
-        return -1;
-    }
-    if (new_len <= b->m_data) return 0;
-    return sam_realloc_bam_data(b, new_len);
-}

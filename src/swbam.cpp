@@ -1,4 +1,3 @@
-
 #include "swbam.h"
 
 using namespace std;
@@ -7,7 +6,7 @@ extern "C" {
 #include <athread.h>
 #include <pthread.h>
     void slave_decompressfunc();
-    void copyfunc();
+    void slave_copyfunc();
     void slave_compressfunc();
 }
 
@@ -65,8 +64,6 @@ void SwBam::ProducerSwBamTask(BGZF *fp, BamRead *read) {
 
 void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
     printf("void SwBam::ConsumerSwBamTask()\n");
-
-    athread_init();
  
     while (true) {
 
@@ -207,8 +204,6 @@ void SwBam:: ProducerSwBamTask2(samFile *fp, BamWrite *write){
 
 void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
     printf("void SwBam::ConsumerSwBamTask2()\n");
-
-    athread_init();
  
     while (true) {
 
