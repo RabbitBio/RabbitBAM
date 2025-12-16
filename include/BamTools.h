@@ -27,6 +27,42 @@
 //#define BGZF_MAX_BLOCK_COMPLETE_SIZE 0x10000
 //#define THREAD_NUM_P 6
 
+
+// Aligned memory allocation helper function
+// Allocates size bytes aligned to alignment (must be power of 2)
+// Returns aligned pointer, stores original pointer before aligned address for deallocation
+inline unsigned char* aligned_alloc_custom(size_t alignment, size_t size) {
+    // Allocate extra space for alignment and storing original pointer
+    size_t total_size = size + alignment + sizeof(void*);
+    unsigned char* raw_ptr = new unsigned char[total_size];
+    if (!raw_ptr) {
+        return nullptr;
+    }
+    
+    // Calculate aligned address
+    uintptr_t raw_addr = (uintptr_t)raw_ptr;
+    uintptr_t aligned_addr = (raw_addr + sizeof(void*) + alignment - 1) & ~(uintptr_t)(alignment - 1);
+    unsigned char* aligned_ptr = (unsigned char*)aligned_addr;
+    
+    // Store original pointer before aligned address
+    void** ptr_storage = (void**)(aligned_ptr - sizeof(void*));
+    *ptr_storage = raw_ptr;
+    
+    return aligned_ptr;
+}
+
+// Free aligned memory allocated by aligned_alloc_custom
+inline void aligned_free_custom(unsigned char* aligned_ptr) {
+    if (aligned_ptr) {
+        // Retrieve original pointer
+        void** ptr_storage = (void**)(aligned_ptr - sizeof(void*));
+        unsigned char* raw_ptr = (unsigned char*)(*ptr_storage);
+        delete[] raw_ptr;
+    }
+}
+
+void bam_destroy1_sw(bam1_t *b);
+
 typedef struct {
     int size;
     uint8_t *block;
@@ -54,8 +90,8 @@ struct Para {
     int n_records;             // 解析得到的条目数
     int status;                // 处理状态标志（0=ok，非0=失败）
 
-    int l_data_list[8192];     // 每条记录的长度（假设一块最多8192条）
-    uint8_t *data_list[8192];  // 每条记录的 data 指针
+    int l_data_list[1024];     // 每条记录的长度（假设一块最多1024条）
+    uint8_t *data_list[1024];  // 每条记录的 data 指针
 };
 
 struct Comp_Para {
@@ -73,10 +109,11 @@ struct Comp_Para {
 
 struct bam_block {
     unsigned int errcode;
-    unsigned char data[BGZF_MAX_BLOCK_SIZE];//0x1000
+    //unsigned char data[BGZF_MAX_BLOCK_SIZE];//0x1000
+    unsigned char *data;
     unsigned int length;
-    unsigned int pos;  //当前记录的读取位置，在解析时使用
-    int64_t block_address; //在整个文件中的偏移位置
+    unsigned int pos;  //记录记录在块中的偏移量，即当前记录的读取位置，在解析时使用
+    int64_t block_address; //该块在整个文件中的偏移位置
 
     int block_id; //块的编号
 
@@ -94,6 +131,9 @@ struct bam_block {
 //     uint8_t *compressed_data;
 // };
 
+
+void print_bam1(const bam1_t *b);
+void print_bam_block(struct bam_block *blk) ;
 
 //bam to sam
 int read_block(BGZF *fp, struct bam_block *j);

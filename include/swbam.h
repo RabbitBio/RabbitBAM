@@ -41,6 +41,15 @@ private:
     void ProducerSwBamTask2(samFile *fp, BamWrite *write);
     int writeBlockTobam(BGZF *fp, bam_block *block);
 
+    static inline const char *get_sam_open_mode(const std::string &out_name) {
+        size_t len = out_name.size();
+        if (len >= 4 && out_name.substr(len - 4) == ".bam") {
+            return "wb";   // BAM (BGZF compressed)
+        } else {
+            return "w";    // SAM text
+        }
+    }
+
 private:
     CmdInfo *cmd_info_;
     sam_hdr_t *hdr;

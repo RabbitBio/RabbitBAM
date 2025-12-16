@@ -18,6 +18,8 @@ int main(int argc, char **argv) {
     athread_init();
 #endif
 
+
+#define DEBUG
 #if 0
     volatile int aa = 0;
 #ifdef DEBUG

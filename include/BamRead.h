@@ -10,13 +10,14 @@
 class BamRead {
 public:
     BamRead(int queue_size );  
-    ~BamRead() {
-        for (int i = 0; i < readBlockSize; ++i) {
-            delete readBlock[i];
-        }
-        delete[] readBlock;
-        delete[] consumer_queue_;
-    }
+    // ~BamRead() {
+    //     for (int i = 0; i < readBlockSize; ++i) {
+    //         delete readBlock[i];
+    //     }
+    //     delete[] readBlock;
+    //     delete[] consumer_queue_;
+    // }
+    ~BamRead();
 
     bam_block* getEmpty();  // 获取一个空 block（从池中）
     void backBlock(bam_block* block);  // 回收 block

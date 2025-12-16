@@ -11,19 +11,17 @@ extern "C" {
 }
 
 SwBam::SwBam(CmdInfo *cmd_info1) {
-    printf("SwBam::SwBam(CmdInfo *cmd_info1)\n");
     cmd_info_ = cmd_info1;
 
 }
 
 SwBam::~SwBam() {
-    printf("SwBam::~SwBam()\n");
-   
 
 }
 
 void SwBam::ProducerSwBamTask(BGZF *fp, BamRead *read) {
-    printf("void SwBam::ProducerSwBamTask()\n");
+    printf("ProducerSwBamTask started\n");
+    double t0 = GetTime();
 
     std::vector<bam_block*> tmp_chunks;
     bam_block* block = read->getEmpty();
@@ -36,11 +34,17 @@ void SwBam::ProducerSwBamTask(BGZF *fp, BamRead *read) {
         ret = read_block(fp, block);
         if (ret < 0) break; //读取错误或结束
 
-        //读到了一块
-        block->block_id = global_block_id++;
+        if(block->length == 28){
+            break;
+        }
+
+        //读到了一块非EOF块
+        block->block_id = ++global_block_id;
         block->pos = 0;
         block_num++;
+        printf("block_id=%d, block_size=%d\n",global_block_id,block->length);
         tmp_chunks.push_back(block);
+
         block = read->getEmpty();
 
         if (tmp_chunks.size() == 64) {
@@ -57,15 +61,19 @@ void SwBam::ProducerSwBamTask(BGZF *fp, BamRead *read) {
         tmp_chunks.clear();
     }
 
+    printf("ProducerSwBamTask finished with block_num = %d , group_num = %d , cost %lf\n", block_num , group_num , GetTime() - t0 );
+
     //标记读取处理结束
     read->markComplete();  
 
 }
 
 void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
-    printf("void SwBam::ConsumerSwBamTask()\n");
+    printf("ConsumerSwBamTask started\n");
+    double t0 = GetTime();
  
     while (true) {
+        printf("INTO while!\n");
 
         auto tmp_chunks = read->getBlock64();
 
@@ -102,37 +110,45 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
         }
 
         //为每条记录分配data区域
-        for(int i = 0; i < 64; i++) {
-            if (degz_paras[i].status == 0 && degz_paras[i].input_block != NULL) {
-                for (int j = 0; j < degz_paras[i].n_records; j++) {
-                   int new_l_data = degz_paras[i].l_data_list[j];
-                   degz_paras[i].output_records[j]->l_data = 0;
-                   realloc_bam_data(degz_paras[i].output_records[j], new_l_data);
-                   degz_paras[i].output_records[j]->l_data = new_l_data;
-                }
-            }
-        }
+        // for(int i = 0; i < 64; i++) {
+        //     if (degz_paras[i].status == 0 && degz_paras[i].input_block != NULL) {
+        //         for (int j = 0; j < degz_paras[i].n_records; j++) {
+        //            int new_l_data = degz_paras[i].l_data_list[j];
+        //            degz_paras[i].output_records[j]->l_data = 0;
+        //            realloc_bam_data(degz_paras[i].output_records[j], new_l_data);
+        //            degz_paras[i].output_records[j]->l_data = new_l_data;
+        //         }
+        //     }
+        // }
 
         //调用从核复制数据到新分配的data区域
-        {
-            __real_athread_spawn((void *) slave_copyfunc, degz_paras, 1);
-            athread_join();
-        }
+        // {
+        //     __real_athread_spawn((void *) slave_copyfunc, degz_paras, 1);
+        //     athread_join();
+        // }
 
-        //处理完的结果放入到complete中
+        //处理完的结果放入到complete中,这一部分是可以在从核中实现的，能优化一点性能！！！！！！！！！！！！
+        //在这里打印一共有几块，每一块有几条！！
         for (int i = 0; i < 64; i++) {
             if (degz_paras[i].status == 0 && degz_paras[i].input_block != NULL) {
                 // 依次收集每个块的bam1_t结果
+                printf("degz_paras[%d].n_records = %d\n",i , degz_paras[i].n_records);
+
                 for (int j = 0; j < degz_paras[i].n_records; j++) {
-                   complete->pushBlockResults(degz_paras[i].output_records,degz_paras[i].n_records);
+                    bam1_t* bam1 = complete->getEmpty();
+                    //这里需要复制一份，因为缓冲区还要使用！！！
+                    (void)bam_copy1(bam1, degz_paras[i].output_records[j]);
+                    complete->inputBam1_t(bam1);
                 }
+
+                read->backBlock(degz_paras[i].input_block); // 回收块
             }
-            read->backBlock(tmp_chunks[i]); // 回收块
         }
     }
 
     complete->markComplete(); // 标记全部处理完成
 
+    printf("ConsumerSwBamTask finished , cost %lf!\n", GetTime() - t0); 
 }
 
 
@@ -148,7 +164,7 @@ int writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b) {
 //---------------------------------------------------------------------------------------------------------------------
 
 void SwBam:: ProducerSwBamTask2(samFile *fp, BamWrite *write){
-    printf("void SwBam::ProducerSwBamTask2()\n");
+    printf("ProducerSwBamTask started\n");
 
     // 当前块和当前组的缓存
     std::vector<bam1_t*> cur_block;
@@ -197,13 +213,15 @@ void SwBam:: ProducerSwBamTask2(samFile *fp, BamWrite *write){
         cur_group.clear();
     }
 
+    //printf("ConsumerSwBamTask finished with block_num = %d , group_num = %d , cost %lf\n", block_num , group_num , GetTime() - t1 );
+
     write->markComplete();
 
 }
 
 
 void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
-    printf("void SwBam::ConsumerSwBamTask2()\n");
+    printf("ConsumerSwBamTask started\n");
  
     while (true) {
 
@@ -283,9 +301,10 @@ int SwBam:: writeBlockTobam(BGZF *fp, bam_block *block) {
 }
 
 
-void SwBam::ProcessSwBam() {
-    printf("void SwBam::ProcessSwBam()\n");
 
+void SwBam::ProcessSwBam() {
+
+    double t0 = GetTime();
     //in文件打开
     sin = sam_open(cmd_info_->in_file_name_.c_str(), "r");
     if (sin == NULL) {
@@ -293,11 +312,15 @@ void SwBam::ProcessSwBam() {
     }
 
     //out文件打开
-    sout = sam_open(cmd_info_->out_file_name_.c_str(), "wb");
+    const char *out_mode = get_sam_open_mode(cmd_info_->out_file_name_);
+    sout = sam_open(cmd_info_->out_file_name_.c_str(), out_mode);
     if (sout == NULL) {
         fprintf(stderr, "Error opening output file %s\n", cmd_info_->out_file_name_.c_str());
     }
+    printf("open the files cost %lf\n", GetTime() - t0);
 
+
+    t0 = GetTime();
     //头部读取
     hdr = sam_hdr_read(sin);
     if (hdr == NULL) {
@@ -308,35 +331,36 @@ void SwBam::ProcessSwBam() {
     if (sam_hdr_write(sout, hdr) != 0) {
         fprintf(stderr, "Error writing header to output file %s\n", cmd_info_->out_file_name_.c_str());
     }
+    printf("Complete the head cost %lf\n", GetTime() - t0);
 
+
+    t0 = GetTime();
     switch (sin->format.format) {
         case bam:{
-            //开辟多线程处理 
-            //进行队列等的初始化
             read = new BamRead(50);
-            complete = new BamComplete(50);
+            complete = new BamComplete(1500);
             //生产者线程---
             thread producer(bind(&SwBam::ProducerSwBamTask, this, sin->fp.bgzf, read));
 
             //消费者线程----
             thread consumer(bind(&SwBam::ConsumerSwBamTask, this, read , complete));
-            
-            //写入线程
-            //thread writer(bind(&SwBam::WriteSwBamTask, this, ));
 
             //剩下是主线程
             long long num = 0;
             bam1_t *b;
             while (true) {
-                b = complete->popRecord();
+                b = complete->getBam1_t();
                 if(b == NULL) break;
+                
+                //print_bam1(b);
                 num++;
                 int ret = writeBam1_tToSam(sout,hdr,b); 
-                complete->backRecord(b);
+                complete->backBam1_t(b);
             }
 
-            printf("num %lld\n", num);
-
+            producer.join();
+            consumer.join();
+            printf("The total bam1_t nums is %lld\n", num);
             break;
         }
             
@@ -371,9 +395,20 @@ void SwBam::ProcessSwBam() {
             break;
     }
 
+    printf("Complete the body cost %lf\n", GetTime() - t0);
 
     //释放内存
     sam_hdr_destroy(hdr);
+    int ret;
+    ret = hts_close(sout);
+    if (ret < 0) {
+        fprintf(stderr, "Error closing output.\n");
+    }
+    ret = hts_close(sin);
+    if (ret < 0) {
+        fprintf(stderr, "Error closing input.\n");
+    }
+
     
 }
 

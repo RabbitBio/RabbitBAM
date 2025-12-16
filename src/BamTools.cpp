@@ -1,8 +1,111 @@
 #include "BamTools.h"
 
 
+// 打印 bam1_t
+void print_bam1(const bam1_t *b)
+{
+    if (!b) {
+        printf("bam1_t pointer is NULL\n");
+        return;
+    }
+
+    printf("bam1_t at %p {\n", (void*)b);
+
+    // core 信息
+    printf("  core:\n");
+    printf("    pos=%d, tid=%d, bin=%u, qual=%u, l_extranul=%u\n",
+           b->core.pos, b->core.tid, b->core.bin, b->core.qual, b->core.l_extranul);
+    printf("    flag=%u, l_qname=%u, n_cigar=%u, l_qseq=%d\n",
+           b->core.flag, b->core.l_qname, b->core.n_cigar, b->core.l_qseq);
+    printf("    mtid=%d, mpos=%d, isize=%d\n",
+           b->core.mtid, b->core.mpos, b->core.isize);
+
+    // id
+    printf("  id          : %lu\n", b->id);
+
+    // data 指针
+    printf("  data ptr    : %p\n", (void*)b->data);
+
+    // data 内容前 16 字节
+    if (b->data && b->l_data > 0) {
+        int n = b->l_data < 16 ? b->l_data : 16;
+        printf("  data content: ");
+        for (int i = 0; i < n; i++) {
+            printf("%02X ", b->data[i]);
+        }
+        if (b->l_data > 16) printf("... (%d bytes total)", b->l_data);
+        printf("\n");
+    } else {
+        printf("  data content: NULL or empty\n");
+    }
+
+    // 长度信息
+    printf("  l_data      : %d\n", b->l_data);
+    printf("  m_data      : %u\n", b->m_data);
+
+    // 内存策略
+    printf("  mempolicy   : %u\n", b->mempolicy);
+
+    printf("}\n");
+}
+
+// 打印 bam_block 内容的函数
+void print_bam_block(struct bam_block *blk) {
+    if (!blk) {
+        printf("bam_block pointer is NULL\n");
+        return;
+    }
+
+    printf("bam_block at %p {\n", (void*)blk);
+    printf("  errcode      : %u\n", blk->errcode);
+    printf("  data ptr     : %p\n", (void*)blk->data);
+    if (blk->data != NULL && blk->length > 0) {
+        // 打印前 16 字节或实际长度
+        unsigned int print_len = blk->length < 16 ? blk->length : 16;
+        printf("  data content : ");
+        for (unsigned int i = 0; i < print_len; i++) {
+            printf("%02X ", blk->data[i]);
+        }
+        if (blk->length > 16) {
+            printf("... (%u bytes total)", blk->length);
+        }
+        printf("\n");
+    }
+    printf("  length       : %u\n", blk->length);
+    printf("  pos          : %u\n", blk->pos);
+    printf("  block_address: %lld\n", (long long)blk->block_address);
+    printf("  block_id     : %d\n", blk->block_id);
+    printf("}\n");
+}
+
 //--------------------------------------------------------------------------------------------------------------
 //bam to sam
+
+void bam_destroy1_sw(bam1_t *b){
+    if (b == NULL) return;
+
+    // 1. 释放 data 区域
+    if (b->data) {
+        // 如果是用户自定义的对齐内存，则用 aligned_free_custom
+        if (bam_get_mempolicy(b) & BAM_USER_OWNS_DATA) {
+            aligned_free_custom(b->data);
+        }
+        else {
+            // 普通 HTSlib 分配（malloc/realloc）
+            free(b->data);
+        }
+
+        // 清空，避免悬空指针
+        b->data = NULL;
+        b->m_data = 0;
+        b->l_data = 0;
+    }
+
+    // 2. 释放 bam1_t 结构体本身
+    if ((bam_get_mempolicy(b) & BAM_USER_OWNS_STRUCT) == 0) {
+        free(b);
+    }
+}
 
 int sam_realloc_bam_data(bam1_t *b, size_t desired) {
     uint32_t new_m_data;
@@ -121,14 +224,20 @@ int read_block(BGZF *fp, struct bam_block *j) {
     return 0;
 }
 
-
 int sam_write1_sw(samFile *fp, const sam_hdr_t *h, const bam1_t *b){
 
+    fp->format.category = sequence_data;
+    fp->format.format = sam;
     //调用 sam_format1() 将 BAM 结构转换为一行 SAM 文本，写入 kstring_t fp->line
     if (sam_format1(h, b, &fp->line) < 0) return -1;
     kputc('\n', &fp->line);
     //写入 SAM 文本数据
-    if ( hwrite(fp->fp.hfile, fp->line.s, fp->line.l) != fp->line.l ) return -1;      
+
+    //printf("=== SAM LINE (len=%zu) ===\n", fp->line.l);
+    //fwrite(fp->line.s, 1, fp->line.l, stdout);
+    //printf("\n=== END SAM LINE ===\n");
+
+    if ( hwrite(fp->fp.hfile, fp->line.s, fp->line.l) != fp->line.l ) return -1;     
 
     return fp->line.l;
 

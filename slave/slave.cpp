@@ -313,6 +313,19 @@ int bgzf_uncompress(uint8_t *dst, size_t *dlen,
                     const uint8_t *src, size_t slen,
                     uint32_t expected_crc) {
 
+    //确保输入输出缓冲区都是 64 字节对齐的!不然会报错
+    //好像注释掉也没报错？？？
+    // const uintptr_t ALIGN_MASK = 63;
+    // if (((uintptr_t)dst & ALIGN_MASK) != 0) {
+    //     printf("The dst data is not aligned\n");
+    //     return -1;
+    // }
+    // if (((uintptr_t)src & ALIGN_MASK) != 0 ) {
+    //     printf("The src data is not aligned\n");
+    //     return -1;
+    // }
+
+
     struct libdeflate_decompressor *z = libdeflate_alloc_decompressor();
     if (!z) {
         hts_log_error("Call to libdeflate_alloc_decompressor failed");
@@ -393,6 +406,8 @@ int read_bam(struct bam_block *fq, bam1_t *b, int is_be) {
         + (((uint64_t) c->l_qseq + 1) >> 1) + c->l_qseq > (uint64_t) new_l_data)
         return -4;
     //在从核内存上开辟空间！！！！！！
+    //这里如果已经分配了最够大小的data空间，就不会再开辟了
+    //printf("The new_l_data is %u\n", new_l_data);
     if (realloc_bam_data(b, new_l_data) < 0) return -4;
     b->l_data = new_l_data;
 
@@ -423,9 +438,86 @@ int read_bam(struct bam_block *fq, bam1_t *b, int is_be) {
     return 4 + block_len;
 }
 
+// 打印 bam1_t
+void print_bam1(const bam1_t *b)
+{
+    if (!b) {
+        printf("bam1_t pointer is NULL\n");
+        return;
+    }
+
+    printf("bam1_t at %p {\n", (void*)b);
+
+    // core 信息
+    printf("  core:\n");
+    printf("    pos=%d, tid=%d, bin=%u, qual=%u, l_extranul=%u\n",
+           b->core.pos, b->core.tid, b->core.bin, b->core.qual, b->core.l_extranul);
+    printf("    flag=%u, l_qname=%u, n_cigar=%u, l_qseq=%d\n",
+           b->core.flag, b->core.l_qname, b->core.n_cigar, b->core.l_qseq);
+    printf("    mtid=%d, mpos=%d, isize=%d\n",
+           b->core.mtid, b->core.mpos, b->core.isize);
+
+    // id
+    printf("  id          : %lu\n", b->id);
+
+    // data 指针
+    printf("  data ptr    : %p\n", (void*)b->data);
+
+    // data 内容前 16 字节
+    if (b->data && b->l_data > 0) {
+        int n = b->l_data < 16 ? b->l_data : 16;
+        printf("  data content: ");
+        for (int i = 0; i < n; i++) {
+            printf("%02X ", b->data[i]);
+        }
+        if (b->l_data > 16) printf("... (%d bytes total)", b->l_data);
+        printf("\n");
+    } else {
+        printf("  data content: NULL or empty\n");
+    }
+
+    // 长度信息
+    printf("  l_data      : %d\n", b->l_data);
+    printf("  m_data      : %u\n", b->m_data);
+
+    // 内存策略
+    printf("  mempolicy   : %u\n", b->mempolicy);
+
+    printf("}\n");
+}
+
+// 打印 bam_block 内容的函数
+void print_bam_block(struct bam_block *blk) {
+    if (!blk) {
+        printf("bam_block pointer is NULL\n");
+        return;
+    }
+
+    printf("bam_block at %p {\n", (void*)blk);
+    printf("  errcode      : %u\n", blk->errcode);
+    printf("  data ptr     : %p\n", (void*)blk->data);
+    if (blk->data != NULL && blk->length > 0) {
+        // 打印前 16 字节或实际长度
+        unsigned int print_len = blk->length < 16 ? blk->length : 16;
+        printf("  data content : ");
+        for (unsigned int i = 0; i < print_len; i++) {
+            printf("%02X ", blk->data[i]);
+        }
+        if (blk->length > 16) {
+            printf("... (%u bytes total)", blk->length);
+        }
+        printf("\n");
+    }
+    printf("  length       : %u\n", blk->length);
+    printf("  pos          : %u\n", blk->pos);
+    printf("  block_address: %lld\n", (long long)blk->block_address);
+    printf("  block_id     : %d\n", blk->block_id);
+    printf("}\n");
+}
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------
 extern "C" void decompressfunc(Para paras[64]) {
+    //printf("decompressfunc started with _PEN = %d\n", _PEN);
 
     int id = _PEN;             // 从核号（0~63）
     Para* para = &paras[id];
@@ -437,22 +529,104 @@ extern "C" void decompressfunc(Para paras[64]) {
         return;
     }
 
+    printf("decompressfunc started with _PEN = %d\n", _PEN);
+
+    //#define TEST_ALIGN
+    #ifdef TEST_ALIGN
+        unsigned char *p = comp->data;  // 64B aligned
+        unsigned char *u = p + 18;      //没对齐
+
+        //test1
+        printf("u = %p\n", u);          // 成功
+        printf("%d\n", *u);             // 成功
+        if (((uintptr_t)u & 63) != 0) {       // 成功
+            printf("u is NOT aligned: addr=%p\n", u);
+        }
+        uint32_t x = *(uint32_t*)u;     // 失败
+        printf("misaligned value = %u\n", x);
+
+        //test2
+        //成功与失败要看具体地址情况
+        // p = 0x500001878040
+        // u = 0x500001878052  (misaligned)
+        printf("p = %p\n", p);           
+        printf("u    = %p  (misaligned)\n", u); 
+        // 1) 测试 1 字节 load —— 成功
+        uint8_t b1 = *u;
+        printf("1-byte load OK: %u\n", b1);
+        // 2) 测试 2 字节 load —— 成功
+        uint16_t h = *(uint16_t*)u;  
+        printf("2-byte load = %u\n", h);
+        // 3) 测试 4 字节 load —— 失败 
+        uint32_t w = *(uint32_t*)u;  
+        printf("4-byte load = %u\n", w);
+        // 4) 测试 8 字节 load ——  
+        uint64_t g = *(uint64_t*)u;  
+        printf("8-byte load = %u\n", g);
+    #endif
+    
+    //#define TEST_MALLOC
+    #ifdef TEST_MALLOC
+        uint8_t *p = NULL;
+        size_t size = 32;
+
+        // 测试 malloc
+        p = (uint8_t *)malloc(size);
+        if (!p) {
+            printf("CPE: malloc failed\n");
+            return;
+        }
+        printf("CPE: malloc(%zu) succeeded, p=%p\n", size, p);
+
+        // 写入测试数据
+        for (size_t i = 0; i < size; i++) p[i] = (uint8_t)i;
+
+        // 测试 realloc
+        size_t new_size = 64;
+        uint8_t *q = (uint8_t *)realloc(p, new_size);
+        if (!q) {
+            printf("CPE: realloc failed\n");
+            free(p); // 原始内存释放
+            return;
+        }
+        printf("CPE: realloc(%zu) succeeded, q=%p\n", new_size, q);
+
+        // 检查数据是否完整
+        for (size_t i = 0; i < size; i++) {
+            if (q[i] != i) {
+                printf("CPE: data corrupted at index %zu\n", i);
+                break;
+            }
+        }
+
+        free(q);
+        printf("CPE: free done\n");
+    #endif
+
+
     // 2. 解压缩该块
     block_decode_func(comp,un_comp);
+    print_bam_block(comp);
+    print_bam_block(un_comp);
+    printf("Complete the decompression!\n");
 
     // 3. 解析解压后的SAM/BAM记录
     int count = 0;
     bam1_t* b = NULL;
     b = para->output_records[count]; 
+    // print_bam1(b);
+    // printf("111\n");
     while(read_bam(un_comp, b, 0)>=0){
-        para->l_data_list[count] = b->l_data;
-        para->data_list[count] = b->data;
+        // printf("222\n");
+        // para->l_data_list[count] = b->l_data;
+        // para->data_list[count] = b->data;
         count++;
+        //print_bam1(b);
 
         b = para->output_records[count];
     }
 
-    //bam_destroy1(b);
+    printf("Complete parsing with %d bam1_t!\n", count);
 
     para->n_records = count;
     para->status = 0;
@@ -470,12 +644,14 @@ extern "C" void copyfunc(Para paras[64]) {
         return;
     }
 
+    printf("copyfunc started with _PEN = %d\n", _PEN);
+
     for (int i = 0; i < para->n_records; i++) {
         // 复制数据到新分配的data区域
         memcpy(para->output_records[i]->data, para->data_list[i], para->l_data_list[i]);
     }
 
-    para->status = 1;  // copy 完成标记
+    para->status = 0;  // copy 完成标记
 
 }
 
@@ -677,7 +853,7 @@ int block_encode_func(bam_block *un_comp, bam_block *comp , int compress_level) 
 extern "C" void slave_compressfunc(Comp_Para paras[64]) {
 
     int id = _PEN;             // 从核号（0~63）
-    int compress_level = 6; // 默认压缩等级
+    int compress_level = 1; // 默认压缩等级
     Comp_Para* para = &paras[id];
 
     // 忽略空任务
