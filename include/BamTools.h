@@ -19,6 +19,7 @@
 #include <htslib/bgzf.h>
 #include <htslib/hfile.h>
 #include <htslib/khash.h>
+#include "Globals.h"
 
 #define BLOCK_HEADER_LENGTH 18
 #define BLOCK_FOOTER_LENGTH 8

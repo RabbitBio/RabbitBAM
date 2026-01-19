@@ -42,7 +42,7 @@ void SwBam::ProducerSwBamTask(BGZF *fp, BamRead *read) {
         block->block_id = ++global_block_id;
         block->pos = 0;
         block_num++;
-        printf("block_id=%d, block_size=%d\n",global_block_id,block->length);
+        //printf("block_id=%d, block_size=%d\n",global_block_id,block->length);
         tmp_chunks.push_back(block);
 
         block = read->getEmpty();
@@ -73,7 +73,7 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
     double t0 = GetTime();
  
     while (true) {
-        printf("INTO while!\n");
+        //printf("INTO while!\n");
 
         auto tmp_chunks = read->getBlock64();
 
@@ -132,7 +132,7 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
         for (int i = 0; i < 64; i++) {
             if (degz_paras[i].status == 0 && degz_paras[i].input_block != NULL) {
                 // 依次收集每个块的bam1_t结果
-                printf("degz_paras[%d].n_records = %d\n",i , degz_paras[i].n_records);
+                //printf("degz_paras[%d].n_records = %d\n",i , degz_paras[i].n_records);
 
                 for (int j = 0; j < degz_paras[i].n_records; j++) {
                     bam1_t* bam1 = complete->getEmpty();
@@ -151,8 +151,7 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
     printf("ConsumerSwBamTask finished , cost %lf!\n", GetTime() - t0); 
 }
 
-
-int writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b) {
+int SwBam::writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b) {
     if (sam_write1_sw(fp, h, b) < 0) {
                 fprintf(stderr, "Error writing SAM record\n");
                 return -1;
@@ -163,8 +162,9 @@ int writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b) {
 
 //---------------------------------------------------------------------------------------------------------------------
 
-void SwBam:: ProducerSwBamTask2(samFile *fp, BamWrite *write){
-    printf("ProducerSwBamTask started\n");
+void SwBam:: ProducerSwBamTask2(samFile *fp, BamWrite *write, sam_hdr_t *h){
+    printf("ProducerSwBamTask2 started\n");
+    double t0 = GetTime();
 
     // 当前块和当前组的缓存
     std::vector<bam1_t*> cur_block;
@@ -174,11 +174,13 @@ void SwBam:: ProducerSwBamTask2(samFile *fp, BamWrite *write){
     int ret;
     bam1_core_t *c;
     uint32_t bam_len , total_len = 0;
+    int block_nums=0 , group_nums=0 , bam1_t_nums=0;
 
     while (true) {
         // 读取一条记录，放入块中
-        ret = sam_read1_sw(fp, NULL, b);
+        ret = sam_read1_sw(fp, h, b);
         if (ret < 0) break;  // 文件结束
+        bam1_t_nums++;
 
         c = &b->core;
         bam_len = b->l_data - c->l_extranul + 32;
@@ -188,6 +190,7 @@ void SwBam:: ProducerSwBamTask2(samFile *fp, BamWrite *write){
             total_len = total_len + bam_len + 4;
         }else{
             // 当前块已满，打包入组，开启新块
+            block_nums++;
             cur_group.push_back(cur_block);
             cur_block.clear();
             cur_block.push_back(b);
@@ -198,6 +201,7 @@ void SwBam:: ProducerSwBamTask2(samFile *fp, BamWrite *write){
 
         // 达到64个块后打包压入队列
         if ((int)cur_group.size() >= 64) {
+            group_nums++;
             write->inputGroup(cur_group);
             cur_group.clear();
         }
@@ -205,23 +209,25 @@ void SwBam:: ProducerSwBamTask2(samFile *fp, BamWrite *write){
 
     // 收尾：处理未满的块或组
     if (!cur_block.empty()) {
+        block_nums++;
         cur_group.push_back(cur_block);
         cur_block.clear();
     }
     if (!cur_group.empty()) {
+        group_nums++;
         write->inputGroup(cur_group);
         cur_group.clear();
     }
 
-    //printf("ConsumerSwBamTask finished with block_num = %d , group_num = %d , cost %lf\n", block_num , group_num , GetTime() - t1 );
+    printf("ProducerSwBamTask2 finished with bam1_t_nums = %d , block_num = %d , group_num = %d , cost %lf\n", bam1_t_nums, block_nums , group_nums , GetTime() - t0 );
 
     write->markComplete();
 
 }
 
-
 void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
-    printf("ConsumerSwBamTask started\n");
+    printf("ConsumerSwBamTask2 started\n");
+    double t0 = GetTime();
  
     while (true) {
 
@@ -281,6 +287,7 @@ void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
         }
     }
     complete->markComplete(); // 标记全部处理完成
+    printf("ConsumerSwBamTask2 finished , cost %lf!\n", GetTime() - t0); 
 }
 
 //一块bgzf写入文件中
@@ -305,6 +312,7 @@ int SwBam:: writeBlockTobam(BGZF *fp, bam_block *block) {
 void SwBam::ProcessSwBam() {
 
     double t0 = GetTime();
+    double tbody;
     //in文件打开
     sin = sam_open(cmd_info_->in_file_name_.c_str(), "r");
     if (sin == NULL) {
@@ -334,11 +342,17 @@ void SwBam::ProcessSwBam() {
     printf("Complete the head cost %lf\n", GetTime() - t0);
 
 
-    t0 = GetTime();
+    tbody = GetTime();
     switch (sin->format.format) {
         case bam:{
+            //这里初始化的性能非常非常差需要后续进行优化！！
+            t0 = GetTime();
+            //BamRead(x) x*64是bam_block的内存池大小
             read = new BamRead(50);
+            //BamComplete(x) x是bam1_t的内存池大小
             complete = new BamComplete(1500);
+            printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
+
             //生产者线程---
             thread producer(bind(&SwBam::ProducerSwBamTask, this, sin->fp.bgzf, read));
 
@@ -346,6 +360,7 @@ void SwBam::ProcessSwBam() {
             thread consumer(bind(&SwBam::ConsumerSwBamTask, this, read , complete));
 
             //剩下是主线程
+            t0 = GetTime();
             long long num = 0;
             bam1_t *b;
             while (true) {
@@ -360,20 +375,27 @@ void SwBam::ProcessSwBam() {
 
             producer.join();
             consumer.join();
+            printf("Complete writing to sam cost %lf\n", GetTime() - t0);
             printf("The total bam1_t nums is %lld\n", num);
             break;
         }
             
 
         case sam:{
+            t0 = GetTime();
+            //BamWrite(x) x*MAX_RECORDS_PER_BLOCK是bam1_t的内存池大小
             write = new BamWrite(50);
+            //BamWriteComplete(x) x是bam_block的内存池大小
             writeComplete = new BamWriteComplete(50);
+            printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
+
             //生产者线程---
-            thread producer2(bind(&SwBam::ProducerSwBamTask2, this, sin, write));
+            thread producer2(bind(&SwBam::ProducerSwBamTask2, this, sin, write, hdr));
             //消费者线程----
             thread consumer2(bind(&SwBam::ConsumerSwBamTask2, this, write , writeComplete));
 
             //剩下是主线程
+            t0 = GetTime();
             long long num2 = 0;
             bam_block* comp_block;
             while (true) {
@@ -384,8 +406,10 @@ void SwBam::ProcessSwBam() {
                 writeComplete->backBlock(comp_block);
             }
 
-            printf("num2 %lld\n", num2);
-
+            producer2.join();
+            consumer2.join();
+            printf("Complete writing to sam cost %lf\n", GetTime() - t0);
+            printf("The total BGZF nums is %lld\n", num2);
             break;
         }
             
@@ -395,7 +419,6 @@ void SwBam::ProcessSwBam() {
             break;
     }
 
-    printf("Complete the body cost %lf\n", GetTime() - t0);
 
     //释放内存
     sam_hdr_destroy(hdr);
@@ -408,6 +431,8 @@ void SwBam::ProcessSwBam() {
     if (ret < 0) {
         fprintf(stderr, "Error closing input.\n");
     }
+
+    printf("Complete the body cost %lf\n", GetTime() - tbody);
 
     
 }

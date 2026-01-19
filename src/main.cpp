@@ -13,6 +13,9 @@
 int main(int argc, char **argv) {
 
 
+    double ttt = GetTime();
+
+
 #ifdef PLATFORM_SUNWAY
     // Initialize athread for Sunway platform
     athread_init();
@@ -38,8 +41,6 @@ int main(int argc, char **argv) {
     swlu_prof_init();
 #endif
 
-    double ttt = GetTime();
-
     CmdInfo cmd_info;
     CLI::App app("SWBAM");
 
@@ -62,8 +63,8 @@ int main(int argc, char **argv) {
 
     //完整程序-------------------------------------------------------------------------------------
     if (strcmp(app.get_subcommands()[0]->get_name().c_str(), "run_all") == 0) {
-        printf("Input file: %s\n", cmd_info.in_file_name_.c_str());
-        printf("Output file: %s\n", cmd_info.out_file_name_.c_str());
+        //printf("Input file: %s\n", cmd_info.in_file_name_.c_str());
+        //printf("Output file: %s\n", cmd_info.out_file_name_.c_str());
 
         if(cmd_info.verbose_){
             printf("Enable verbose logging\n");
@@ -90,8 +91,6 @@ int main(int argc, char **argv) {
         
     }
 
-    printf("TOT TIME %lf\n", GetTime() - ttt);
-
 
 #ifdef USE_SWLU
     swlu_prof_print();
@@ -101,6 +100,8 @@ int main(int argc, char **argv) {
     // Halt athread for Sunway platform
     athread_halt();
 #endif
+
+    printf("TOT TIME %lf\n", GetTime() - ttt);
 
     return 0;
 }

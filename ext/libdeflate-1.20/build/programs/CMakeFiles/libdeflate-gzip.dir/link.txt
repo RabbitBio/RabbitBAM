@@ -1,0 +1,1 @@
+/usr/sw/swgcc/swgcc710-tools-SEA-1307/usr/bin/swgcc -O2 -DNDEBUG "CMakeFiles/libdeflate-gzip.dir/gzip.c.o" -o libdeflate-gzip  libdeflate_prog_utils.a ../libdeflate.a 

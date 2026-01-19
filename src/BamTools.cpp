@@ -229,14 +229,16 @@ int sam_write1_sw(samFile *fp, const sam_hdr_t *h, const bam1_t *b){
     fp->format.category = sequence_data;
     fp->format.format = sam;
     //调用 sam_format1() 将 BAM 结构转换为一行 SAM 文本，写入 kstring_t fp->line
+    //这一步可以调用从核并行处理，一次处理一批次的数据TODO----------------------------------------------------------
     if (sam_format1(h, b, &fp->line) < 0) return -1;
     kputc('\n', &fp->line);
-    //写入 SAM 文本数据
 
+    //写入 SAM 文本数据
     //printf("=== SAM LINE (len=%zu) ===\n", fp->line.l);
     //fwrite(fp->line.s, 1, fp->line.l, stdout);
     //printf("\n=== END SAM LINE ===\n");
 
+    //这里要按顺序写入文件，在主核中完成
     if ( hwrite(fp->fp.hfile, fp->line.s, fp->line.l) != fp->line.l ) return -1;     
 
     return fp->line.l;

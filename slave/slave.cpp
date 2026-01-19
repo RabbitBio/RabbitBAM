@@ -362,6 +362,7 @@ int block_decode_func(struct bam_block *comp, struct bam_block *un_comp) {
 
 int Rabbit_bgzf_read(struct bam_block *fq, void *data, unsigned int length) {
     if (length <= 0) return -1;
+    //这里如果记录跨块会输出One Block Is Small----------------
     if (length > fq->length - fq->pos) printf("One Block Is Small\n");
     length = fq->pos + length > fq->length ? fq->length - fq->pos : length;
     memcpy((uint8_t *) data, fq->data + fq->pos, length);
@@ -529,7 +530,7 @@ extern "C" void decompressfunc(Para paras[64]) {
         return;
     }
 
-    printf("decompressfunc started with _PEN = %d\n", _PEN);
+    //printf("decompressfunc started with _PEN = %d\n", _PEN);
 
     //#define TEST_ALIGN
     #ifdef TEST_ALIGN
@@ -606,9 +607,9 @@ extern "C" void decompressfunc(Para paras[64]) {
 
     // 2. 解压缩该块
     block_decode_func(comp,un_comp);
-    print_bam_block(comp);
-    print_bam_block(un_comp);
-    printf("Complete the decompression!\n");
+    //print_bam_block(comp);
+    //print_bam_block(un_comp);
+    //printf("Complete the decompression!\n");
 
     // 3. 解析解压后的SAM/BAM记录
     int count = 0;
@@ -626,7 +627,7 @@ extern "C" void decompressfunc(Para paras[64]) {
         b = para->output_records[count];
     }
 
-    printf("Complete parsing with %d bam1_t!\n", count);
+    //printf("Complete parsing with %d bam1_t!\n", count);
 
     para->n_records = count;
     para->status = 0;
@@ -769,6 +770,7 @@ int writeBam1_to_block(bam_block *&write_block, bam1_t *b , int is_be) {
 }
 
 int rabbit_bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int level) {
+    //写入一个EOF块，但是从核这里用不到，可以在主核写入
     if (slen == 0) {
         // EOF block
         if (*dlen < 28) return -1;
@@ -779,43 +781,26 @@ int rabbit_bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen,
 
     uint8_t *dst = (uint8_t *) _dst;
 
-    if (level == 0) {
-        // Uncompressed data
-//        printf("Compress 1\n");
-        if (*dlen < slen + 5 + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH) return -1;
-//        printf("Compress 2\n");
-        dst[BLOCK_HEADER_LENGTH] = 1; // BFINAL=1, BTYPE=00; see RFC1951
-//        printf("Compress 3\n");
-        u16_to_le(slen, &dst[BLOCK_HEADER_LENGTH + 1]); // length
-//        printf("Compress 4\n");
-        u16_to_le(~slen, &dst[BLOCK_HEADER_LENGTH + 3]); // ones-complement length
-//        printf("Compress 5\n");
-        memcpy(dst + BLOCK_HEADER_LENGTH + 5, src, slen);
-//        printf("Compress 6\n");
-        *dlen = slen + 5 + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
-//        printf("Compress 7\n");
-    } else {
-        level = level > 0 ? level : 6; // libdeflate doesn't honour -1 as default
-        // NB levels go up to 12 here.
-        struct libdeflate_compressor *z = libdeflate_alloc_compressor(level);
-        if (!z) return -1;
+    level = level > 0 ? level : 6; // libdeflate doesn't honour -1 as default
+    // NB levels go up to 12 here.
+    struct libdeflate_compressor *z = libdeflate_alloc_compressor(level);
+    if (!z) return -1;
 
-        // Raw deflate
-        size_t clen =
-                libdeflate_deflate_compress(z, src, slen,
-                                            dst + BLOCK_HEADER_LENGTH,
-                                            *dlen - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH);
+    // Raw deflate
+    size_t clen =
+            libdeflate_deflate_compress(z, src, slen,
+                                        dst + BLOCK_HEADER_LENGTH,
+                                        *dlen - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH);
 
-        if (clen <= 0) {
-            hts_log_error("Call to libdeflate_deflate_compress failed");
-            libdeflate_free_compressor(z);
-            return -1;
-        }
-
-        *dlen = clen + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
-
+    if (clen <= 0) {
+        hts_log_error("Call to libdeflate_deflate_compress failed");
         libdeflate_free_compressor(z);
-    }
+        return -1;
+     }
+
+    *dlen = clen + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
+
+    libdeflate_free_compressor(z);
 
     // write the header
     memcpy(dst, g_magic, BLOCK_HEADER_LENGTH); // the last two bytes are a place holder for the length of the block
@@ -834,12 +819,6 @@ int block_encode_func(bam_block *un_comp, bam_block *comp , int compress_level) 
     int ret;
     ret = rabbit_bgzf_compress(comp->data, &comp_size, un_comp->data, un_comp->pos,
                                      compress_level);
-    // if (!fp->is_gzip)
-    //     ret = rabbit_bgzf_compress(write_block->compressed_data, &comp_size, write_block->uncompressed_data,
-    //                                write_block->block_offset, fp->compress_level);
-    // else
-    //     ret = rabbit_bgzf_gzip_compress(fp, write_block->compressed_data, &comp_size, write_block->uncompressed_data,
-    //                                     write_block->block_offset, fp->compress_level);
 
     if (ret != 0) {
         hts_log_debug("Compression error %d", ret);
@@ -859,6 +838,8 @@ extern "C" void slave_compressfunc(Comp_Para paras[64]) {
     // 忽略空任务
     if (para->status != 0 || para->input_records == nullptr || para->n_records == 0) return;
 
+    printf("Parsing started with _PEN = %d\n", _PEN);
+
     bam_block* uncompressed = para->un_comp_block;
     bam_block* compressed = para->output_block;
     uncompressed->pos = 0;     //压缩时看这个实际的数据长度
@@ -870,9 +851,13 @@ extern "C" void slave_compressfunc(Comp_Para paras[64]) {
         bam1_t* b = para->input_records[i];
         writeBam1_to_block(uncompressed, b , 0);
     }
+    printf("Complete parsing with %d bam1_t!\n", para->n_records);
 
     //2. 对 uncompressed 进行压缩
-    compressed->length = block_encode_func(uncompressed, compressed , compress_level); //TODO para->fp
+    compressed->length = block_encode_func(uncompressed, compressed , compress_level); //TODO 根据para->fp传入的参数来执行
+    print_bam_block(uncompressed);
+    print_bam_block(compressed);
+    printf("Complete the compression!\n");
 
     para->output_size = compressed->length;
     para->status = 0; // success

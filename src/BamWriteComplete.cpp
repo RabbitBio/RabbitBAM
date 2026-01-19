@@ -6,6 +6,8 @@ BamWriteComplete::BamWriteComplete(int queue_size) {
     buffer_pool_.resize(64);
     for (int i = 0; i < 64; ++i) {
         buffer_pool_[i] = new bam_block;
+        // Allocate data buffer with 64-byte alignment for Sunway slave cores
+        buffer_pool_[i]->data = aligned_alloc_custom(64, BGZF_MAX_BLOCK_SIZE);
     }
 
     // 初始化空闲块池
@@ -15,6 +17,8 @@ BamWriteComplete::BamWriteComplete(int queue_size) {
     pool_ed = queue_size - 1; 
     for (int i = pool_bg; i <= pool_ed; i++) {
         blockPool[i] = new bam_block;
+        // Allocate data buffer with 64-byte alignment for Sunway slave cores
+        buffer_pool_[i]->data = aligned_alloc_custom(64, BGZF_MAX_BLOCK_SIZE);
     }
 
     // 初始化压缩块队列

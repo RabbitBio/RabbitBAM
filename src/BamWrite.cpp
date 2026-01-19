@@ -1,13 +1,22 @@
 #include "BamWrite.h"
 
 BamWrite::BamWrite(int queue_size) {
-    int total_bams = 4096; //需要合适的大小
-    pool_size = total_bams + 1 ; // 多申请一个，防止边界问题
+    int total_size = queue_size * MAX_RECORDS_PER_BLOCK;
+    pool_size = total_size + 1 ; // 多申请一个，防止边界问题
     bamPool = new bam1_t*[pool_size];
     pool_bg = 0;
-    pool_ed = total_bams - 1;
+    pool_ed = total_size - 1;
     for (int i = pool_bg; i <= pool_ed; i++) {
-        bamPool[i] = bam_init1();
+        // bamPool[i] = bam_init1();
+
+        //分配足够大小的空间
+        bam1_t *b = bam_init1();
+        // 分配 1KB 对齐内存
+        b->data = (uint8_t*)aligned_alloc_custom(64, INIT_DATA_SIZE);
+        b->m_data = INIT_DATA_SIZE;
+        b->l_data = 0;
+        b->mempolicy = BAM_USER_OWNS_DATA;
+        bamPool[i] = b;    
     }
 
     q_size = queue_size + 5;
@@ -19,7 +28,11 @@ BamWrite::BamWrite(int queue_size) {
 }
 
 BamWrite::~BamWrite() {
-    for (int i = 0; i < pool_size-1; i++) bam_destroy1(bamPool[i]);
+    for (int i = 0; i < pool_size-1; i++){
+        if (bamPool[i]->data) {
+            aligned_free_custom(bamPool[i]->data);
+        }
+    }
     delete[] bamPool;
     delete[] groupQueue;
 }

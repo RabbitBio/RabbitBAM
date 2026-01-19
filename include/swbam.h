@@ -34,11 +34,10 @@ public:
 private:
     void ConsumerSwBamTask(BamRead *read, BamComplete *complete);
     void ProducerSwBamTask(BGZF *fp, BamRead *read);
-    //void WriteSwBamTask();
-    int writeBam1_t(samFile *fp, const sam_hdr_t *h, const bam1_t *b);
+    int writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b);
 
     void ConsumerSwBamTask2(BamWrite *write, BamWriteComplete *complete);
-    void ProducerSwBamTask2(samFile *fp, BamWrite *write);
+    void ProducerSwBamTask2(samFile *fp, BamWrite *write, sam_hdr_t *h);
     int writeBlockTobam(BGZF *fp, bam_block *block);
 
     static inline const char *get_sam_open_mode(const std::string &out_name) {
