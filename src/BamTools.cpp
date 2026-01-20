@@ -233,11 +233,6 @@ int sam_write1_sw(samFile *fp, const sam_hdr_t *h, const bam1_t *b){
     if (sam_format1(h, b, &fp->line) < 0) return -1;
     kputc('\n', &fp->line);
 
-    //写入 SAM 文本数据
-    //printf("=== SAM LINE (len=%zu) ===\n", fp->line.l);
-    //fwrite(fp->line.s, 1, fp->line.l, stdout);
-    //printf("\n=== END SAM LINE ===\n");
-
     //这里要按顺序写入文件，在主核中完成
     if ( hwrite(fp->fp.hfile, fp->line.s, fp->line.l) != fp->line.l ) return -1;     
 

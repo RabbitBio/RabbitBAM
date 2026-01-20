@@ -8,7 +8,11 @@ extern "C" {
     void slave_decompressfunc();
     void slave_copyfunc();
     void slave_compressfunc();
+    void slave_sam_format();
 }
+
+// Global mutex to coordinate reader and writer spawn
+std::mutex g_athread_spawn_mutex;
 
 SwBam::SwBam(CmdInfo *cmd_info1) {
     cmd_info_ = cmd_info1;
@@ -105,9 +109,11 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
 
         //调用从核处理一块：解压缩，解析
         {
+            std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
             __real_athread_spawn((void *) slave_decompressfunc, degz_paras, 1);
-            athread_join();
         }
+        athread_join();
+
 
         //为每条记录分配data区域
         // for(int i = 0; i < 64; i++) {
@@ -151,13 +157,36 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
     printf("ConsumerSwBamTask finished , cost %lf!\n", GetTime() - t0); 
 }
 
-int SwBam::writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b) {
-    if (sam_write1_sw(fp, h, b) < 0) {
-                fprintf(stderr, "Error writing SAM record\n");
-                return -1;
+void init_batch_buffers(SamFormatBatch *batch)
+{
+    batch->count = 0;
+
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+        kstring_t *ks = &batch->sam_lines[i];
+
+        ks->l = 0;
+        ks->m = MAX_SAM_LINE_SIZE;
+        ks->s = (char *)aligned_alloc_custom(64, MAX_SAM_LINE_SIZE);
+
+        if (!ks->s) {
+            fprintf(stderr, "Failed to alloc sam buffer %d\n", i);
+            abort();
+        }
     }
-    return 0;
 }
+
+void destroy_batch_buffers(SamFormatBatch *batch)
+{
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+        kstring_t *ks = &batch->sam_lines[i];
+        if (ks->s) {
+            aligned_free_custom((unsigned char*)ks->s);
+            ks->s = NULL;
+        }
+        ks->l = ks->m = 0;
+    }
+}
+
 
 
 //---------------------------------------------------------------------------------------------------------------------
@@ -361,17 +390,63 @@ void SwBam::ProcessSwBam() {
 
             //剩下是主线程
             t0 = GetTime();
+            // long long num = 0;
+            // bam1_t *b;
+            // while (true) {
+            //     b = complete->getBam1_t();
+            //     if(b == NULL) break;
+                
+            //     //print_bam1(b);
+            //     num++;
+            //     int ret = writeBam1_tToSam(sout,hdr,b); 
+            //     complete->backBam1_t(b);
+            // }
+
+            SamFormatBatch batch;
+            init_batch_buffers(&batch);
+            batch.hdr = hdr;
+
             long long num = 0;
             bam1_t *b;
             while (true) {
-                b = complete->getBam1_t();
-                if(b == NULL) break;
-                
-                //print_bam1(b);
-                num++;
-                int ret = writeBam1_tToSam(sout,hdr,b); 
-                complete->backBam1_t(b);
+                batch.count = 0;
+
+                // 1. 收集 bam
+                while (batch.count < BATCH_SIZE) {
+                    b = complete->getBam1_t();
+                    if (!b) break;
+                    num++;
+
+                    batch.bams[batch.count] = b;
+                    kstring_t *ks = &batch.sam_lines[batch.count];
+                    ks->l = 0;
+                    // ks->m = 0;
+                    // ks->s = NULL;
+
+                    batch.count++;
+                }
+                if (batch.count == 0) break;
+
+                // 2. 从核并行 sam_format1
+                sout->format.category = sequence_data;
+                sout->format.format = sam;
+                {
+                    std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
+                    __real_athread_spawn((void*)slave_sam_format, &batch, 1);
+                }
+                athread_join();
+
+                // 3. 主核按顺序写入文件中
+                for (int i = 0; i < batch.count; i++) {
+                    kstring_t *ks = &batch.sam_lines[i];
+                    if (hwrite(sout->fp.hfile, ks->s, ks->l) != ks->l) {
+                        fprintf(stderr, "write failed\n");
+                    }
+                    complete->backBam1_t(batch.bams[i]);
+                }
             }
+
+            destroy_batch_buffers(&batch);
 
             producer.join();
             consumer.join();
@@ -408,7 +483,7 @@ void SwBam::ProcessSwBam() {
 
             producer2.join();
             consumer2.join();
-            printf("Complete writing to sam cost %lf\n", GetTime() - t0);
+            printf("Complete writing to bam cost %lf\n", GetTime() - t0);
             printf("The total BGZF nums is %lld\n", num2);
             break;
         }

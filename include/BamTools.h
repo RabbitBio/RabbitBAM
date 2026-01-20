@@ -81,6 +81,19 @@ struct bgzf_cache_t {
 
 typedef struct bam_block bam_block;
 
+
+#define MAX_SAM_LINE_SIZE 8192   // 8 KB（足够覆盖绝大多数）
+#define BATCH_PER_CORE 16
+#define BATCH_SIZE (64 * BATCH_PER_CORE)
+
+typedef struct {
+    const sam_hdr_t *hdr;
+    bam1_t *bams[BATCH_SIZE];
+    kstring_t sam_lines[BATCH_SIZE];  // 每条 BAM 对应一条 SAM 字符串
+    int count;   // 实际 bam 数
+} SamFormatBatch;
+
+
 struct Para {
     int block_id;              // 当前块号
     bam_block* input_block;    // 压缩块指针
@@ -144,6 +157,8 @@ int sam_write1_sw(samFile *fp, const sam_hdr_t *h, const bam1_t *b);
 int sam_realloc_bam_data(bam1_t *b, size_t desired);
 
 int realloc_bam_data(bam1_t *b, size_t desired);
+
+
 
 
 //sam to bam
