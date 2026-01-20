@@ -1007,7 +1007,8 @@ int writeBam1_to_block(bam_block *&write_block, bam1_t *b , int is_be) {
     x[6] = c->mpos;
     x[7] = c->isize;
 
-    //这里空间一定是够的
+    //这里空间一定是够的，ok要赋值为1！！！！
+    ok = 1;
     //ok = (rabbit_bgzf_mul_flush_try(fp, bam_write_compress, write_block, 4 + block_len) >= 0);
     if (is_be) {
         for (i = 0; i < 8; ++i) ed_swap_4p(x + i);
@@ -1081,10 +1082,15 @@ int rabbit_bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen,
         return 0;
     }
 
+    // const uintptr_t ALIGN_MASK = 63;
+    // if (((uintptr_t)src & ALIGN_MASK) != 0 || 
+    //     ((uintptr_t)_dst & ALIGN_MASK) != 0) {
+    //         printf("NOT ALIGN!\n" );
+    //     return -1;
+    // }
+
     uint8_t *dst = (uint8_t *) _dst;
 
-    level = level > 0 ? level : 6; // libdeflate doesn't honour -1 as default
-    // NB levels go up to 12 here.
     struct libdeflate_compressor *z = libdeflate_alloc_compressor(level);
     if (!z) return -1;
 
@@ -1099,9 +1105,7 @@ int rabbit_bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen,
         libdeflate_free_compressor(z);
         return -1;
      }
-
     *dlen = clen + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
-
     libdeflate_free_compressor(z);
 
     // write the header
@@ -1134,18 +1138,16 @@ int block_encode_func(bam_block *un_comp, bam_block *comp , int compress_level) 
 extern "C" void slave_compressfunc(Comp_Para paras[64]) {
 
     int id = _PEN;             // 从核号（0~63）
-    int compress_level = 1; // 默认压缩等级
+    int compress_level = 1;    // 默认压缩等级为1
     Comp_Para* para = &paras[id];
 
     // 忽略空任务
     if (para->status != 0 || para->input_records == nullptr || para->n_records == 0) return;
 
-    printf("Parsing started with _PEN = %d\n", _PEN);
-
     bam_block* uncompressed = para->un_comp_block;
-    print_bam_block(uncompressed);
+    //print_bam_block(uncompressed);
     bam_block* compressed = para->output_block;
-    print_bam_block(compressed);
+    //print_bam_block(compressed);
     //这里只用到了data和pos两个字段
     uncompressed->pos = 0;     //压缩时看这个作为实际的数据长度
     uncompressed->length = 0;  
@@ -1157,19 +1159,17 @@ extern "C" void slave_compressfunc(Comp_Para paras[64]) {
     //1. 将 bam1_t 记录 逐个解析并写入 到 uncompressed 中
     for (int i = 0; i < para->n_records; i++) {
         bam1_t* b = para->input_records[i];
-        print_bam1(b);
+        //print_bam1(b);
         writeBam1_to_block(uncompressed, b , 0);
     }
-    print_bam_block(uncompressed);
-    printf("Complete parsing with %d bam1_t!\n", para->n_records);
+    //print_bam_block(uncompressed);
+    //printf("Complete parsing with %d bam1_t!\n", para->n_records);
 
     //2. 对 uncompressed 进行压缩
-    printf("1111------------------------------------------------\n");
-    compressed->length = block_encode_func(uncompressed, compressed , compress_level); //TODO 根据para->fp传入的参数来执行
-    printf("222-------------------------------------------------\n");
-    print_bam_block(uncompressed);
-    print_bam_block(compressed);
-    printf("Complete the compression!\n");
+    compressed->length = block_encode_func(uncompressed, compressed , compress_level); 
+    //print_bam_block(uncompressed);
+    //print_bam_block(compressed);
+    //printf("Complete the compression!\n");
 
     para->output_size = compressed->length;
     para->status = 0; // success

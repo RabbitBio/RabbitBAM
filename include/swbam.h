@@ -49,6 +49,7 @@ private:
         }
     }
 
+
 private:
     CmdInfo *cmd_info_;
     sam_hdr_t *hdr;

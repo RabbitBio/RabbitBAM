@@ -336,8 +336,6 @@ int SwBam:: writeBlockTobam(BGZF *fp, bam_block *block) {
     return 0;
 }
 
-
-
 void SwBam::ProcessSwBam() {
 
     double t0 = GetTime();
@@ -459,9 +457,9 @@ void SwBam::ProcessSwBam() {
         case sam:{
             t0 = GetTime();
             //BamWrite(x) x*MAX_RECORDS_PER_BLOCK是bam1_t的内存池大小
-            write = new BamWrite(50);
+            write = new BamWrite(500);
             //BamWriteComplete(x) x是bam_block的内存池大小
-            writeComplete = new BamWriteComplete(50);
+            writeComplete = new BamWriteComplete(500);
             printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
 
             //生产者线程---
@@ -477,6 +475,7 @@ void SwBam::ProcessSwBam() {
                 comp_block = writeComplete->getCompressedBlock();
                 if(comp_block == nullptr) break;
                 num2++;
+                //print_bam_block(comp_block);
                 int write_ret = writeBlockTobam(sout->fp.bgzf, comp_block);
                 writeComplete->backBlock(comp_block);
             }
