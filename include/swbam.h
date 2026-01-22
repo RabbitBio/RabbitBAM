@@ -38,6 +38,7 @@ private:
 
     void ConsumerSwBamTask2(BamWrite *write, BamWriteComplete *complete);
     void ProducerSwBamTask2(samFile *fp, BamWrite *write, sam_hdr_t *h);
+    void ProducerSwBamTask2_parallel(samFile *fp, BamWrite *write, sam_hdr_t *h);
     int writeBlockTobam(BGZF *fp, bam_block *block);
 
     static inline const char *get_sam_open_mode(const std::string &out_name) {

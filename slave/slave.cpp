@@ -16,6 +16,9 @@
 #include <htslib/bgzf.h>
 #include <htslib/hfile.h>
 #include <htslib/hts.h>
+#include <htslib/khash.h>
+
+#include "test.h"
 
 #ifdef PLATFORM_SUNWAY
 #include <slave.h>
@@ -1135,6 +1138,7 @@ int block_encode_func(bam_block *un_comp, bam_block *comp , int compress_level) 
 }
 
 //-------------------------------------------------------------------------------------------------------------------------------------------------
+
 extern "C" void slave_compressfunc(Comp_Para paras[64]) {
 
     int id = _PEN;             // 从核号（0~63）
@@ -1177,6 +1181,17 @@ extern "C" void slave_compressfunc(Comp_Para paras[64]) {
 }
 
 
+extern "C" void slave_sam_parse(void *arg) {
 
+    SamFormatBatch *batch = (SamFormatBatch *)arg;
+    int tid = _PEN;  // 0~63
 
+    //均匀划分
+    for (int i = tid; i < batch->count; i += 64) {
+        kstring_t *ks = &batch->sam_lines[i];
+
+        sam_parse1(ks, (sam_hdr_t *)batch->hdr, batch->bams[i]);
+        ks->l = 0;
+    }
+}
 

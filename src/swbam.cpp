@@ -9,6 +9,7 @@ extern "C" {
     void slave_copyfunc();
     void slave_compressfunc();
     void slave_sam_format();
+    void slave_sam_parse();
 }
 
 // Global mutex to coordinate reader and writer spawn
@@ -111,8 +112,8 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
         {
             std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
             __real_athread_spawn((void *) slave_decompressfunc, degz_paras, 1);
+            athread_join();
         }
-        athread_join();
 
 
         //为每条记录分配data区域
@@ -157,6 +158,14 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
     printf("ConsumerSwBamTask finished , cost %lf!\n", GetTime() - t0); 
 }
 
+int SwBam::writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b) {
+    if (sam_write1_sw(fp, h, b) < 0) {
+        fprintf(stderr, "Error writing SAM record\n");
+        return -1;
+    }
+    return 0;
+}
+
 void init_batch_buffers(SamFormatBatch *batch)
 {
     batch->count = 0;
@@ -190,6 +199,102 @@ void destroy_batch_buffers(SamFormatBatch *batch)
 
 
 //---------------------------------------------------------------------------------------------------------------------
+
+void SwBam:: ProducerSwBamTask2_parallel(samFile *fp, BamWrite *write, sam_hdr_t *h){
+    printf("ProducerSwBamTask2 started\n");
+    double t0 = GetTime();
+
+    // 当前块和当前组的缓存
+    std::vector<bam1_t*> cur_block;
+    std::vector<std::vector<bam1_t*>> cur_group;
+
+    bam1_t *b = write->getEmpty();
+    int ret;
+    bam1_core_t *c;
+    uint32_t bam_len , total_len = 0;
+    int block_nums=0 , group_nums=0 , bam1_t_nums=0;
+
+    SamFormatBatch batch;
+    init_batch_buffers(&batch);
+    batch.hdr = h;
+
+    while (true) {
+        batch.count = 0;
+
+        // 处理 header 预读行
+        if (fp->line.l != 0) {
+            printf("The header has a line!!!");
+            batch.sam_lines[0] = fp->line;
+            batch.bams[0] = write->getEmpty();
+            batch.count = 1;
+            fp->line.l = 0;
+        }
+
+        //1. 主核读取 SAM 文本 ----------
+        while (batch.count < BATCH_SIZE) {
+            int ret = hts_getline(fp, KS_SEP_LINE,&batch.sam_lines[batch.count]);
+            if (ret < 0) break;
+            batch.bams[batch.count] = write->getEmpty();
+            batch.count++;
+        }
+        if (batch.count == 0) break;
+
+        //2. 从核并行 sam_parse1 ----------
+        {
+            std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
+            __real_athread_spawn((void *)slave_sam_parse, &batch, 1);
+            athread_join();
+        }
+
+        //3. 主核对一个批次进行打包 ---------
+        for (int i = 0; i < batch.count; i++) {
+            bam1_t *b = batch.bams[i];
+            bam1_t_nums++;
+
+            c = &b->core;
+            bam_len = b->l_data - c->l_extranul + 32;
+            if( bam_len + 4 + total_len <= BGZF_BLOCK_SIZE ) { //压缩前的最大大小
+                // 放入当前记录到块中
+                cur_block.push_back(b);
+                total_len = total_len + bam_len + 4;
+            }else{
+                // 当前块已满，打包入组，开启新块
+                block_nums++;
+                cur_group.push_back(cur_block);
+                cur_block.clear();
+                cur_block.push_back(b);
+                total_len = bam_len + 4;
+            }
+
+            // 达到64个块后打包压入队列
+            if ((int)cur_group.size() >= 64) {
+                group_nums++;
+                write->inputGroup(cur_group);
+                cur_group.clear();
+            }
+        }
+        
+    }
+
+    // 收尾：处理未满的块或组
+    if (!cur_block.empty()) {
+        block_nums++;
+        cur_group.push_back(cur_block);
+        cur_block.clear();
+    }
+    if (!cur_group.empty()) {
+        group_nums++;
+        write->inputGroup(cur_group);
+        cur_group.clear();
+    }
+
+    destroy_batch_buffers(&batch);
+
+    printf("ProducerSwBamTask2 finished with bam1_t_nums = %d , block_num = %d , group_num = %d , cost %lf\n", bam1_t_nums, block_nums , group_nums , GetTime() - t0 );
+
+    write->markComplete();
+
+}
 
 void SwBam:: ProducerSwBamTask2(samFile *fp, BamWrite *write, sam_hdr_t *h){
     printf("ProducerSwBamTask2 started\n");
@@ -257,7 +362,7 @@ void SwBam:: ProducerSwBamTask2(samFile *fp, BamWrite *write, sam_hdr_t *h){
 void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
     printf("ConsumerSwBamTask2 started\n");
     double t0 = GetTime();
- 
+
     while (true) {
 
         auto group = write->getGroup();
@@ -295,6 +400,7 @@ void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
 
         //调用从核处理一块：解析，压缩成bgzf块
         {
+            std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
             __real_athread_spawn((void*)slave_compressfunc, comp_paras, 1);
             athread_join();
         }
@@ -377,7 +483,7 @@ void SwBam::ProcessSwBam() {
             //BamRead(x) x*64是bam_block的内存池大小
             read = new BamRead(50);
             //BamComplete(x) x是bam1_t的内存池大小
-            complete = new BamComplete(1500);
+            complete = new BamComplete(512000);
             printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
 
             //生产者线程---
@@ -388,17 +494,10 @@ void SwBam::ProcessSwBam() {
 
             //剩下是主线程
             t0 = GetTime();
-            // long long num = 0;
-            // bam1_t *b;
-            // while (true) {
-            //     b = complete->getBam1_t();
-            //     if(b == NULL) break;
-                
-            //     //print_bam1(b);
-            //     num++;
-            //     int ret = writeBam1_tToSam(sout,hdr,b); 
-            //     complete->backBam1_t(b);
-            // }
+
+            #define SAM_FORMAT_PARALLEL
+            #ifdef SAM_FORMAT_PARALLEL
+            printf("Enable the SAM_FORMAT_PARALLEL!!!\n");
 
             SamFormatBatch batch;
             init_batch_buffers(&batch);
@@ -409,7 +508,7 @@ void SwBam::ProcessSwBam() {
             while (true) {
                 batch.count = 0;
 
-                // 1. 收集 bam
+                // 1. 收集 bam1_t
                 while (batch.count < BATCH_SIZE) {
                     b = complete->getBam1_t();
                     if (!b) break;
@@ -418,8 +517,6 @@ void SwBam::ProcessSwBam() {
                     batch.bams[batch.count] = b;
                     kstring_t *ks = &batch.sam_lines[batch.count];
                     ks->l = 0;
-                    // ks->m = 0;
-                    // ks->s = NULL;
 
                     batch.count++;
                 }
@@ -431,8 +528,8 @@ void SwBam::ProcessSwBam() {
                 {
                     std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
                     __real_athread_spawn((void*)slave_sam_format, &batch, 1);
+                    athread_join();
                 }
-                athread_join();
 
                 // 3. 主核按顺序写入文件中
                 for (int i = 0; i < batch.count; i++) {
@@ -445,6 +542,19 @@ void SwBam::ProcessSwBam() {
             }
 
             destroy_batch_buffers(&batch);
+            #else
+            long long num = 0;
+            bam1_t *b;
+            while (true) {
+                b = complete->getBam1_t();
+                if(b == NULL) break;
+                
+                //print_bam1(b);
+                num++;
+                int ret = writeBam1_tToSam(sout,hdr,b); 
+                complete->backBam1_t(b);
+            }
+            #endif
 
             producer.join();
             consumer.join();
@@ -456,6 +566,8 @@ void SwBam::ProcessSwBam() {
 
         case sam:{
             t0 = GetTime();
+            // const size_t INIT_DATA_SIZE = 1024;  
+            // const size_t MAX_RECORDS_PER_BLOCK = 1024; 
             //BamWrite(x) x*MAX_RECORDS_PER_BLOCK是bam1_t的内存池大小
             write = new BamWrite(500);
             //BamWriteComplete(x) x是bam_block的内存池大小
@@ -463,7 +575,14 @@ void SwBam::ProcessSwBam() {
             printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
 
             //生产者线程---
+            #define SAM_PARSE_PARALLEL
+            #ifdef SAM_PARSE_PARALLEL
+            printf("Enable the SAM_PARSE_PARALLEL!!!\n");
+            thread producer2(bind(&SwBam::ProducerSwBamTask2_parallel, this, sin, write, hdr));
+            #else
             thread producer2(bind(&SwBam::ProducerSwBamTask2, this, sin, write, hdr));
+            #endif
+
             //消费者线程----
             thread consumer2(bind(&SwBam::ConsumerSwBamTask2, this, write , writeComplete));
 

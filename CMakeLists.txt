@@ -33,7 +33,8 @@ set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Compiler flags
-set(COMMON_FLAGS "-g -O0 -ffast-math -DTIMING")
+# set(COMMON_FLAGS "-g -O0 -ffast-math -DTIMING")
+set(COMMON_FLAGS "-g -O3 -ffast-math -DTIMING")
 
 if(PLATFORM_X86)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${COMMON_FLAGS} -fopenmp")
@@ -83,12 +84,13 @@ file(GLOB_RECURSE SRC_FILES "src/*.cpp")
 if(PLATFORM_SUNWAY)
     # For Sunway, also compile slave code
     file(GLOB SLAVE_FILES "slave/*.cpp")
+    file(GLOB SLAVE_C_FILES   "slave/*.c")
     # Include slave_zlib source files (compile with -mslave)
     # Only files in slave_zlib directory, not subdirectories
     file(GLOB SLAVE_ZLIB_FILES "slave/slave_zlib/*.c")
     
     # Create object library for slave code with special flags
-    add_library(slave_objects OBJECT ${SLAVE_FILES} ${SLAVE_ZLIB_FILES})
+    add_library(slave_objects OBJECT ${SLAVE_FILES}  ${SLAVE_C_FILES} ${SLAVE_ZLIB_FILES})
     target_compile_options(slave_objects PRIVATE ${SLAVE_FLAGS})
     target_include_directories(slave_objects PRIVATE
         ${CMAKE_SOURCE_DIR}/include

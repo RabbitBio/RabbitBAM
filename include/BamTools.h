@@ -83,8 +83,13 @@ typedef struct bam_block bam_block;
 
 
 #define MAX_SAM_LINE_SIZE 8192   // 8 KB（足够覆盖绝大多数）
-#define BATCH_PER_CORE 16
+#define BATCH_PER_CORE 1024
 #define BATCH_SIZE (64 * BATCH_PER_CORE)
+
+#define KS_SEP_SPACE 0 // isspace(): \t, \n, \v, \f, \r
+#define KS_SEP_TAB   1 // isspace() && !' '
+#define KS_SEP_LINE  2 // line separator: "\n" (Unix) or "\r\n" (Windows)
+#define KS_SEP_MAX   2
 
 typedef struct {
     const sam_hdr_t *hdr;
