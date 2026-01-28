@@ -1,7 +1,6 @@
 #ifndef H_GLOBALS
 #define H_GLOBALS
 
-
 #include <sys/time.h>
 #include <cstddef>
 
@@ -10,7 +9,6 @@ inline double GetTime() {
     gettimeofday(&tv, NULL);
     return (double) tv.tv_sec + (double) tv.tv_usec / 1000000;
 }
-
 
 namespace rabbit {
 

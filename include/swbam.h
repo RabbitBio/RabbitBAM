@@ -10,10 +10,18 @@
 #include <queue>
 #include <atomic>
 #include <functional>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 
 // #include <htslib/sam.h>
 // #include <htslib/hts.h>
+#include <htslib/bgzf.h>
+#include <htslib/sam.h>
+#include <htslib/hfile.h>
+
 #include "BamRead.h"
 #include "BamComplete.h"
 #include "BamWrite.h"
@@ -39,6 +47,7 @@ private:
     void ConsumerSwBamTask2(BamWrite *write, BamWriteComplete *complete);
     void ProducerSwBamTask2(samFile *fp, BamWrite *write, sam_hdr_t *h);
     void ProducerSwBamTask2_parallel(samFile *fp, BamWrite *write, sam_hdr_t *h);
+    void ProducerSwBamTask2_parallel_memory(BamWrite *write, sam_hdr_t *h , size_t sam_size,char *sam_mem);
     int writeBlockTobam(BGZF *fp, bam_block *block);
 
     static inline const char *get_sam_open_mode(const std::string &out_name) {
