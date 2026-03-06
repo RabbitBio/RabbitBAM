@@ -1125,25 +1125,25 @@ extern "C" void sam_format(void *arg) {
     // }
 }
 
-extern "C" void copyfunc(Para paras[64]) {
+// extern "C" void copyfunc(Para paras[64]) {
 
-    int id = _PEN;             // 从核号（0~63）
-    Para* para = &paras[id];
+//     int id = _PEN;             // 从核号（0~63）
+//     Para* para = &paras[id];
 
-    if(para->input_block == NULL) {
-        return;
-    }
+//     if(para->input_block == NULL) {
+//         return;
+//     }
 
-    printf("copyfunc started with _PEN = %d\n", _PEN);
+//     printf("copyfunc started with _PEN = %d\n", _PEN);
 
-    for (int i = 0; i < para->n_records; i++) {
-        // 复制数据到新分配的data区域
-        memcpy(para->output_records[i]->data, para->data_list[i], para->l_data_list[i]);
-    }
+//     for (int i = 0; i < para->n_records; i++) {
+//         // 复制数据到新分配的data区域
+//         memcpy(para->output_records[i]->data, para->data_list[i], para->l_data_list[i]);
+//     }
 
-    para->status = 0;  // copy 完成标记
+//     para->status = 0;  // copy 完成标记
 
-}
+// }
 
 
 //sam2bam-------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1204,7 +1204,6 @@ extern "C" void slave_sam_parse(void *arg) {
 
     for (int i = start; i < end; i++) {
         kstring_t *ks = &batch->sam_lines[i];
-
         sam_parse1(ks, (sam_hdr_t *)batch->hdr, batch->bams[i]);
         ks->l = 0;
     }

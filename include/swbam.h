@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <algorithm>
 
 
 // #include <htslib/sam.h>
@@ -42,12 +43,13 @@ public:
 private:
     void ConsumerSwBamTask(BamRead *read, BamComplete *complete);
     void ProducerSwBamTask(BGZF *fp, BamRead *read);
+    void ProducerSwBamTask_memory(BGZF *fp, BamRead *read , char *bam_mem, size_t bam_size);
     int writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b);
 
     void ConsumerSwBamTask2(BamWrite *write, BamWriteComplete *complete);
     void ProducerSwBamTask2(samFile *fp, BamWrite *write, sam_hdr_t *h);
     void ProducerSwBamTask2_parallel(samFile *fp, BamWrite *write, sam_hdr_t *h);
-    void ProducerSwBamTask2_parallel_memory(BamWrite *write, sam_hdr_t *h , size_t sam_size,char *sam_mem);
+    void ProducerSwBamTask2_parallel_memory(BamWrite *write, sam_hdr_t *h , MemReader reader);
     int writeBlockTobam(BGZF *fp, bam_block *block);
 
     static inline const char *get_sam_open_mode(const std::string &out_name) {

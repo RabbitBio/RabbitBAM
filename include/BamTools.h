@@ -28,6 +28,17 @@
 //#define BGZF_MAX_BLOCK_COMPLETE_SIZE 0x10000
 //#define THREAD_NUM_P 6
 
+//使用内存读写--
+struct MemReader {
+    char *base;
+    size_t size;
+    size_t pos;
+};
+struct MemWriter {
+    char *data;
+    size_t size;
+    size_t capacity;
+};
 
 // Aligned memory allocation helper function
 // Allocates size bytes aligned to alignment (must be power of 2)
@@ -108,9 +119,6 @@ struct Para {
     std::vector<bam1_t*> output_records;  // 解析得到的bam1_t数组
     int n_records;             // 解析得到的条目数
     int status;                // 处理状态标志（0=ok，非0=失败）
-
-    int l_data_list[1024];     // 每条记录的长度（假设一块最多1024条）
-    uint8_t *data_list[1024];  // 每条记录的 data 指针
 };
 
 struct Comp_Para {
@@ -141,16 +149,6 @@ struct bam_block {
 };
 
 
-// struct bam_write_block {
-//     int status = 0; // 0:uncompress 1:compress
-//     int block_num = -1; // -1 : not used correctly
-//     int block_offset;
-//     int block_length;
-//     uint8_t *uncompressed_data;
-//     uint8_t *compressed_data;
-// };
-
-
 void print_bam1(const bam1_t *b);
 void print_bam_block(struct bam_block *blk) ;
 
@@ -162,8 +160,6 @@ int sam_write1_sw(samFile *fp, const sam_hdr_t *h, const bam1_t *b);
 int sam_realloc_bam_data(bam1_t *b, size_t desired);
 
 int realloc_bam_data(bam1_t *b, size_t desired);
-
-
 
 
 //sam to bam
