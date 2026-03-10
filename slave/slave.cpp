@@ -979,7 +979,7 @@ int block_encode_func(bam_block *un_comp, bam_block *comp , int compress_level) 
 extern "C" void decompressfunc(Para paras[64]) {
     //printf("decompressfunc started with _PEN = %d\n", _PEN);
 
-    int id = _PEN;             // 从核号（0~63）
+    int id = _PEN;           
     Para* para = &paras[id];
 
     // 1. 读取压缩块数据
@@ -990,79 +990,6 @@ extern "C" void decompressfunc(Para paras[64]) {
     }
 
     //printf("decompressfunc started with _PEN = %d\n", _PEN);
-
-    //#define TEST_ALIGN
-    #ifdef TEST_ALIGN
-        unsigned char *p = comp->data;  // 64B aligned
-        unsigned char *u = p + 18;      //没对齐
-
-        //test1
-        printf("u = %p\n", u);          // 成功
-        printf("%d\n", *u);             // 成功
-        if (((uintptr_t)u & 63) != 0) {       // 成功
-            printf("u is NOT aligned: addr=%p\n", u);
-        }
-        uint32_t x = *(uint32_t*)u;     // 失败
-        printf("misaligned value = %u\n", x);
-
-        //test2
-        //成功与失败要看具体地址情况
-        // p = 0x500001878040
-        // u = 0x500001878052  (misaligned)
-        printf("p = %p\n", p);           
-        printf("u    = %p  (misaligned)\n", u); 
-        // 1) 测试 1 字节 load —— 成功
-        uint8_t b1 = *u;
-        printf("1-byte load OK: %u\n", b1);
-        // 2) 测试 2 字节 load —— 成功
-        uint16_t h = *(uint16_t*)u;  
-        printf("2-byte load = %u\n", h);
-        // 3) 测试 4 字节 load —— 失败 
-        uint32_t w = *(uint32_t*)u;  
-        printf("4-byte load = %u\n", w);
-        // 4) 测试 8 字节 load ——  
-        uint64_t g = *(uint64_t*)u;  
-        printf("8-byte load = %u\n", g);
-    #endif
-    
-    //#define TEST_MALLOC
-    #ifdef TEST_MALLOC
-        uint8_t *p = NULL;
-        size_t size = 32;
-
-        // 测试 malloc
-        p = (uint8_t *)malloc(size);
-        if (!p) {
-            printf("CPE: malloc failed\n");
-            return;
-        }
-        printf("CPE: malloc(%zu) succeeded, p=%p\n", size, p);
-
-        // 写入测试数据
-        for (size_t i = 0; i < size; i++) p[i] = (uint8_t)i;
-
-        // 测试 realloc
-        size_t new_size = 64;
-        uint8_t *q = (uint8_t *)realloc(p, new_size);
-        if (!q) {
-            printf("CPE: realloc failed\n");
-            free(p); // 原始内存释放
-            return;
-        }
-        printf("CPE: realloc(%zu) succeeded, q=%p\n", new_size, q);
-
-        // 检查数据是否完整
-        for (size_t i = 0; i < size; i++) {
-            if (q[i] != i) {
-                printf("CPE: data corrupted at index %zu\n", i);
-                break;
-            }
-        }
-
-        free(q);
-        printf("CPE: free done\n");
-    #endif
-
 
     // 2. 解压缩该块
     block_decode_func(comp,un_comp);
@@ -1075,14 +1002,10 @@ extern "C" void decompressfunc(Para paras[64]) {
     bam1_t* b = NULL;
     b = para->output_records[count]; 
     // print_bam1(b);
-    // printf("111\n");
     while(read_bam(un_comp, b, 0)>=0){
-        // printf("222\n");
         // para->l_data_list[count] = b->l_data;
         // para->data_list[count] = b->data;
         count++;
-        //print_bam1(b);
-
         b = para->output_records[count];
     }
 
@@ -1090,8 +1013,6 @@ extern "C" void decompressfunc(Para paras[64]) {
 
     para->n_records = count;
     para->status = 0;
-
-
 }
 
 extern "C" void sam_format(void *arg) {
@@ -1124,26 +1045,6 @@ extern "C" void sam_format(void *arg) {
     //     kputc('\n', ks);
     // }
 }
-
-// extern "C" void copyfunc(Para paras[64]) {
-
-//     int id = _PEN;             // 从核号（0~63）
-//     Para* para = &paras[id];
-
-//     if(para->input_block == NULL) {
-//         return;
-//     }
-
-//     printf("copyfunc started with _PEN = %d\n", _PEN);
-
-//     for (int i = 0; i < para->n_records; i++) {
-//         // 复制数据到新分配的data区域
-//         memcpy(para->output_records[i]->data, para->data_list[i], para->l_data_list[i]);
-//     }
-
-//     para->status = 0;  // copy 完成标记
-
-// }
 
 
 //sam2bam-------------------------------------------------------------------------------------------------------------------------------------------------

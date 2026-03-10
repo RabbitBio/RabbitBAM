@@ -33,19 +33,14 @@ public:
 
 private:
 
+     std::atomic_flag pro_lock = ATOMIC_FLAG_INIT;
 
     //队列容量（结果队列中bam1_t条数）
     int queue_size_;                
-    //bam1_t 的data最大长度 暂定1KB
-    const size_t INIT_DATA_SIZE = 1024;  
-    //每块最大bam1_t数量，暂定1024块
-    const size_t MAX_RECORDS_PER_BLOCK = 1024; 
-
 
     //解压用缓冲区
     std::vector<bam_block*> buffer_pool_;
     std::vector<std::vector<bam1_t*>> result_pool_;
-
 
     //内存池实现
     bam1_t** consumer_queue_; 

@@ -119,6 +119,7 @@ bam1_t* BamComplete::getEmpty() {
     //等待直到有空闲 bam1_t
     while ((pro_ed + 1) % pro_queueSizeLim == pro_bg) {
         usleep(10); 
+        //  std::this_thread::sleep_for(std::chrono::nanoseconds(1));
     }
     //先取再+1
     int num = pro_bg;
@@ -142,6 +143,7 @@ bam1_t* BamComplete::getBam1_t() {
     //等待直到有可用组
     while ((con_ed + 1) % con_queueSizeLim == con_bg) {
         usleep(10); 
+        //  std::this_thread::sleep_for(std::chrono::nanoseconds(1));
         if (complete_flag && (con_ed + 1) % con_queueSizeLim == con_bg) return nullptr;
     }
     //先取再+1

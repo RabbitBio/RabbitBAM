@@ -60,6 +60,8 @@ bam_block* BamRead::getEmpty() {
     //等待直到有空闲 block
     while ((read_ed + 1) % readBlockSize == read_bg) {
         usleep(10); 
+        //  std::this_thread::sleep_for(std::chrono::nanoseconds(1));
+        sched_yield();
     }
     //先取再+1
     int num = read_bg;
@@ -83,6 +85,7 @@ std::vector<bam_block*> BamRead::getBlock64() {
     //等待直到有可用组
     while ((con_ed + 1) % con_queueSizeLim == con_bg) {
         usleep(10); 
+        //  std::this_thread::sleep_for(std::chrono::nanoseconds(1));
         if (read_complete && (con_ed + 1) % con_queueSizeLim == con_bg) return std::vector<bam_block*>();
     }
     //先取再+1

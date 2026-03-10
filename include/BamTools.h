@@ -28,7 +28,14 @@
 //#define BGZF_MAX_BLOCK_COMPLETE_SIZE 0x10000
 //#define THREAD_NUM_P 6
 
-//使用内存读写--
+
+//一些预先设定好的大小----
+//每块最大bam1_t数量，暂定1024块
+const size_t MAX_RECORDS_PER_BLOCK = 1024; 
+//bam1_t 的data最大长度 暂定1KB
+const size_t INIT_DATA_SIZE = 1024;  
+
+//使用内存读写----
 struct MemReader {
     char *base;
     size_t size;

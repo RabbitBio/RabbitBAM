@@ -14,6 +14,7 @@ extern "C" {
 
 // Global mutex to coordinate reader and writer spawn
 std::mutex g_athread_spawn_mutex;
+std::mutex g_test_mutex;
 
 double temp1 = 0 , temp2 = 0 ,temp3 = 0 , temp4 = 0;
 double t_sam2bam_write = 0 , t_sam2bam_read = 0 , t_sam2bam_slave = 0 , t_sam_parse = 0 , t_sam2bam_for = 0;
@@ -136,18 +137,18 @@ void SwBam::ProducerSwBamTask_memory(BGZF *fp, BamRead *read , char *bam_mem, si
 
     while (true) {
 
-        temp1 = GetTime();
+        // temp1 = GetTime();
         ret = mem_read_block(
                 bam_mem,
                 bam_size,
                 pos,
                 block);
-        t_bam2sam_read += GetTime() - temp1;
+        // t_bam2sam_read += GetTime() - temp1;
         
         if (ret < 0) break; //读取错误或结束
 
         if(block->length == 28){
-            printf("Read a EOF block!\n");
+            // printf("Read a EOF block!\n");
             break;
         }
 
@@ -201,7 +202,7 @@ void SwBam::ProducerSwBamTask(BGZF *fp, BamRead *read) {
         if (ret < 0) break; //读取错误或结束
 
         if(block->length == 28){
-            printf("Read a EOF block!\n");
+            // printf("Read a EOF block!\n");
             break;
         }
 
@@ -253,8 +254,6 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
 
         //处理从核所需要的参数
         Para degz_paras[64];
-
-        // temp2 = GetTime();
         for (int i = 0; i < 64; i++) {
             if(tmp_chunks[i] == NULL) {
                 degz_paras[i].input_block = NULL ;
@@ -266,37 +265,46 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
             degz_paras[i].block_id = i;
             degz_paras[i].input_block = tmp_chunks[i];
             degz_paras[i].un_comp_block = complete->getBuffer(i);
-            degz_paras[i].output_records = complete->getResultBuf(i); 
             degz_paras[i].status = 0;
+            degz_paras[i].output_records = complete->getResultBuf(i); 
         }
-        // t_bam2sam_slave += GetTime() - temp2;
 
         //调用从核进行解压缩，解析
-        temp2 = GetTime();
+        // temp2 = GetTime();
         {
             std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
             __real_athread_spawn((void *) slave_decompressfunc, degz_paras, 1);
             athread_join();
         }
-        t_bam2sam_slave += GetTime() - temp2;
+        // t_bam2sam_slave += GetTime() - temp2;
 
-        //这里是一处性能瓶颈，记录数量太多了----
-        temp2 = GetTime();
+        // temp2 = GetTime();
         for (int i = 0; i < 64; i++) {
             if (degz_paras[i].status == 0 && degz_paras[i].input_block != NULL) {
                 //printf("degz_paras[%d].n_records = %d\n",i , degz_paras[i].n_records);
 
-                for (int j = 0; j < degz_paras[i].n_records; j++) {
-                    bam1_t* bam1 = complete->getEmpty();
-                    //这里需要复制一份，因为缓冲区还要使用！！！
-                    (void)bam_copy1(bam1, degz_paras[i].output_records[j]);
-                    complete->inputBam1_t(bam1);
-                }
+                // for (int j = 0; j < degz_paras[i].n_records; j++) {
+                //     bam1_t* bam1 = complete->getEmpty();
+                //     (void)bam_copy1(bam1, degz_paras[i].output_records[j]);
+                //     complete->inputBam1_t(bam1);
+                // }
 
-                read->backBlock(degz_paras[i].input_block); // 回收块
+                int n_records = degz_paras[i].n_records;
+                auto &records = degz_paras[i].output_records; 
+
+                for (int j = 0; j < n_records; j++) {
+                    bam1_t* queue_bam = complete->getEmpty(); 
+                    
+                    bam1_t temp = *queue_bam;
+                    *queue_bam = *(records[j]);
+                    *(records[j]) = temp;
+                
+                    complete->inputBam1_t(queue_bam);
+                }
+                read->backBlock(degz_paras[i].input_block);
             }
         }
-        t_bam2sam_for += GetTime() - temp2;
+        // t_bam2sam_for += GetTime() - temp2;
     }
 
     complete->markComplete(); // 标记全部处理完成
@@ -836,10 +844,10 @@ void SwBam::ProcessSwBam() {
             //BamComplete(x) x是bam1_t的内存池大小
 
             //read = new BamRead(50);
-            read = new BamRead(260);
-            complete = new BamComplete(2932000);
-            // read = new BamRead(5);
-            // complete = new BamComplete(132000);
+            // read = new BamRead(260);
+            // complete = new BamComplete(2932000);
+            read = new BamRead(5);
+            complete = new BamComplete(132000);
 
             printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
 
@@ -849,11 +857,11 @@ void SwBam::ProcessSwBam() {
             #else
             thread producer(bind(&SwBam::ProducerSwBamTask, this, sin->fp.bgzf, read));
             #endif
-            producer.join();
+            // producer.join();
 
             //消费者线程----
             thread consumer(bind(&SwBam::ConsumerSwBamTask, this, read , complete));
-            consumer.join();
+            // consumer.join();
 
             //剩下是主线程
             t0 = GetTime();
@@ -872,7 +880,6 @@ void SwBam::ProcessSwBam() {
                 batch.count = 0;
 
                 // 1. 收集 bam1_t
-                // temp4 = GetTime();
                 while (batch.count < BATCH_SIZE) {
                     b = complete->getBam1_t();
                     if (!b) break;
@@ -885,7 +892,6 @@ void SwBam::ProcessSwBam() {
                     batch.count++;
                 }
                 if (batch.count == 0) break;
-                // t_sam_parse += GetTime() - temp4;
 
                 // 2. 从核并行 sam_format1
                 sout->format.category = sequence_data;
@@ -912,6 +918,7 @@ void SwBam::ProcessSwBam() {
                     #endif
 
                     complete->backBam1_t(batch.bams[i]);
+                    
                 }
                 t_bam2sam_write += GetTime() - temp3;
             }
@@ -935,13 +942,13 @@ void SwBam::ProcessSwBam() {
             }
             #endif
 
-            // producer.join();
-            // consumer.join();
-            printf("The actual time of reading bam cost %lf\n", t_bam2sam_read);
-            printf("The actual time of slave cost %lf\n", t_bam2sam_slave);
-            printf("The actual time of for loops in consumer cost %lf\n", t_bam2sam_for);
-            printf("The actual time of sam parsing cost %lf\n", t_sam_parse);
-            printf("The actual time of writing to sam cost %lf\n", t_bam2sam_write);
+            producer.join();
+            consumer.join();
+            // printf("The actual time of reading bam cost %lf\n", t_bam2sam_read);
+            // printf("The actual time of slave cost %lf\n", t_bam2sam_slave);
+            // printf("The actual time of for loops in consumer cost %lf\n", t_bam2sam_for);
+            // printf("The actual time of sam parsing cost %lf\n", t_sam_parse);
+            // printf("The actual time of writing to sam cost %lf\n", t_bam2sam_write);
             printf("Complete main thread writing to sam cost %lf\n", GetTime() - t0);
             printf("The total bam1_t nums is %lld\n", num);
             break;
