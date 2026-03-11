@@ -34,7 +34,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Compiler flags
 # set(COMMON_FLAGS "-g -O0 -ffast-math -DTIMING")
-set(COMMON_FLAGS "-g -O3 -ffast-math -DTIMING")
+set(COMMON_FLAGS "-g -O3 -ffast-math -DTIMING -funroll-loops -fstrict-aliasing")
 
 if(PLATFORM_X86)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${COMMON_FLAGS} -fopenmp")

@@ -6,7 +6,6 @@ extern "C" {
 #include <athread.h>
 #include <pthread.h>
     void slave_decompressfunc();
-    void slave_copyfunc();
     void slave_compressfunc();
     void slave_sam_format();
     void slave_sam_parse();
@@ -14,7 +13,6 @@ extern "C" {
 
 // Global mutex to coordinate reader and writer spawn
 std::mutex g_athread_spawn_mutex;
-std::mutex g_test_mutex;
 
 double temp1 = 0 , temp2 = 0 ,temp3 = 0 , temp4 = 0;
 double t_sam2bam_write = 0 , t_sam2bam_read = 0 , t_sam2bam_slave = 0 , t_sam_parse = 0 , t_sam2bam_for = 0;
@@ -375,7 +373,7 @@ void SwBam:: ProducerSwBamTask2_parallel_memory( BamWrite *write, sam_hdr_t *h ,
         batch.count = 0;
 
         //1. 主核读取 SAM 文本 ----------
-        temp1 = GetTime();
+        // temp1 = GetTime();
         while (batch.count < BATCH_SIZE) {
             bool ok = mem_getline(reader, &batch.sam_lines[batch.count]);
 
@@ -384,19 +382,19 @@ void SwBam:: ProducerSwBamTask2_parallel_memory( BamWrite *write, sam_hdr_t *h ,
             batch.count++;
         }
         if (batch.count == 0) break;
-        t_sam2bam_read += GetTime() - temp1;
+        // t_sam2bam_read += GetTime() - temp1;
 
         //2. 从核并行 sam_parse1 ----------
-        temp4 = GetTime();
+        // temp4 = GetTime();
         {
             std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
             __real_athread_spawn((void *)slave_sam_parse, &batch, 1);
             athread_join();
         }
-        t_sam_parse += GetTime() - temp4;
+        // t_sam_parse += GetTime() - temp4;
 
         //3. 主核对一个批次进行打包 ---------
-        temp4 = GetTime();
+        // temp4 = GetTime();
         for (int i = 0; i < batch.count; i++) {
             bam1_t *b = batch.bams[i];
             bam1_t_nums++;
@@ -423,7 +421,7 @@ void SwBam:: ProducerSwBamTask2_parallel_memory( BamWrite *write, sam_hdr_t *h ,
                 cur_group.clear();
             }
         }
-        t_sam2bam_for += GetTime() - temp4;
+        // t_sam2bam_for += GetTime() - temp4;
         
     }
 
@@ -657,13 +655,13 @@ void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
         }
 
         //调用从核处理一块：解析，压缩成bgzf块
-        temp2 = GetTime();
+        // temp2 = GetTime();
         {
             std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
             __real_athread_spawn((void*)slave_compressfunc, comp_paras, 1);
             athread_join();
         }
-        t_sam2bam_slave += GetTime() - temp2;
+        // t_sam2bam_slave += GetTime() - temp2;
 
         for (int i = 0; i < 64; i++) {
             //处理完的结果放入到complete中
@@ -883,12 +881,9 @@ void SwBam::ProcessSwBam() {
                 while (batch.count < BATCH_SIZE) {
                     b = complete->getBam1_t();
                     if (!b) break;
+
                     num++;
-
                     batch.bams[batch.count] = b;
-                    kstring_t *ks = &batch.sam_lines[batch.count];
-                    ks->l = 0;
-
                     batch.count++;
                 }
                 if (batch.count == 0) break;
@@ -897,16 +892,16 @@ void SwBam::ProcessSwBam() {
                 sout->format.category = sequence_data;
                 sout->format.format = sam;
 
-                temp4 = GetTime();
+                // temp4 = GetTime();
                 {
                     std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
                     __real_athread_spawn((void*)slave_sam_format, &batch, 1);
                     athread_join();
                 }
-                t_sam_parse += GetTime() - temp4;
+                // t_sam_parse += GetTime() - temp4;
 
                 // 3. 主核按顺序写入文件中
-                temp3 = GetTime();
+                // temp3 = GetTime();
                 for (int i = 0; i < batch.count; i++) {
                     kstring_t *ks = &batch.sam_lines[i];
 
@@ -920,7 +915,7 @@ void SwBam::ProcessSwBam() {
                     complete->backBam1_t(batch.bams[i]);
                     
                 }
-                t_bam2sam_write += GetTime() - temp3;
+                // t_bam2sam_write += GetTime() - temp3;
             }
 
             destroy_batch_buffers(&batch);
@@ -964,10 +959,10 @@ void SwBam::ProcessSwBam() {
 
             // write = new BamWrite(500);
             // writeComplete = new BamWriteComplete(500);
-            write = new BamWrite(2870);
-            writeComplete = new BamWriteComplete(16400);
-            // write = new BamWrite(128);
-            // writeComplete = new BamWriteComplete(128);
+            // write = new BamWrite(2870);
+            // writeComplete = new BamWriteComplete(16400);
+            write = new BamWrite(128);
+            writeComplete = new BamWriteComplete(128);
             printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
 
             //生产者线程---
@@ -984,11 +979,11 @@ void SwBam::ProcessSwBam() {
             #else
             thread producer2(bind(&SwBam::ProducerSwBamTask2, this, sin, write, hdr));
             #endif
-            producer2.join();
+            // producer2.join();
 
             //消费者线程----
             thread consumer2(bind(&SwBam::ConsumerSwBamTask2, this, write , writeComplete));
-            consumer2.join();
+            // consumer2.join();
 
             //剩下是主线程
             t0 = GetTime();
@@ -1008,13 +1003,13 @@ void SwBam::ProcessSwBam() {
                 writeComplete->backBlock(comp_block);
             }
 
-            // producer2.join();
-            // consumer2.join();
-            printf("The actual time of reading sam cost %lf\n", t_sam2bam_read);
-            printf("The actual time of sam parsing cost %lf\n", t_sam_parse);
-            printf("The actual time of for loops in producer cost %lf\n", t_sam2bam_for);
-            printf("The actual time of slave cost %lf\n", t_sam2bam_slave);
-            printf("The actual time of writing to bam cost %lf\n", t_sam2bam_write);
+            producer2.join();
+            consumer2.join();
+            // printf("The actual time of reading sam cost %lf\n", t_sam2bam_read);
+            // printf("The actual time of sam parsing cost %lf\n", t_sam_parse);
+            // printf("The actual time of for loops in producer cost %lf\n", t_sam2bam_for);
+            // printf("The actual time of slave cost %lf\n", t_sam2bam_slave);
+            // printf("The actual time of writing to bam cost %lf\n", t_sam2bam_write);
             printf("Complete main thread writing to bam cost %lf\n", GetTime() - t0);
             printf("The total BGZF nums is %lld\n", num2);
             break;
