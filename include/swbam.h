@@ -50,6 +50,7 @@ private:
     void ProducerSwBamTask2(samFile *fp, BamWrite *write, sam_hdr_t *h);
     void ProducerSwBamTask2_parallel(samFile *fp, BamWrite *write, sam_hdr_t *h);
     void ProducerSwBamTask2_parallel_memory(BamWrite *write, sam_hdr_t *h , MemReader reader);
+    void ProducerSwBamTask2_parallel_memory_OP( BamWrite *write, sam_hdr_t *h , MemReader reader);
     int writeBlockTobam(BGZF *fp, bam_block *block);
 
     static inline const char *get_sam_open_mode(const std::string &out_name) {

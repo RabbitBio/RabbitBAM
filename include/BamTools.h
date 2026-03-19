@@ -35,6 +35,30 @@ const size_t MAX_RECORDS_PER_BLOCK = 1024;
 //bam1_t 的data最大长度 暂定1KB
 const size_t INIT_DATA_SIZE = 1024;  
 
+//一条sam文本的最大长度
+#define MAX_SAM_LINE_SIZE 8192   // 8 KB
+#define BATCH_PER_CORE 1024
+//一个批次的大小
+#define BATCH_SIZE (64 * BATCH_PER_CORE)
+
+
+//sam读取时需要用的-------------------------------
+#define SAM_CHUNK_SIZE (4 * 1024 * 1024)         // 目标切分大小 4MB
+#define CHUNK_BUFFER_SIZE (5 * 1024 * 1024)      // 实际分配 5MB，防止向后扫描找换行时越界
+#define MAX_BAMS_PER_CHUNK 10240                 // 4MB最多包含的记录数（安全值）
+typedef struct {
+    char *text_buf;                      
+    size_t text_len;                     
+    bam1_t *bams[MAX_BAMS_PER_CHUNK];    
+    int count;                           
+} SamParseChunk;
+
+typedef struct {
+    const sam_hdr_t *hdr;
+    SamParseChunk chunks[64];            
+} SamParseBatch; 
+
+
 //使用内存读写----
 struct MemReader {
     char *base;
@@ -99,11 +123,6 @@ struct bgzf_cache_t {
 
 typedef struct bam_block bam_block;
 
-
-#define MAX_SAM_LINE_SIZE 8192   // 8 KB（足够覆盖绝大多数）
-#define BATCH_PER_CORE 1024
-#define BATCH_SIZE (64 * BATCH_PER_CORE)
-
 #define KS_SEP_SPACE 0 // isspace(): \t, \n, \v, \f, \r
 #define KS_SEP_TAB   1 // isspace() && !' '
 #define KS_SEP_LINE  2 // line separator: "\n" (Unix) or "\r\n" (Windows)
@@ -112,8 +131,9 @@ typedef struct bam_block bam_block;
 typedef struct {
     const sam_hdr_t *hdr;
     bam1_t *bams[BATCH_SIZE];
-    kstring_t sam_lines[BATCH_SIZE];  // 每条 BAM 对应一条 SAM 字符串
-    int count;   // 实际 bam 数
+    kstring_t sam_lines[BATCH_SIZE];  
+    kstring_t core_out_lines[64];  
+    int count;   
 } SamFormatBatch;
 
 

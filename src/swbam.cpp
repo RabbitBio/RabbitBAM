@@ -9,6 +9,9 @@ extern "C" {
     void slave_compressfunc();
     void slave_sam_format();
     void slave_sam_parse();
+
+    void slave_sam_parse_chunk();
+    void slave_count_lines();
 }
 
 // Global mutex to coordinate reader and writer spawn
@@ -25,6 +28,90 @@ SwBam::SwBam(CmdInfo *cmd_info1) {
 
 SwBam::~SwBam() {
 
+}
+
+void init_batch_buffers(SamFormatBatch *batch)
+{
+    batch->count = 0;
+
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+        kstring_t *ks = &batch->sam_lines[i];
+
+        ks->l = 0;
+        ks->m = MAX_SAM_LINE_SIZE;
+        ks->s = (char *)aligned_alloc_custom(64, MAX_SAM_LINE_SIZE);
+
+        if (!ks->s) {
+            fprintf(stderr, "Failed to alloc sam buffer %d\n", i);
+            abort();
+        }
+    }
+}
+
+void destroy_batch_buffers(SamFormatBatch *batch)
+{
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+        kstring_t *ks = &batch->sam_lines[i];
+        if (ks->s) {
+            aligned_free_custom((unsigned char*)ks->s);
+            ks->s = NULL;
+        }
+        ks->l = ks->m = 0;
+    }
+}
+
+void init_sam_format_batch_buffers(SamFormatBatch *batch)
+{
+    batch->count = 0;
+    
+    int batch_per_core = (BATCH_SIZE / 64) + 1; 
+    size_t core_buf_size = MAX_SAM_LINE_SIZE * batch_per_core;
+
+    for (int i = 0; i < 64; ++i) {
+        kstring_t *ks = &batch->core_out_lines[i];
+
+        ks->l = 0;
+        ks->m = core_buf_size;
+        ks->s = (char *)aligned_alloc_custom(64, core_buf_size);
+
+        if (!ks->s) {
+            fprintf(stderr, "Failed to alloc sam buffer for core %d\n", i);
+            abort();
+        }
+    }
+}
+
+void destroy_sam_format_batch_buffers(SamFormatBatch *batch)
+{
+    for (int i = 0; i < 64; ++i) {
+        kstring_t *ks = &batch->core_out_lines[i];
+        if (ks->s) {
+            aligned_free_custom((unsigned char*)ks->s);
+            ks->s = NULL;
+        }
+        ks->l = ks->m = 0;
+    }
+}
+
+void init_sam_parse_batch(SamParseBatch *batch) {
+    for (int i = 0; i < 64; ++i) {
+        batch->chunks[i].text_buf = (char *)aligned_alloc_custom(64, CHUNK_BUFFER_SIZE);
+        if (!batch->chunks[i].text_buf) {
+            fprintf(stderr, "Failed to allocate 5MB chunk for core %d\n", i);
+            abort();
+        }
+        batch->chunks[i].text_len = 0;
+        batch->chunks[i].count = 0;
+    }
+}
+
+void destroy_sam_parse_batch(SamParseBatch *batch) {
+    for (int i = 0; i < 64; ++i) {
+        if (batch->chunks[i].text_buf) {
+            aligned_free_custom((unsigned char*)batch->chunks[i].text_buf);
+            batch->chunks[i].text_buf = nullptr;
+        }
+    }
 }
 
 //使用内存读写-----------------------------------------------------------------------------------------------------------------------
@@ -131,17 +218,17 @@ void SwBam::ProducerSwBamTask_memory(BGZF *fp, BamRead *read , char *bam_mem, si
     int group_num = 0;
     int ret=-1;
 
-    size_t pos = 0;
+    size_t pos = fp->block_address;
 
     while (true) {
 
-        // temp1 = GetTime();
+        temp1 = GetTime();
         ret = mem_read_block(
                 bam_mem,
                 bam_size,
                 pos,
                 block);
-        // t_bam2sam_read += GetTime() - temp1;
+        t_bam2sam_read += GetTime() - temp1;
         
         if (ret < 0) break; //读取错误或结束
 
@@ -268,15 +355,15 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
         }
 
         //调用从核进行解压缩，解析
-        // temp2 = GetTime();
+        temp2 = GetTime();
         {
             std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
             __real_athread_spawn((void *) slave_decompressfunc, degz_paras, 1);
             athread_join();
         }
-        // t_bam2sam_slave += GetTime() - temp2;
+        t_bam2sam_slave += GetTime() - temp2;
 
-        // temp2 = GetTime();
+        temp2 = GetTime();
         for (int i = 0; i < 64; i++) {
             if (degz_paras[i].status == 0 && degz_paras[i].input_block != NULL) {
                 //printf("degz_paras[%d].n_records = %d\n",i , degz_paras[i].n_records);
@@ -302,7 +389,7 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
                 read->backBlock(degz_paras[i].input_block);
             }
         }
-        // t_bam2sam_for += GetTime() - temp2;
+        t_bam2sam_for += GetTime() - temp2;
     }
 
     complete->markComplete(); // 标记全部处理完成
@@ -318,39 +405,141 @@ int SwBam::writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b) {
     return 0;
 }
 
-void init_batch_buffers(SamFormatBatch *batch)
-{
-    batch->count = 0;
-
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-        kstring_t *ks = &batch->sam_lines[i];
-
-        ks->l = 0;
-        ks->m = MAX_SAM_LINE_SIZE;
-        ks->s = (char *)aligned_alloc_custom(64, MAX_SAM_LINE_SIZE);
-
-        if (!ks->s) {
-            fprintf(stderr, "Failed to alloc sam buffer %d\n", i);
-            abort();
-        }
-    }
-}
-
-void destroy_batch_buffers(SamFormatBatch *batch)
-{
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-        kstring_t *ks = &batch->sam_lines[i];
-        if (ks->s) {
-            aligned_free_custom((unsigned char*)ks->s);
-            ks->s = NULL;
-        }
-        ks->l = ks->m = 0;
-    }
-}
-
-
 
 //---------------------------------------------------------------------------------------------------------------------
+
+void SwBam::ProducerSwBamTask2_parallel_memory_OP(BamWrite *write, sam_hdr_t *h, MemReader reader) {
+    printf("ProducerSwBamTask2_parallel_memory (Read-Forward) started\n");
+    double t0 = GetTime();
+
+    std::vector<bam1_t*> cur_block;
+    std::vector<std::vector<bam1_t*>> cur_group;
+
+    bam1_core_t *c;
+    uint32_t bam_len, total_len = 0;
+    int block_nums = 0, group_nums = 0, bam1_t_nums = 0;
+
+    SamParseBatch batch;
+    init_sam_parse_batch(&batch);
+    batch.hdr = h;
+
+    while (reader.pos < reader.size) {
+        int active_chunks = 0;
+
+        //向后寻找换行并拷贝
+        for (int i = 0; i < 64; i++) {
+            if (reader.pos >= reader.size) break;
+
+            size_t start_pos = reader.pos;
+            size_t end_pos = start_pos + SAM_CHUNK_SIZE; 
+
+            if (end_pos < reader.size) {
+                while (end_pos < reader.size && reader.base[end_pos] != '\n') {
+                    end_pos++;
+                }
+                if (end_pos < reader.size && reader.base[end_pos] == '\n') {
+                    end_pos++;
+                }
+            } else {
+                end_pos = reader.size;
+            }
+
+            size_t read_len = end_pos - start_pos;
+            if (read_len >= CHUNK_BUFFER_SIZE) {
+                printf("FATAL: Single line exceeds 1MB redundancy buffer!\n");
+            }
+
+            SamParseChunk *chunk = &batch.chunks[i];
+            
+            memcpy(chunk->text_buf, reader.base + start_pos, read_len);
+            chunk->text_len = read_len;
+            chunk->text_buf[read_len] = '\0'; 
+            chunk->count = 0;
+
+            reader.pos = end_pos;
+            active_chunks++;
+        }
+
+        if (active_chunks == 0) break;
+
+        //将未使用的 chunk 清零，防止旧数据被从核处理
+        for (int i = active_chunks; i < 64; i++) {
+            batch.chunks[i].text_len = 0;
+            batch.chunks[i].count    = 0;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
+            __real_athread_spawn((void *)slave_count_lines, &batch, 1);
+            athread_join();
+        }
+
+        for (int i = 0; i < active_chunks; i++) {
+            SamParseChunk *chunk = &batch.chunks[i];
+            if (chunk->count > MAX_BAMS_PER_CHUNK) {
+                printf("\n[FATAL ERROR] Core %d chunk count (%d) EXCEEDS array limit (%d)!\n", 
+                        i, chunk->count, MAX_BAMS_PER_CHUNK);
+                printf("Please increase MAX_BAMS_PER_CHUNK in your header!\n");
+            }
+
+            for (int j = 0; j < chunk->count; j++) {
+                chunk->bams[j] = write->getEmpty();
+            }
+        }
+
+        //从核并行解析
+        {
+            std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
+            __real_athread_spawn((void *)slave_sam_parse_chunk, &batch, 1);
+            athread_join();
+        }
+
+        //打包写入
+        for (int i = 0; i < active_chunks; i++) {
+            SamParseChunk *chunk = &batch.chunks[i];
+            
+            for (int j = 0; j < chunk->count; j++) {
+                bam1_t *b = chunk->bams[j];
+                bam1_t_nums++;
+                c = &b->core;
+                bam_len = b->l_data - c->l_extranul + 32; 
+                
+                if( bam_len + 4 + total_len <= BGZF_BLOCK_SIZE ) { 
+                    cur_block.push_back(b);
+                    total_len = total_len + bam_len + 4;
+                } else {
+                    block_nums++;
+                    cur_group.push_back(cur_block);
+                    cur_block.clear();
+                    cur_block.push_back(b);
+                    total_len = bam_len + 4;
+                }
+
+                if ((int)cur_group.size() >= 64) {
+                    group_nums++;
+                    write->inputGroup(cur_group);
+                    cur_group.clear();
+                }
+            }
+        }
+    }
+
+    if (!cur_block.empty()) {
+        block_nums++;
+        cur_group.push_back(cur_block);
+        cur_block.clear();
+    }
+    if (!cur_group.empty()) {
+        group_nums++;
+        write->inputGroup(cur_group);
+        cur_group.clear();
+    }
+
+    write->markComplete();
+    destroy_sam_parse_batch(&batch);
+    printf("ProducerSwBamTask2_parallel_memory finished. bam1_t_nums=%d, blocks=%d, groups=%d, cost %lf\n", bam1_t_nums, block_nums, group_nums, GetTime() - t0);
+}
+
 void SwBam:: ProducerSwBamTask2_parallel_memory( BamWrite *write, sam_hdr_t *h , MemReader reader){
     printf("ProducerSwBamTask2_parallel_memory started\n");
     double t0 = GetTime();
@@ -442,7 +631,6 @@ void SwBam:: ProducerSwBamTask2_parallel_memory( BamWrite *write, sam_hdr_t *h ,
     printf("ProducerSwBamTask2_parallel_memory finished with bam1_t_nums = %d , block_num = %d , group_num = %d , cost %lf\n", bam1_t_nums, block_nums , group_nums , GetTime() - t0 );
 
     write->markComplete();
-
 }
 
 void SwBam:: ProducerSwBamTask2_parallel(samFile *fp, BamWrite *write, sam_hdr_t *h){
@@ -524,7 +712,6 @@ void SwBam:: ProducerSwBamTask2_parallel(samFile *fp, BamWrite *write, sam_hdr_t
                 cur_group.clear();
             }
         }
-        // t_sam_parse += GetTime() - temp4;
         
     }
 
@@ -704,7 +891,6 @@ int SwBam:: writeBlockTobam(BGZF *fp, bam_block *block) {
 }
 
 void SwBam::ProcessSwBam() {
-
     double t0 = GetTime();
 
     //in文件打开
@@ -742,10 +928,10 @@ void SwBam::ProcessSwBam() {
 
     t0 = GetTime();
     size_t sam_size;
-    char *sam_mem;
+    char *sam_mem = nullptr;
     MemReader reader;
     size_t bam_size;
-    char *bam_mem;
+    char *bam_mem = nullptr;
     MemWriter mem_writer;
 
     switch (sin->format.format) {
@@ -764,7 +950,7 @@ void SwBam::ProcessSwBam() {
             printf("Loaded BAM into memory: %.2f MB\n",bam_size / 1024.0 / 1024.0);
 
             //内存写--
-            size_t sam_estimate = bam_size * 4;
+            size_t sam_estimate = bam_size * 5;
             init_mem_writer(mem_writer, sam_estimate);
             printf("Initialized SAM memory writer: %.2f MB\n",sam_estimate / 1024.0 / 1024.0);
         
@@ -842,10 +1028,10 @@ void SwBam::ProcessSwBam() {
             //BamComplete(x) x是bam1_t的内存池大小
 
             //read = new BamRead(50);
-            // read = new BamRead(260);
-            // complete = new BamComplete(2932000);
-            read = new BamRead(5);
-            complete = new BamComplete(132000);
+            read = new BamRead(260);
+            complete = new BamComplete(2932000);
+            // read = new BamRead(5);
+            // complete = new BamComplete(132000);
 
             printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
 
@@ -855,11 +1041,11 @@ void SwBam::ProcessSwBam() {
             #else
             thread producer(bind(&SwBam::ProducerSwBamTask, this, sin->fp.bgzf, read));
             #endif
-            // producer.join();
+            producer.join();
 
             //消费者线程----
             thread consumer(bind(&SwBam::ConsumerSwBamTask, this, read , complete));
-            // consumer.join();
+            consumer.join();
 
             //剩下是主线程
             t0 = GetTime();
@@ -869,7 +1055,7 @@ void SwBam::ProcessSwBam() {
             printf("Enable the SAM_FORMAT_PARALLEL!!!\n");
 
             SamFormatBatch batch;
-            init_batch_buffers(&batch);
+            init_sam_format_batch_buffers(&batch);
             batch.hdr = hdr;
 
             long long num = 0;
@@ -892,33 +1078,33 @@ void SwBam::ProcessSwBam() {
                 sout->format.category = sequence_data;
                 sout->format.format = sam;
 
-                // temp4 = GetTime();
+                temp4 = GetTime();
                 {
                     std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
                     __real_athread_spawn((void*)slave_sam_format, &batch, 1);
                     athread_join();
                 }
-                // t_sam_parse += GetTime() - temp4;
+                t_sam_parse += GetTime() - temp4;
 
                 // 3. 主核按顺序写入文件中
-                // temp3 = GetTime();
-                for (int i = 0; i < batch.count; i++) {
-                    kstring_t *ks = &batch.sam_lines[i];
-
+                temp3 = GetTime();
+                for (int i = 0; i < 64; i++) {
+                    kstring_t *ks = &batch.core_out_lines[i];
+                    
                     #ifdef USE_MEMORY
                     write_sam_to_mem(mem_writer, ks->s, ks->l);
                     #else
                     if (hwrite(sout->fp.hfile, ks->s, ks->l) != ks->l)
                         fprintf(stderr,"write failed\n");
                     #endif
-
-                    complete->backBam1_t(batch.bams[i]);
-                    
                 }
-                // t_bam2sam_write += GetTime() - temp3;
+                for (int i = 0; i < batch.count; i++) {
+                    complete->backBam1_t(batch.bams[i]);
+                }
+                t_bam2sam_write += GetTime() - temp3;
             }
 
-            destroy_batch_buffers(&batch);
+            destroy_sam_format_batch_buffers(&batch);
             #else
             long long num = 0;
             bam1_t *b;
@@ -937,13 +1123,13 @@ void SwBam::ProcessSwBam() {
             }
             #endif
 
-            producer.join();
-            consumer.join();
-            // printf("The actual time of reading bam cost %lf\n", t_bam2sam_read);
-            // printf("The actual time of slave cost %lf\n", t_bam2sam_slave);
-            // printf("The actual time of for loops in consumer cost %lf\n", t_bam2sam_for);
-            // printf("The actual time of sam parsing cost %lf\n", t_sam_parse);
-            // printf("The actual time of writing to sam cost %lf\n", t_bam2sam_write);
+            // producer.join();
+            // consumer.join();
+            printf("The actual time of reading bam cost %lf\n", t_bam2sam_read);
+            printf("The actual time of slave cost %lf\n", t_bam2sam_slave);
+            printf("The actual time of for loops in consumer cost %lf\n", t_bam2sam_for);
+            printf("The actual time of sam parsing cost %lf\n", t_sam_parse);
+            printf("The actual time of writing to sam cost %lf\n", t_bam2sam_write);
             printf("Complete main thread writing to sam cost %lf\n", GetTime() - t0);
             printf("The total bam1_t nums is %lld\n", num);
             break;
@@ -959,9 +1145,12 @@ void SwBam::ProcessSwBam() {
 
             // write = new BamWrite(500);
             // writeComplete = new BamWriteComplete(500);
+
             // write = new BamWrite(2870);
             // writeComplete = new BamWriteComplete(16400);
-            write = new BamWrite(128);
+
+            // write = new BamWrite(128);
+            write = new BamWrite(700);
             writeComplete = new BamWriteComplete(128);
             printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
 
@@ -971,7 +1160,7 @@ void SwBam::ProcessSwBam() {
             #ifdef USE_MEMORY
             printf("Enable the SAM_PARSE_PARALLEL!!!\n");
             printf("Enable the USE_MEMORY!!!\n");
-            thread producer2(bind(&SwBam::ProducerSwBamTask2_parallel_memory, this, write, hdr, reader));
+            thread producer2(bind(&SwBam::ProducerSwBamTask2_parallel_memory_OP, this, write, hdr, reader));
             #else
             printf("Enable the SAM_PARSE_PARALLEL!!!\n");
             thread producer2(bind(&SwBam::ProducerSwBamTask2_parallel, this, sin, write, hdr));
@@ -989,6 +1178,7 @@ void SwBam::ProcessSwBam() {
             t0 = GetTime();
             long long num2 = 0;
             bam_block* comp_block;
+
             while (true) {
                 comp_block = writeComplete->getCompressedBlock();
                 if(comp_block == nullptr) break;
@@ -997,11 +1187,13 @@ void SwBam::ProcessSwBam() {
 
                 #ifdef USE_MEMORY
                 write_block_to_mem(mem_writer, comp_block);
+                // int write_ret = writeBlockTobam(sout->fp.bgzf, comp_block);
                 #else
                 int write_ret = writeBlockTobam(sout->fp.bgzf, comp_block);
                 #endif
                 writeComplete->backBlock(comp_block);
             }
+
 
             producer2.join();
             consumer2.join();
@@ -1021,6 +1213,40 @@ void SwBam::ProcessSwBam() {
             break;
     }
 
+
+    printf("Complete the body1 cost %lf\n", GetTime() - tbody);
+
+    #ifdef USE_MEMORY
+    #define DUMP_MEM
+    #ifdef DUMP_MEM
+    //将内存中的主体数据落盘到sout中
+    double dump_t0 = GetTime();
+    if (sout->format.format == bam) {
+        bgzf_flush(sout->fp.bgzf);
+        if (hwrite(sout->fp.bgzf->fp, mem_writer.data, mem_writer.size) != mem_writer.size) {
+            fprintf(stderr, "Error dumping memory to BAM output file\n");
+        }
+    } else if (sout->format.format == sam) {
+        hflush(sout->fp.hfile); 
+        if (hwrite(sout->fp.hfile, mem_writer.data, mem_writer.size) != mem_writer.size) {
+            fprintf(stderr, "Error dumping memory to SAM output file\n");
+        }
+    }
+    // 释放内存池
+    if (mem_writer.data) {
+        free(mem_writer.data);
+        mem_writer.data = nullptr;
+    }
+    if (sam_mem){
+        free(sam_mem);
+    }
+    if (bam_mem){
+        free(bam_mem);
+    }
+    printf("Dump memory to output file cost %lf\n", GetTime() - dump_t0);
+    #endif
+    #endif
+
     //释放内存
     sam_hdr_destroy(hdr);
     int ret;
@@ -1034,6 +1260,8 @@ void SwBam::ProcessSwBam() {
     }
     printf("Complete the body cost %lf\n", GetTime() - tbody);
 
+
+    
     
 }
 

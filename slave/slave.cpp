@@ -916,9 +916,9 @@ int rabbit_bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen,
     //写入一个EOF块，但是从核这里用不到，可以在主核写入
     if (slen == 0) {
         // EOF block
-        if (*dlen < 28) return -1;
-        memcpy(_dst, "\037\213\010\4\0\0\0\0\0\377\6\0\102\103\2\0\033\0\3\0\0\0\0\0\0\0\0\0", 28);
-        *dlen = 28;
+        // if (*dlen < 28) return -1;
+        // memcpy(_dst, "\037\213\010\4\0\0\0\0\0\377\6\0\102\103\2\0\033\0\3\0\0\0\0\0\0\0\0\0", 28);
+        // *dlen = 28;
         return 0;
     }
 
@@ -1019,31 +1019,31 @@ extern "C" void sam_format(void *arg) {
     SamFormatBatch *batch = (SamFormatBatch *)arg;
     int cid = _PEN;
 
-    //按块划分
-    int start = cid * BATCH_PER_CORE;
-    int end   = start + BATCH_PER_CORE;
+    kstring_t *ks_out = &batch->core_out_lines[cid];
+    ks_out->l = 0; 
 
-    if (start >= batch->count) return;
-    if (end > batch->count) end = batch->count;
+    int total_tasks = batch->count;
+    if (total_tasks == 0) return;
 
-    for (int i = start; i < end; i++) {
-        kstring_t *ks = &batch->sam_lines[i];
-        ks->l = 0;
+    int start, end;
+    int base_tasks = total_tasks >> 6;  
+    int remainder = total_tasks & 63;   
 
-        sam_format1(batch->hdr, batch->bams[i], ks);
-
-        kputc('\n', ks);
+    if (cid < remainder) {
+        start = cid * (base_tasks + 1);
+        end = start + base_tasks + 1;
+    } else {
+        start = remainder + cid * base_tasks;
+        end = start + base_tasks;
     }
 
-    //均匀划分
-    // for (int i = cid; i < batch->count; i += 64) {
-    //     kstring_t *ks = &batch->sam_lines[i];
-    //     ks->l = 0;
+    if (start >= total_tasks || start >= end) return;
 
-    //     sam_format1(batch->hdr, batch->bams[i], ks);
-
-    //     kputc('\n', ks);
-    // }
+    for (int i = start; i < end; i++) {
+        // sam_format1(batch->hdr, batch->bams[i], ks_out);
+        sam_format1_append(batch->hdr, batch->bams[i], ks_out);
+        kputc('\n', ks_out);
+    }
 }
 
 
@@ -1071,8 +1071,16 @@ extern "C" void slave_compressfunc(Comp_Para paras[64]) {
 
 
     //1. 将 bam1_t 记录 逐个解析并写入 到 uncompressed 中
+    int a=0;
     for (int i = 0; i < para->n_records; i++) {
         bam1_t* b = para->input_records[i];
+
+        if( b->l_data == 0){
+            printf("slave_compressfunc: b->l_data is 0\n");
+            printf("slave_compressfunc: b->core.l_qseq is %d\n", b->core.l_qseq);
+            printf("slave_compressfunc: b->core.l_qname is %s\n", b->core.l_qname);
+        }
+
         //print_bam1(b);
         writeBam1_to_block(uncompressed, b , 0);
     }
@@ -1091,30 +1099,101 @@ extern "C" void slave_compressfunc(Comp_Para paras[64]) {
 }
 
 
+
 extern "C" void slave_sam_parse(void *arg) {
-
     SamFormatBatch *batch = (SamFormatBatch *)arg;
-    int tid = _PEN;  // 0~63
+    int tid = _PEN;
 
-    //按块划分
-    int start = tid * BATCH_PER_CORE;
-    int end   = start + BATCH_PER_CORE;
+    int total_tasks = batch->count;
+    if (total_tasks == 0) return;
 
-    if (start >= batch->count) return;
-    if (end > batch->count) end = batch->count;
+    int start, end;
+
+    if (total_tasks == 64 * BATCH_PER_CORE) { 
+        start = tid * BATCH_PER_CORE;
+        end = start + BATCH_PER_CORE;
+    } else {
+        int base_tasks = total_tasks >> 6;  
+        int remainder = total_tasks & 63;   
+
+        if (tid < remainder) {
+            start = tid * (base_tasks + 1);
+            end = start + (base_tasks + 1);
+        } else {
+            start = remainder + tid * base_tasks;
+            end = start + base_tasks;
+        }
+    }
+
+    if (start >= total_tasks || start >= end) return;
 
     for (int i = start; i < end; i++) {
         kstring_t *ks = &batch->sam_lines[i];
         sam_parse1(ks, (sam_hdr_t *)batch->hdr, batch->bams[i]);
         ks->l = 0;
     }
-
-    // //均匀划分
-    // for (int i = tid; i < batch->count; i += 64) {
-    //     kstring_t *ks = &batch->sam_lines[i];
-
-    //     sam_parse1(ks, (sam_hdr_t *)batch->hdr, batch->bams[i]);
-    //     ks->l = 0;
-    // }
 }
+
+
+extern "C" void slave_count_lines(void *arg) {
+    SamParseBatch *batch = (SamParseBatch *)arg;
+    int tid = _PEN; 
+    SamParseChunk *chunk = &batch->chunks[tid];
+    
+    if (chunk->text_len == 0) return;
+    char *ptr = chunk->text_buf;
+    size_t len = chunk->text_len;
+    int count = 0;
+
+    for (size_t i = 0; i < len; ++i) {
+        if (ptr[i] == '\n') count++;
+    }
+    chunk->count = count;
+}
+
+extern "C" void slave_sam_parse_chunk(void *arg) {
+    SamParseBatch *batch = (SamParseBatch *)arg;
+    int tid = _PEN; 
+    SamParseChunk *chunk = &batch->chunks[tid];
+    
+    if (chunk->text_len == 0 || chunk->count == 0) return;
+
+    char *ptr = chunk->text_buf;
+    char *end = ptr + chunk->text_len;
+    int valid_count = 0;
+
+    while (ptr < end && valid_count < chunk->count) {
+        char *eol = ptr;
+        while (eol < end && *eol != '\n') eol++;
+
+        if (eol == ptr) { 
+            ptr = eol + 1;
+            continue;
+        }
+
+        kstring_t ks;
+        ks.s = ptr;
+        ks.l = eol - ptr;
+        ks.m = ks.l + 1;
+
+        if (ks.l > 0 && ks.s[ks.l - 1] == '\r') {
+            ks.l--; 
+        }
+
+        char saved_char = ks.s[ks.l]; 
+        ks.s[ks.l] = '\0'; 
+
+        int ret = sam_parse1(&ks, (sam_hdr_t *)batch->hdr, chunk->bams[valid_count]);
+
+        ks.s[ks.l] = saved_char; 
+
+        if (ret >= 0) {
+            valid_count++;
+        }
+        ptr = eol + 1; 
+    }
+    chunk->count = valid_count;
+}
+
+
 
