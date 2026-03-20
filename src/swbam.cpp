@@ -9,9 +9,8 @@ extern "C" {
     void slave_compressfunc();
     void slave_sam_format();
     void slave_sam_parse();
-
     void slave_sam_parse_chunk();
-    void slave_count_lines();
+    void slave_copy_and_count(); 
 }
 
 // Global mutex to coordinate reader and writer spawn
@@ -414,6 +413,9 @@ void SwBam::ProducerSwBamTask2_parallel_memory_OP(BamWrite *write, sam_hdr_t *h,
 
     std::vector<bam1_t*> cur_block;
     std::vector<std::vector<bam1_t*>> cur_group;
+    //预留容量，避免 push_back 时频繁扩容
+    cur_block.reserve(MAX_RECORDS_PER_BLOCK); 
+    cur_group.reserve(64);
 
     bam1_core_t *c;
     uint32_t bam_len, total_len = 0;
@@ -426,12 +428,18 @@ void SwBam::ProducerSwBamTask2_parallel_memory_OP(BamWrite *write, sam_hdr_t *h,
     while (reader.pos < reader.size) {
         int active_chunks = 0;
 
-        //向后寻找换行并拷贝
+        // 阶段 1：主核只做边界切分，记录 src_ptr/src_len，不再 memcpy
         for (int i = 0; i < 64; i++) {
-            if (reader.pos >= reader.size) break;
+            SamParseChunk *chunk = &batch.chunks[i];
+            if (reader.pos >= reader.size) {
+                // 清零未使用 chunk，防止 slave_copy_and_count 处理旧数据
+                chunk->src_len = 0;
+                chunk->count   = 0;
+                continue;
+            }
 
             size_t start_pos = reader.pos;
-            size_t end_pos = start_pos + SAM_CHUNK_SIZE; 
+            size_t end_pos   = start_pos + SAM_CHUNK_SIZE;
 
             if (end_pos < reader.size) {
                 while (end_pos < reader.size && reader.base[end_pos] != '\n') {
@@ -446,15 +454,14 @@ void SwBam::ProducerSwBamTask2_parallel_memory_OP(BamWrite *write, sam_hdr_t *h,
 
             size_t read_len = end_pos - start_pos;
             if (read_len >= CHUNK_BUFFER_SIZE) {
-                printf("FATAL: Single line exceeds 1MB redundancy buffer!\n");
+                fprintf(stderr, "FATAL: chunk exceeds buffer! read_len=%zu\n", read_len);
+                abort();
             }
 
-            SamParseChunk *chunk = &batch.chunks[i];
-            
-            memcpy(chunk->text_buf, reader.base + start_pos, read_len);
-            chunk->text_len = read_len;
-            chunk->text_buf[read_len] = '\0'; 
-            chunk->count = 0;
+            // 只记录原始指针和长度，memcpy 留给从核并行完成
+            chunk->src_ptr = reader.base + start_pos;
+            chunk->src_len = read_len;
+            chunk->count   = 0;
 
             reader.pos = end_pos;
             active_chunks++;
@@ -462,51 +469,56 @@ void SwBam::ProducerSwBamTask2_parallel_memory_OP(BamWrite *write, sam_hdr_t *h,
 
         if (active_chunks == 0) break;
 
-        //将未使用的 chunk 清零，防止旧数据被从核处理
-        for (int i = active_chunks; i < 64; i++) {
-            batch.chunks[i].text_len = 0;
-            batch.chunks[i].count    = 0;
-        }
-
+        // 阶段 2：从核并行 copy + count
         {
             std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
-            __real_athread_spawn((void *)slave_count_lines, &batch, 1);
+            __real_athread_spawn((void *)slave_copy_and_count, &batch, 1);
             athread_join();
         }
 
+        // 阶段 3：主核分配 bam1_t*（记录预分配数量，供阶段 4 后回收多余的）
+        int pre_alloc_count[64] = {};
         for (int i = 0; i < active_chunks; i++) {
             SamParseChunk *chunk = &batch.chunks[i];
             if (chunk->count > MAX_BAMS_PER_CHUNK) {
-                printf("\n[FATAL ERROR] Core %d chunk count (%d) EXCEEDS array limit (%d)!\n", 
+                fprintf(stderr, "\n[FATAL ERROR] Core %d chunk count (%d) EXCEEDS array limit (%d)!\n",
                         i, chunk->count, MAX_BAMS_PER_CHUNK);
-                printf("Please increase MAX_BAMS_PER_CHUNK in your header!\n");
+                abort();
             }
-
+            pre_alloc_count[i] = chunk->count;
             for (int j = 0; j < chunk->count; j++) {
                 chunk->bams[j] = write->getEmpty();
             }
         }
 
-        //从核并行解析
+        // 阶段 4：从核并行解析
         {
             std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
             __real_athread_spawn((void *)slave_sam_parse_chunk, &batch, 1);
             athread_join();
         }
 
-        //打包写入
+        // 阶段 4.5：回收解析失败导致多余分配的 bam1_t，但是会有互斥访问的问题，暂时注释掉
+        // for (int i = 0; i < active_chunks; i++) {
+        //     printf("回收解析失败导致多余分配的 %d 个 bam1_t\n", pre_alloc_count[i] - batch.chunks[i].count);
+        //     SamParseChunk *chunk = &batch.chunks[i];
+        //     for (int j = chunk->count; j < pre_alloc_count[i]; j++) {
+        //         write->backBam(chunk->bams[j]);
+        //     }
+        // }
+
+        // 阶段 5：主核打包写入队列
         for (int i = 0; i < active_chunks; i++) {
             SamParseChunk *chunk = &batch.chunks[i];
-            
             for (int j = 0; j < chunk->count; j++) {
                 bam1_t *b = chunk->bams[j];
                 bam1_t_nums++;
                 c = &b->core;
-                bam_len = b->l_data - c->l_extranul + 32; 
-                
-                if( bam_len + 4 + total_len <= BGZF_BLOCK_SIZE ) { 
+                bam_len = b->l_data - c->l_extranul + 32;
+
+                if (bam_len + 4 + total_len <= BGZF_BLOCK_SIZE) {
                     cur_block.push_back(b);
-                    total_len = total_len + bam_len + 4;
+                    total_len += bam_len + 4;
                 } else {
                     block_nums++;
                     cur_group.push_back(cur_block);
@@ -537,7 +549,8 @@ void SwBam::ProducerSwBamTask2_parallel_memory_OP(BamWrite *write, sam_hdr_t *h,
 
     write->markComplete();
     destroy_sam_parse_batch(&batch);
-    printf("ProducerSwBamTask2_parallel_memory finished. bam1_t_nums=%d, blocks=%d, groups=%d, cost %lf\n", bam1_t_nums, block_nums, group_nums, GetTime() - t0);
+    printf("ProducerSwBamTask2_parallel_memory finished. bam1_t_nums=%d, blocks=%d, groups=%d, cost %lf\n",
+           bam1_t_nums, block_nums, group_nums, GetTime() - t0);
 }
 
 void SwBam:: ProducerSwBamTask2_parallel_memory( BamWrite *write, sam_hdr_t *h , MemReader reader){
@@ -1138,19 +1151,15 @@ void SwBam::ProcessSwBam() {
 
         case sam:{
             t0 = GetTime();
-            // const size_t INIT_DATA_SIZE = 1024;  
-            // const size_t MAX_RECORDS_PER_BLOCK = 1024; 
             //BamWrite(x) x*MAX_RECORDS_PER_BLOCK是bam1_t的内存池大小
             //BamWriteComplete(x) x是bam_block的内存池大小
 
-            // write = new BamWrite(500);
-            // writeComplete = new BamWriteComplete(500);
-
+            //串行测试用
             // write = new BamWrite(2870);
             // writeComplete = new BamWriteComplete(16400);
 
             // write = new BamWrite(128);
-            write = new BamWrite(700);
+            write = new BamWrite(640);
             writeComplete = new BamWriteComplete(128);
             printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
 
@@ -1262,7 +1271,119 @@ void SwBam::ProcessSwBam() {
 
 
     
+    //#define DEBUG_COMPARE
+    #ifdef DEBUG_COMPARE
+    printf("\n======================================================\n");
+    printf("开始进行底层解压全量比对，寻找 BUG 根源...\n");
     
+    // 替换为你的正确文件路径
+    const char* correct_file_path = "../data/output-HG00096-parallel.bam"; 
+    const char* test_file_path = cmd_info_->out_file_name_.c_str(); 
+
+    BGZF *fp_correct = bgzf_open(correct_file_path, "r");
+    BGZF *fp_test = bgzf_open(test_file_path, "r");
+
+    if (!fp_correct || !fp_test) {
+        fprintf(stderr, "比对失败：无法打开其中一个比对文件！\n");
+        if (fp_correct) bgzf_close(fp_correct);
+        if (fp_test) bgzf_close(fp_test);
+    } else {
+        const int BUF_SIZE = 65536;
+        uint8_t *buf_correct = (uint8_t*)malloc(BUF_SIZE);
+        uint8_t *buf_test = (uint8_t*)malloc(BUF_SIZE);
+
+        long long total_bytes = 0;
+        
+        // 【新增】：用于宏观统计的变量
+        long long diff_byte_count = 0;   // 总共错了多少个字节
+        long long diff_chunk_count = 0;  // 错了多少个 64KB 的块
+        int max_dumps = 3;               // 最多打印 3 次案发现场，防止终端被刷爆
+        int dumps_printed = 0;
+
+        while (1) {
+            // 读取解压后的明文二进制数据
+            int len1 = bgzf_read(fp_correct, buf_correct, BUF_SIZE);
+            int len2 = bgzf_read(fp_test, buf_test, BUF_SIZE);
+
+            if (len1 <= 0 && len2 <= 0) break; // 读到文件末尾
+
+            // 取两者中较短的长度进行安全比对
+            int min_len = len1 < len2 ? len1 : len2;
+            bool chunk_has_diff = false;
+
+            for (int i = 0; i < min_len; i++) {
+                if (buf_correct[i] != buf_test[i]) {
+                    diff_byte_count++; // 记录错误字节数
+                    
+                    if (!chunk_has_diff) {
+                        chunk_has_diff = true;
+                        diff_chunk_count++; // 记录错误块数
+                    }
+
+                    // 只详细打印前几个案发现场
+                    if (dumps_printed < max_dumps) {
+                        long long offset = total_bytes + i;
+                        fprintf(stderr, "\n🚨 抓到内鬼！在解压后的第 %lld 字节处发生不一致！\n", offset);
+                        fprintf(stderr, "正确文件字节: 0x%02X\n", buf_correct[i]);
+                        fprintf(stderr, "你的文件字节: 0x%02X\n", buf_test[i]);
+                        
+                        fprintf(stderr, "\n[案发现场 - 正确 BAM 的内存 (Hex)]:\n");
+                        int start = (i >= 16) ? i - 16 : 0;
+                        int end = (i + 16 < min_len) ? i + 16 : min_len;
+                        for(int j = start; j < end; j++) {
+                            if (j == i) fprintf(stderr, "[[%02X]] ", buf_correct[j]); 
+                            else fprintf(stderr, "%02X ", buf_correct[j]);
+                        }
+                        
+                        fprintf(stderr, "\n\n[案发现场 - 你的 BAM 的内存 (Hex)]:\n");
+                        for(int j = start; j < end; j++) {
+                            if (j == i) fprintf(stderr, "[[%02X]] ", buf_test[j]);   
+                            else fprintf(stderr, "%02X ", buf_test[j]);
+                        }
+                        fprintf(stderr, "\n\n");
+                        dumps_printed++;
+                    }
+                }
+            }
+
+            // 如果长度发生分歧，后续所有字节必然全部错位，继续比对无意义，必须跳出
+            if (len1 != len2) {
+                fprintf(stderr, "\n🚨 警告：数据长度在解压后第 %lld 字节处发生分歧！正确长度 %d，你的长度 %d\n", total_bytes, len1, len2);
+                break;
+            }
+
+            total_bytes += min_len;
+            if (total_bytes % (1024 * 1024 * 50) == 0) { 
+                printf("已比对 %lld MB 解压数据... 当前发现 %lld 个错误字节，分布在 %lld 个 64KB 读取块中\n", 
+                        total_bytes / (1024 * 1024), diff_byte_count, diff_chunk_count);
+            }
+        }
+
+        // ================= 输出最终体检报告 =================
+        if (diff_byte_count == 0) {
+            printf("\n🎉 恭喜！这两个文件的底层解压数据【完全一模一样】！\n");
+            if (bgzf_check_EOF(fp_correct) && !bgzf_check_EOF(fp_test)) {
+                 printf("🚨 警告：你的文件缺少合法的 EOF 尾块！\n");
+            }
+        } else {
+            printf("\n💥 比对结束！共发现 %lld 个错误字节，分布在 %lld 个 64KB 解压块中。\n", 
+                   diff_byte_count, diff_chunk_count);
+            
+            // 简单推论：
+            if (diff_byte_count > 10000) {
+                printf("💡 推论：错误字节极其庞大，说明在第一个错误点之后，数据发生了严重的【移位】或整块【被覆盖/跳过】。\n");
+            } else {
+                printf("💡 推论：错误只发生在局部少数几个字节，极有可能是因为【从核 64KB 溢出截断】导致。\n");
+            }
+        }
+
+        free(buf_correct);
+        free(buf_test);
+        bgzf_close(fp_correct);
+        bgzf_close(fp_test);
+    }
+    printf("======================================================\n");
+    #endif
 }
 
 

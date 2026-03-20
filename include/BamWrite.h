@@ -30,6 +30,10 @@ private:
     int q_bg, q_ed, q_size;
 
     bool write_complete;
+
+    // 批量分配的底层资源（替代每条记录独立 alloc，大幅降低初始化耗时）
+    bam1_t  *bam1_struct_pool_;  // 所有 bam1_t 结构体的连续内存
+    uint8_t *data_pool_;         // 所有 data 缓冲区的连续 64 字节对齐内存
 };
 
 #endif

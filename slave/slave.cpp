@@ -1074,13 +1074,6 @@ extern "C" void slave_compressfunc(Comp_Para paras[64]) {
     int a=0;
     for (int i = 0; i < para->n_records; i++) {
         bam1_t* b = para->input_records[i];
-
-        if( b->l_data == 0){
-            printf("slave_compressfunc: b->l_data is 0\n");
-            printf("slave_compressfunc: b->core.l_qseq is %d\n", b->core.l_qseq);
-            printf("slave_compressfunc: b->core.l_qname is %s\n", b->core.l_qname);
-        }
-
         //print_bam1(b);
         writeBam1_to_block(uncompressed, b , 0);
     }
@@ -1097,8 +1090,6 @@ extern "C" void slave_compressfunc(Comp_Para paras[64]) {
     para->status = 0; // success
 
 }
-
-
 
 extern "C" void slave_sam_parse(void *arg) {
     SamFormatBatch *batch = (SamFormatBatch *)arg;
@@ -1134,19 +1125,26 @@ extern "C" void slave_sam_parse(void *arg) {
     }
 }
 
-
-extern "C" void slave_count_lines(void *arg) {
+extern "C" void slave_copy_and_count(void *arg) {
     SamParseBatch *batch = (SamParseBatch *)arg;
-    int tid = _PEN; 
+    int tid = _PEN;
     SamParseChunk *chunk = &batch->chunks[tid];
-    
-    if (chunk->text_len == 0) return;
-    char *ptr = chunk->text_buf;
-    size_t len = chunk->text_len;
-    int count = 0;
 
+    if (chunk->src_len == 0) {
+        chunk->text_len = 0;
+        chunk->count    = 0;
+        return;
+    }
+
+    memcpy(chunk->text_buf, chunk->src_ptr, chunk->src_len);
+    chunk->text_buf[chunk->src_len] = '\0';
+    chunk->text_len = chunk->src_len;
+
+    int count = 0;
+    const char *p = chunk->text_buf;
+    size_t len = chunk->src_len;
     for (size_t i = 0; i < len; ++i) {
-        if (ptr[i] == '\n') count++;
+        if (p[i] == '\n') count++;
     }
     chunk->count = count;
 }

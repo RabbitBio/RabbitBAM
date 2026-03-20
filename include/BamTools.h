@@ -45,10 +45,13 @@ const size_t INIT_DATA_SIZE = 1024;
 //sam读取时需要用的-------------------------------
 #define SAM_CHUNK_SIZE (4 * 1024 * 1024)         // 目标切分大小 4MB
 #define CHUNK_BUFFER_SIZE (5 * 1024 * 1024)      // 实际分配 5MB，防止向后扫描找换行时越界
-#define MAX_BAMS_PER_CHUNK 10240                 // 4MB最多包含的记录数（安全值）
+#define MAX_BAMS_PER_CHUNK 10240                 // 4MB最多包含的记录数
 typedef struct {
-    char *text_buf;                      
-    size_t text_len;                     
+    const char *src_ptr;                 // 指向原始 SAM 内存的 chunk 起始位置
+    size_t src_len;                      // chunk 原始字节数（不含 \0）
+
+    char *text_buf;                      // 从核 copy 的目标缓冲区（64 字节对齐）
+    size_t text_len;                     // copy 后的有效字节数（slave_copy_and_count 填写）
     bam1_t *bams[MAX_BAMS_PER_CHUNK];    
     int count;                           
 } SamParseChunk;
