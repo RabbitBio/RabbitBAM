@@ -16,7 +16,6 @@ BamWrite::BamWrite(int queue_size) {
     if (posix_memalign((void**)&data_pool_, 64, (size_t)total_size * INIT_DATA_SIZE) != 0) {
         perror("posix_memalign data pool"); exit(1);
     }
-    memset(data_pool_, 0, (size_t)total_size * INIT_DATA_SIZE);
 
     for (int i = 0; i < total_size; i++) {
         bam1_t *b = &bam1_struct_pool_[i];
@@ -51,13 +50,46 @@ bam1_t* BamWrite::getEmpty() {
     return bamPool[num];
 }
 
+void BamWrite::getEmptyBatch(bam1_t** dst, int n) {
+    // 等待池中积累足够槽位
+    while (true) {
+        int avail = (pool_ed - pool_bg + pool_size) % pool_size;
+        if (avail >= n) break;
+        usleep(10);
+    }
+    // 批量 memcpy，处理环形缓冲区绕回
+    int next = pool_bg;
+    int part1 = pool_size - next;
+    if (part1 >= n) {
+        memcpy(dst, bamPool + next, (size_t)n * sizeof(bam1_t*));
+    } else {
+        memcpy(dst,        bamPool + next, (size_t)part1       * sizeof(bam1_t*));
+        memcpy(dst + part1, bamPool,       (size_t)(n - part1) * sizeof(bam1_t*));
+    }
+    pool_bg = (pool_bg + n) % pool_size;
+}
+
 void BamWrite::backBam(bam1_t *b) {
     bamPool[(pool_ed + 1) % pool_size] = b;
     pool_ed = (pool_ed + 1) % pool_size;
 }
 
-void BamWrite::inputGroup(const std::vector<std::vector<bam1_t*>>& group) {
-    groupQueue[(q_ed + 1) % q_size] = group;
+void BamWrite::backBamBatch(bam1_t** const records, int n) {
+    if (n <= 0) return;
+    int next = (pool_ed + 1) % pool_size;
+    int part1 = pool_size - next;
+    if (part1 >= n) {
+        memcpy(bamPool + next, records, (size_t)n * sizeof(bam1_t*));
+    } else {
+        memcpy(bamPool + next, records,        (size_t)part1       * sizeof(bam1_t*));
+        memcpy(bamPool,        records + part1, (size_t)(n - part1) * sizeof(bam1_t*));
+    }
+    pool_ed = (pool_ed + n) % pool_size;
+}
+
+void BamWrite::inputGroup(std::vector<std::vector<bam1_t*>> group) {
+    // move 进队列：避免深拷贝和 ~64 次子 vector 堆分配
+    groupQueue[(q_ed + 1) % q_size] = std::move(group);
     q_ed = (q_ed + 1) % q_size;
 }
 
@@ -67,8 +99,8 @@ std::vector<std::vector<bam1_t*>> BamWrite::getGroup() {
         if (write_complete && (q_ed + 1) % q_size == q_bg) return {};
     }
 
-    int num = q_bg;
-    auto group = groupQueue[q_bg];
+    // move 出队列：避免深拷贝，queue 槽位变为空状态，下次 inputGroup 复用
+    auto group = std::move(groupQueue[q_bg]);
     q_bg = (q_bg + 1) % q_size;
     return group;
 }

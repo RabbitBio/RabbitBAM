@@ -1186,6 +1186,8 @@ extern "C" void slave_sam_parse_chunk(void *arg) {
         ks.s[ks.l] = saved_char; 
 
         if (ret >= 0) {
+            bam1_t *b = chunk->bams[valid_count];
+            chunk->bam_lens[valid_count] = (uint32_t)(b->l_data - b->core.l_extranul + 32);
             valid_count++;
         }
         ptr = eol + 1; 

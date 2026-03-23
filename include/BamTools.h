@@ -52,7 +52,8 @@ typedef struct {
 
     char *text_buf;                      // 从核 copy 的目标缓冲区（64 字节对齐）
     size_t text_len;                     // copy 后的有效字节数（slave_copy_and_count 填写）
-    bam1_t *bams[MAX_BAMS_PER_CHUNK];    
+    bam1_t *bams[MAX_BAMS_PER_CHUNK];
+    uint32_t *bam_lens;                  //预计算 bam_len
     int count;                           
 } SamParseChunk;
 

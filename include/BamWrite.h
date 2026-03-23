@@ -2,7 +2,7 @@
 #define BAMWRITE_H
 
 #include <vector>
-#include <htslib/sam.h>   //bam_init1();  bam_destroy1();
+#include <htslib/sam.h>  
 #include <unistd.h>
 #include <cstdio>
 #include "BamTools.h"
@@ -13,9 +13,11 @@ public:
     ~BamWrite();
 
     bam1_t* getEmpty();
+    void getEmptyBatch(bam1_t** dst, int n);
     void backBam(bam1_t *b);
+    void backBamBatch(bam1_t** const records, int n);
 
-    void inputGroup(const std::vector<std::vector<bam1_t*>>& group);
+    void inputGroup(std::vector<std::vector<bam1_t*>> group);
     std::vector<std::vector<bam1_t*>> getGroup();
 
     bool isComplete() const;
@@ -31,7 +33,6 @@ private:
 
     bool write_complete;
 
-    // 批量分配的底层资源（替代每条记录独立 alloc，大幅降低初始化耗时）
     bam1_t  *bam1_struct_pool_;  // 所有 bam1_t 结构体的连续内存
     uint8_t *data_pool_;         // 所有 data 缓冲区的连续 64 字节对齐内存
 };

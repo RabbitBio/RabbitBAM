@@ -99,6 +99,12 @@ void init_sam_parse_batch(SamParseBatch *batch) {
             fprintf(stderr, "Failed to allocate 5MB chunk for core %d\n", i);
             abort();
         }
+        // bam_lens：64 字节对齐，供从核写入预计算的 bam_len，pack 阶段顺序读取
+        batch->chunks[i].bam_lens = (uint32_t *)aligned_alloc_custom(64, MAX_BAMS_PER_CHUNK * sizeof(uint32_t));
+        if (!batch->chunks[i].bam_lens) {
+            fprintf(stderr, "Failed to allocate bam_lens for core %d\n", i);
+            abort();
+        }
         batch->chunks[i].text_len = 0;
         batch->chunks[i].count = 0;
     }
@@ -109,6 +115,10 @@ void destroy_sam_parse_batch(SamParseBatch *batch) {
         if (batch->chunks[i].text_buf) {
             aligned_free_custom((unsigned char*)batch->chunks[i].text_buf);
             batch->chunks[i].text_buf = nullptr;
+        }
+        if (batch->chunks[i].bam_lens) {
+            aligned_free_custom((unsigned char*)batch->chunks[i].bam_lens);
+            batch->chunks[i].bam_lens = nullptr;
         }
     }
 }
@@ -417,7 +427,7 @@ void SwBam::ProducerSwBamTask2_parallel_memory_OP(BamWrite *write, sam_hdr_t *h,
     cur_block.reserve(MAX_RECORDS_PER_BLOCK); 
     cur_group.reserve(64);
 
-    bam1_core_t *c;
+    bam1_core_t *c __attribute__((unused));
     uint32_t bam_len, total_len = 0;
     int block_nums = 0, group_nums = 0, bam1_t_nums = 0;
 
@@ -429,6 +439,7 @@ void SwBam::ProducerSwBamTask2_parallel_memory_OP(BamWrite *write, sam_hdr_t *h,
         int active_chunks = 0;
 
         // 阶段 1：主核只做边界切分，记录 src_ptr/src_len，不再 memcpy
+        temp1 = GetTime();
         for (int i = 0; i < 64; i++) {
             SamParseChunk *chunk = &batch.chunks[i];
             if (reader.pos >= reader.size) {
@@ -466,6 +477,7 @@ void SwBam::ProducerSwBamTask2_parallel_memory_OP(BamWrite *write, sam_hdr_t *h,
             reader.pos = end_pos;
             active_chunks++;
         }
+        t_sam2bam_read += GetTime() - temp1;
 
         if (active_chunks == 0) break;
 
@@ -476,79 +488,65 @@ void SwBam::ProducerSwBamTask2_parallel_memory_OP(BamWrite *write, sam_hdr_t *h,
             athread_join();
         }
 
-        // 阶段 3：主核分配 bam1_t*（记录预分配数量，供阶段 4 后回收多余的）
-        int pre_alloc_count[64] = {};
+        // 阶段 3：主核分配 bam1_t*（getEmptyBatch 一次 memcpy 取出 count 个，
         for (int i = 0; i < active_chunks; i++) {
             SamParseChunk *chunk = &batch.chunks[i];
-            if (chunk->count > MAX_BAMS_PER_CHUNK) {
-                fprintf(stderr, "\n[FATAL ERROR] Core %d chunk count (%d) EXCEEDS array limit (%d)!\n",
-                        i, chunk->count, MAX_BAMS_PER_CHUNK);
-                abort();
-            }
-            pre_alloc_count[i] = chunk->count;
-            for (int j = 0; j < chunk->count; j++) {
-                chunk->bams[j] = write->getEmpty();
-            }
+            write->getEmptyBatch(chunk->bams, chunk->count);
         }
 
         // 阶段 4：从核并行解析
+        temp4 = GetTime();
         {
             std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
             __real_athread_spawn((void *)slave_sam_parse_chunk, &batch, 1);
             athread_join();
         }
-
-        // 阶段 4.5：回收解析失败导致多余分配的 bam1_t，但是会有互斥访问的问题，暂时注释掉
-        // for (int i = 0; i < active_chunks; i++) {
-        //     printf("回收解析失败导致多余分配的 %d 个 bam1_t\n", pre_alloc_count[i] - batch.chunks[i].count);
-        //     SamParseChunk *chunk = &batch.chunks[i];
-        //     for (int j = chunk->count; j < pre_alloc_count[i]; j++) {
-        //         write->backBam(chunk->bams[j]);
-        //     }
-        // }
+        t_sam_parse += GetTime() - temp4;
 
         // 阶段 5：主核打包写入队列
+        temp4 = GetTime();
         for (int i = 0; i < active_chunks; i++) {
             SamParseChunk *chunk = &batch.chunks[i];
             for (int j = 0; j < chunk->count; j++) {
                 bam1_t *b = chunk->bams[j];
                 bam1_t_nums++;
-                c = &b->core;
-                bam_len = b->l_data - c->l_extranul + 32;
+                bam_len = (int)chunk->bam_lens[j]; // 从核已在 parse 时预算好，无需再访问 bam1_t
 
                 if (bam_len + 4 + total_len <= BGZF_BLOCK_SIZE) {
                     cur_block.push_back(b);
                     total_len += bam_len + 4;
                 } else {
                     block_nums++;
-                    cur_group.push_back(cur_block);
+                    // move 而非 copy：避免 ~3200 次/轮次的堆拷贝，move 后 cur_block 变空
+                    cur_group.push_back(std::move(cur_block));
                     cur_block.clear();
+                    cur_block.reserve(MAX_RECORDS_PER_BLOCK); // 立即重新预留，避免下次 push_back 重分配
                     cur_block.push_back(b);
                     total_len = bam_len + 4;
                 }
 
                 if ((int)cur_group.size() >= 64) {
                     group_nums++;
-                    write->inputGroup(cur_group);
+                    // move 传入：inputGroup 内部再 move 进队列，整条路径无深拷贝
+                    write->inputGroup(std::move(cur_group));
                     cur_group.clear();
+                    cur_group.reserve(64);
                 }
             }
         }
+        t_sam2bam_for += GetTime() - temp4;
     }
 
     if (!cur_block.empty()) {
         block_nums++;
-        cur_group.push_back(cur_block);
-        cur_block.clear();
+        cur_group.push_back(std::move(cur_block));
     }
     if (!cur_group.empty()) {
         group_nums++;
-        write->inputGroup(cur_group);
-        cur_group.clear();
+        write->inputGroup(std::move(cur_group));
     }
 
     write->markComplete();
-    destroy_sam_parse_batch(&batch);
     printf("ProducerSwBamTask2_parallel_memory finished. bam1_t_nums=%d, blocks=%d, groups=%d, cost %lf\n",
            bam1_t_nums, block_nums, group_nums, GetTime() - t0);
 }
@@ -855,13 +853,13 @@ void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
         }
 
         //调用从核处理一块：解析，压缩成bgzf块
-        // temp2 = GetTime();
+        temp2 = GetTime();
         {
             std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
             __real_athread_spawn((void*)slave_compressfunc, comp_paras, 1);
             athread_join();
         }
-        // t_sam2bam_slave += GetTime() - temp2;
+        t_sam2bam_slave += GetTime() - temp2;
 
         for (int i = 0; i < 64; i++) {
             //处理完的结果放入到complete中
@@ -869,18 +867,217 @@ void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
                 complete->pushCompressedBlock(comp_paras[i].output_block);
             }
 
-            // 回收输入的bam1_t
             if (comp_paras[i].input_records && comp_paras[i].n_records > 0) {
-                for (int r = 0; r < comp_paras[i].n_records; ++r) {
-                    bam1_t *rec = comp_paras[i].input_records[r];
-                    write->backBam(rec);
-                }
+                write->backBamBatch(comp_paras[i].input_records, comp_paras[i].n_records);
             }
         }
     }
 
-    complete->markComplete(); // 标记全部处理完成
+    complete->markComplete(); 
     printf("ConsumerSwBamTask2 finished , cost %lf!\n", GetTime() - t0); 
+}
+
+// ---------------------------------------------------------------------------
+// FusedSamToBam: 单线程融合 Producer + Consumer + Writer
+//
+// 核心思路：
+//   1. 消除 3-thread 带来的 mutex 竞争、上下文切换和 usleep 轮询开销
+//   2. 在 spawn → join 之间插入主核写盘工作，利用从核工作窗口
+//   3. 双缓冲 Comp_Para：当前 compress 的 slave 运行期间，
+//      主核处理上一次 compress 的结果（write_block_to_mem + backBamBatch）
+//
+// 预期时间：~1.84s = slave_total(1.76) + serial_gaps(0.08)
+// ---------------------------------------------------------------------------
+void SwBam::FusedSamToBam(BamWrite *write, BamWriteComplete *complete,
+                          sam_hdr_t *h, MemReader reader, MemWriter &mem_writer) {
+    double t0 = GetTime();
+    double t_copy_count = 0, t_parse = 0, t_compress = 0, t_pack = 0;
+    double ts;
+
+    SamParseBatch batch;
+    init_sam_parse_batch(&batch);
+    batch.hdr = h;
+
+    std::vector<bam1_t*> cur_block;
+    std::vector<std::vector<bam1_t*>> cur_group;
+    cur_block.reserve(MAX_RECORDS_PER_BLOCK);
+    cur_group.reserve(64);
+
+    uint32_t bam_len, total_len = 0;
+    int block_nums = 0, group_nums = 0, bam1_t_nums = 0;
+    long long bgzf_nums = 0;
+
+    // 双缓冲 Comp_Para：A/B 交替使用，一个给当前 spawn，一个保存上次结果
+    Comp_Para comp_buf_A[64], comp_buf_B[64];
+    Comp_Para *comp_active  = comp_buf_A;
+    Comp_Para *comp_pending = comp_buf_B;
+    std::vector<std::vector<bam1_t*>> pending_group;
+    bool has_pending = false;
+
+    // 处理上一次 compress 的结果（写盘 + 回收 bam1_t）
+    auto flush_pending = [&]() {
+        if (!has_pending) return;
+        for (int k = 0; k < 64; k++) {
+            if (comp_pending[k].status == 0 && comp_pending[k].output_block) {
+                write_block_to_mem(mem_writer, comp_pending[k].output_block);
+                complete->backBlock(comp_pending[k].output_block);
+                bgzf_nums++;
+            }
+            if (comp_pending[k].input_records && comp_pending[k].n_records > 0) {
+                write->backBamBatch(comp_pending[k].input_records, comp_pending[k].n_records);
+            }
+        }
+        pending_group.clear();
+        has_pending = false;
+    };
+
+    // 压缩一个 group（64 blocks）并将上一次结果在从核工作期间写盘
+    auto do_compress = [&]() {
+        for (int k = (int)cur_group.size(); k < 64; k++)
+            cur_group.push_back({});
+
+        for (int k = 0; k < 64; k++) {
+            if (cur_group[k].empty()) {
+                comp_active[k].block_id = k;
+                comp_active[k].input_records = nullptr;
+                comp_active[k].n_records = 0;
+                comp_active[k].output_block = nullptr;
+                comp_active[k].un_comp_block = nullptr;
+                comp_active[k].output_size = 0;
+                comp_active[k].status = -1;
+                continue;
+            }
+            comp_active[k].block_id = k;
+            comp_active[k].input_records = cur_group[k].data();
+            comp_active[k].n_records = (int)cur_group[k].size();
+            comp_active[k].output_block = complete->getEmpty();
+            comp_active[k].un_comp_block = complete->getBuffer(k);
+            comp_active[k].output_size = 0;
+            comp_active[k].status = 0;
+        }
+
+        ts = GetTime();
+        __real_athread_spawn((void*)slave_compressfunc, comp_active, 1);
+        flush_pending();   // 主核：在从核压缩期间处理上一轮结果
+        athread_join();
+        t_compress += GetTime() - ts;
+
+        // 当前结果变为 pending，下一次 spawn 时再处理
+        pending_group = std::move(cur_group);
+        std::swap(comp_active, comp_pending);
+        has_pending = true;
+
+        cur_group.clear();
+        cur_group.reserve(64);
+    };
+
+    while (reader.pos < reader.size) {
+        int active_chunks = 0;
+
+        // 阶段 1：主核边界切分
+        for (int i = 0; i < 64; i++) {
+            SamParseChunk *chunk = &batch.chunks[i];
+            if (reader.pos >= reader.size) {
+                chunk->src_len = 0;
+                chunk->count   = 0;
+                continue;
+            }
+            size_t start_pos = reader.pos;
+            size_t end_pos   = start_pos + SAM_CHUNK_SIZE;
+            if (end_pos < reader.size) {
+                while (end_pos < reader.size && reader.base[end_pos] != '\n') end_pos++;
+                if (end_pos < reader.size && reader.base[end_pos] == '\n') end_pos++;
+            } else {
+                end_pos = reader.size;
+            }
+            size_t read_len = end_pos - start_pos;
+            if (read_len >= CHUNK_BUFFER_SIZE) {
+                fprintf(stderr, "FATAL: chunk exceeds buffer! read_len=%zu\n", read_len);
+                abort();
+            }
+            chunk->src_ptr = reader.base + start_pos;
+            chunk->src_len = read_len;
+            chunk->count   = 0;
+            reader.pos = end_pos;
+            active_chunks++;
+        }
+        if (active_chunks == 0) break;
+
+        // 阶段 2：从核 copy+count（无 mutex！单线程不需要）
+        ts = GetTime();
+        __real_athread_spawn((void *)slave_copy_and_count, &batch, 1);
+        flush_pending();   // 主核：在从核 copy 期间写上一轮压缩结果
+        athread_join();
+        t_copy_count += GetTime() - ts;
+
+        // 阶段 3：主核 getEmptyBatch
+        int pre_alloc_count[64];
+        for (int i = 0; i < active_chunks; i++) {
+            SamParseChunk *chunk = &batch.chunks[i];
+            pre_alloc_count[i] = chunk->count;
+            write->getEmptyBatch(chunk->bams, chunk->count);
+        }
+
+        // 阶段 4：从核并行解析（无 mutex！）
+        ts = GetTime();
+        __real_athread_spawn((void *)slave_sam_parse_chunk, &batch, 1);
+        athread_join();
+        t_parse += GetTime() - ts;
+
+        // 阶段 4.5：回收解析失败的 bam1_t
+        for (int i = 0; i < active_chunks; i++) {
+            SamParseChunk *chunk = &batch.chunks[i];
+            for (int j = chunk->count; j < pre_alloc_count[i]; j++)
+                write->backBam(chunk->bams[j]);
+        }
+
+        // 阶段 5+6：打包 + 压缩（交织执行）
+        ts = GetTime();
+        for (int i = 0; i < active_chunks; i++) {
+            SamParseChunk *chunk = &batch.chunks[i];
+            for (int j = 0; j < chunk->count; j++) {
+                bam1_t *b = chunk->bams[j];
+                bam1_t_nums++;
+                bam_len = (int)chunk->bam_lens[j];
+
+                if (bam_len + 4 + total_len <= BGZF_BLOCK_SIZE) {
+                    cur_block.push_back(b);
+                    total_len += bam_len + 4;
+                } else {
+                    block_nums++;
+                    cur_group.push_back(std::move(cur_block));
+                    cur_block.clear();
+                    cur_block.reserve(MAX_RECORDS_PER_BLOCK);
+                    cur_block.push_back(b);
+                    total_len = bam_len + 4;
+                }
+
+                if ((int)cur_group.size() >= 64) {
+                    group_nums++;
+                    do_compress();
+                }
+            }
+        }
+        t_pack += GetTime() - ts;
+    }
+
+    // 收尾
+    if (!cur_block.empty()) {
+        block_nums++;
+        cur_group.push_back(std::move(cur_block));
+    }
+    if (!cur_group.empty()) {
+        group_nums++;
+        do_compress();
+    }
+    flush_pending();
+
+    destroy_sam_parse_batch(&batch);
+
+    printf("FusedSamToBam finished. bam1_t=%d, blocks=%d, groups=%d, bgzf=%lld, cost %lf\n",
+           bam1_t_nums, block_nums, group_nums, bgzf_nums, GetTime() - t0);
+    printf("  copy_count=%lf  parse=%lf  pack(+compress)=%lf  compress_slave=%lf\n",
+           t_copy_count, t_parse, t_pack, t_compress);
 }
 
 int SwBam:: writeBlockTobam(BGZF *fp, bam_block *block) {
@@ -935,7 +1132,6 @@ void SwBam::ProcessSwBam() {
     printf("Complete the head cost %lf\n", GetTime() - t0);
 
 
-    //使用内存进行读写----------------------------------------------------------------------------------
     #define USE_MEMORY
     #ifdef USE_MEMORY
 
@@ -1158,65 +1354,77 @@ void SwBam::ProcessSwBam() {
             // write = new BamWrite(2870);
             // writeComplete = new BamWriteComplete(16400);
 
-            // write = new BamWrite(128);
             write = new BamWrite(640);
             writeComplete = new BamWriteComplete(128);
             printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
 
-            //生产者线程---
-            #define SAM_PARSE_PARALLEL
-            #ifdef SAM_PARSE_PARALLEL
-            #ifdef USE_MEMORY
-            printf("Enable the SAM_PARSE_PARALLEL!!!\n");
-            printf("Enable the USE_MEMORY!!!\n");
-            thread producer2(bind(&SwBam::ProducerSwBamTask2_parallel_memory_OP, this, write, hdr, reader));
-            #else
-            printf("Enable the SAM_PARSE_PARALLEL!!!\n");
-            thread producer2(bind(&SwBam::ProducerSwBamTask2_parallel, this, sin, write, hdr));
-            #endif
-            #else
-            thread producer2(bind(&SwBam::ProducerSwBamTask2, this, sin, write, hdr));
-            #endif
-            // producer2.join();
 
-            //消费者线程----
-            thread consumer2(bind(&SwBam::ConsumerSwBamTask2, this, write , writeComplete));
-            // consumer2.join();
+            //单线程：融合版本，内存模式，从内存读写数据
+            #define USE_FUSED_SAM2BAM
+            #if defined(USE_MEMORY) && defined(USE_FUSED_SAM2BAM)
+            printf("Enable FUSED single-thread mode (USE_MEMORY + USE_FUSED_SAM2BAM)!!!\n");
+            FusedSamToBam(write, writeComplete, hdr, reader, mem_writer);
 
-            //剩下是主线程
-            t0 = GetTime();
-            long long num2 = 0;
-            bam_block* comp_block;
 
-            while (true) {
-                comp_block = writeComplete->getCompressedBlock();
-                if(comp_block == nullptr) break;
-                num2++;
-                //print_bam_block(comp_block);
+            //流水线：内存模式，从内存读写数据
+            #elif defined(USE_MEMORY)
+            printf("Enable the SAM_PARSE_PARALLEL (3-thread, read and write from memory)!!!\n");
+            {
+                thread producer2(bind(&SwBam::ProducerSwBamTask2_parallel_memory_OP, this, write, hdr, reader));
+                // producer2.join();
+                thread consumer2(bind(&SwBam::ConsumerSwBamTask2, this, write , writeComplete));
+                // consumer2.join();
 
-                #ifdef USE_MEMORY
-                write_block_to_mem(mem_writer, comp_block);
-                // int write_ret = writeBlockTobam(sout->fp.bgzf, comp_block);
-                #else
-                int write_ret = writeBlockTobam(sout->fp.bgzf, comp_block);
-                #endif
-                writeComplete->backBlock(comp_block);
+                t0 = GetTime();
+                long long num2 = 0;
+                bam_block* comp_block;
+                while (true) {
+                    comp_block = writeComplete->getCompressedBlock();
+                    if (comp_block == nullptr) break;
+                    num2++;
+                    write_block_to_mem(mem_writer, comp_block);
+                    writeComplete->backBlock(comp_block);
+                }
+
+                producer2.join();
+                consumer2.join();
+                printf("The actual time of reading sam cost %lf\n", t_sam2bam_read);
+                printf("The actual time of sam parsing cost %lf\n", t_sam_parse);
+                printf("The actual time of for loops in producer cost %lf\n", t_sam2bam_for);
+                printf("The actual time of slave cost %lf\n", t_sam2bam_slave);
+                printf("The actual time of writing to bam cost %lf\n", t_sam2bam_write);
+                printf("Complete main thread writing to bam cost %lf\n", GetTime() - t0);
+                printf("The total BGZF nums is %lld\n", num2);
             }
 
 
-            producer2.join();
-            consumer2.join();
-            // printf("The actual time of reading sam cost %lf\n", t_sam2bam_read);
-            // printf("The actual time of sam parsing cost %lf\n", t_sam_parse);
-            // printf("The actual time of for loops in producer cost %lf\n", t_sam2bam_for);
-            // printf("The actual time of slave cost %lf\n", t_sam2bam_slave);
-            // printf("The actual time of writing to bam cost %lf\n", t_sam2bam_write);
-            printf("Complete main thread writing to bam cost %lf\n", GetTime() - t0);
-            printf("The total BGZF nums is %lld\n", num2);
+            //流水线：非内存模式，从磁盘读写数据
+            #else
+            printf("Enable the SAM_PARSE_PARALLEL (3-thread, read and write from disk)!!!\n");
+            {
+                thread producer2(bind(&SwBam::ProducerSwBamTask2_parallel, this, sin, write, hdr));
+                thread consumer2(bind(&SwBam::ConsumerSwBamTask2, this, write, writeComplete));
+                t0 = GetTime();
+                long long num2 = 0;
+                bam_block* comp_block;
+
+                while (true) {
+                    comp_block = writeComplete->getCompressedBlock();
+                    if (comp_block == nullptr) break;
+                    num2++;
+                    (void)writeBlockTobam(sout->fp.bgzf, comp_block);
+                    writeComplete->backBlock(comp_block);
+                }
+
+                producer2.join();
+                consumer2.join();
+                printf("Complete main thread writing to bam cost %lf\n", GetTime() - t0);
+                printf("The total BGZF nums is %lld\n", num2);
+            }
+            #endif
             break;
         }
             
-
         default:
             fprintf(stderr, "Unknown file format\n");
             break;
