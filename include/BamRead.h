@@ -1,5 +1,5 @@
 #ifndef BAMREAD_H
-#define BAMREADER_H
+#define BAMREAD_H
 
 #include <vector> 
 #include <unistd.h>
@@ -9,20 +9,20 @@
 
 class BamRead {
 public:
-    BamRead(int queue_size );  
+    BamRead(int blocks_size, int queue_size );  
     ~BamRead();
 
-    bam_block* getEmpty();  // 获取一个空 block（从池中）
-    void backBlock(bam_block* block);  // 回收 block
+    bam_block* getEmpty();  
+    void backBlock(bam_block* block);  
 
-    void inputBlock64(std::vector<bam_block*>& group);  // 推入一组64个
-    std::vector<bam_block*> getBlock64();  // 取出一组（64个）
+    void inputBlock64(std::vector<bam_block*>& group);  
+    std::vector<bam_block*> getBlock64();  
 
     bool isComplete() const;
     void markComplete();
 
 private:
-    std::vector<bam_block*> *consumer_queue_; // 每个元素是一组64个bam_block*
+    std::vector<bam_block*> *consumer_queue_; 
     int con_bg;
     int con_ed;
     int con_queueSizeLim;

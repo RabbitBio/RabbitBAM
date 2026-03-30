@@ -23,37 +23,34 @@
 
 #define BLOCK_HEADER_LENGTH 18
 #define BLOCK_FOOTER_LENGTH 8
-//#define BGZF_MAX_BLOCK_SIZE 0x10000
-//#define BGZF_MAX_BLOCK_COMPLETE_SIZE 0x40000
-//#define BGZF_MAX_BLOCK_COMPLETE_SIZE 0x10000
-//#define THREAD_NUM_P 6
 
 
-//一些预先设定好的大小----
-//每块最大bam1_t数量，暂定1024块
-const size_t MAX_RECORDS_PER_BLOCK = 1024; 
-//bam1_t 的data最大长度 暂定1KB
-const size_t INIT_DATA_SIZE = 1024;  
-
-//一条sam文本的最大长度
-#define MAX_SAM_LINE_SIZE 8192   // 8 KB
+const size_t MAX_RECORDS_PER_BLOCK = 1024;   //每块最大bam1_t数量，暂定1024块
+#define MAX_SAM_LINE_SIZE 8192   // 8 KB     //一条sam文本的最大长度
 #define BATCH_PER_CORE 1024
-//一个批次的大小
-#define BATCH_SIZE (64 * BATCH_PER_CORE)
+#define BATCH_SIZE (64 * BATCH_PER_CORE)     //一个批次的大小
 
+const size_t INIT_DATA_SIZE = 1024;           //bam1_t 的data最大长度 暂定1KB
 
-//sam读取时需要用的-------------------------------
-#define SAM_CHUNK_SIZE (4 * 1024 * 1024)         // 目标切分大小 4MB
-#define CHUNK_BUFFER_SIZE (5 * 1024 * 1024)      // 实际分配 5MB，防止向后扫描找换行时越界
-#define MAX_BAMS_PER_CHUNK 10240                 // 4MB最多包含的记录数
+#define SAM_CHUNK_SIZE (4 * 1024 * 1024)         
+#define CHUNK_BUFFER_SIZE (5 * 1024 * 1024)      
+#define MAX_BAMS_PER_CHUNK 10240              // 4MB最多包含的记录数
+
 typedef struct {
-    const char *src_ptr;                 // 指向原始 SAM 内存的 chunk 起始位置
-    size_t src_len;                      // chunk 原始字节数（不含 \0）
+    const sam_hdr_t *hdr;
+    bam1_t *bams[BATCH_SIZE];
+    kstring_t core_out_lines[64];  
+    int count;   
+} SamFormatBatch;
 
-    char *text_buf;                      // 从核 copy 的目标缓冲区（64 字节对齐）
-    size_t text_len;                     // copy 后的有效字节数（slave_copy_and_count 填写）
+
+typedef struct {
+    const char *src_ptr;                 
+    size_t src_len;                      
+    char *text_buf;                      
+    size_t text_len;                     
     bam1_t *bams[MAX_BAMS_PER_CHUNK];
-    uint32_t *bam_lens;                  //预计算 bam_len
+    uint32_t *bam_lens;             
     int count;                           
 } SamParseChunk;
 
@@ -62,8 +59,15 @@ typedef struct {
     SamParseChunk chunks[64];            
 } SamParseBatch; 
 
+typedef struct {
+    const sam_hdr_t *hdr;
+    bam1_t *bams[BATCH_SIZE];
+    kstring_t sam_lines[BATCH_SIZE];  
+    int count;   
+} SamParseByteBatch;
 
-//使用内存读写----
+
+
 struct MemReader {
     char *base;
     size_t size;
@@ -74,6 +78,45 @@ struct MemWriter {
     size_t size;
     size_t capacity;
 };
+
+typedef struct bam_block bam_block;
+
+
+struct Para {
+    int block_id;       
+
+    bam_block* input_block;   
+    bam_block* un_comp_block;
+
+    int decompress_size;      
+    std::vector<bam1_t*> output_records;  
+    int n_records;             
+    int status;               
+};
+
+struct Comp_Para {
+    int block_id;         
+    bam1_t **input_records; 
+    int n_records;       
+
+    bam_block *un_comp_block;         
+    int un_comp_size;            
+
+    bam_block *output_block; 
+    int output_size;     
+    int status;          
+};
+
+struct bam_block {
+    unsigned int errcode;
+    unsigned char *data;
+    unsigned int length;
+    unsigned int pos;      //记录记录在块中的偏移量，即当前记录的读取位置，在解析时使用
+    int64_t block_address; //该块在整个文件中的偏移位置
+    int block_id;          //块的编号
+};
+
+
 
 // Aligned memory allocation helper function
 // Allocates size bytes aligned to alignment (must be power of 2)
@@ -125,65 +168,16 @@ struct bgzf_cache_t {
 };
 
 
-typedef struct bam_block bam_block;
-
 #define KS_SEP_SPACE 0 // isspace(): \t, \n, \v, \f, \r
 #define KS_SEP_TAB   1 // isspace() && !' '
 #define KS_SEP_LINE  2 // line separator: "\n" (Unix) or "\r\n" (Windows)
 #define KS_SEP_MAX   2
 
-typedef struct {
-    const sam_hdr_t *hdr;
-    bam1_t *bams[BATCH_SIZE];
-    kstring_t sam_lines[BATCH_SIZE];  
-    kstring_t core_out_lines[64];  
-    int count;   
-} SamFormatBatch;
-
-
-struct Para {
-    int block_id;              // 当前块号
-    bam_block* input_block;    // 压缩块指针
-    bam_block* un_comp_block;
-    //uint8_t* decompress_buf;   // 解压缓冲区
-    int decompress_size;       // 解压后大小
-    std::vector<bam1_t*> output_records;  // 解析得到的bam1_t数组
-    int n_records;             // 解析得到的条目数
-    int status;                // 处理状态标志（0=ok，非0=失败）
-};
-
-struct Comp_Para {
-    int block_id;         // 本组中索引（0..63）
-    bam1_t **input_records; // 指向该块内的 bam1_t* 数组（MPE 分配并传给 CPE）
-    int n_records;        // 该块中记录数
-
-    bam_block *un_comp_block;         // 未压缩数据缓存
-    int un_comp_size;            // 未压缩数据大小
-
-    bam_block *output_block; // 输出压缩块（MPE 传给 CPE，用于写入压缩数据）
-    int output_size;      // CPE 返回：压缩后长度（字节）
-    int status;           // 0 = success, <0 = error, -1 = empty
-};
-
-struct bam_block {
-    unsigned int errcode;
-    //unsigned char data[BGZF_MAX_BLOCK_SIZE];//0x1000
-    unsigned char *data;
-    unsigned int length;
-    unsigned int pos;  //记录记录在块中的偏移量，即当前记录的读取位置，在解析时使用
-    int64_t block_address; //该块在整个文件中的偏移位置
-
-    int block_id; //块的编号
-
-    //unsigned int split_pos;
-    //unsigned int bam_number;
-};
-
 
 void print_bam1(const bam1_t *b);
 void print_bam_block(struct bam_block *blk) ;
 
-//bam to sam
+
 int read_block(BGZF *fp, struct bam_block *j);
 
 int sam_write1_sw(samFile *fp, const sam_hdr_t *h, const bam1_t *b);
@@ -192,14 +186,10 @@ int sam_realloc_bam_data(bam1_t *b, size_t desired);
 
 int realloc_bam_data(bam1_t *b, size_t desired);
 
-
-//sam to bam
 const char *bgzf_zerr(int errnum, z_stream *zs);
 
 int sam_read1_sw(samFile *fp, sam_hdr_t *h, bam1_t *b);
 
-
-//从核使用的
 void swap_data(const bam1_core_t *c, int l_data, uint8_t *data, int is_host);
 
 void bam_cigar2rqlens(int n_cigar, const uint32_t *cigar,
@@ -208,7 +198,7 @@ void bam_cigar2rqlens(int n_cigar, const uint32_t *cigar,
 inline int possibly_expand_bam_data(bam1_t *b, size_t bytes);
 
 int bam_tag2cigar(bam1_t *b, int recal_bin,
-                  int give_warning); // return 0 if CIGAR is untouched; 1 if CIGAR is updated with CG
+                  int give_warning); 
 
 int fixup_missing_qname_nul(bam1_t *b);
 

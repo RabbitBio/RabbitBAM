@@ -1,15 +1,14 @@
 #include "BamRead.h"
 
-BamRead::BamRead(int queue_size) {
+BamRead::BamRead(int blocks_size, int queue_size) {
 
-    int total_blocks = queue_size * 64;
+    int total_blocks = blocks_size;
     readBlockSize = total_blocks + 1; // 多申请一个，防止边界问题
     readBlock = new bam_block *[readBlockSize];
     read_bg = 0;
     read_ed = total_blocks - 1;
 
 
-    //for (int i = read_bg; i <= read_ed; i++) readBlock[i] = new bam_block;
     for (int i = read_bg; i <= read_ed; i++) {
         readBlock[i] = new bam_block;
         // Allocate data buffer with 64-byte alignment for Sunway slave cores
@@ -60,8 +59,6 @@ bam_block* BamRead::getEmpty() {
     //等待直到有空闲 block
     while ((read_ed + 1) % readBlockSize == read_bg) {
         usleep(10); 
-        //  std::this_thread::sleep_for(std::chrono::nanoseconds(1));
-        sched_yield();
     }
     //先取再+1
     int num = read_bg;
@@ -77,23 +74,20 @@ void BamRead::backBlock(bam_block *block) {
 
 void BamRead::inputBlock64(std::vector<bam_block*>& group) {
     //先+1再放入
-    consumer_queue_[(con_ed + 1) % con_queueSizeLim] = group;
+    consumer_queue_[(con_ed + 1) % con_queueSizeLim] = std::move(group);
     con_ed = (con_ed + 1) % con_queueSizeLim;
 }
 
 std::vector<bam_block*> BamRead::getBlock64() {
     //等待直到有可用组
     while ((con_ed + 1) % con_queueSizeLim == con_bg) {
-        usleep(10); 
-        //  std::this_thread::sleep_for(std::chrono::nanoseconds(1));
-        if (read_complete && (con_ed + 1) % con_queueSizeLim == con_bg) return std::vector<bam_block*>();
+        usleep(10);
+        if (read_complete && (con_ed + 1) % con_queueSizeLim == con_bg) return {};
     }
     //先取再+1
     int num = con_bg;
-    std::vector<bam_block*> group = consumer_queue_[con_bg];
     con_bg = (con_bg + 1) % con_queueSizeLim;
-
-    return group;
+    return std::move(consumer_queue_[num]);
 }
 
 bool BamRead::isComplete() const {

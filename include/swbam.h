@@ -44,12 +44,12 @@ private:
     void ConsumerSwBamTask(BamRead *read, BamComplete *complete);
     void ProducerSwBamTask(BGZF *fp, BamRead *read);
     void ProducerSwBamTask_memory(BGZF *fp, BamRead *read , char *bam_mem, size_t bam_size);
+    void FusedBamToSam(BamRead *read, BamComplete *complete, sam_hdr_t *h, MemReader &reader, MemWriter &mem_writer);
     int writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b);
 
     void ConsumerSwBamTask2(BamWrite *write, BamWriteComplete *complete);
     void ProducerSwBamTask2(samFile *fp, BamWrite *write, sam_hdr_t *h);
     void ProducerSwBamTask2_parallel(samFile *fp, BamWrite *write, sam_hdr_t *h);
-    void ProducerSwBamTask2_parallel_memory(BamWrite *write, sam_hdr_t *h , MemReader reader);
     void ProducerSwBamTask2_parallel_memory_OP( BamWrite *write, sam_hdr_t *h , MemReader reader);
     void FusedSamToBam(BamWrite *write, BamWriteComplete *complete,sam_hdr_t *h, MemReader reader, MemWriter &mem_writer);
     int writeBlockTobam(BGZF *fp, bam_block *block);

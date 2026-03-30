@@ -9,7 +9,7 @@
 
 class BamWrite {
 public:
-    BamWrite(int queue_size);
+    BamWrite(int bams_size, int queue_size);
     ~BamWrite();
 
     bam1_t* getEmpty();

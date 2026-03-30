@@ -1,7 +1,6 @@
 #include "BamTools.h"
 
 
-// 打印 bam1_t
 void print_bam1(const bam1_t *b)
 {
     if (!b) {
@@ -49,7 +48,6 @@ void print_bam1(const bam1_t *b)
     printf("}\n");
 }
 
-// 打印 bam_block 内容的函数
 void print_bam_block(struct bam_block *blk) {
     if (!blk) {
         printf("bam_block pointer is NULL\n");
@@ -77,9 +75,6 @@ void print_bam_block(struct bam_block *blk) {
     printf("  block_id     : %d\n", blk->block_id);
     printf("}\n");
 }
-
-//--------------------------------------------------------------------------------------------------------------
-//bam to sam
 
 void bam_destroy1_sw(bam1_t *b){
     if (b == NULL) return;
@@ -228,21 +223,15 @@ int sam_write1_sw(samFile *fp, const sam_hdr_t *h, const bam1_t *b){
 
     fp->format.category = sequence_data;
     fp->format.format = sam;
-    //调用 sam_format1() 将 BAM 结构转换为一行 SAM 文本，写入 kstring_t fp->line
-    //这一步可以调用从核并行处理，一次处理一批次的数据TODO----------------------------------------------------------
+
     if (sam_format1(h, b, &fp->line) < 0) return -1;
     kputc('\n', &fp->line);
 
-    //这里要按顺序写入文件，在主核中完成
     if ( hwrite(fp->fp.hfile, fp->line.s, fp->line.l) != fp->line.l ) return -1;     
 
     return fp->line.l;
 
 }
-
-
-//--------------------------------------------------------------------------------------------------------------
-//sam to bam
 
 const char *bgzf_zerr(int errnum, z_stream *zs) {
     static char buffer[32];
@@ -285,10 +274,6 @@ int sam_read1_sw(samFile *fp, sam_hdr_t *h,  bam1_t *b){
     return ret;
 }
 
-
-
-//--------------------------------------------------------------------------------------------------------------
-//从核使用的函数
 void swap_data(const bam1_core_t *c, int l_data, uint8_t *data, int is_host) {
     uint32_t *cigar = (uint32_t * )(data + c->l_qname);
     uint32_t i;

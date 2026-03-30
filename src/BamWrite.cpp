@@ -1,7 +1,7 @@
 #include "BamWrite.h"
 
-BamWrite::BamWrite(int queue_size) {
-    int total_size = queue_size * MAX_RECORDS_PER_BLOCK;
+BamWrite::BamWrite(int bams_size, int queue_size) {
+    int total_size = bams_size;
     pool_size = total_size + 1;
     bamPool = new bam1_t*[pool_size];
     pool_bg = 0;

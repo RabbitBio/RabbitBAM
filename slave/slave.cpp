@@ -18,7 +18,7 @@
 #include <htslib/hts.h>
 #include <htslib/khash.h>
 
-#include "test.h"
+#include "sam_parse.h"
 
 #ifdef PLATFORM_SUNWAY
 #include <slave.h>
@@ -1092,7 +1092,7 @@ extern "C" void slave_compressfunc(Comp_Para paras[64]) {
 }
 
 extern "C" void slave_sam_parse(void *arg) {
-    SamFormatBatch *batch = (SamFormatBatch *)arg;
+    SamParseByteBatch *batch = (SamParseByteBatch *)arg;
     int tid = _PEN;
 
     int total_tasks = batch->count;
