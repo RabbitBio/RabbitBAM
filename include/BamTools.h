@@ -174,6 +174,7 @@ struct bgzf_cache_t {
 #define KS_SEP_MAX   2
 
 
+int check_bam_cross_block(const char *bam_path);
 void print_bam1(const bam1_t *b);
 void print_bam_block(struct bam_block *blk) ;
 

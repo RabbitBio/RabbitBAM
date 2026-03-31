@@ -369,3 +369,112 @@ int fixup_missing_qname_nul(bam1_t *b) {
 }
 
 
+
+// 检测 BAM 文件中是否存在跨 BGZF 块的记录
+int check_bam_cross_block(const char *bam_path) {
+    samFile *in = sam_open(bam_path, "r");
+    if (!in) {
+        fprintf(stderr, "[check_bam_cross_block] ERROR: cannot open '%s'\n", bam_path);
+        return -1;
+    }
+    if (in->format.format != bam) {
+        fprintf(stderr, "[check_bam_cross_block] ERROR: '%s' is not a BAM file\n", bam_path);
+        sam_close(in);
+        return -1;
+    }
+    sam_hdr_t *hdr = sam_hdr_read(in);
+    if (!hdr) {
+        fprintf(stderr, "[check_bam_cross_block] ERROR: failed to read BAM header\n");
+        sam_close(in);
+        return -1;
+    }
+    sam_hdr_destroy(hdr);
+
+    BGZF *fp = in->fp.bgzf;
+    long long total = 0, cross = 0;
+
+    int64_t skip_remaining = 0;  // 上一块末尾跨块 record 还需跳过的字节数
+    uint8_t split_hdr[4];        // 4 字节头部被切分时已收集的部分字节
+    int     split_hdr_bytes = 0; // 已收集的头部字节数（>0 表示头部被切分）
+
+    while (true) {
+        const uint8_t *blk = (const uint8_t *)fp->uncompressed_block;
+        int blen = fp->block_length;
+        int pos  = fp->block_offset;  
+
+        //1.处理上一块的跨块遗留
+        if (split_hdr_bytes > 0) {
+            // 4 字节头部被切分，继续从本块收集剩余字节
+            while (pos < blen && split_hdr_bytes < 4)
+                split_hdr[split_hdr_bytes++] = blk[pos++];
+            if (split_hdr_bytes < 4) goto advance;  // 极罕见：头部跨 3 块以上
+
+            int32_t bsize = (int32_t)((uint32_t)split_hdr[0]       |
+                                      (uint32_t)split_hdr[1] <<  8  |
+                                      (uint32_t)split_hdr[2] << 16  |
+                                      (uint32_t)split_hdr[3] << 24);
+            split_hdr_bytes = 0;
+            if (bsize < 0) break;  // 非法值，退出
+            int avail = blen - pos;
+            if (bsize <= avail)    pos += bsize;          // body 在本块内
+            else                   { skip_remaining = bsize - avail; pos = blen; }
+        }
+
+        if (skip_remaining > 0) {
+            // 跨块 record 的 body 还需继续跳过
+            int avail = blen - pos;
+            if ((int64_t)avail >= skip_remaining) {
+                pos += (int)skip_remaining;
+                skip_remaining = 0;
+            } else {
+                skip_remaining -= avail;
+                pos = blen;
+            }
+        }
+
+        //2.逐个扫描本块内的 BAM 记录
+        while (pos < blen) {
+            if (blen - pos < 4) {
+                // 4 字节头部跨块（头部的 1~3 字节在本块末尾）
+                cross++; total++;
+                memcpy(split_hdr, blk + pos, blen - pos);
+                split_hdr_bytes = blen - pos;
+                pos = blen;
+                break;
+            }
+            int32_t bsize = (int32_t)((uint32_t)blk[pos]       |
+                                       (uint32_t)blk[pos+1] <<  8 |
+                                       (uint32_t)blk[pos+2] << 16 |
+                                       (uint32_t)blk[pos+3] << 24);
+            if (bsize <= 0) break;  // 块末尾填充 / 非法值，停止扫描
+
+            if (pos + 4 + bsize > blen) {
+                // record body 跨块
+                cross++; total++;
+                skip_remaining = (int64_t)(pos + 4 + bsize) - blen;
+                pos = blen;
+                break;
+            }
+            pos += 4 + bsize;
+            total++;
+        }
+
+advance:
+        //3.读取下一块
+        fp->block_offset = blen;  
+        if (bgzf_read_block(fp) != 0 || fp->block_length == 0) break;  
+    }
+
+    sam_close(in);
+
+    printf("[check_bam_cross_block] file: %s\n", bam_path);
+    printf("  total records  : %lld\n", total);
+    printf("  cross-block    : %lld\n", cross);
+    if (cross > 0) {
+        printf("  result: CROSS-BLOCK RECORDS EXIST — bam2sam fast-path NOT safe\n");
+        return 1;
+    } else {
+        printf("  result: NO cross-block records — bam2sam fast-path is safe\n");
+        return 0;
+    }
+}

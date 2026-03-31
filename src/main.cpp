@@ -2,6 +2,7 @@
 #include "CmdInfo.h"
 #include "Globals.h"
 #include "swbam.h"
+#include "BamTools.h"
 
 #ifdef PLATFORM_SUNWAY
 #include <athread.h>
@@ -54,6 +55,11 @@ int main(int argc, char **argv) {
     test_api->add_option("-o,--outFile", cmd_info.out_file_name_, "output sam/bam name")->required();
     test_api->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
 
+    CLI::App *check_cross = app.add_subcommand("check_cross_block",
+        "Check whether a BAM file contains records that span across BGZF block boundaries. "
+        "The bam2sam fast-path assumes no cross-block records; use this command to verify.");
+    check_cross->add_option("-i,--inFile", cmd_info.in_file_name_, "input BAM file")->required()->check(CLI::ExistingFile);
+
     CLI11_PARSE(app, argc, argv);
 
     if (app.get_subcommands().size() > 1) {
@@ -77,6 +83,17 @@ int main(int argc, char **argv) {
 
     }
 
+    //检测 BAM 记录是否跨 BGZF 块----------------------------------------------------------------------
+    if (strcmp(app.get_subcommands()[0]->get_name().c_str(), "check_cross_block") == 0) {
+        // ret == 0: 无跨块，安全；ret == 1: 有跨块，不安全；ret == -1: 文件打开/读取错误
+        int ret = check_bam_cross_block(cmd_info.in_file_name_.c_str());
+        if (ret < 0) {
+            fprintf(stderr, "ERROR: check_bam_cross_block failed\n");
+            return 1;  
+        }
+    
+    }
+
 
     //测试部分接口函数-------------------------------------------------------------------------------
     if (strcmp(app.get_subcommands()[0]->get_name().c_str(), "test_api") == 0) {
@@ -87,9 +104,8 @@ int main(int argc, char **argv) {
             printf("Enable verbose logging\n");
         }
 
-
-        
     }
+
 
 
 #ifdef USE_SWLU
