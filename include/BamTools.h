@@ -34,7 +34,7 @@ const size_t INIT_DATA_SIZE = 1024;           //bam1_t 的data最大长度 暂�
 
 #define SAM_CHUNK_SIZE (4 * 1024 * 1024)         
 #define CHUNK_BUFFER_SIZE (5 * 1024 * 1024)      
-#define MAX_BAMS_PER_CHUNK 10240              // 4MB最多包含的记录数
+#define MAX_BAMS_PER_CHUNK 12110              // 4MB最多包含的记录数
 
 typedef struct {
     const sam_hdr_t *hdr;

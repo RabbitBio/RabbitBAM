@@ -207,6 +207,10 @@ inline void write_sam_to_mem(MemWriter &w, const char *data, size_t len)
 {
     ensure_capacity(w, len);
 
+    // if (w.size + len > w.capacity) {
+    //     w.size = 0; 
+    // }
+
     memcpy(w.data + w.size, data, len);
 
     w.size += len;
@@ -402,7 +406,7 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
 void SwBam::FusedBamToSam(BamRead *read, BamComplete *complete,
                            sam_hdr_t *h, MemReader &reader, MemWriter &mem_writer) {
     double t1 = GetTime();
-    double t_decomp = 0, t_format = 0 , t_read = 0 , t_collect = 0;
+    double t_decomp = 0, t_format = 0 , t_read = 0 , t_write = 0, t_collect = 0;
     double ts;
     const int NB = 64;
 
@@ -419,6 +423,7 @@ void SwBam::FusedBamToSam(BamRead *read, BamComplete *complete,
     bool has_pending_write = false;
 
     auto flush_pending_write = [&]() {
+        // double t0 = GetTime();
         if (!has_pending_write) return;
         for (int i = 0; i < NB; i++) {
             kstring_t *ks = &fmt_prev->core_out_lines[i];
@@ -426,9 +431,11 @@ void SwBam::FusedBamToSam(BamRead *read, BamComplete *complete,
             if (ks->l > 0) write_sam_to_mem(mem_writer, ks->s, ks->l);
         }
         has_pending_write = false;
+        // t_write += GetTime() - t0;
     };
 
     auto do_read_group = [&](std::vector<bam_block*> &blocks) {
+        // double t0 = GetTime();
         blocks.clear();
         for (int b = 0; b < NB; b++) {
             bam_block *blk = read->getEmpty();
@@ -441,7 +448,10 @@ void SwBam::FusedBamToSam(BamRead *read, BamComplete *complete,
             blk->pos      = 0;
             blocks.push_back(blk);
         }
+        // t_read += GetTime() - t0;
     };
+
+
 
     long long total_records = 0, group_count = 0, block_count = 0;
 
@@ -483,6 +493,13 @@ void SwBam::FusedBamToSam(BamRead *read, BamComplete *complete,
         athread_join();
         t_decomp += GetTime() - ts;
 
+        // ts = GetTime();
+        // flush_pending_write();
+        // for (auto blk : prev_blocks) read->backBlock(blk);
+        // prev_blocks.clear();
+        // t_write += GetTime() - ts;
+        
+
         // 收集 bam1_t 到 SamFormatBatch 中
         ts = GetTime();
         fmt_cur->count = 0;
@@ -504,6 +521,10 @@ void SwBam::FusedBamToSam(BamRead *read, BamComplete *complete,
         athread_join();
         t_format += GetTime() - ts;
 
+        // ts = GetTime();
+        // do_read_group(next_blocks);
+        // t_read += GetTime() - ts;
+
         std::swap(fmt_cur, fmt_prev);
         prev_blocks = std::move(cur_blocks);
         has_pending_write = (fmt_prev->count > 0);
@@ -521,8 +542,8 @@ void SwBam::FusedBamToSam(BamRead *read, BamComplete *complete,
     // printf("  max_bams_per_block=%d  max_data_size=%d  max_line_size=%d\n", max_bams_per_block, max_data_size, max_line_size);
     printf("FusedBamToSam finished. blocks=%lld groups=%lld records=%lld cost=%.3f s\n",
            block_count, group_count, total_records, GetTime() - t1);
-    printf("  decomp_slave=%.3f  format_slave=%.3f  collect=%.3f \n",
-           t_decomp, t_format, t_collect);
+    printf("  decomp_slave=%.3f  format_slave=%.3f  collect=%.3f  read=%.3f  write=%.3f \n",
+           t_decomp, t_format, t_collect, t_read, t_write);
 }
 
 int SwBam::writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b) {
@@ -907,7 +928,7 @@ void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
 void SwBam::FusedSamToBam(BamWrite *write, BamWriteComplete *complete,
                           sam_hdr_t *h, MemReader reader, MemWriter &mem_writer) {
     double t0 , t1 = GetTime();
-    double t_copy_count = 0, t_parse = 0, t_compress = 0, t_pack = 0;
+    double t_copy_count = 0, t_parse = 0, t_compress = 0, t_pack = 0 , t_write = 0;
     double ts;
 
     SamParseBatch batch;
@@ -934,10 +955,16 @@ void SwBam::FusedSamToBam(BamWrite *write, BamWriteComplete *complete,
 
     // 处理上一次 compress 的结果（写盘 + 回收 bam1_t）
     auto flush_pending = [&]() {
+        double t0 = GetTime();
+
         if (!has_pending) return;
         for (int k = 0; k < 64; k++) {
             if (comp_pending[k].status == 0 && comp_pending[k].output_block) {
+
+                // double t0 = GetTime();
                 write_block_to_mem(mem_writer, comp_pending[k].output_block);
+                // t_write += GetTime() - t0;
+
                 complete->backBlock(comp_pending[k].output_block);
                 bgzf_nums++;
             }
@@ -947,6 +974,8 @@ void SwBam::FusedSamToBam(BamWrite *write, BamWriteComplete *complete,
         }
         pending_group.clear();
         has_pending = false;
+
+        t_write += GetTime() - t0;
     };
 
     // 压缩一个 group（64 blocks）并将上一次结果在从核工作期间写盘
@@ -976,9 +1005,10 @@ void SwBam::FusedSamToBam(BamWrite *write, BamWriteComplete *complete,
 
         ts = GetTime();
         __real_athread_spawn((void*)slave_compressfunc, comp_active, 1);
-        flush_pending();   // 主核：在从核压缩期间处理上一轮结果
+        flush_pending();  
         athread_join();
         t_compress += GetTime() - ts;
+        // flush_pending();  
 
         // 当前结果变为 pending，下一次 spawn 时再处理
         pending_group = std::move(cur_group);
@@ -1024,9 +1054,10 @@ void SwBam::FusedSamToBam(BamWrite *write, BamWriteComplete *complete,
         // 阶段 2：从核 copy+count
         ts = GetTime();
         __real_athread_spawn((void *)slave_copy_and_count, &batch, 1);
-        flush_pending();   // 主核：在从核 copy 期间写上一轮压缩结果
+        flush_pending();   
         athread_join();
         t_copy_count += GetTime() - ts;
+        // flush_pending();   
 
         // 阶段 3：主核 getEmptyBatch，几乎不花时间
         int pre_alloc_count[64];
@@ -1097,8 +1128,8 @@ void SwBam::FusedSamToBam(BamWrite *write, BamWriteComplete *complete,
     // printf("max_bams_per_chunk=%d, max_data_size=%d\n",max_bams_per_chunk , max_data_size);
     printf("FusedSamToBam finished. bam1_t=%d, blocks=%d, groups=%d, bgzf=%lld, cost %lf\n",
            bam1_t_nums, block_nums, group_nums, bgzf_nums, GetTime() - t1);
-    printf("  copy_count_slave=%lf  parse_slave=%lf  pack(+compress)=%lf  compress_slave=%lf\n",
-           t_copy_count, t_parse, t_pack, t_compress);
+    printf("  copy_count_slave=%lf  parse_slave=%lf  pack(+compress)=%lf  compress_slave=%lf  write=%lf\n",
+           t_copy_count, t_parse, t_pack, t_compress, t_write);
 }
 
 int SwBam:: writeBlockTobam(BGZF *fp, bam_block *block) {
@@ -1124,6 +1155,8 @@ int SwBam:: writeBlockTobam(BGZF *fp, bam_block *block) {
 void SwBam::ProcessSwBam() {
     double t0 = GetTime();
 
+    double t_header = 0, t_total = 0;
+
     //in文件打开
     sin = sam_open(cmd_info_->in_file_name_.c_str(), "r");
     if (sin == NULL) {
@@ -1136,7 +1169,7 @@ void SwBam::ProcessSwBam() {
     if (sout == NULL) {
         fprintf(stderr, "Error opening output file %s\n", cmd_info_->out_file_name_.c_str());
     }
-    printf("open the files cost %lf\n", GetTime() - t0);
+    printf("open the files cost %lf---\n", GetTime() - t0);
 
 
     t0 = GetTime();
@@ -1150,7 +1183,9 @@ void SwBam::ProcessSwBam() {
     if (sam_hdr_write(sout, hdr) != 0) {
         fprintf(stderr, "Error writing header to output file %s\n", cmd_info_->out_file_name_.c_str());
     }
-    printf("Complete the head cost %lf\n", GetTime() - t0);
+    t_header = GetTime() - t0;
+    t_total += t_header;
+    printf("Complete the head cost %lf\n", t_header);
 
 
     #define USE_MEMORY
@@ -1185,6 +1220,9 @@ void SwBam::ProcessSwBam() {
 
             //内存写--
             size_t sam_estimate = bam_size * 5;
+
+            // size_t GB = 1024LL * 1024LL * 1024LL;
+            // size_t sam_estimate = 1 * GB;
             init_mem_writer(mem_writer, sam_estimate);
             printf("Initialized SAM memory writer: %.2f MB\n",sam_estimate / 1024.0 / 1024.0);
         
@@ -1391,7 +1429,7 @@ void SwBam::ProcessSwBam() {
                 printf("Enable FUSED single-thread mode (USE_MEMORY + USE_FUSED_SAM2BAM)!!!\n");
                 //BamWrite(x , y) x是bam1_t的内存池大小 , y是打包的block的size
                 //BamWriteComplete(x) x是bam_block的内存池大小
-                write = new BamWrite(655360 ,640);
+                write = new BamWrite(720999 ,1);
                 writeComplete = new BamWriteComplete(130);
                 printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
 
@@ -1486,7 +1524,9 @@ void SwBam::ProcessSwBam() {
     }
 
 
-    printf("Complete the body1 cost %lf\n", GetTime() - tbody);
+    t_total += GetTime() - tbody;
+    printf("Complete the body cost %lf\n", GetTime() - tbody);
+    printf("Complete the total cost %lf---\n", t_total);
 
     #ifdef USE_MEMORY
     #define DUMP_MEM
@@ -1531,8 +1571,7 @@ void SwBam::ProcessSwBam() {
     if (ret < 0) {
         fprintf(stderr, "Error closing input.\n");
     }
-    printf("close the files cost %lf\n", GetTime() - t0);
-    printf("Complete the body cost %lf\n", GetTime() - tbody);
+    printf("close the files cost %lf---\n", GetTime() - t0);
 
 }
 
