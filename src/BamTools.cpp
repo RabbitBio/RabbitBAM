@@ -370,21 +370,20 @@ int fixup_missing_qname_nul(bam1_t *b) {
 
 
 
-// 检测 BAM 文件中是否存在跨 BGZF 块的记录
-int check_bam_cross_block(const char *bam_path) {
+int check_bam_cross_block_ex(const char *bam_path, BamCrossBlockStats *stats, bool verbose) {
     samFile *in = sam_open(bam_path, "r");
     if (!in) {
-        fprintf(stderr, "[check_bam_cross_block] ERROR: cannot open '%s'\n", bam_path);
+        if (verbose) fprintf(stderr, "[check_bam_cross_block] ERROR: cannot open '%s'\n", bam_path);
         return -1;
     }
     if (in->format.format != bam) {
-        fprintf(stderr, "[check_bam_cross_block] ERROR: '%s' is not a BAM file\n", bam_path);
+        if (verbose) fprintf(stderr, "[check_bam_cross_block] ERROR: '%s' is not a BAM file\n", bam_path);
         sam_close(in);
         return -1;
     }
     sam_hdr_t *hdr = sam_hdr_read(in);
     if (!hdr) {
-        fprintf(stderr, "[check_bam_cross_block] ERROR: failed to read BAM header\n");
+        if (verbose) fprintf(stderr, "[check_bam_cross_block] ERROR: failed to read BAM header\n");
         sam_close(in);
         return -1;
     }
@@ -467,14 +466,26 @@ advance:
 
     sam_close(in);
 
-    printf("[check_bam_cross_block] file: %s\n", bam_path);
-    printf("  total records  : %lld\n", total);
-    printf("  cross-block    : %lld\n", cross);
-    if (cross > 0) {
-        printf("  result: CROSS-BLOCK RECORDS EXIST — bam2sam fast-path NOT safe\n");
-        return 1;
-    } else {
-        printf("  result: NO cross-block records — bam2sam fast-path is safe\n");
-        return 0;
+    if (stats) {
+        stats->total_records = total;
+        stats->cross_block_records = cross;
     }
+
+    if (verbose) {
+        printf("[check_bam_cross_block] file: %s\n", bam_path);
+        printf("  total records  : %lld\n", total);
+        printf("  cross-block    : %lld\n", cross);
+        if (cross > 0) {
+            printf("  result: CROSS-BLOCK RECORDS EXIST — bam2sam fast-path NOT safe\n");
+        } else {
+            printf("  result: NO cross-block records — bam2sam fast-path is safe\n");
+        }
+    }
+
+    return cross > 0 ? 1 : 0;
+}
+
+// 检测 BAM 文件中是否存在跨 BGZF 块的记录
+int check_bam_cross_block(const char *bam_path) {
+    return check_bam_cross_block_ex(bam_path, nullptr, true);
 }

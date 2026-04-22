@@ -4,7 +4,7 @@ BamRead::BamRead(int blocks_size, int queue_size) {
 
     int total_blocks = blocks_size;
     readBlockSize = total_blocks + 1; // 多申请一个，防止边界问题
-    readBlock = new bam_block *[readBlockSize];
+    readBlock = new bam_block *[readBlockSize]();
     read_bg = 0;
     read_ed = total_blocks - 1;
 
@@ -33,9 +33,9 @@ BamRead:: ~BamRead() {
         // 释放 readBlock 内存
         if (readBlock) {
             for (int i = 0; i < readBlockSize; i++) {
-                if (readBlock[i]) {
-                    // 释放对齐的 data
-                    if (readBlock[i]->data) {
+        if (readBlock[i]) {
+            // 释放对齐的 data
+            if (readBlock[i]->data) {
                         aligned_free_custom(readBlock[i]->data);
                         readBlock[i]->data = nullptr;
                     }
@@ -62,8 +62,10 @@ bam_block* BamRead::getEmpty() {
     }
     //先取再+1
     int num = read_bg;
+    bam_block *block = readBlock[num];
+    readBlock[num] = nullptr;
     read_bg = (read_bg + 1) % readBlockSize;
-    return readBlock[num];
+    return block;
 }
 
 void BamRead::backBlock(bam_block *block) {

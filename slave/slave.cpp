@@ -443,6 +443,74 @@ int read_bam(struct bam_block *fq, bam1_t *b, int is_be) {
     return 4 + block_len;
 }
 
+static inline int read_bam_checked(struct bam_block *fq, bam1_t *b, int is_be,
+                                   long long *actual_value, long long *limit_value) {
+    if (fq->pos >= fq->length) return -1;
+    bam1_core_t *c = &b->core;
+    int32_t block_len, ret, i;
+    uint32_t x[8], new_l_data;
+
+    b->l_data = 0;
+
+    if ((ret = Rabbit_bgzf_read(fq, &block_len, 4)) != 4) {
+        if (ret == 0) return -1;
+        return -2;
+    }
+
+    if (is_be) ed_swap_4p(&block_len);
+    if (block_len < 32) return -4;
+    if (Rabbit_bgzf_read(fq, x, 32) != 32) return -3;
+    if (is_be) { for (i = 0; i < 8; ++i) ed_swap_4p(x + i); }
+    c->tid = x[0];
+    c->pos = (int32_t)x[1];
+    c->bin = x[2] >> 16;
+    c->qual = x[2] >> 8 & 0xff;
+    c->l_qname = x[2] & 0xff;
+    c->l_extranul = (c->l_qname % 4 != 0) ? (4 - c->l_qname % 4) : 0;
+    c->flag = x[3] >> 16;
+    c->n_cigar = x[3] & 0xffff;
+    c->l_qseq = x[4];
+    c->mtid = x[5];
+    c->mpos = (int32_t)x[6];
+    c->isize = (int32_t)x[7];
+
+    new_l_data = block_len - 32 + c->l_extranul;
+    if (new_l_data > INT_MAX || c->l_qseq < 0 || c->l_qname < 1) return -4;
+    if (((uint64_t)c->n_cigar << 2) + c->l_qname + c->l_extranul
+        + (((uint64_t)c->l_qseq + 1) >> 1) + c->l_qseq > (uint64_t)new_l_data)
+        return -4;
+    if (new_l_data > INIT_DATA_SIZE) {
+        if (actual_value) *actual_value = new_l_data;
+        if (limit_value) *limit_value = INIT_DATA_SIZE;
+        return -5;
+    }
+    if (realloc_bam_data(b, new_l_data) < 0) return -4;
+    b->l_data = new_l_data;
+
+    if (Rabbit_bgzf_read(fq, b->data, c->l_qname) != c->l_qname) return -4;
+    if (b->data[c->l_qname - 1] != '\0') {
+        if (fixup_missing_qname_nul(b) < 0) return -4;
+    }
+    for (i = 0; i < c->l_extranul; ++i) b->data[c->l_qname + i] = '\0';
+    c->l_qname += c->l_extranul;
+    if (b->l_data < c->l_qname ||
+        Rabbit_bgzf_read(fq, b->data + c->l_qname, b->l_data - c->l_qname) != b->l_data - c->l_qname)
+        return -4;
+    if (is_be) swap_data(c, b->l_data, b->data, 0);
+    if (bam_tag2cigar(b, 0, 0) < 0) return -4;
+    if (c->n_cigar > 0) {
+        hts_pos_t rlen, qlen;
+        bam_cigar2rqlens(c->n_cigar, bam_get_cigar(b), &rlen, &qlen);
+        if ((b->core.flag & BAM_FUNMAP) || rlen == 0) rlen = 1;
+        b->core.bin = hts_reg2bin(b->core.pos, b->core.pos + rlen, 14, 5);
+        if (c->l_qseq > 0 && !(c->flag & BAM_FUNMAP) && qlen != c->l_qseq) {
+            hts_log_error("CIGAR and query sequence lengths differ for %s", bam_get_qname(b));
+            return -4;
+        }
+    }
+    return 4 + block_len;
+}
+
 // 打印 bam1_t
 void print_bam1(const bam1_t *b)
 {
@@ -1015,6 +1083,155 @@ extern "C" void decompressfunc(Para paras[64]) {
     para->status = 0;
 }
 
+extern "C" void slave_decompress_checked(CheckedPara paras[64]) {
+    int id = _PEN;
+    CheckedPara *para = &paras[id];
+
+    bam_block *comp = para->input_block;
+    bam_block *un_comp = para->un_comp_block;
+    if (comp == NULL) return;
+
+    if (block_decode_func(comp, un_comp) != 0) {
+        para->status = -2;
+        return;
+    }
+
+    int count = 0;
+    int ret = -1;
+    while (true) {
+        if (count >= (int)MAX_RECORDS_PER_BLOCK) {
+            if (un_comp->pos < un_comp->length) {
+                para->status = -3;
+                para->limit_id = BOUNDS_LIMIT_MAX_RECORDS_PER_BLOCK;
+                para->limit_value = MAX_RECORDS_PER_BLOCK;
+                para->actual_value = count + 1;
+                para->record_index = count;
+                return;
+            }
+            break;
+        }
+        bam1_t *b = para->output_records[count];
+        ret = read_bam_checked(un_comp, b, 0, &para->actual_value, &para->limit_value);
+        if (ret < 0) break;
+        count++;
+    }
+
+    para->n_records = count;
+    if (ret == -1) {
+        para->status = 0;
+        return;
+    }
+    if (ret == -5) {
+        para->status = -3;
+        para->limit_id = BOUNDS_LIMIT_INIT_DATA_SIZE;
+        para->record_index = count;
+        return;
+    }
+    para->status = -2;
+}
+
+extern "C" void slave_decompress_filterfunc(Bam2BamPara paras[64]) {
+    int id = _PEN;
+    Bam2BamPara *para = &paras[id];
+
+    bam_block *comp = para->input_block;
+    bam_block *un_comp = para->un_comp_block;
+    if (comp == NULL) {
+        return;
+    }
+
+    if (block_decode_func(comp, un_comp) != 0) {
+        para->status = -2;
+        return;
+    }
+
+    int total_count = 0;
+    int kept_count = 0;
+    int ret = -1;
+
+    while (total_count < (int)MAX_RECORDS_PER_BLOCK) {
+        bam1_t *b = para->output_records[total_count];
+        ret = read_bam(un_comp, b, 0);
+        if (ret < 0) break;
+
+        total_count++;
+        if (bam_filter_matches(b, para->filter)) {
+            para->output_records[kept_count] = b;
+            para->bam_lens[kept_count] = (uint32_t)(b->l_data - b->core.l_extranul + 32);
+            kept_count++;
+        }
+    }
+
+    para->n_total_records = total_count;
+    para->n_kept_records = kept_count;
+
+    if (ret < -1) {
+        para->status = -2;
+        return;
+    }
+
+    if (total_count == (int)MAX_RECORDS_PER_BLOCK && un_comp->pos < un_comp->length) {
+        para->status = -3;
+        return;
+    }
+
+    para->status = 0;
+}
+
+extern "C" void slave_decompress_filter_checked(CheckedBam2BamPara paras[64]) {
+    int id = _PEN;
+    CheckedBam2BamPara *para = &paras[id];
+
+    bam_block *comp = para->input_block;
+    bam_block *un_comp = para->un_comp_block;
+    if (comp == NULL) return;
+
+    if (block_decode_func(comp, un_comp) != 0) {
+        para->status = -2;
+        return;
+    }
+
+    int total_count = 0;
+    int kept_count = 0;
+    int ret = -1;
+    while (true) {
+        if (total_count >= (int)MAX_RECORDS_PER_BLOCK) {
+            if (un_comp->pos < un_comp->length) {
+                para->status = -3;
+                para->limit_id = BOUNDS_LIMIT_MAX_RECORDS_PER_BLOCK;
+                para->limit_value = MAX_RECORDS_PER_BLOCK;
+                para->actual_value = total_count + 1;
+                para->record_index = total_count;
+                return;
+            }
+            break;
+        }
+        bam1_t *b = para->output_records[total_count];
+        ret = read_bam_checked(un_comp, b, 0, &para->actual_value, &para->limit_value);
+        if (ret < 0) break;
+        total_count++;
+        if (bam_filter_matches(b, para->filter)) {
+            para->output_records[kept_count] = b;
+            para->bam_lens[kept_count] = (uint32_t)(b->l_data - b->core.l_extranul + 32);
+            kept_count++;
+        }
+    }
+
+    para->n_total_records = total_count;
+    para->n_kept_records = kept_count;
+    if (ret == -1) {
+        para->status = 0;
+        return;
+    }
+    if (ret == -5) {
+        para->status = -3;
+        para->limit_id = BOUNDS_LIMIT_INIT_DATA_SIZE;
+        para->record_index = total_count;
+        return;
+    }
+    para->status = -2;
+}
+
 extern "C" void sam_format(void *arg) {
     SamFormatBatch *batch = (SamFormatBatch *)arg;
     int cid = _PEN;
@@ -1194,6 +1411,4 @@ extern "C" void slave_sam_parse_chunk(void *arg) {
     }
     chunk->count = valid_count;
 }
-
-
 

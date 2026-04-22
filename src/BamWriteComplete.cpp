@@ -12,7 +12,7 @@ BamWriteComplete::BamWriteComplete(int queue_size) {
 
     // 初始化空闲块池
     pool_size = queue_size + 1;
-    blockPool = new bam_block*[pool_size];
+    blockPool = new bam_block*[pool_size]();
     pool_bg = 0;
     pool_ed = queue_size - 1; 
     for (int i = pool_bg; i <= pool_ed; i++) {
@@ -31,10 +31,37 @@ BamWriteComplete::BamWriteComplete(int queue_size) {
 }
 
 BamWriteComplete::~BamWriteComplete() {
-    for (int i = 0; i < pool_size-1; i++)
-        delete blockPool[i];
-    delete[] blockPool;
-    delete[] queue;
+    for (size_t i = 0; i < buffer_pool_.size(); ++i) {
+        if (buffer_pool_[i]) {
+            if (buffer_pool_[i]->data) {
+                aligned_free_custom(buffer_pool_[i]->data);
+                buffer_pool_[i]->data = nullptr;
+            }
+            delete buffer_pool_[i];
+            buffer_pool_[i] = nullptr;
+        }
+    }
+    buffer_pool_.clear();
+
+    if (blockPool) {
+        for (int i = 0; i < pool_size; ++i) {
+            if (blockPool[i]) {
+                if (blockPool[i]->data) {
+                    aligned_free_custom(blockPool[i]->data);
+                    blockPool[i]->data = nullptr;
+                }
+                delete blockPool[i];
+                blockPool[i] = nullptr;
+            }
+        }
+        delete[] blockPool;
+        blockPool = nullptr;
+    }
+
+    if (queue) {
+        delete[] queue;
+        queue = nullptr;
+    }
 }
 
 bam_block* BamWriteComplete::getBuffer(int idx) {
@@ -46,6 +73,7 @@ bam_block* BamWriteComplete::getEmpty() {
         usleep(10);
     }
     bam_block* blk = blockPool[pool_bg];
+    blockPool[pool_bg] = nullptr;
     pool_bg = (pool_bg + 1) % pool_size;
     return blk;
 }

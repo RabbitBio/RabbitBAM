@@ -49,6 +49,14 @@ int main(int argc, char **argv) {
     run_all->add_option("-i,--inFile", cmd_info.in_file_name_, "input sam/bam name")->required()->check(CLI::ExistingFile);
     run_all->add_option("-o,--outFile", cmd_info.out_file_name_, "output sam/bam name")->required();
     run_all->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
+    run_all->add_flag("--validate-bounds", cmd_info.validate_bounds_, "Enable full boundary validation on checked paths")->default_val(false);
+    run_all->add_option("--min-mapq", cmd_info.min_mapq_, "Keep reads with MAPQ >= value");
+    run_all->add_option("--max-mapq", cmd_info.max_mapq_, "Keep reads with MAPQ <= value");
+    run_all->add_option("--require-flag", cmd_info.require_flag_, "Keep reads whose FLAG contains all bits in value");
+    run_all->add_option("--exclude-flag", cmd_info.exclude_flag_, "Drop reads whose FLAG contains any bit in value");
+    run_all->add_option("--ref-name", cmd_info.ref_name_, "Keep reads mapped to the given reference name");
+    run_all->add_option("--min-read-len", cmd_info.min_read_len_, "Keep reads with read length >= value");
+    run_all->add_option("--max-read-len", cmd_info.max_read_len_, "Keep reads with read length <= value");
 
     CLI::App *check_cross = app.add_subcommand("check_cross_block",
         "Check whether a BAM file contains records that span across BGZF block boundaries. "
@@ -56,28 +64,31 @@ int main(int argc, char **argv) {
     check_cross->add_option("-i,--inFile", cmd_info.in_file_name_, "input BAM file")->required()->check(CLI::ExistingFile);
 
     CLI::App *test_api = app.add_subcommand("test_api", "Test internal API functions");
-    // test_api->add_option("-i,--inFile", cmd_info.in_file_name_, "input sam/bam name")->required()->check(CLI::ExistingFile);
-    // test_api->add_option("-o,--outFile", cmd_info.out_file_name_, "output sam/bam name")->required();
     test_api->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
 
     CLI11_PARSE(app, argc, argv);
 
+    if (app.get_subcommands().empty()) {
+        fprintf(stderr, "ERROR: You should input one command!\n");
+        return 1;
+    }
+
     if (app.get_subcommands().size() > 1) {
         fprintf(stderr, "ERROR: You should input one command!\n");
-        return 0;
+        return 1;
     }
 
     //完整程序-------------------------------------------------------------------------------------
+    int exit_code = 0;
+
     if (strcmp(app.get_subcommands()[0]->get_name().c_str(), "run_all") == 0) {
-        //printf("Input file: %s\n", cmd_info.in_file_name_.c_str());
-        //printf("Output file: %s\n", cmd_info.out_file_name_.c_str());
 
         if(cmd_info.verbose_){
             printf("Enable verbose logging\n");
         }
 
         SwBam *swbam = new SwBam(&cmd_info);
-        swbam->ProcessSwBam();
+        exit_code = swbam->ProcessSwBam();
         delete swbam;
 
 
@@ -85,6 +96,7 @@ int main(int argc, char **argv) {
 
     //检测 BAM 记录是否跨 BGZF 块----------------------------------------------------------------------
     if (strcmp(app.get_subcommands()[0]->get_name().c_str(), "check_cross_block") == 0) {
+        
         // ret == 0: 无跨块，安全；ret == 1: 有跨块，不安全；ret == -1: 文件打开/读取错误
         int ret = check_bam_cross_block(cmd_info.in_file_name_.c_str());
         if (ret < 0) {
@@ -97,8 +109,6 @@ int main(int argc, char **argv) {
 
     //测试部分接口函数-------------------------------------------------------------------------------
     if (strcmp(app.get_subcommands()[0]->get_name().c_str(), "test_api") == 0) {
-        // printf("Input file: %s\n", cmd_info.in_file_name_.c_str());
-        // printf("Output file: %s\n", cmd_info.out_file_name_.c_str());
 
         // 探测当前环境下 malloc 的极限
         size_t GB = 1024LL * 1024LL * 1024LL;
@@ -135,5 +145,5 @@ int main(int argc, char **argv) {
 
     printf("TOT TIME %lf\n", GetTime() - ttt);
 
-    return 0;
+    return exit_code;
 }

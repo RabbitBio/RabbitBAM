@@ -6,6 +6,9 @@ extern "C" {
 #include <athread.h>
 #include <pthread.h>
     void slave_decompressfunc();
+    void slave_decompress_checked();
+    void slave_decompress_filterfunc();
+    void slave_decompress_filter_checked();
     void slave_compressfunc();
     void slave_sam_format();
     void slave_sam_parse();
@@ -20,12 +23,162 @@ double temp1 = 0 , temp2 = 0 ,temp3 = 0 , temp4 = 0;
 double t_sam2bam_write = 0 , t_sam2bam_read = 0 , t_sam2bam_slave = 0 , t_sam_parse = 0 , t_sam2bam_for = 0;
 double t_bam2sam_write = 0 , t_bam2sam_read = 0 , t_bam2sam_slave = 0 , t_bam2sam_for = 0;
 
-SwBam::SwBam(CmdInfo *cmd_info1) {
-    cmd_info_ = cmd_info1;
+namespace {
 
+bool HasBamFilterRequest(const CmdInfo *cmd_info) {
+    return cmd_info->min_mapq_ >= 0 ||
+           cmd_info->max_mapq_ >= 0 ||
+           cmd_info->require_flag_ != 0 ||
+           cmd_info->exclude_flag_ != 0 ||
+           !cmd_info->ref_name_.empty() ||
+           cmd_info->min_read_len_ >= 0 ||
+           cmd_info->max_read_len_ >= 0;
 }
 
-SwBam::~SwBam() { }
+BamFilterOptions BuildBamFilterOptions(const CmdInfo *cmd_info) {
+    BamFilterOptions filter;
+    filter.min_mapq = cmd_info->min_mapq_;
+    filter.max_mapq = cmd_info->max_mapq_;
+    filter.require_flag = cmd_info->require_flag_;
+    filter.exclude_flag = cmd_info->exclude_flag_;
+    filter.ref_tid = -2;
+    filter.min_read_len = cmd_info->min_read_len_;
+    filter.max_read_len = cmd_info->max_read_len_;
+    return filter;
+}
+
+bool IsSamLikeFormat(int format) {
+    return format == sam || format == text_format;
+}
+
+bool IsBamLikeFormat(int format) {
+    return format == bam || format == binary_format;
+}
+
+const char *BoundsLimitName(int limit_id) {
+    switch (limit_id) {
+        case BOUNDS_LIMIT_MAX_RECORDS_PER_BLOCK: return "MAX_RECORDS_PER_BLOCK";
+        case BOUNDS_LIMIT_MAX_SAM_LINE_SIZE: return "MAX_SAM_LINE_SIZE";
+        case BOUNDS_LIMIT_INIT_DATA_SIZE: return "INIT_DATA_SIZE";
+        case BOUNDS_LIMIT_MAX_BAMS_PER_CHUNK: return "MAX_BAMS_PER_CHUNK";
+        case BOUNDS_LIMIT_CHUNK_BUFFER_SIZE: return "CHUNK_BUFFER_SIZE";
+        case BOUNDS_LIMIT_FUSED_SAM2BAM_BAM_POOL_SIZE: return "FUSED_SAM2BAM_BAM_POOL_SIZE";
+        case BOUNDS_LIMIT_BGZF_RECORD_SIZE: return "BGZF_BLOCK_SIZE";
+        case BOUNDS_LIMIT_MAX_SAM_FORMAT_CORE_BUFFER_SIZE: return "MAX_SAM_FORMAT_CORE_BUFFER_SIZE";
+        case BOUNDS_LIMIT_GENERIC_RUNTIME_ERROR: return "RUNTIME_STATUS";
+        default: return "UNKNOWN_LIMIT";
+    }
+}
+
+void ClearBoundsError(BoundsCheckError *err) {
+    if (!err) return;
+    err->pipeline = nullptr;
+    err->stage = nullptr;
+    err->limit_name = nullptr;
+    err->limit_value = 0;
+    err->actual_value = 0;
+    err->block_id = -1;
+    err->chunk_id = -1;
+    err->record_index = -1;
+    err->core_id = -1;
+}
+
+void SetBoundsError(BoundsCheckError *err,
+                    const char *pipeline,
+                    const char *stage,
+                    int limit_id,
+                    long long limit_value,
+                    long long actual_value,
+                    int block_id,
+                    int chunk_id,
+                    int record_index,
+                    int core_id) {
+    if (!err) return;
+    err->pipeline = pipeline;
+    err->stage = stage;
+    err->limit_name = BoundsLimitName(limit_id);
+    err->limit_value = limit_value;
+    err->actual_value = actual_value;
+    err->block_id = block_id;
+    err->chunk_id = chunk_id;
+    err->record_index = record_index;
+    err->core_id = core_id;
+}
+
+void SetGenericBoundsError(BoundsCheckError *err,
+                           const char *pipeline,
+                           const char *stage,
+                           long long actual_value,
+                           int block_id,
+                           int chunk_id,
+                           int record_index,
+                           int core_id) {
+    SetBoundsError(err, pipeline, stage, BOUNDS_LIMIT_GENERIC_RUNTIME_ERROR, 0,
+                   actual_value, block_id, chunk_id, record_index, core_id);
+}
+
+void PrintBoundsError(const BoundsCheckError &err) {
+    fprintf(stderr,
+            "BOUNDS CHECK FAILED: pipeline=%s stage=%s limit=%s limit_value=%lld actual_value=%lld block_id=%d chunk_id=%d record_index=%d core_id=%d\n",
+            err.pipeline ? err.pipeline : "unknown",
+            err.stage ? err.stage : "unknown",
+            err.limit_name ? err.limit_name : "unknown",
+            err.limit_value,
+            err.actual_value,
+            err.block_id,
+            err.chunk_id,
+            err.record_index,
+            err.core_id);
+    fprintf(stderr, "ERROR: boundary validation failed while --validate-bounds was enabled.\n");
+}
+
+void SetBoundsErrorFromCheckedPara(BoundsCheckError *err,
+                                   const char *pipeline,
+                                   const char *stage,
+                                   const CheckedPara &para,
+                                   int core_id) {
+    if (para.limit_id == BOUNDS_LIMIT_NONE) {
+        SetGenericBoundsError(err, pipeline, stage, para.status, para.block_id, -1,
+                              para.record_index, core_id);
+        return;
+    }
+    SetBoundsError(err, pipeline, stage, para.limit_id, para.limit_value, para.actual_value,
+                   para.block_id, -1, para.record_index, core_id);
+}
+
+void SetBoundsErrorFromCheckedBam2BamPara(BoundsCheckError *err,
+                                          const char *pipeline,
+                                          const char *stage,
+                                          const CheckedBam2BamPara &para,
+                                          int core_id) {
+    if (para.limit_id == BOUNDS_LIMIT_NONE) {
+        SetGenericBoundsError(err, pipeline, stage, para.status, para.block_id, -1,
+                              para.record_index, core_id);
+        return;
+    }
+    SetBoundsError(err, pipeline, stage, para.limit_id, para.limit_value, para.actual_value,
+                   para.block_id, -1, para.record_index, core_id);
+}
+
+} // namespace
+
+SwBam::SwBam(CmdInfo *cmd_info1) {
+    cmd_info_ = cmd_info1;
+    hdr = nullptr;
+    sin = nullptr;
+    sout = nullptr;
+    read = nullptr;
+    complete = nullptr;
+    write = nullptr;
+    writeComplete = nullptr;
+}
+
+SwBam::~SwBam() {
+    delete read;
+    delete complete;
+    delete write;
+    delete writeComplete;
+}
 
 void init_sam_format_batch_buffers(SamFormatBatch *batch)
 {
@@ -544,6 +697,638 @@ void SwBam::FusedBamToSam(BamRead *read, BamComplete *complete,
            block_count, group_count, total_records, GetTime() - t1);
     printf("  decomp_slave=%.3f  format_slave=%.3f  collect=%.3f  read=%.3f  write=%.3f \n",
            t_decomp, t_format, t_collect, t_read, t_write);
+}
+
+namespace {
+
+int FormatSamRecordsChecked(const sam_hdr_t *h,
+                            bam1_t **records,
+                            int total_records,
+                            MemWriter &mem_writer,
+                            BoundsCheckError *bounds_error) {
+    kstring_t line = {0, MAX_SAM_LINE_SIZE + 1, (char *)malloc(MAX_SAM_LINE_SIZE + 1)};
+    if (!line.s) {
+        SetGenericBoundsError(bounds_error, "bam2sam", "sam_format_alloc", errno, -1, -1, -1, -1);
+        return -1;
+    }
+
+    int base_tasks = total_records >> 6;
+    int remainder = total_records & 63;
+    for (int cid = 0; cid < 64; ++cid) {
+        size_t core_total_len = 0;
+        int start = 0;
+        int end = 0;
+        if (cid < remainder) {
+            start = cid * (base_tasks + 1);
+            end = start + base_tasks + 1;
+        } else {
+            start = remainder + cid * base_tasks;
+            end = start + base_tasks;
+        }
+
+        if (start >= total_records || start >= end) continue;
+
+        for (int idx = start; idx < end; ++idx) {
+            int line_len = sam_format1(h, records[idx], &line);
+            if (line_len < 0) {
+                SetGenericBoundsError(bounds_error, "bam2sam", "sam_format", line_len, -1, -1, idx, cid);
+                free(line.s);
+                return -1;
+            }
+            if ((size_t)line_len > MAX_SAM_LINE_SIZE) {
+                SetBoundsError(bounds_error, "bam2sam", "sam_format",
+                               BOUNDS_LIMIT_MAX_SAM_LINE_SIZE, MAX_SAM_LINE_SIZE, line_len,
+                               -1, -1, idx, cid);
+                free(line.s);
+                return -1;
+            }
+            if (core_total_len + (size_t)line_len + 1 > MAX_SAM_FORMAT_CORE_BUFFER_SIZE) {
+                SetBoundsError(bounds_error, "bam2sam", "sam_format_batch",
+                               BOUNDS_LIMIT_MAX_SAM_FORMAT_CORE_BUFFER_SIZE,
+                               MAX_SAM_FORMAT_CORE_BUFFER_SIZE, core_total_len + line_len + 1,
+                               -1, -1, idx, cid);
+                free(line.s);
+                return -1;
+            }
+            if (line.l > 0) write_sam_to_mem(mem_writer, line.s, line.l);
+            write_sam_to_mem(mem_writer, "\n", 1);
+            core_total_len += (size_t)line_len + 1;
+        }
+    }
+
+    free(line.s);
+    return 0;
+}
+
+} // namespace
+
+int SwBam::FusedBamToSamChecked(BamRead *read, BamComplete *complete,
+                                sam_hdr_t *h, MemReader &reader, MemWriter &mem_writer,
+                                BoundsCheckError *bounds_error) {
+    double t0 = GetTime();
+    const int NB = 64;
+    CheckedPara degz_para[NB];
+    for (int b = 0; b < NB; ++b) {
+        degz_para[b].output_records = complete->getResultBuf(b).data();
+        degz_para[b].input_block = nullptr;
+        degz_para[b].un_comp_block = nullptr;
+        degz_para[b].n_records = 0;
+        degz_para[b].status = -1;
+        degz_para[b].record_index = -1;
+        degz_para[b].actual_value = 0;
+        degz_para[b].limit_value = 0;
+        degz_para[b].limit_id = BOUNDS_LIMIT_NONE;
+    }
+
+    auto do_read_group = [&](std::vector<bam_block*> &blocks) {
+        blocks.clear();
+        blocks.reserve(NB);
+        for (int b = 0; b < NB; ++b) {
+            bam_block *blk = read->getEmpty();
+            int ret = mem_read_block(reader.base, reader.size, reader.pos, blk);
+            if (ret < 0 || blk->length == 28) {
+                read->backBlock(blk);
+                break;
+            }
+            blk->block_id = b;
+            blk->pos = 0;
+            blocks.push_back(blk);
+        }
+    };
+
+    std::vector<bam_block*> next_blocks;
+    next_blocks.reserve(NB);
+    do_read_group(next_blocks);
+
+    long long block_count = 0;
+    long long group_count = 0;
+    long long total_records = 0;
+
+    while (!next_blocks.empty()) {
+        std::vector<bam_block*> cur_blocks = std::move(next_blocks);
+        next_blocks.clear();
+        next_blocks.reserve(NB);
+
+        const int n_blocks = (int)cur_blocks.size();
+        block_count += n_blocks;
+
+        for (int b = 0; b < NB; ++b) {
+            degz_para[b].block_id = b;
+            degz_para[b].input_block = (b < n_blocks) ? cur_blocks[b] : nullptr;
+            degz_para[b].un_comp_block = (b < n_blocks) ? complete->getBuffer(b) : nullptr;
+            degz_para[b].n_records = 0;
+            degz_para[b].status = (b < n_blocks) ? 0 : -1;
+            degz_para[b].record_index = -1;
+            degz_para[b].actual_value = 0;
+            degz_para[b].limit_value = 0;
+            degz_para[b].limit_id = BOUNDS_LIMIT_NONE;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
+            __real_athread_spawn((void*)slave_decompress_checked, degz_para, 1);
+            athread_join();
+        }
+
+        for (int b = 0; b < n_blocks; ++b) {
+            if (degz_para[b].status != 0) {
+                SetBoundsErrorFromCheckedPara(bounds_error, "bam2sam", "decompress", degz_para[b], b);
+                for (auto blk : cur_blocks) read->backBlock(blk);
+                return -1;
+            }
+        }
+
+        std::vector<bam1_t*> records;
+        records.reserve((size_t)n_blocks * MAX_RECORDS_PER_BLOCK);
+        for (int b = 0; b < n_blocks; ++b) {
+            for (int r = 0; r < degz_para[b].n_records; ++r)
+                records.push_back(degz_para[b].output_records[r]);
+            total_records += degz_para[b].n_records;
+        }
+
+        if (!records.empty() &&
+            FormatSamRecordsChecked(h, records.data(), (int)records.size(), mem_writer, bounds_error) != 0) {
+            for (auto blk : cur_blocks) read->backBlock(blk);
+            return -1;
+        }
+
+        for (auto blk : cur_blocks) read->backBlock(blk);
+        do_read_group(next_blocks);
+        group_count++;
+    }
+
+    printf("FusedBamToSamChecked finished. blocks=%lld groups=%lld records=%lld cost=%.3f s\n",
+           block_count, group_count, total_records, GetTime() - t0);
+    return 0;
+}
+
+// FusedBamToBam: 单线程融合 Producer + Consumer + Writer
+void SwBam::FusedBamToBam(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
+                          MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter) {
+    double t0 = GetTime();
+    double t_decomp_filter = 0, t_pack = 0, t_compress = 0, t_read = 0, t_write = 0;
+    const int NB = 64;
+
+    Bam2BamPara paras[NB];
+    for (int b = 0; b < NB; ++b) {
+        paras[b].output_records = complete->getResultBuf(b).data();
+        paras[b].bam_lens = (uint32_t *)aligned_alloc_custom(64, MAX_RECORDS_PER_BLOCK * sizeof(uint32_t));
+        if (!paras[b].bam_lens) {
+            fprintf(stderr, "Failed to allocate bam2bam bam_lens for block %d\n", b);
+            abort();
+        }
+        paras[b].input_block = nullptr;
+        paras[b].un_comp_block = nullptr;
+        paras[b].n_total_records = 0;
+        paras[b].n_kept_records = 0;
+        paras[b].status = -1;
+        paras[b].filter = filter;
+    }
+
+    Comp_Para comp_buf_A[NB], comp_buf_B[NB];
+    Comp_Para *comp_active = comp_buf_A;
+    Comp_Para *comp_pending = comp_buf_B;
+    std::vector<std::vector<bam1_t*>> pending_group;
+    bool has_pending = false;
+    long long bgzf_blocks = 0;
+
+    long long total_records = 0;
+    long long kept_records = 0;
+    long long dropped_records = 0;
+    long long input_blocks = 0;
+    long long group_count = 0;
+
+    auto flush_pending = [&]() {
+        double flush_t0 = GetTime();
+
+        if (!has_pending) return;
+        for (int k = 0; k < NB; ++k) {
+            if (comp_pending[k].status == 0 && comp_pending[k].output_block) {
+                write_block_to_mem(mem_writer, comp_pending[k].output_block);
+                write_complete->backBlock(comp_pending[k].output_block);
+                bgzf_blocks++;
+            }
+        }
+        pending_group.clear();
+        has_pending = false;
+
+        t_write += GetTime() - flush_t0;
+    };
+
+    auto do_read_group = [&](std::vector<bam_block*> &blocks) {
+        double read_t0 = GetTime();
+
+        blocks.clear();
+        blocks.reserve(NB);
+        for (int b = 0; b < NB; ++b) {
+            bam_block *blk = read->getEmpty();
+            int ret = mem_read_block(reader.base, reader.size, reader.pos, blk);
+            if (ret < 0 || blk->length == 28) {
+                read->backBlock(blk);
+                break;
+            }
+            blk->block_id = b;
+            blk->pos = 0;
+            blocks.push_back(blk);
+        }
+
+        t_read += GetTime() - read_t0;
+    };
+
+    auto do_compress = [&](std::vector<std::vector<bam1_t*>> &group,
+                           std::vector<bam_block*> &next_blocks) {
+        for (int k = (int)group.size(); k < NB; ++k)
+            group.push_back({});
+
+        for (int k = 0; k < NB; ++k) {
+            if (group[k].empty()) {
+                comp_active[k].block_id = k;
+                comp_active[k].input_records = nullptr;
+                comp_active[k].n_records = 0;
+                comp_active[k].output_block = nullptr;
+                comp_active[k].un_comp_block = nullptr;
+                comp_active[k].output_size = 0;
+                comp_active[k].status = -1;
+                continue;
+            }
+
+            comp_active[k].block_id = k;
+            comp_active[k].input_records = group[k].data();
+            comp_active[k].n_records = (int)group[k].size();
+            comp_active[k].output_block = write_complete->getEmpty();
+            comp_active[k].un_comp_block = write_complete->getBuffer(k);
+            comp_active[k].output_size = 0;
+            comp_active[k].status = 0;
+        }
+
+        double compress_t0 = GetTime();
+        __real_athread_spawn((void*)slave_compressfunc, comp_active, 1);
+        flush_pending();
+        do_read_group(next_blocks);
+        athread_join();
+        t_compress += GetTime() - compress_t0;
+
+        pending_group = std::move(group);
+        std::swap(comp_active, comp_pending);
+        has_pending = true;
+
+        group.clear();
+        group.reserve(NB);
+    };
+
+    std::vector<bam_block*> next_blocks;
+    next_blocks.reserve(NB);
+    do_read_group(next_blocks);
+
+    while (!next_blocks.empty()) {
+        std::vector<bam_block*> cur_blocks = std::move(next_blocks);
+        next_blocks.clear();
+        next_blocks.reserve(NB);
+
+        const int n_blocks = (int)cur_blocks.size();
+        input_blocks += n_blocks;
+
+        for (int b = 0; b < NB; ++b) {
+            paras[b].filter = filter;
+            if (b < n_blocks) {
+                paras[b].block_id = b;
+                paras[b].input_block = cur_blocks[b];
+                paras[b].un_comp_block = complete->getBuffer(b);
+                paras[b].n_total_records = 0;
+                paras[b].n_kept_records = 0;
+                paras[b].status = 0;
+            } else {
+                paras[b].block_id = b;
+                paras[b].input_block = nullptr;
+                paras[b].un_comp_block = nullptr;
+                paras[b].n_total_records = 0;
+                paras[b].n_kept_records = 0;
+                paras[b].status = -1;
+            }
+        }
+
+        double decomp_t0 = GetTime();
+        __real_athread_spawn((void*)slave_decompress_filterfunc, paras, 1);
+        athread_join();
+        t_decomp_filter += GetTime() - decomp_t0;
+
+        for (int b = 0; b < n_blocks; ++b) {
+            if (paras[b].status != 0) {
+                fprintf(stderr, "FATAL: slave_decompress_filterfunc failed on block %d with status %d\n",
+                        b, paras[b].status);
+                abort();
+            }
+        }
+
+        std::vector<std::vector<bam1_t*>> cur_group;
+        cur_group.reserve(NB);
+        std::vector<bam1_t*> cur_block;
+        cur_block.reserve(MAX_RECORDS_PER_BLOCK);
+        uint32_t total_len = 0;
+
+        double pack_t0 = GetTime();
+        for (int b = 0; b < n_blocks; ++b) {
+            total_records += paras[b].n_total_records;
+            kept_records += paras[b].n_kept_records;
+            dropped_records += paras[b].n_total_records - paras[b].n_kept_records;
+
+            for (int r = 0; r < paras[b].n_kept_records; ++r) {
+                bam1_t *record = paras[b].output_records[r];
+                uint32_t bam_len = paras[b].bam_lens[r];
+
+                if (bam_len + 4 + total_len <= BGZF_BLOCK_SIZE) {
+                    cur_block.push_back(record);
+                    total_len += bam_len + 4;
+                } else {
+                    if (cur_block.empty()) {
+                        fprintf(stderr, "FATAL: bam2bam pack encountered an oversized BAM record\n");
+                        abort();
+                    }
+                    cur_group.push_back(std::move(cur_block));
+                    cur_block.clear();
+                    cur_block.reserve(MAX_RECORDS_PER_BLOCK);
+                    cur_block.push_back(record);
+                    total_len = bam_len + 4;
+                }
+            }
+        }
+
+        if (!cur_block.empty()) {
+            cur_group.push_back(std::move(cur_block));
+        }
+
+        if (cur_group.size() > (size_t)NB) {
+            fprintf(stderr, "FATAL: bam2bam produced %zu output blocks from one input group\n", cur_group.size());
+            abort();
+        }
+
+        for (auto blk : cur_blocks) read->backBlock(blk);
+        t_pack += GetTime() - pack_t0;
+
+        group_count++;
+        if (cur_group.empty()) {
+            flush_pending();
+            do_read_group(next_blocks);
+            continue;
+        }
+
+        do_compress(cur_group, next_blocks);
+    }
+
+    flush_pending();
+
+    for (int b = 0; b < NB; ++b) {
+        if (paras[b].bam_lens) {
+            aligned_free_custom((unsigned char*)paras[b].bam_lens);
+            paras[b].bam_lens = nullptr;
+        }
+    }
+
+    printf("FusedBamToBam finished. in_blocks=%lld groups=%lld total_records=%lld kept_records=%lld dropped_records=%lld bgzf_blocks=%lld cost=%.3f s\n",
+           input_blocks, group_count, total_records, kept_records, dropped_records, bgzf_blocks, GetTime() - t0);
+    printf("  decomp_filter_slave=%.3f  pack=%.3f  compress_slave=%.3f  read=%.3f  write=%.3f\n",
+           t_decomp_filter, t_pack, t_compress, t_read, t_write);
+}
+
+int SwBam::FusedBamToBamChecked(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
+                                MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter,
+                                BoundsCheckError *bounds_error) {
+    double t0 = GetTime();
+    const int NB = 64;
+
+    CheckedBam2BamPara paras[NB];
+    for (int b = 0; b < NB; ++b) {
+        paras[b].output_records = complete->getResultBuf(b).data();
+        paras[b].bam_lens = (uint32_t *)aligned_alloc_custom(64, MAX_RECORDS_PER_BLOCK * sizeof(uint32_t));
+        if (!paras[b].bam_lens) {
+            SetGenericBoundsError(bounds_error, "bam2bam", "alloc_bam_lens", errno, -1, -1, -1, b);
+            for (int j = 0; j < b; ++j) {
+                if (paras[j].bam_lens) aligned_free_custom((unsigned char*)paras[j].bam_lens);
+            }
+            return -1;
+        }
+        paras[b].status = -1;
+        paras[b].record_index = -1;
+        paras[b].actual_value = 0;
+        paras[b].limit_value = 0;
+        paras[b].limit_id = BOUNDS_LIMIT_NONE;
+        paras[b].filter = filter;
+    }
+
+    Comp_Para comp_buf_A[NB], comp_buf_B[NB];
+    Comp_Para *comp_active = comp_buf_A;
+    Comp_Para *comp_pending = comp_buf_B;
+    std::vector<std::vector<bam1_t*>> pending_group;
+    bool has_pending = false;
+    long long bgzf_blocks = 0;
+
+    auto release_pending_outputs = [&](Comp_Para *buf) {
+        for (int k = 0; k < NB; ++k) {
+            if (buf[k].output_block) {
+                write_complete->backBlock(buf[k].output_block);
+                buf[k].output_block = nullptr;
+            }
+        }
+    };
+
+    auto do_read_group = [&](std::vector<bam_block*> &blocks) {
+        blocks.clear();
+        blocks.reserve(NB);
+        for (int b = 0; b < NB; ++b) {
+            bam_block *blk = read->getEmpty();
+            int ret = mem_read_block(reader.base, reader.size, reader.pos, blk);
+            if (ret < 0 || blk->length == 28) {
+                read->backBlock(blk);
+                break;
+            }
+            blk->block_id = b;
+            blk->pos = 0;
+            blocks.push_back(blk);
+        }
+    };
+
+    auto flush_pending = [&]() {
+        if (!has_pending) return;
+        for (int k = 0; k < NB; ++k) {
+            if (comp_pending[k].status == 0 && comp_pending[k].output_block) {
+                write_block_to_mem(mem_writer, comp_pending[k].output_block);
+                write_complete->backBlock(comp_pending[k].output_block);
+                comp_pending[k].output_block = nullptr;
+                bgzf_blocks++;
+            }
+        }
+        pending_group.clear();
+        has_pending = false;
+    };
+
+    auto do_compress = [&](std::vector<std::vector<bam1_t*>> &group,
+                           std::vector<bam_block*> &next_blocks) -> int {
+        for (int k = (int)group.size(); k < NB; ++k)
+            group.push_back({});
+
+        for (int k = 0; k < NB; ++k) {
+            if (group[k].empty()) {
+                comp_active[k].block_id = k;
+                comp_active[k].input_records = nullptr;
+                comp_active[k].n_records = 0;
+                comp_active[k].output_block = nullptr;
+                comp_active[k].un_comp_block = nullptr;
+                comp_active[k].output_size = 0;
+                comp_active[k].status = -1;
+                continue;
+            }
+            comp_active[k].block_id = k;
+            comp_active[k].input_records = group[k].data();
+            comp_active[k].n_records = (int)group[k].size();
+            comp_active[k].output_block = write_complete->getEmpty();
+            comp_active[k].un_comp_block = write_complete->getBuffer(k);
+            comp_active[k].output_size = 0;
+            comp_active[k].status = 0;
+        }
+
+        __real_athread_spawn((void*)slave_compressfunc, comp_active, 1);
+        flush_pending();
+        do_read_group(next_blocks);
+        athread_join();
+
+        for (int k = 0; k < NB; ++k) {
+            if (!group[k].empty() && comp_active[k].status != 0) {
+                SetGenericBoundsError(bounds_error, "bam2bam", "compress", comp_active[k].status,
+                                      k, -1, -1, k);
+                release_pending_outputs(comp_active);
+                return -1;
+            }
+        }
+
+        pending_group = std::move(group);
+        std::swap(comp_active, comp_pending);
+        has_pending = true;
+        group.clear();
+        group.reserve(NB);
+        return 0;
+    };
+
+    std::vector<bam_block*> next_blocks;
+    next_blocks.reserve(NB);
+    do_read_group(next_blocks);
+
+    long long total_records = 0;
+    long long kept_records = 0;
+    long long dropped_records = 0;
+    long long input_blocks = 0;
+    long long group_count = 0;
+
+    while (!next_blocks.empty()) {
+        std::vector<bam_block*> cur_blocks = std::move(next_blocks);
+        next_blocks.clear();
+        next_blocks.reserve(NB);
+
+        const int n_blocks = (int)cur_blocks.size();
+        input_blocks += n_blocks;
+
+        for (int b = 0; b < NB; ++b) {
+            paras[b].filter = filter;
+            paras[b].block_id = b;
+            paras[b].input_block = (b < n_blocks) ? cur_blocks[b] : nullptr;
+            paras[b].un_comp_block = (b < n_blocks) ? complete->getBuffer(b) : nullptr;
+            paras[b].n_total_records = 0;
+            paras[b].n_kept_records = 0;
+            paras[b].status = (b < n_blocks) ? 0 : -1;
+            paras[b].record_index = -1;
+            paras[b].actual_value = 0;
+            paras[b].limit_value = 0;
+            paras[b].limit_id = BOUNDS_LIMIT_NONE;
+        }
+
+        __real_athread_spawn((void*)slave_decompress_filter_checked, paras, 1);
+        athread_join();
+
+        for (int b = 0; b < n_blocks; ++b) {
+            if (paras[b].status != 0) {
+                SetBoundsErrorFromCheckedBam2BamPara(bounds_error, "bam2bam", "decompress_filter",
+                                                     paras[b], b);
+                for (auto blk : cur_blocks) read->backBlock(blk);
+                release_pending_outputs(comp_active);
+                release_pending_outputs(comp_pending);
+                for (int j = 0; j < NB; ++j) {
+                    aligned_free_custom((unsigned char*)paras[j].bam_lens);
+                    paras[j].bam_lens = nullptr;
+                }
+                return -1;
+            }
+        }
+
+        std::vector<std::vector<bam1_t*>> cur_group;
+        cur_group.reserve(NB);
+        std::vector<bam1_t*> cur_block;
+        cur_block.reserve(MAX_RECORDS_PER_BLOCK);
+        uint32_t total_len = 0;
+
+        for (int b = 0; b < n_blocks; ++b) {
+            total_records += paras[b].n_total_records;
+            kept_records += paras[b].n_kept_records;
+            dropped_records += paras[b].n_total_records - paras[b].n_kept_records;
+
+            for (int r = 0; r < paras[b].n_kept_records; ++r) {
+                bam1_t *record = paras[b].output_records[r];
+                uint32_t bam_len = paras[b].bam_lens[r];
+                if ((uint32_t)(bam_len + 4) > BGZF_BLOCK_SIZE) {
+                    SetBoundsError(bounds_error, "bam2bam", "pack",
+                                   BOUNDS_LIMIT_BGZF_RECORD_SIZE, BGZF_BLOCK_SIZE, bam_len + 4,
+                                   paras[b].block_id, -1, r, b);
+                    for (auto blk : cur_blocks) read->backBlock(blk);
+                    release_pending_outputs(comp_active);
+                    release_pending_outputs(comp_pending);
+                    for (int j = 0; j < NB; ++j) {
+                        aligned_free_custom((unsigned char*)paras[j].bam_lens);
+                        paras[j].bam_lens = nullptr;
+                    }
+                    return -1;
+                }
+
+                if (bam_len + 4 + total_len <= BGZF_BLOCK_SIZE) {
+                    cur_block.push_back(record);
+                    total_len += bam_len + 4;
+                } else {
+                    cur_group.push_back(std::move(cur_block));
+                    cur_block.clear();
+                    cur_block.reserve(MAX_RECORDS_PER_BLOCK);
+                    cur_block.push_back(record);
+                    total_len = bam_len + 4;
+                }
+            }
+        }
+
+        if (!cur_block.empty()) cur_group.push_back(std::move(cur_block));
+        for (auto blk : cur_blocks) read->backBlock(blk);
+
+        group_count++;
+        if (cur_group.empty()) {
+            flush_pending();
+            do_read_group(next_blocks);
+            continue;
+        }
+        if (do_compress(cur_group, next_blocks) != 0) {
+            for (int j = 0; j < NB; ++j) {
+                aligned_free_custom((unsigned char*)paras[j].bam_lens);
+                paras[j].bam_lens = nullptr;
+            }
+            return -1;
+        }
+    }
+
+    flush_pending();
+
+    for (int b = 0; b < NB; ++b) {
+        if (paras[b].bam_lens) {
+            aligned_free_custom((unsigned char*)paras[b].bam_lens);
+            paras[b].bam_lens = nullptr;
+        }
+    }
+
+    printf("FusedBamToBamChecked finished. in_blocks=%lld groups=%lld total_records=%lld kept_records=%lld dropped_records=%lld bgzf_blocks=%lld cost=%.3f s\n",
+           input_blocks, group_count, total_records, kept_records, dropped_records, bgzf_blocks, GetTime() - t0);
+    return 0;
 }
 
 int SwBam::writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b) {
@@ -1132,6 +1917,285 @@ void SwBam::FusedSamToBam(BamWrite *write, BamWriteComplete *complete,
            t_copy_count, t_parse, t_pack, t_compress, t_write);
 }
 
+int SwBam::FusedSamToBamChecked(BamWriteComplete *complete, sam_hdr_t *h,
+                                MemReader reader, MemWriter &mem_writer, BoundsCheckError *bounds_error) {
+    double t1 = GetTime();
+
+    std::vector<bam1_t*> cur_block;
+    std::vector<std::vector<bam1_t*>> cur_group;
+    cur_block.reserve(MAX_RECORDS_PER_BLOCK);
+    cur_group.reserve(64);
+
+    uint32_t bam_len = 0;
+    uint32_t total_len = 0;
+    long long block_nums = 0;
+    long long group_nums = 0;
+    long long bam1_t_nums = 0;
+    long long bgzf_nums = 0;
+    long long cur_group_records = 0;
+    long long pending_records = 0;
+
+    Comp_Para comp_buf_A[64], comp_buf_B[64];
+    Comp_Para *comp_active = comp_buf_A;
+    Comp_Para *comp_pending = comp_buf_B;
+    std::vector<std::vector<bam1_t*>> pending_group;
+    bool has_pending = false;
+
+    auto destroy_group_records = [](std::vector<std::vector<bam1_t*>> &group) {
+        for (auto &block : group) {
+            for (bam1_t *b : block) bam_destroy1(b);
+        }
+        group.clear();
+    };
+    auto destroy_block_records = [](std::vector<bam1_t*> &block) {
+        for (bam1_t *b : block) bam_destroy1(b);
+        block.clear();
+    };
+    auto release_outputs = [&](Comp_Para *buf) {
+        for (int i = 0; i < 64; ++i) {
+            if (buf[i].output_block) {
+                complete->backBlock(buf[i].output_block);
+                buf[i].output_block = nullptr;
+            }
+        }
+    };
+    auto cleanup_state = [&]() {
+        destroy_block_records(cur_block);
+        destroy_group_records(cur_group);
+        destroy_group_records(pending_group);
+        release_outputs(comp_active);
+        release_outputs(comp_pending);
+    };
+
+    auto flush_pending = [&]() {
+        if (!has_pending) return;
+        for (int k = 0; k < 64; ++k) {
+            if (comp_pending[k].status == 0 && comp_pending[k].output_block) {
+                write_block_to_mem(mem_writer, comp_pending[k].output_block);
+                complete->backBlock(comp_pending[k].output_block);
+                comp_pending[k].output_block = nullptr;
+                bgzf_nums++;
+            }
+        }
+        destroy_group_records(pending_group);
+        pending_records = 0;
+        has_pending = false;
+    };
+
+    auto do_compress = [&]() -> int {
+        for (int k = (int)cur_group.size(); k < 64; ++k)
+            cur_group.push_back({});
+
+        for (int k = 0; k < 64; ++k) {
+            if (cur_group[k].empty()) {
+                comp_active[k].block_id = k;
+                comp_active[k].input_records = nullptr;
+                comp_active[k].n_records = 0;
+                comp_active[k].output_block = nullptr;
+                comp_active[k].un_comp_block = nullptr;
+                comp_active[k].output_size = 0;
+                comp_active[k].status = -1;
+                continue;
+            }
+            comp_active[k].block_id = k;
+            comp_active[k].input_records = cur_group[k].data();
+            comp_active[k].n_records = (int)cur_group[k].size();
+            comp_active[k].output_block = complete->getEmpty();
+            comp_active[k].un_comp_block = complete->getBuffer(k);
+            comp_active[k].output_size = 0;
+            comp_active[k].status = 0;
+        }
+
+        __real_athread_spawn((void*)slave_compressfunc, comp_active, 1);
+        flush_pending();
+        athread_join();
+
+        for (int k = 0; k < 64; ++k) {
+            if (!cur_group[k].empty() && comp_active[k].status != 0) {
+                SetGenericBoundsError(bounds_error, "sam2bam", "compress", comp_active[k].status,
+                                      k, -1, -1, k);
+                release_outputs(comp_active);
+                return -1;
+            }
+        }
+
+        pending_group = std::move(cur_group);
+        pending_records = cur_group_records;
+        std::swap(comp_active, comp_pending);
+        has_pending = true;
+        cur_group.clear();
+        cur_group.reserve(64);
+        cur_group_records = 0;
+        return 0;
+    };
+
+    std::vector<char> line_buf(MAX_SAM_LINE_SIZE + 1);
+
+    while (reader.pos < reader.size) {
+        struct ChunkPlan {
+            size_t start;
+            size_t end;
+            int count;
+        };
+        std::vector<ChunkPlan> plans;
+        plans.reserve(64);
+        long long batch_record_count = 0;
+
+        for (int chunk_id = 0; chunk_id < 64 && reader.pos < reader.size; ++chunk_id) {
+            size_t start_pos = reader.pos;
+            size_t end_pos = start_pos + SAM_CHUNK_SIZE;
+            if (end_pos < reader.size) {
+                while (end_pos < reader.size && reader.base[end_pos] != '\n') end_pos++;
+                if (end_pos < reader.size && reader.base[end_pos] == '\n') end_pos++;
+            } else {
+                end_pos = reader.size;
+            }
+
+            size_t read_len = end_pos - start_pos;
+            if (read_len + 1 > CHUNK_BUFFER_SIZE) {
+                SetBoundsError(bounds_error, "sam2bam", "copy_count",
+                               BOUNDS_LIMIT_CHUNK_BUFFER_SIZE, CHUNK_BUFFER_SIZE, read_len + 1,
+                               -1, chunk_id, -1, -1);
+                cleanup_state();
+                return -1;
+            }
+
+            int count = 0;
+            size_t pos = start_pos;
+            while (pos < end_pos) {
+                size_t line_start = pos;
+                while (pos < end_pos && reader.base[pos] != '\n') pos++;
+                size_t line_len = pos - line_start;
+                if (line_len > 0 && reader.base[line_start + line_len - 1] == '\r') line_len--;
+                if (pos < end_pos && reader.base[pos] == '\n') pos++;
+                if (line_len == 0) continue;
+                if (line_len > MAX_SAM_LINE_SIZE) {
+                    SetBoundsError(bounds_error, "sam2bam", "copy_count",
+                                   BOUNDS_LIMIT_MAX_SAM_LINE_SIZE, MAX_SAM_LINE_SIZE, line_len,
+                                   -1, chunk_id, count, -1);
+                    cleanup_state();
+                    return -1;
+                }
+                count++;
+                if (count > MAX_BAMS_PER_CHUNK) {
+                    SetBoundsError(bounds_error, "sam2bam", "copy_count",
+                                   BOUNDS_LIMIT_MAX_BAMS_PER_CHUNK, MAX_BAMS_PER_CHUNK, count,
+                                   -1, chunk_id, count - 1, -1);
+                    cleanup_state();
+                    return -1;
+                }
+            }
+
+            plans.push_back({start_pos, end_pos, count});
+            batch_record_count += count;
+            reader.pos = end_pos;
+        }
+
+        if (plans.empty()) break;
+
+        long long estimated_in_flight = pending_records + cur_group_records + (long long)cur_block.size() + batch_record_count;
+        if (estimated_in_flight > FUSED_SAM2BAM_BAM_POOL_SIZE) {
+            SetBoundsError(bounds_error, "sam2bam", "pool_estimate",
+                           BOUNDS_LIMIT_FUSED_SAM2BAM_BAM_POOL_SIZE, FUSED_SAM2BAM_BAM_POOL_SIZE,
+                           estimated_in_flight, -1, -1, -1, -1);
+            cleanup_state();
+            return -1;
+        }
+
+        for (int chunk_id = 0; chunk_id < (int)plans.size(); ++chunk_id) {
+            size_t pos = plans[chunk_id].start;
+            int record_index = 0;
+            while (pos < plans[chunk_id].end) {
+                size_t line_start = pos;
+                while (pos < plans[chunk_id].end && reader.base[pos] != '\n') pos++;
+                size_t line_len = pos - line_start;
+                if (line_len > 0 && reader.base[line_start + line_len - 1] == '\r') line_len--;
+                if (pos < plans[chunk_id].end && reader.base[pos] == '\n') pos++;
+                if (line_len == 0) continue;
+
+                memcpy(line_buf.data(), reader.base + line_start, line_len);
+                line_buf[line_len] = '\0';
+                kstring_t ks = {line_len, line_len + 1, line_buf.data()};
+                bam1_t *b = bam_init1();
+                if (!b) {
+                    SetGenericBoundsError(bounds_error, "sam2bam", "sam_parse_alloc", errno,
+                                          -1, chunk_id, record_index, -1);
+                    cleanup_state();
+                    return -1;
+                }
+                int ret = sam_parse1(&ks, h, b);
+                if (ret < 0) {
+                    bam_destroy1(b);
+                    SetGenericBoundsError(bounds_error, "sam2bam", "sam_parse", ret,
+                                          -1, chunk_id, record_index, -1);
+                    cleanup_state();
+                    return -1;
+                }
+                if (b->m_data > INIT_DATA_SIZE || b->l_data > (int)INIT_DATA_SIZE) {
+                    long long actual = std::max<long long>(b->m_data, b->l_data);
+                    bam_destroy1(b);
+                    SetBoundsError(bounds_error, "sam2bam", "sam_parse",
+                                   BOUNDS_LIMIT_INIT_DATA_SIZE, INIT_DATA_SIZE, actual,
+                                   -1, chunk_id, record_index, -1);
+                    cleanup_state();
+                    return -1;
+                }
+
+                bam_len = (uint32_t)(b->l_data - b->core.l_extranul + 32);
+                if ((uint32_t)(bam_len + 4) > BGZF_BLOCK_SIZE) {
+                    bam_destroy1(b);
+                    SetBoundsError(bounds_error, "sam2bam", "pack",
+                                   BOUNDS_LIMIT_BGZF_RECORD_SIZE, BGZF_BLOCK_SIZE, bam_len + 4,
+                                   -1, chunk_id, record_index, -1);
+                    cleanup_state();
+                    return -1;
+                }
+
+                bam1_t_nums++;
+                if (bam_len + 4 + total_len <= BGZF_BLOCK_SIZE) {
+                    cur_block.push_back(b);
+                    total_len += bam_len + 4;
+                } else {
+                    block_nums++;
+                    cur_group_records += cur_block.size();
+                    cur_group.push_back(std::move(cur_block));
+                    cur_block.clear();
+                    cur_block.reserve(MAX_RECORDS_PER_BLOCK);
+                    cur_block.push_back(b);
+                    total_len = bam_len + 4;
+                }
+
+                if ((int)cur_group.size() >= 64) {
+                    group_nums++;
+                    if (do_compress() != 0) {
+                        cleanup_state();
+                        return -1;
+                    }
+                }
+                record_index++;
+            }
+        }
+    }
+
+    if (!cur_block.empty()) {
+        block_nums++;
+        cur_group_records += cur_block.size();
+        cur_group.push_back(std::move(cur_block));
+    }
+    if (!cur_group.empty()) {
+        group_nums++;
+        if (do_compress() != 0) {
+            cleanup_state();
+            return -1;
+        }
+    }
+    flush_pending();
+
+    printf("FusedSamToBamChecked finished. bam1_t=%lld, blocks=%lld, groups=%lld, bgzf=%lld, cost=%lf\n",
+           bam1_t_nums, block_nums, group_nums, bgzf_nums, GetTime() - t1);
+    return 0;
+}
+
 int SwBam:: writeBlockTobam(BGZF *fp, bam_block *block) {
     int block_offset = block->pos;
     if (block->length < 0) {
@@ -1152,115 +2216,196 @@ int SwBam:: writeBlockTobam(BGZF *fp, bam_block *block) {
     return 0;
 }
 
-void SwBam::ProcessSwBam() {
+int SwBam::ProcessSwBam() {
     double t0 = GetTime();
-
     double t_header = 0, t_total = 0;
+    MemReader reader = {};
+    MemWriter mem_writer = {};
+    BoundsCheckError bounds_error = {};
+    size_t sam_size = 0;
+    size_t bam_size = 0;
+    char *sam_mem = nullptr;
+    char *bam_mem = nullptr;
+    bool ran_body = false;
+    int exit_code = 1;
+    int input_format = -1;
+    int output_format = -1;
+    bool bam_to_bam = false;
+    bool bam_to_sam = false;
+    bool sam_to_bam = false;
+    bool filter_requested = HasBamFilterRequest(cmd_info_);
+    BamFilterOptions bam_filter = BuildBamFilterOptions(cmd_info_);
+    ClearBoundsError(&bounds_error);
 
-    //in文件打开
+    // in文件打开
     sin = sam_open(cmd_info_->in_file_name_.c_str(), "r");
     if (sin == NULL) {
         fprintf(stderr, "Error opening input file %s\n", cmd_info_->in_file_name_.c_str());
+        return exit_code;
     }
 
-    //out文件打开
+    // out文件打开
     const char *out_mode = get_sam_open_mode(cmd_info_->out_file_name_);
     sout = sam_open(cmd_info_->out_file_name_.c_str(), out_mode);
     if (sout == NULL) {
         fprintf(stderr, "Error opening output file %s\n", cmd_info_->out_file_name_.c_str());
+        goto cleanup;
     }
     printf("open the files cost %lf---\n", GetTime() - t0);
 
-
     t0 = GetTime();
-    //头部读取
     hdr = sam_hdr_read(sin);
     if (hdr == NULL) {
         fprintf(stderr, "Error reading header from input file %s\n", cmd_info_->in_file_name_.c_str());
+        goto cleanup;
     }
 
-    //头部写入
+    input_format = sin->format.format;
+    output_format = sout->format.format;
+    if (IsBamLikeFormat(input_format)) input_format = bam;
+    else if (IsSamLikeFormat(input_format)) input_format = sam;
+    if (IsBamLikeFormat(output_format)) output_format = bam;
+    else if (IsSamLikeFormat(output_format)) output_format = sam;
+    bam_to_bam = IsBamLikeFormat(input_format) && IsBamLikeFormat(output_format);
+    bam_to_sam = IsBamLikeFormat(input_format) && IsSamLikeFormat(output_format);
+    sam_to_bam = IsSamLikeFormat(input_format) && IsBamLikeFormat(output_format);
+
+    if (!bam_to_bam && !bam_to_sam && !sam_to_bam) {
+        fprintf(stderr, "Unsupported conversion: input format %d -> output format %d\n", input_format, output_format);
+        goto cleanup;
+    }
+
+    if (filter_requested && !bam_to_bam) {
+        fprintf(stderr, "ERROR: BAM filtering options are only supported for BAM -> BAM.\n");
+        goto cleanup;
+    }
+
+    if (cmd_info_->min_mapq_ > cmd_info_->max_mapq_ && cmd_info_->max_mapq_ >= 0) {
+        fprintf(stderr, "ERROR: --min-mapq cannot be greater than --max-mapq.\n");
+        goto cleanup;
+    }
+
+    if (cmd_info_->min_read_len_ > cmd_info_->max_read_len_ && cmd_info_->max_read_len_ >= 0) {
+        fprintf(stderr, "ERROR: --min-read-len cannot be greater than --max-read-len.\n");
+        goto cleanup;
+    }
+
+    if (!cmd_info_->ref_name_.empty()) {
+        int ref_tid = sam_hdr_name2tid(hdr, cmd_info_->ref_name_.c_str());
+        if (ref_tid < 0) {
+            fprintf(stderr, "ERROR: reference name '%s' does not exist in the BAM header.\n",
+                    cmd_info_->ref_name_.c_str());
+            goto cleanup;
+        }
+        bam_filter.ref_tid = ref_tid;
+    }
+
+    //这里不做验证，直接放行
+    // if (bam_to_bam) {
+    //     BamCrossBlockStats cross_stats = {0, 0};
+    //     int cross_ret = check_bam_cross_block_ex(cmd_info_->in_file_name_.c_str(), &cross_stats, false);
+    //     if (cross_ret < 0) {
+    //         fprintf(stderr, "ERROR: failed to pre-check cross-block records for BAM -> BAM.\n");
+    //         goto cleanup;
+    //     }
+    //     if (cross_ret > 0) {
+    //         fprintf(stderr,
+    //                 "ERROR: input BAM contains %lld cross-block records; BAM -> BAM fused fast-path is disabled for this file.\n",
+    //                 cross_stats.cross_block_records);
+    //         goto cleanup;
+    //     }
+    // }
+
     if (sam_hdr_write(sout, hdr) != 0) {
         fprintf(stderr, "Error writing header to output file %s\n", cmd_info_->out_file_name_.c_str());
+        goto cleanup;
     }
+
     t_header = GetTime() - t0;
     t_total += t_header;
     printf("Complete the head cost %lf\n", t_header);
 
-
     #define USE_MEMORY
     #ifdef USE_MEMORY
-
     t0 = GetTime();
-    MemReader reader;
-    MemWriter mem_writer;
-    size_t sam_size;
-    char *sam_mem = nullptr;
-    size_t bam_size;
-    char *bam_mem = nullptr;
-
-    switch (sin->format.format) {
-        case bam:{
+    switch (input_format) {
+        case bam: {
             printf("MEMORY BAM\n");
 
-            //内存读--
             FILE *f = fopen(cmd_info_->in_file_name_.c_str(), "rb");
-            if (!f) { perror("fopen"); exit(1); }
+            if (!f) {
+                perror("fopen");
+                goto cleanup;
+            }
             fseek(f, 0, SEEK_END);
             bam_size = ftell(f);
             fseek(f, 0, SEEK_SET);
             bam_mem = (char*)malloc(bam_size);
-            fread(bam_mem, 1, bam_size, f);
+            if (!bam_mem) {
+                fclose(f);
+                fprintf(stderr, "Failed to allocate memory for BAM file\n");
+                goto cleanup;
+            }
+            if (fread(bam_mem, 1, bam_size, f) != bam_size) {
+                fclose(f);
+                fprintf(stderr, "Failed to read BAM file\n");
+                goto cleanup;
+            }
             fclose(f);
-            printf("Loaded BAM into memory: %.2f MB\n",bam_size / 1024.0 / 1024.0);
+            printf("Loaded BAM into memory: %.2f MB\n", bam_size / 1024.0 / 1024.0);
 
             reader.base = bam_mem;
             reader.size = bam_size;
             reader.pos = sin->fp.bgzf->block_address;
 
-            //内存写--
-            size_t sam_estimate = bam_size * 5;
-
             // size_t GB = 1024LL * 1024LL * 1024LL;
             // size_t sam_estimate = 1 * GB;
-            init_mem_writer(mem_writer, sam_estimate);
-            printf("Initialized SAM memory writer: %.2f MB\n",sam_estimate / 1024.0 / 1024.0);
-        
+            size_t writer_estimate = bam_to_sam ? bam_size * 5 : bam_size;
+            if (writer_estimate == 0) writer_estimate = 64 * 1024 * 1024;
+            init_mem_writer(mem_writer, writer_estimate);
+            printf("Initialized %s memory writer: %.2f MB\n",
+                   output_format == bam ? "BAM" : "SAM",
+                   writer_estimate / 1024.0 / 1024.0);
             break;
         }
 
-        case sam:{
+        case sam: {
             printf("MEMORY SAM\n");
 
-            //内存读--
             FILE *f = fopen(cmd_info_->in_file_name_.c_str(), "r");
-            if (!f) { perror("fopen"); exit(1); }
-            // 获取文件大小
+            if (!f) {
+                perror("fopen");
+                goto cleanup;
+            }
             fseek(f, 0, SEEK_END);
             sam_size = ftell(f);
             fseek(f, 0, SEEK_SET);
-            // 分配内存
             sam_mem = (char*)malloc(sam_size);
-            if (!sam_mem) { fprintf(stderr, "Failed to allocate memory for SAM file\n"); exit(1); }
-            // 读取文件
-            size_t read_bytes = fread(sam_mem, 1, sam_size, f);
-            if (read_bytes != sam_size) {
+            if (!sam_mem) {
+                fclose(f);
+                fprintf(stderr, "Failed to allocate memory for SAM file\n");
+                goto cleanup;
+            }
+            if (fread(sam_mem, 1, sam_size, f) != sam_size) {
+                fclose(f);
                 fprintf(stderr, "Failed to read SAM file\n");
-                exit(1);
+                goto cleanup;
             }
             fclose(f);
             printf("Loaded SAM into memory: %.2f MB\n", sam_size / 1024.0 / 1024.0);
 
-            // 初始化 reader
             reader.base = sam_mem;
             reader.size = sam_size;
-            reader.pos  = 0;
+            reader.pos = 0;
 
-            // 跳过 header
             kstring_t tmp;
             tmp.l = 0;
             tmp.m = MAX_SAM_LINE_SIZE;
             tmp.s = (char*)malloc(MAX_SAM_LINE_SIZE);
+            if (!tmp.s) {
+                fprintf(stderr, "Failed to allocate temporary SAM header buffer\n");
+                goto cleanup;
+            }
 
             while (true) {
                 size_t old_pos = reader.pos;
@@ -1269,310 +2414,336 @@ void SwBam::ProcessSwBam() {
                 if (tmp.l == 0)
                     continue;
                 if (tmp.s[0] != '@') {
-                    reader.pos = old_pos;   // 回退到该行开始
+                    reader.pos = old_pos;
                     break;
                 }
             }
             free(tmp.s);
 
-            //内存写--
             size_t bam_estimate = sam_size / 2;
+            if (bam_estimate == 0) bam_estimate = 64 * 1024 * 1024;
             init_mem_writer(mem_writer, bam_estimate);
-            printf("Initialized BAM memory writer: %.2f MB\n",bam_estimate / 1024.0 / 1024.0);
-
+            printf("Initialized BAM memory writer: %.2f MB\n", bam_estimate / 1024.0 / 1024.0);
             break;
         }
 
         default:
-            fprintf(stderr, "Unknown file format\n");
-            break;
+            fprintf(stderr, "Unknown input file format\n");
+            goto cleanup;
     }
     printf("Complete the memory cost %lf\n", GetTime() - t0);
     #endif
 
-    double tbody;
-    tbody = GetTime();
-    switch (sin->format.format) {
-        case bam:{
-            t0 = GetTime();
+    {
+        double tbody = GetTime();
 
-            //单线程：融合版本，内存模式，从内存读写数据
-            #define USE_FUSED_BAM2SAM
-            #if defined(USE_MEMORY) && defined(USE_FUSED_BAM2SAM)
-            {
-                printf("Enable FUSED BAM2SAM single-thread mode (USE_MEMORY + USE_FUSED_BAM2SAM)!!!\n");
-                // BamRead(128,1): 128块压缩block池（两轮各64），queue不用
-                // BamComplete(1): 仅需 buffer_pool_（解压缓冲）和 result_pool_（bam1_t）
+        switch (input_format) {
+            case bam: {
                 t0 = GetTime();
-                read     = new BamRead(128, 1);
-                complete = new BamComplete(1);
-                printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
-                FusedBamToSam(read, complete, hdr, reader, mem_writer);
-            }
 
-            //流水线：内存模式，从内存读写数据
-            #elif defined(USE_MEMORY)
-            {
-                printf("Enable 3-thread BAM2SAM pipeline (USE_MEMORY)!!!\n");
-                //BamRead(x , y) x是blocks的内存池大小，y是打包之后队列的大小
-                //BamComplete(x) x是bam1_t的内存池大小
-
-                //串行测试用
-                // read = new BamRead(16640 , 260);
-                // complete = new BamComplete(2932000);
-
-                read     = new BamRead(320, 5);
-                complete = new BamComplete(132000);
-                printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
-
-                thread producer(bind(&SwBam::ProducerSwBamTask_memory, this, sin->fp.bgzf, read, bam_mem, bam_size));
-                thread consumer(bind(&SwBam::ConsumerSwBamTask, this, read, complete));
-
-                t0 = GetTime();
-                SamFormatBatch batch;
-                init_sam_format_batch_buffers(&batch);
-                batch.hdr = hdr;
-
-                long long num = 0;
-                bam1_t *b;
-                while (true) {
-                    batch.count = 0;
-                    while (batch.count < BATCH_SIZE) {
-                        b = complete->getBam1_t();
-                        if (!b) break;
-                        num++;
-                        batch.bams[batch.count++] = b;
-                    }
-                    if (batch.count == 0) break;
-
+                if (output_format == sam) {
+                    #define USE_FUSED_BAM2SAM
+                    #if defined(USE_MEMORY) && defined(USE_FUSED_BAM2SAM)
                     {
-                        std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
-                        __real_athread_spawn((void*)slave_sam_format, &batch, 1);
-                        athread_join();
+                        printf("Enable FUSED BAM2SAM single-thread mode (USE_MEMORY + USE_FUSED_BAM2SAM)!!!\n");
+                        //BamRead(x , y) x是blocks的内存池大小，y是打包之后队列的大小
+                        //BamComplete(x) x是bam1_t的内存池大小
+                        // BamRead(128,1): 128块压缩block池（两轮各64），queue不用
+                        // BamComplete(1): 仅需 buffer_pool_（解压缓冲）和 result_pool_（bam1_t）
+                        read = new BamRead(128, 1);
+                        complete = new BamComplete(1);
+                        printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
+                        if (cmd_info_->validate_bounds_) {
+                            printf("Enable CHECKED BAM2SAM mode (--validate-bounds)!!!\n");
+                            if (FusedBamToSamChecked(read, complete, hdr, reader, mem_writer, &bounds_error) != 0) {
+                                PrintBoundsError(bounds_error);
+                                goto cleanup;
+                            }
+                        } else {
+                            FusedBamToSam(read, complete, hdr, reader, mem_writer);
+                        }
                     }
-
-                    for (int i = 0; i < 64; i++) {
-                        kstring_t *ks = &batch.core_out_lines[i];
-                        write_sam_to_mem(mem_writer, ks->s, ks->l);
-                    }
-                    complete->backBam1_tBatch(batch.bams, batch.count);
-                }
-
-                destroy_sam_format_batch_buffers(&batch);
-                producer.join();
-                consumer.join();
-                printf("Complete main thread writing to sam cost %lf\n", GetTime() - t0);
-                printf("The total bam1_t nums is %lld\n", num);
-            }
-
-            //流水线：非内存模式，从磁盘读写数据
-            #else
-            {
-                printf("Enable 3-thread BAM2SAM pipeline (disk mode)!!!\n");
-                read     = new BamRead(320, 5);
-                complete = new BamComplete(132000);
-                printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
-
-                thread producer(bind(&SwBam::ProducerSwBamTask, this, sin->fp.bgzf, read));
-                thread consumer(bind(&SwBam::ConsumerSwBamTask, this, read, complete));
-
-                t0 = GetTime();
-                SamFormatBatch batch;
-                init_sam_format_batch_buffers(&batch);
-                batch.hdr = hdr;
-
-                long long num = 0;
-                bam1_t *b;
-                while (true) {
-                    batch.count = 0;
-                    while (batch.count < BATCH_SIZE) {
-                        b = complete->getBam1_t();
-                        if (!b) break;
-                        num++;
-                        batch.bams[batch.count++] = b;
-                    }
-                    if (batch.count == 0) break;
-
+                    #elif defined(USE_MEMORY)
                     {
-                        std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
-                        __real_athread_spawn((void*)slave_sam_format, &batch, 1);
-                        athread_join();
+                        printf("Enable 3-thread BAM2SAM pipeline (USE_MEMORY)!!!\n");
+
+                        read = new BamRead(320, 5);
+                        complete = new BamComplete(132000);
+                        printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
+
+                        thread producer(bind(&SwBam::ProducerSwBamTask_memory, this, sin->fp.bgzf, read, bam_mem, bam_size));
+                        thread consumer(bind(&SwBam::ConsumerSwBamTask, this, read, complete));
+
+                        t0 = GetTime();
+                        SamFormatBatch batch;
+                        init_sam_format_batch_buffers(&batch);
+                        batch.hdr = hdr;
+
+                        long long num = 0;
+                        bam1_t *b;
+                        while (true) {
+                            batch.count = 0;
+                            while (batch.count < BATCH_SIZE) {
+                                b = complete->getBam1_t();
+                                if (!b) break;
+                                num++;
+                                batch.bams[batch.count++] = b;
+                            }
+                            if (batch.count == 0) break;
+
+                            {
+                                std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
+                                __real_athread_spawn((void*)slave_sam_format, &batch, 1);
+                                athread_join();
+                            }
+
+                            for (int i = 0; i < 64; i++) {
+                                kstring_t *ks = &batch.core_out_lines[i];
+                                write_sam_to_mem(mem_writer, ks->s, ks->l);
+                            }
+                            complete->backBam1_tBatch(batch.bams, batch.count);
+                        }
+
+                        destroy_sam_format_batch_buffers(&batch);
+                        producer.join();
+                        consumer.join();
+                        printf("Complete main thread writing to sam cost %lf\n", GetTime() - t0);
+                        printf("The total bam1_t nums is %lld\n", num);
+                    }
+                    #else
+                    {
+                        printf("Enable 3-thread BAM2SAM pipeline (disk mode)!!!\n");
+                        read = new BamRead(320, 5);
+                        complete = new BamComplete(132000);
+                        printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
+
+                        thread producer(bind(&SwBam::ProducerSwBamTask, this, sin->fp.bgzf, read));
+                        thread consumer(bind(&SwBam::ConsumerSwBamTask, this, read, complete));
+
+                        t0 = GetTime();
+                        SamFormatBatch batch;
+                        init_sam_format_batch_buffers(&batch);
+                        batch.hdr = hdr;
+
+                        long long num = 0;
+                        bam1_t *b;
+                        while (true) {
+                            batch.count = 0;
+                            while (batch.count < BATCH_SIZE) {
+                                b = complete->getBam1_t();
+                                if (!b) break;
+                                num++;
+                                batch.bams[batch.count++] = b;
+                            }
+                            if (batch.count == 0) break;
+
+                            {
+                                std::lock_guard<std::mutex> lock(g_athread_spawn_mutex);
+                                __real_athread_spawn((void*)slave_sam_format, &batch, 1);
+                                athread_join();
+                            }
+
+                            for (int i = 0; i < 64; i++) {
+                                kstring_t *ks = &batch.core_out_lines[i];
+                                if (hwrite(sout->fp.hfile, ks->s, ks->l) != (ssize_t)ks->l)
+                                    fprintf(stderr, "write failed\n");
+                            }
+                            complete->backBam1_tBatch(batch.bams, batch.count);
+                        }
+
+                        destroy_sam_format_batch_buffers(&batch);
+                        producer.join();
+                        consumer.join();
+                        printf("Complete main thread writing to sam cost %lf\n", GetTime() - t0);
+                        printf("The total bam1_t nums is %lld\n", num);
+                    }
+                    #endif
+                } else if (output_format == bam) {
+                    #define USE_FUSED_BAM2BAM
+                    #if defined(USE_MEMORY) && defined(USE_FUSED_BAM2BAM)
+                    {
+                        printf("Enable FUSED BAM2BAM single-thread mode (USE_MEMORY + USE_FUSED_BAM2BAM)!!!\n");
+                        read = new BamRead(128, 1);
+                        complete = new BamComplete(1);
+                        writeComplete = new BamWriteComplete(130);
+                        printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
+                        if (cmd_info_->validate_bounds_) {
+                            printf("Enable CHECKED BAM2BAM mode (--validate-bounds)!!!\n");
+                            if (FusedBamToBamChecked(read, complete, writeComplete, reader, mem_writer,
+                                                     bam_filter, &bounds_error) != 0) {
+                                PrintBoundsError(bounds_error);
+                                goto cleanup;
+                            }
+                        } else {
+                            FusedBamToBam(read, complete, writeComplete, reader, mem_writer, bam_filter);
+                        }
+                    }
+                    #else
+                    {
+                        fprintf(stderr, "BAM -> BAM is only supported in fused memory mode in this version.\n");
+                        goto cleanup;
+                    }
+                    #endif
+                }
+
+                break;
+            }
+
+            case sam: {
+                t0 = GetTime();
+
+                #define USE_FUSED_SAM2BAM
+                #if defined(USE_MEMORY) && defined(USE_FUSED_SAM2BAM)
+                {
+                    printf("Enable FUSED single-thread mode (USE_MEMORY + USE_FUSED_SAM2BAM)!!!\n");
+                    //BamWrite(x , y) x是bam1_t的内存池大小 , y是打包的block的size
+                    //BamWriteComplete(x) x是bam_block的内存池大小
+                    writeComplete = new BamWriteComplete(130);
+                    printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
+                    if (cmd_info_->validate_bounds_) {
+                        printf("Enable CHECKED SAM2BAM mode (--validate-bounds)!!!\n");
+                        if (FusedSamToBamChecked(writeComplete, hdr, reader, mem_writer, &bounds_error) != 0) {
+                            PrintBoundsError(bounds_error);
+                            goto cleanup;
+                        }
+                    } else {
+                        write = new BamWrite(FUSED_SAM2BAM_BAM_POOL_SIZE, 1);
+                        FusedSamToBam(write, writeComplete, hdr, reader, mem_writer);
+                    }
+                }
+                #elif defined(USE_MEMORY)
+                {
+                    printf("Enable the SAM_PARSE_PARALLEL (3-thread, read and write from memory)!!!\n");
+
+                    write = new BamWrite(655360 ,640);
+                    writeComplete = new BamWriteComplete(130);
+                    printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
+                    
+                    thread producer2(bind(&SwBam::ProducerSwBamTask2_parallel_memory_OP, this, write, hdr, reader));
+                    thread consumer2(bind(&SwBam::ConsumerSwBamTask2, this, write , writeComplete));
+
+                    t0 = GetTime();
+                    long long num2 = 0;
+                    bam_block* comp_block;
+                    while (true) {
+                        comp_block = writeComplete->getCompressedBlock();
+                        if (comp_block == nullptr) break;
+                        num2++;
+                        write_block_to_mem(mem_writer, comp_block);
+                        writeComplete->backBlock(comp_block);
                     }
 
-                    for (int i = 0; i < 64; i++) {
-                        kstring_t *ks = &batch.core_out_lines[i];
-                        if (hwrite(sout->fp.hfile, ks->s, ks->l) != (ssize_t)ks->l)
-                            fprintf(stderr, "write failed\n");
+                    producer2.join();
+                    consumer2.join();
+                    printf("The actual time of reading sam cost %lf\n", t_sam2bam_read);
+                    printf("The actual time of sam parsing cost %lf\n", t_sam_parse);
+                    printf("The actual time of for loops in producer cost %lf\n", t_sam2bam_for);
+                    printf("The actual time of slave cost %lf\n", t_sam2bam_slave);
+                    printf("The actual time of writing to bam cost %lf\n", t_sam2bam_write);
+                    printf("Complete main thread writing to bam cost %lf\n", GetTime() - t0);
+                    printf("The total BGZF nums is %lld\n", num2);
+                }
+                #else
+                {
+                    printf("Enable the SAM_PARSE_PARALLEL (3-thread, read and write from disk)!!!\n");
+
+                    write = new BamWrite(655360 ,640);
+                    writeComplete = new BamWriteComplete(130);
+                    printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
+                    
+                    thread producer2(bind(&SwBam::ProducerSwBamTask2_parallel, this, sin, write, hdr));
+                    thread consumer2(bind(&SwBam::ConsumerSwBamTask2, this, write, writeComplete));
+                    t0 = GetTime();
+                    long long num2 = 0;
+                    bam_block* comp_block;
+
+                    while (true) {
+                        comp_block = writeComplete->getCompressedBlock();
+                        if (comp_block == nullptr) break;
+                        num2++;
+                        (void)writeBlockTobam(sout->fp.bgzf, comp_block);
+                        writeComplete->backBlock(comp_block);
                     }
-                    complete->backBam1_tBatch(batch.bams, batch.count);
+
+                    producer2.join();
+                    consumer2.join();
+                    printf("Complete main thread writing to bam cost %lf\n", GetTime() - t0);
+                    printf("The total BGZF nums is %lld\n", num2);
                 }
-
-                destroy_sam_format_batch_buffers(&batch);
-                producer.join();
-                consumer.join();
-                printf("Complete main thread writing to sam cost %lf\n", GetTime() - t0);
-                printf("The total bam1_t nums is %lld\n", num);
+                #endif
+                break;
             }
-            #endif
 
-            break;
+            default:
+                fprintf(stderr, "Unknown file format\n");
+                goto cleanup;
         }
-            
 
-        case sam:{
-            t0 = GetTime();
-
-            //单线程：融合版本，内存模式，从内存读写数据
-            #define USE_FUSED_SAM2BAM
-            #if defined(USE_MEMORY) && defined(USE_FUSED_SAM2BAM)
-            {
-                printf("Enable FUSED single-thread mode (USE_MEMORY + USE_FUSED_SAM2BAM)!!!\n");
-                //BamWrite(x , y) x是bam1_t的内存池大小 , y是打包的block的size
-                //BamWriteComplete(x) x是bam_block的内存池大小
-                write = new BamWrite(720999 ,1);
-                writeComplete = new BamWriteComplete(130);
-                printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
-
-                FusedSamToBam(write, writeComplete, hdr, reader, mem_writer);
-            }
-
-
-            //流水线：内存模式，从内存读写数据
-            #elif defined(USE_MEMORY)
-            {
-                printf("Enable the SAM_PARSE_PARALLEL (3-thread, read and write from memory)!!!\n");
-                //BamWrite(x , y) x是bam1_t的内存池大小 , y是打包的block的size
-                //BamWriteComplete(x) x是bam_block的内存池大小
-
-                //串行测试用
-                // write = new BamWrite(2938880 , 2870);
-                // writeComplete = new BamWriteComplete(16400);
-
-                write = new BamWrite(655360 ,640);
-                writeComplete = new BamWriteComplete(130);
-                printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
-                
-                thread producer2(bind(&SwBam::ProducerSwBamTask2_parallel_memory_OP, this, write, hdr, reader));
-                // producer2.join();
-                thread consumer2(bind(&SwBam::ConsumerSwBamTask2, this, write , writeComplete));
-                // consumer2.join();
-
-                t0 = GetTime();
-                long long num2 = 0;
-                bam_block* comp_block;
-                while (true) {
-                    comp_block = writeComplete->getCompressedBlock();
-                    if (comp_block == nullptr) break;
-                    num2++;
-                    write_block_to_mem(mem_writer, comp_block);
-                    writeComplete->backBlock(comp_block);
-                }
-
-                producer2.join();
-                consumer2.join();
-                printf("The actual time of reading sam cost %lf\n", t_sam2bam_read);
-                printf("The actual time of sam parsing cost %lf\n", t_sam_parse);
-                printf("The actual time of for loops in producer cost %lf\n", t_sam2bam_for);
-                printf("The actual time of slave cost %lf\n", t_sam2bam_slave);
-                printf("The actual time of writing to bam cost %lf\n", t_sam2bam_write);
-                printf("Complete main thread writing to bam cost %lf\n", GetTime() - t0);
-                printf("The total BGZF nums is %lld\n", num2);
-            }
-
-
-            //流水线：非内存模式，从磁盘读写数据
-            #else
-            {
-                printf("Enable the SAM_PARSE_PARALLEL (3-thread, read and write from disk)!!!\n");
-                //BamWrite(x , y) x是bam1_t的内存池大小 , y是打包的block的size
-                //BamWriteComplete(x) x是bam_block的内存池大小
-
-                //串行测试用
-                // write = new BamWrite(2938880 , 2870);
-                // writeComplete = new BamWriteComplete(16400);
-
-                write = new BamWrite(655360 ,640);
-                writeComplete = new BamWriteComplete(130);
-                printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
-                
-                thread producer2(bind(&SwBam::ProducerSwBamTask2_parallel, this, sin, write, hdr));
-                thread consumer2(bind(&SwBam::ConsumerSwBamTask2, this, write, writeComplete));
-                t0 = GetTime();
-                long long num2 = 0;
-                bam_block* comp_block;
-
-                while (true) {
-                    comp_block = writeComplete->getCompressedBlock();
-                    if (comp_block == nullptr) break;
-                    num2++;
-                    (void)writeBlockTobam(sout->fp.bgzf, comp_block);
-                    writeComplete->backBlock(comp_block);
-                }
-
-                producer2.join();
-                consumer2.join();
-                printf("Complete main thread writing to bam cost %lf\n", GetTime() - t0);
-                printf("The total BGZF nums is %lld\n", num2);
-            }
-            #endif
-            break;
-        }
-            
-        default:
-            fprintf(stderr, "Unknown file format\n");
-            break;
+        ran_body = true;
+        exit_code = 0;
+        t_total += GetTime() - tbody;
+        printf("Complete the body cost %lf\n", GetTime() - tbody);
+        printf("Complete the total cost %lf---\n", t_total);
     }
-
-
-    t_total += GetTime() - tbody;
-    printf("Complete the body cost %lf\n", GetTime() - tbody);
-    printf("Complete the total cost %lf---\n", t_total);
 
     #ifdef USE_MEMORY
     #define DUMP_MEM
     #ifdef DUMP_MEM
-    //将内存中的主体数据落盘到sout中
-    double dump_t0 = GetTime();
-    if (sout->format.format == bam) {
-        bgzf_flush(sout->fp.bgzf);
-        if (hwrite(sout->fp.bgzf->fp, mem_writer.data, mem_writer.size) != mem_writer.size) {
-            fprintf(stderr, "Error dumping memory to BAM output file\n");
+    if (ran_body && exit_code == 0) {
+        double dump_t0 = GetTime();
+        if (sout->format.format == bam) {
+            if (bgzf_flush(sout->fp.bgzf) != 0) {
+                fprintf(stderr, "Error flushing BAM output header/body stream\n");
+            }
+            if (hwrite(sout->fp.bgzf->fp, mem_writer.data, mem_writer.size) != mem_writer.size) {
+                fprintf(stderr, "Error dumping memory to BAM output file\n");
+            }
+        } else if (sout->format.format == sam) {
+            if (hflush(sout->fp.hfile) != 0) {
+                fprintf(stderr, "Error flushing SAM output header/body stream\n");
+            }
+            if (hwrite(sout->fp.hfile, mem_writer.data, mem_writer.size) != mem_writer.size) {
+                fprintf(stderr, "Error dumping memory to SAM output file\n");
+            }
         }
-    } else if (sout->format.format == sam) {
-        hflush(sout->fp.hfile); 
-        if (hwrite(sout->fp.hfile, mem_writer.data, mem_writer.size) != mem_writer.size) {
-            fprintf(stderr, "Error dumping memory to SAM output file\n");
-        }
+        printf("Dump memory to output file cost %lf\n", GetTime() - dump_t0);
     }
-    // 释放内存池
+    #endif
+    #endif
+
+cleanup:
     if (mem_writer.data) {
         free(mem_writer.data);
         mem_writer.data = nullptr;
     }
-    if (sam_mem){
+    if (sam_mem) {
         free(sam_mem);
+        sam_mem = nullptr;
     }
-    if (bam_mem){
+    if (bam_mem) {
         free(bam_mem);
+        bam_mem = nullptr;
     }
-    printf("Dump memory to output file cost %lf\n", GetTime() - dump_t0);
-    #endif
-    #endif
 
-    //释放内存
     t0 = GetTime();
-    sam_hdr_destroy(hdr);
-    int ret;
-    ret = hts_close(sout);
-    if (ret < 0) {
-        fprintf(stderr, "Error closing output.\n");
+    if (hdr) {
+        sam_hdr_destroy(hdr);
+        hdr = nullptr;
     }
-    ret = hts_close(sin);
-    if (ret < 0) {
-        fprintf(stderr, "Error closing input.\n");
+    if (sout) {
+        int ret = hts_close(sout);
+        if (ret < 0) {
+            fprintf(stderr, "Error closing output.\n");
+        }
+        sout = nullptr;
+    }
+    if (sin) {
+        int ret = hts_close(sin);
+        if (ret < 0) {
+            fprintf(stderr, "Error closing input.\n");
+        }
+        sin = nullptr;
     }
     printf("close the files cost %lf---\n", GetTime() - t0);
-
+    return exit_code;
 }
-
-

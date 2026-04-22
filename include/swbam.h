@@ -38,13 +38,20 @@ public:
 
     ~SwBam();
 
-    void ProcessSwBam();
+    int ProcessSwBam();
 
 private:
     void ConsumerSwBamTask(BamRead *read, BamComplete *complete);
     void ProducerSwBamTask(BGZF *fp, BamRead *read);
     void ProducerSwBamTask_memory(BGZF *fp, BamRead *read , char *bam_mem, size_t bam_size);
     void FusedBamToSam(BamRead *read, BamComplete *complete, sam_hdr_t *h, MemReader &reader, MemWriter &mem_writer);
+    int FusedBamToSamChecked(BamRead *read, BamComplete *complete, sam_hdr_t *h,
+                             MemReader &reader, MemWriter &mem_writer, BoundsCheckError *bounds_error);
+    void FusedBamToBam(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
+                       MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter);
+    int FusedBamToBamChecked(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
+                             MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter,
+                             BoundsCheckError *bounds_error);
     int writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b);
 
     void ConsumerSwBamTask2(BamWrite *write, BamWriteComplete *complete);
@@ -52,6 +59,8 @@ private:
     void ProducerSwBamTask2_parallel(samFile *fp, BamWrite *write, sam_hdr_t *h);
     void ProducerSwBamTask2_parallel_memory_OP( BamWrite *write, sam_hdr_t *h , MemReader reader);
     void FusedSamToBam(BamWrite *write, BamWriteComplete *complete,sam_hdr_t *h, MemReader reader, MemWriter &mem_writer);
+    int FusedSamToBamChecked(BamWriteComplete *complete, sam_hdr_t *h,
+                             MemReader reader, MemWriter &mem_writer, BoundsCheckError *bounds_error);
     int writeBlockTobam(BGZF *fp, bam_block *block);
 
     static inline const char *get_sam_open_mode(const std::string &out_name) {

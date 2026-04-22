@@ -29,8 +29,10 @@ const size_t MAX_RECORDS_PER_BLOCK = 1024;   //每块最大bam1_t数量，暂定
 #define MAX_SAM_LINE_SIZE 8192   // 8 KB     //一条sam文本的最大长度
 #define BATCH_PER_CORE 1024
 #define BATCH_SIZE (64 * BATCH_PER_CORE)     //一个批次的大小
+const size_t MAX_SAM_FORMAT_CORE_BUFFER_SIZE = MAX_SAM_LINE_SIZE * ((BATCH_SIZE / 64) + 1); //每一个核要承担的sam格式化输出缓冲区大小，预留一些空间以防万一
 
 const size_t INIT_DATA_SIZE = 1024;           //bam1_t 的data最大长度 暂定1KB
+const int FUSED_SAM2BAM_BAM_POOL_SIZE = 720999;  
 
 #define SAM_CHUNK_SIZE (4 * 1024 * 1024)         
 #define CHUNK_BUFFER_SIZE (5 * 1024 * 1024)      
@@ -42,6 +44,31 @@ typedef struct {
     kstring_t core_out_lines[64];  
     int count;   
 } SamFormatBatch;
+
+enum BoundsLimitId {
+    BOUNDS_LIMIT_NONE = 0,
+    BOUNDS_LIMIT_MAX_RECORDS_PER_BLOCK,
+    BOUNDS_LIMIT_MAX_SAM_LINE_SIZE,
+    BOUNDS_LIMIT_INIT_DATA_SIZE,
+    BOUNDS_LIMIT_MAX_BAMS_PER_CHUNK,
+    BOUNDS_LIMIT_CHUNK_BUFFER_SIZE,
+    BOUNDS_LIMIT_FUSED_SAM2BAM_BAM_POOL_SIZE,
+    BOUNDS_LIMIT_BGZF_RECORD_SIZE,
+    BOUNDS_LIMIT_MAX_SAM_FORMAT_CORE_BUFFER_SIZE,
+    BOUNDS_LIMIT_GENERIC_RUNTIME_ERROR
+};
+
+struct BoundsCheckError {
+    const char *pipeline;
+    const char *stage;
+    const char *limit_name;
+    long long limit_value;
+    long long actual_value;
+    int block_id;
+    int chunk_id;
+    int record_index;
+    int core_id;
+};
 
 
 typedef struct {
@@ -92,6 +119,57 @@ struct Para {
     std::vector<bam1_t*> output_records;  
     int n_records;             
     int status;               
+};
+
+struct BamFilterOptions {
+    int min_mapq;
+    int max_mapq;
+    uint32_t require_flag;
+    uint32_t exclude_flag;
+    int ref_tid;
+    int min_read_len;
+    int max_read_len;
+};
+
+struct Bam2BamPara {
+    int block_id;
+    bam_block *input_block;
+    bam_block *un_comp_block;
+    bam1_t **output_records;
+    uint32_t *bam_lens;
+    BamFilterOptions filter;
+    int n_total_records;
+    int n_kept_records;
+    int status;
+};
+
+struct CheckedPara {
+    int block_id;
+    bam_block *input_block;
+    bam_block *un_comp_block;
+    bam1_t **output_records;
+    int n_records;
+    int status;
+    int record_index;
+    long long actual_value;
+    long long limit_value;
+    int limit_id;
+};
+
+struct CheckedBam2BamPara {
+    int block_id;
+    bam_block *input_block;
+    bam_block *un_comp_block;
+    bam1_t **output_records;
+    uint32_t *bam_lens;
+    BamFilterOptions filter;
+    int n_total_records;
+    int n_kept_records;
+    int status;
+    int record_index;
+    long long actual_value;
+    long long limit_value;
+    int limit_id;
 };
 
 struct Comp_Para {
@@ -167,6 +245,11 @@ struct bgzf_cache_t {
     khint_t last_pos;
 };
 
+struct BamCrossBlockStats {
+    long long total_records;
+    long long cross_block_records;
+};
+
 
 #define KS_SEP_SPACE 0 // isspace(): \t, \n, \v, \f, \r
 #define KS_SEP_TAB   1 // isspace() && !' '
@@ -175,6 +258,7 @@ struct bgzf_cache_t {
 
 
 int check_bam_cross_block(const char *bam_path);
+int check_bam_cross_block_ex(const char *bam_path, BamCrossBlockStats *stats, bool verbose);
 void print_bam1(const bam1_t *b);
 void print_bam_block(struct bam_block *blk) ;
 
@@ -202,6 +286,20 @@ int bam_tag2cigar(bam1_t *b, int recal_bin,
                   int give_warning); 
 
 int fixup_missing_qname_nul(bam1_t *b);
+
+inline bool bam_filter_matches(const bam1_t *b, const BamFilterOptions &filter) {
+    const bam1_core_t &core = b->core;
+
+    if (filter.min_mapq >= 0 && core.qual < filter.min_mapq) return false;
+    if (filter.max_mapq >= 0 && core.qual > filter.max_mapq) return false;
+    if (filter.require_flag != 0 && (core.flag & filter.require_flag) != filter.require_flag) return false;
+    if (filter.exclude_flag != 0 && (core.flag & filter.exclude_flag) != 0) return false;
+    if (filter.ref_tid != -2 && core.tid != filter.ref_tid) return false;
+    if (filter.min_read_len >= 0 && core.l_qseq < filter.min_read_len) return false;
+    if (filter.max_read_len >= 0 && core.l_qseq > filter.max_read_len) return false;
+
+    return true;
+}
 
 inline void packInt16(uint8_t *buffer, uint16_t value) {
     buffer[0] = value;
