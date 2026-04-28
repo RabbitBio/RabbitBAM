@@ -779,7 +779,7 @@ static inline void nibble2base(uint8_t *nib, char *seq, int len) {
         seq[i] = seq_nt16_str[bam_seqi(nib, i)];
 }
 
-static int sam_format1_append(const bam_hdr_t *h, const bam1_t *b, kstring_t *str)
+int sam_format1_append(const bam_hdr_t *h, const bam1_t *b, kstring_t *str)
 {
     int i, r = 0;
     uint8_t *s, *end;
@@ -1150,7 +1150,8 @@ extern "C" void slave_decompress_filterfunc(Bam2BamPara paras[64]) {
     int ret = -1;
 
     while (total_count < (int)MAX_RECORDS_PER_BLOCK) {
-        bam1_t *b = para->output_records[total_count];
+        bam1_t *b = para->record_base ? para->record_base + total_count
+                                      : para->output_records[total_count];
         ret = read_bam(un_comp, b, 0);
         if (ret < 0) break;
 
@@ -1164,6 +1165,48 @@ extern "C" void slave_decompress_filterfunc(Bam2BamPara paras[64]) {
 
     para->n_total_records = total_count;
     para->n_kept_records = kept_count;
+
+    if (ret < -1) {
+        para->status = -2;
+        return;
+    }
+
+    if (total_count == (int)MAX_RECORDS_PER_BLOCK && un_comp->pos < un_comp->length) {
+        para->status = -3;
+        return;
+    }
+
+    para->status = 0;
+}
+
+extern "C" void slave_decompress_bam2bam_passthrough(Bam2BamPara paras[64]) {
+    int id = _PEN;
+    Bam2BamPara *para = &paras[id];
+
+    bam_block *comp = para->input_block;
+    bam_block *un_comp = para->un_comp_block;
+    if (comp == NULL) {
+        return;
+    }
+
+    if (block_decode_func(comp, un_comp) != 0) {
+        para->status = -2;
+        return;
+    }
+
+    int total_count = 0;
+    int ret = -1;
+    while (total_count < (int)MAX_RECORDS_PER_BLOCK) {
+        bam1_t *b = para->output_records[total_count];
+        ret = read_bam(un_comp, b, 0);
+        if (ret < 0) break;
+
+        para->bam_lens[total_count] = (uint32_t)(b->l_data - b->core.l_extranul + 32);
+        total_count++;
+    }
+
+    para->n_total_records = total_count;
+    para->n_kept_records = total_count;
 
     if (ret < -1) {
         para->status = -2;
@@ -1267,7 +1310,6 @@ extern "C" void sam_format(void *arg) {
 //sam2bam-------------------------------------------------------------------------------------------------------------------------------------------------
 
 extern "C" void slave_compressfunc(Comp_Para paras[64]) {
-
     int id = _PEN;             // 从核号（0~63）
     int compress_level = 1;    // 默认压缩等级为1
     Comp_Para* para = &paras[id];
@@ -1285,7 +1327,6 @@ extern "C" void slave_compressfunc(Comp_Para paras[64]) {
     uncompressed->errcode = 0;
     uncompressed->block_id = 0;
     uncompressed->block_address = 0;
-
 
     //1. 将 bam1_t 记录 逐个解析并写入 到 uncompressed 中
     int a=0;
@@ -1358,10 +1399,18 @@ extern "C" void slave_copy_and_count(void *arg) {
     chunk->text_len = chunk->src_len;
 
     int count = 0;
-    const char *p = chunk->text_buf;
-    size_t len = chunk->src_len;
-    for (size_t i = 0; i < len; ++i) {
-        if (p[i] == '\n') count++;
+    char *p = chunk->text_buf;
+    char *end = chunk->text_buf + chunk->text_len;
+    while (p < end) {
+        char *line_end = p;
+        while (line_end < end && *line_end != '\n' && *line_end != '\0') line_end++;
+
+        int line_len = (int)(line_end - p);
+        if (line_len > 0 && p[line_len - 1] == '\r') line_len--;
+        if (line_len > 0) count++;
+
+        if (line_end < end && *line_end == '\n') line_end++;
+        p = line_end;
     }
     chunk->count = count;
 }
@@ -1373,42 +1422,41 @@ extern "C" void slave_sam_parse_chunk(void *arg) {
     
     if (chunk->text_len == 0 || chunk->count == 0) return;
 
-    char *ptr = chunk->text_buf;
-    char *end = ptr + chunk->text_len;
     int valid_count = 0;
+    char *ptr = chunk->text_buf;
+    char *end = chunk->text_buf + chunk->text_len;
 
-    while (ptr < end && valid_count < chunk->count) {
+    while (ptr < end) {
         char *eol = ptr;
-        while (eol < end && *eol != '\n') eol++;
+        while (eol < end && *eol != '\n' && *eol != '\0') eol++;
 
-        if (eol == ptr) { 
-            ptr = eol + 1;
-            continue;
-        }
-
+        int line_len = (int)(eol - ptr);
         kstring_t ks;
         ks.s = ptr;
-        ks.l = eol - ptr;
-        ks.m = ks.l + 1;
+        ks.l = line_len;
+        ks.m = line_len + 1;
 
         if (ks.l > 0 && ks.s[ks.l - 1] == '\r') {
             ks.l--; 
         }
 
-        char saved_char = ks.s[ks.l]; 
-        ks.s[ks.l] = '\0'; 
+        if (ks.l > 0) {
+            char saved_char = ks.s[ks.l]; 
+            ks.s[ks.l] = '\0'; 
 
-        int ret = sam_parse1(&ks, (sam_hdr_t *)batch->hdr, chunk->bams[valid_count]);
+            int ret = sam_parse1(&ks, (sam_hdr_t *)batch->hdr, chunk->bams[valid_count]);
 
-        ks.s[ks.l] = saved_char; 
+            ks.s[ks.l] = saved_char; 
 
-        if (ret >= 0) {
-            bam1_t *b = chunk->bams[valid_count];
-            chunk->bam_lens[valid_count] = (uint32_t)(b->l_data - b->core.l_extranul + 32);
-            valid_count++;
+            if (ret >= 0) {
+                bam1_t *b = chunk->bams[valid_count];
+                chunk->bam_lens[valid_count] = (uint32_t)(b->l_data - b->core.l_extranul + 32);
+                valid_count++;
+            }
         }
-        ptr = eol + 1; 
+
+        if (eol < end && *eol == '\n') eol++;
+        ptr = eol;
     }
     chunk->count = valid_count;
 }
-

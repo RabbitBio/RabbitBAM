@@ -30,6 +30,9 @@
 #include "BamTools.h"
 #include "CmdInfo.h"
 
+int ProcessSwBamCGS(CmdInfo *cmd_info);
+int ProcessBamToBamCGS(CmdInfo *cmd_info);
+
 class SwBam {
 public:
     SwBam(CmdInfo *cmd_info);
@@ -49,6 +52,8 @@ private:
                              MemReader &reader, MemWriter &mem_writer, BoundsCheckError *bounds_error);
     void FusedBamToBam(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
                        MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter);
+    void FusedBamToBamOptimized(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
+                                MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter);
     int FusedBamToBamChecked(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
                              MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter,
                              BoundsCheckError *bounds_error);

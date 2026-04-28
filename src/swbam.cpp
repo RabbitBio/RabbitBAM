@@ -8,6 +8,7 @@ extern "C" {
     void slave_decompressfunc();
     void slave_decompress_checked();
     void slave_decompress_filterfunc();
+    void slave_decompress_bam2bam_passthrough();
     void slave_decompress_filter_checked();
     void slave_compressfunc();
     void slave_sam_format();
@@ -158,6 +159,71 @@ void SetBoundsErrorFromCheckedBam2BamPara(BoundsCheckError *err,
     }
     SetBoundsError(err, pipeline, stage, para.limit_id, para.limit_value, para.actual_value,
                    para.block_id, -1, para.record_index, core_id);
+}
+
+struct PackedBlockPlan {
+    bam1_t **records;
+    int n_records;
+    uint32_t total_len;
+};
+
+struct FlatPackWorkspace {
+    std::vector<bam1_t*> records;
+    PackedBlockPlan plans[64];
+    int active_blocks;
+    int total_records;
+    bam1_t **current_begin;
+    int current_records;
+    uint32_t current_len;
+};
+
+void ResetFlatPackWorkspace(FlatPackWorkspace *workspace) {
+    workspace->active_blocks = 0;
+    workspace->total_records = 0;
+    workspace->current_begin = workspace->records.empty() ? nullptr : workspace->records.data();
+    workspace->current_records = 0;
+    workspace->current_len = 0;
+}
+
+void InitFlatPackWorkspace(FlatPackWorkspace *workspace, size_t capacity) {
+    workspace->records.resize(capacity);
+    ResetFlatPackWorkspace(workspace);
+}
+
+void SealCurrentBlock(FlatPackWorkspace *workspace) {
+    if (workspace->current_records == 0) return;
+    PackedBlockPlan &plan = workspace->plans[workspace->active_blocks++];
+    plan.records = workspace->current_begin;
+    plan.n_records = workspace->current_records;
+    plan.total_len = workspace->current_len;
+    workspace->current_begin = workspace->records.data() + workspace->total_records;
+    workspace->current_records = 0;
+    workspace->current_len = 0;
+}
+
+int AppendRecordToWorkspace(FlatPackWorkspace *workspace, bam1_t *record, uint32_t bam_len) {
+    const uint32_t packed_len = bam_len + 4;
+    if (packed_len > BGZF_BLOCK_SIZE) return -1;
+    if (workspace->current_records > 0 && workspace->current_len + packed_len > BGZF_BLOCK_SIZE) return 1;
+    if (workspace->total_records >= (int)workspace->records.size()) return -2;
+    if (workspace->current_records == 0) {
+        workspace->current_begin = workspace->records.data() + workspace->total_records;
+    }
+    workspace->records[workspace->total_records++] = record;
+    workspace->current_records++;
+    workspace->current_len += packed_len;
+    return 0;
+}
+
+void InitEmptyCompPara(Comp_Para *para, int block_id) {
+    para->block_id = block_id;
+    para->input_records = nullptr;
+    para->n_records = 0;
+    para->un_comp_block = nullptr;
+    para->un_comp_size = 0;
+    para->output_block = nullptr;
+    para->output_size = 0;
+    para->status = -1;
 }
 
 } // namespace
@@ -865,13 +931,20 @@ int SwBam::FusedBamToSamChecked(BamRead *read, BamComplete *complete,
 // FusedBamToBam: 单线程融合 Producer + Consumer + Writer
 void SwBam::FusedBamToBam(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
                           MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter) {
+    FusedBamToBamOptimized(read, complete, write_complete, reader, mem_writer, filter);
+}
+
+void SwBam::FusedBamToBamOptimized(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
+                                   MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter) {
     double t0 = GetTime();
     double t_decomp_filter = 0, t_pack = 0, t_compress = 0, t_read = 0, t_write = 0;
     const int NB = 64;
+    const bool no_filter = bam_filter_is_noop(filter);
 
     Bam2BamPara paras[NB];
     for (int b = 0; b < NB; ++b) {
         paras[b].output_records = complete->getResultBuf(b).data();
+        paras[b].record_base = paras[b].output_records[0];
         paras[b].bam_lens = (uint32_t *)aligned_alloc_custom(64, MAX_RECORDS_PER_BLOCK * sizeof(uint32_t));
         if (!paras[b].bam_lens) {
             fprintf(stderr, "Failed to allocate bam2bam bam_lens for block %d\n", b);
@@ -885,39 +958,40 @@ void SwBam::FusedBamToBam(BamRead *read, BamComplete *complete, BamWriteComplete
         paras[b].filter = filter;
     }
 
+    FlatPackWorkspace pack_workspace;
+    InitFlatPackWorkspace(&pack_workspace, 64 * MAX_RECORDS_PER_BLOCK);
+
     Comp_Para comp_buf_A[NB], comp_buf_B[NB];
     Comp_Para *comp_active = comp_buf_A;
     Comp_Para *comp_pending = comp_buf_B;
-    std::vector<std::vector<bam1_t*>> pending_group;
     bool has_pending = false;
-    long long bgzf_blocks = 0;
 
+    long long bgzf_blocks = 0;
     long long total_records = 0;
     long long kept_records = 0;
     long long dropped_records = 0;
     long long input_blocks = 0;
     long long group_count = 0;
+    long long pack_records = 0;
 
     auto flush_pending = [&]() {
         double flush_t0 = GetTime();
-
         if (!has_pending) return;
         for (int k = 0; k < NB; ++k) {
             if (comp_pending[k].status == 0 && comp_pending[k].output_block) {
                 write_block_to_mem(mem_writer, comp_pending[k].output_block);
                 write_complete->backBlock(comp_pending[k].output_block);
+                comp_pending[k].output_block = nullptr;
                 bgzf_blocks++;
             }
+            InitEmptyCompPara(&comp_pending[k], k);
         }
-        pending_group.clear();
         has_pending = false;
-
         t_write += GetTime() - flush_t0;
     };
 
     auto do_read_group = [&](std::vector<bam_block*> &blocks) {
         double read_t0 = GetTime();
-
         blocks.clear();
         blocks.reserve(NB);
         for (int b = 0; b < NB; ++b) {
@@ -931,34 +1005,22 @@ void SwBam::FusedBamToBam(BamRead *read, BamComplete *complete, BamWriteComplete
             blk->pos = 0;
             blocks.push_back(blk);
         }
-
         t_read += GetTime() - read_t0;
     };
 
-    auto do_compress = [&](std::vector<std::vector<bam1_t*>> &group,
-                           std::vector<bam_block*> &next_blocks) {
-        for (int k = (int)group.size(); k < NB; ++k)
-            group.push_back({});
-
-        for (int k = 0; k < NB; ++k) {
-            if (group[k].empty()) {
-                comp_active[k].block_id = k;
-                comp_active[k].input_records = nullptr;
-                comp_active[k].n_records = 0;
-                comp_active[k].output_block = nullptr;
-                comp_active[k].un_comp_block = nullptr;
-                comp_active[k].output_size = 0;
-                comp_active[k].status = -1;
-                continue;
-            }
-
+    auto do_compress = [&](int active_output_blocks, std::vector<bam_block*> &next_blocks) {
+        for (int k = 0; k < active_output_blocks; ++k) {
             comp_active[k].block_id = k;
-            comp_active[k].input_records = group[k].data();
-            comp_active[k].n_records = (int)group[k].size();
+            comp_active[k].input_records = pack_workspace.plans[k].records;
+            comp_active[k].n_records = pack_workspace.plans[k].n_records;
             comp_active[k].output_block = write_complete->getEmpty();
             comp_active[k].un_comp_block = write_complete->getBuffer(k);
+            comp_active[k].un_comp_size = (int)pack_workspace.plans[k].total_len;
             comp_active[k].output_size = 0;
             comp_active[k].status = 0;
+        }
+        for (int k = active_output_blocks; k < NB; ++k) {
+            InitEmptyCompPara(&comp_active[k], k);
         }
 
         double compress_t0 = GetTime();
@@ -968,12 +1030,9 @@ void SwBam::FusedBamToBam(BamRead *read, BamComplete *complete, BamWriteComplete
         athread_join();
         t_compress += GetTime() - compress_t0;
 
-        pending_group = std::move(group);
+        has_pending = active_output_blocks > 0;
         std::swap(comp_active, comp_pending);
-        has_pending = true;
-
-        group.clear();
-        group.reserve(NB);
+        ResetFlatPackWorkspace(&pack_workspace);
     };
 
     std::vector<bam_block*> next_blocks;
@@ -1008,71 +1067,69 @@ void SwBam::FusedBamToBam(BamRead *read, BamComplete *complete, BamWriteComplete
         }
 
         double decomp_t0 = GetTime();
-        __real_athread_spawn((void*)slave_decompress_filterfunc, paras, 1);
+        __real_athread_spawn((void*)(no_filter ? slave_decompress_bam2bam_passthrough
+                                               : slave_decompress_filterfunc),
+                             paras, 1);
         athread_join();
         t_decomp_filter += GetTime() - decomp_t0;
 
         for (int b = 0; b < n_blocks; ++b) {
             if (paras[b].status != 0) {
-                fprintf(stderr, "FATAL: slave_decompress_filterfunc failed on block %d with status %d\n",
+                fprintf(stderr, "FATAL: bam2bam v2 decompress failed on block %d with status %d\n",
                         b, paras[b].status);
                 abort();
             }
         }
 
-        std::vector<std::vector<bam1_t*>> cur_group;
-        cur_group.reserve(NB);
-        std::vector<bam1_t*> cur_block;
-        cur_block.reserve(MAX_RECORDS_PER_BLOCK);
-        uint32_t total_len = 0;
-
+        ResetFlatPackWorkspace(&pack_workspace);
         double pack_t0 = GetTime();
         for (int b = 0; b < n_blocks; ++b) {
             total_records += paras[b].n_total_records;
             kept_records += paras[b].n_kept_records;
             dropped_records += paras[b].n_total_records - paras[b].n_kept_records;
+            pack_records += paras[b].n_kept_records;
 
             for (int r = 0; r < paras[b].n_kept_records; ++r) {
                 bam1_t *record = paras[b].output_records[r];
                 uint32_t bam_len = paras[b].bam_lens[r];
 
-                if (bam_len + 4 + total_len <= BGZF_BLOCK_SIZE) {
-                    cur_block.push_back(record);
-                    total_len += bam_len + 4;
-                } else {
-                    if (cur_block.empty()) {
-                        fprintf(stderr, "FATAL: bam2bam pack encountered an oversized BAM record\n");
+                while (true) {
+                    int ret = AppendRecordToWorkspace(&pack_workspace, record, bam_len);
+                    if (ret == 0) break;
+                    if (ret == -1) {
+                        fprintf(stderr, "FATAL: bam2bam v2 pack encountered an oversized BAM record\n");
                         abort();
                     }
-                    cur_group.push_back(std::move(cur_block));
-                    cur_block.clear();
-                    cur_block.reserve(MAX_RECORDS_PER_BLOCK);
-                    cur_block.push_back(record);
-                    total_len = bam_len + 4;
+                    if (ret == -2) {
+                        fprintf(stderr, "FATAL: bam2bam v2 workspace capacity exceeded during pack\n");
+                        abort();
+                    }
+                    SealCurrentBlock(&pack_workspace);
+                    if (pack_workspace.active_blocks >= NB) {
+                        fprintf(stderr, "FATAL: bam2bam v2 produced more than %d output blocks from one input group\n", NB);
+                        abort();
+                    }
                 }
             }
         }
-
-        if (!cur_block.empty()) {
-            cur_group.push_back(std::move(cur_block));
-        }
-
-        if (cur_group.size() > (size_t)NB) {
-            fprintf(stderr, "FATAL: bam2bam produced %zu output blocks from one input group\n", cur_group.size());
+        SealCurrentBlock(&pack_workspace);
+        if (pack_workspace.active_blocks > NB) {
+            fprintf(stderr, "FATAL: bam2bam v2 produced %d output blocks from one input group\n",
+                    pack_workspace.active_blocks);
             abort();
         }
 
-        for (auto blk : cur_blocks) read->backBlock(blk);
+        for (auto *blk : cur_blocks) read->backBlock(blk);
         t_pack += GetTime() - pack_t0;
 
         group_count++;
-        if (cur_group.empty()) {
+        if (pack_workspace.active_blocks == 0) {
             flush_pending();
             do_read_group(next_blocks);
             continue;
         }
 
-        do_compress(cur_group, next_blocks);
+        do_compress(pack_workspace.active_blocks, next_blocks);
     }
 
     flush_pending();
@@ -1084,10 +1141,13 @@ void SwBam::FusedBamToBam(BamRead *read, BamComplete *complete, BamWriteComplete
         }
     }
 
+    double keep_ratio = total_records > 0 ? (double)kept_records / (double)total_records : 1.0;
     printf("FusedBamToBam finished. in_blocks=%lld groups=%lld total_records=%lld kept_records=%lld dropped_records=%lld bgzf_blocks=%lld cost=%.3f s\n",
            input_blocks, group_count, total_records, kept_records, dropped_records, bgzf_blocks, GetTime() - t0);
     printf("  decomp_filter_slave=%.3f  pack=%.3f  compress_slave=%.3f  read=%.3f  write=%.3f\n",
            t_decomp_filter, t_pack, t_compress, t_read, t_write);
+    printf("  pack_records=%lld  output_bgzf_blocks=%lld  keep_ratio=%.6f  filter_mode=%s\n",
+           pack_records, bgzf_blocks, keep_ratio, no_filter ? "passthrough" : "filtered");
 }
 
 int SwBam::FusedBamToBamChecked(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,

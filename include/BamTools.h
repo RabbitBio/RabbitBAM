@@ -32,7 +32,19 @@ const size_t MAX_RECORDS_PER_BLOCK = 1024;   //每块最大bam1_t数量，暂定
 const size_t MAX_SAM_FORMAT_CORE_BUFFER_SIZE = MAX_SAM_LINE_SIZE * ((BATCH_SIZE / 64) + 1); //每一个核要承担的sam格式化输出缓冲区大小，预留一些空间以防万一
 
 const size_t INIT_DATA_SIZE = 1024;           //bam1_t 的data最大长度 暂定1KB
-const int FUSED_SAM2BAM_BAM_POOL_SIZE = 720999;  
+const int FUSED_SAM2BAM_BAM_POOL_SIZE = 720999; 
+
+
+const int CGS_NUM_CGS = 6;
+const int CGS_PES_PER_CG = 64;
+const int CGS_NB = CGS_NUM_CGS * CGS_PES_PER_CG;
+const int CGS_BAM2SAM_FORMAT_RECORDS_PER_CPE = 192;
+const size_t CGS_SAM_CHUNK_SIZE = 512 * 1024;
+const size_t CGS_SAM_CHUNK_BUFFER_SIZE = CGS_SAM_CHUNK_SIZE + MAX_SAM_LINE_SIZE;
+const int CGS_SAM2BAM_MAX_BAMS_PER_CHUNK = 4096;
+const int CGS_SAM2BAM_RECORD_POOL_SIZE = FUSED_SAM2BAM_BAM_POOL_SIZE;
+const size_t CGS_SAM_FORMAT_CORE_BUFFER_SIZE =
+    MAX_SAM_LINE_SIZE * (CGS_BAM2SAM_FORMAT_RECORDS_PER_CPE + 1);
 
 #define SAM_CHUNK_SIZE (4 * 1024 * 1024)         
 #define CHUNK_BUFFER_SIZE (5 * 1024 * 1024)      
@@ -136,11 +148,47 @@ struct Bam2BamPara {
     bam_block *input_block;
     bam_block *un_comp_block;
     bam1_t **output_records;
+    bam1_t *record_base;
     uint32_t *bam_lens;
     BamFilterOptions filter;
     int n_total_records;
     int n_kept_records;
     int status;
+};
+
+struct CgsBamDecodePara {
+    int block_id;
+    bam_block *input_block;
+    bam_block *un_comp_block;
+    bam1_t **output_records;
+    int n_records;
+    int status;
+};
+
+struct CgsSamFormatBatch {
+    const sam_hdr_t *hdr;
+    bam1_t **records;
+    int total_records;
+    kstring_t core_out_lines[CGS_NB];
+    kstring_t core_line_bufs[CGS_NB];
+    int status[CGS_NB];
+    int formatted_records[CGS_NB];
+};
+
+struct CgsSamParseChunk {
+    const char *src_ptr;
+    size_t src_len;
+    char *text_buf;
+    size_t text_len;
+    bam1_t **bams;
+    uint32_t *bam_lens;
+    int count;
+    int status;
+};
+
+struct CgsSamParseBatch {
+    const sam_hdr_t *hdr;
+    CgsSamParseChunk chunks[CGS_NB];
 };
 
 struct CheckedPara {
@@ -299,6 +347,16 @@ inline bool bam_filter_matches(const bam1_t *b, const BamFilterOptions &filter) 
     if (filter.max_read_len >= 0 && core.l_qseq > filter.max_read_len) return false;
 
     return true;
+}
+
+inline bool bam_filter_is_noop(const BamFilterOptions &filter) {
+    return filter.min_mapq < 0 &&
+           filter.max_mapq < 0 &&
+           filter.require_flag == 0 &&
+           filter.exclude_flag == 0 &&
+           filter.ref_tid == -2 &&
+           filter.min_read_len < 0 &&
+           filter.max_read_len < 0;
 }
 
 inline void packInt16(uint8_t *buffer, uint16_t value) {

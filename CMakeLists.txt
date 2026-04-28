@@ -80,17 +80,27 @@ endif()
 
 # Collect source files from src directory
 file(GLOB_RECURSE SRC_FILES "src/*.cpp")
+set(MAIN_SRC "${CMAKE_SOURCE_DIR}/src/main.cpp")
+set(CGS_MAIN_SRC "${CMAKE_SOURCE_DIR}/src/main_cgs.cpp")
+file(GLOB CGS_ONLY_SRC "src/*cgs*.cpp")
+set(SINGLE_SRC_FILES ${SRC_FILES})
+list(REMOVE_ITEM SINGLE_SRC_FILES ${CGS_ONLY_SRC})
+set(CGS_SRC_FILES ${SRC_FILES})
+list(REMOVE_ITEM CGS_SRC_FILES ${MAIN_SRC})
 
 if(PLATFORM_SUNWAY)
     # For Sunway, also compile slave code
     file(GLOB SLAVE_FILES "slave/*.cpp")
     file(GLOB SLAVE_C_FILES   "slave/*.c")
+    file(GLOB CGS_SLAVE_FILES "slave/*cgs*.cpp")
+    set(SINGLE_SLAVE_FILES ${SLAVE_FILES})
+    list(REMOVE_ITEM SINGLE_SLAVE_FILES ${CGS_SLAVE_FILES})
     # Include slave_zlib source files (compile with -mslave)
     # Only files in slave_zlib directory, not subdirectories
     file(GLOB SLAVE_ZLIB_FILES "slave/slave_zlib/*.c")
     
     # Create object library for slave code with special flags
-    add_library(slave_objects OBJECT ${SLAVE_FILES}  ${SLAVE_C_FILES} ${SLAVE_ZLIB_FILES})
+    add_library(slave_objects OBJECT ${SINGLE_SLAVE_FILES} ${SLAVE_C_FILES} ${SLAVE_ZLIB_FILES})
     target_compile_options(slave_objects PRIVATE ${SLAVE_FLAGS})
     target_include_directories(slave_objects PRIVATE
         ${CMAKE_SOURCE_DIR}/include
@@ -99,14 +109,26 @@ if(PLATFORM_SUNWAY)
         ${CMAKE_SOURCE_DIR}/slave/slave_zlib
     )
     target_compile_definitions(slave_objects PRIVATE PLATFORM_SUNWAY)
+    add_library(slave_cgs_objects OBJECT ${SLAVE_FILES} ${SLAVE_C_FILES} ${SLAVE_ZLIB_FILES})
+    target_compile_options(slave_cgs_objects PRIVATE ${SLAVE_FLAGS})
+    target_include_directories(slave_cgs_objects PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/ext/htslib-1.20
+        ${CMAKE_SOURCE_DIR}/ext/libdeflate-1.20
+        ${CMAKE_SOURCE_DIR}/slave/slave_zlib
+    )
+    target_compile_definitions(slave_cgs_objects PRIVATE PLATFORM_SUNWAY ENABLE_CGS_BAM2BAM ENABLE_CGS_BAM2SAM ENABLE_CGS_SAM2BAM)
     
     # Main executable with host code and slave objects
-    add_executable(${PROJECT_NAME} ${SRC_FILES} $<TARGET_OBJECTS:slave_objects>)
+    add_executable(${PROJECT_NAME} ${SINGLE_SRC_FILES} $<TARGET_OBJECTS:slave_objects>)
     # Apply host flags to all source files in src directory
     target_compile_options(${PROJECT_NAME} PRIVATE ${HOST_FLAGS})
+    add_executable(RabbitBAM-CGS ${CGS_SRC_FILES} $<TARGET_OBJECTS:slave_cgs_objects>)
+    target_compile_options(RabbitBAM-CGS PRIVATE ${HOST_FLAGS})
+    target_compile_definitions(RabbitBAM-CGS PRIVATE PLATFORM_SUNWAY ENABLE_CGS_BAM2BAM ENABLE_CGS_BAM2SAM ENABLE_CGS_SAM2BAM)
 else()
     # For x86, only compile src files
-    add_executable(${PROJECT_NAME} ${SRC_FILES})
+    add_executable(${PROJECT_NAME} ${SINGLE_SRC_FILES})
 endif()
 
 # Link libraries
@@ -117,10 +139,22 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     hts
     z
 )
+if(PLATFORM_SUNWAY)
+    target_link_libraries(RabbitBAM-CGS PRIVATE
+        pthread
+        rt
+        deflate
+        hts
+        z
+    )
+endif()
 
 # Link SWLU library if enabled
 if(USE_SWLU)
     target_link_libraries(${PROJECT_NAME} PRIVATE swlu)
+    if(PLATFORM_SUNWAY)
+        target_link_libraries(RabbitBAM-CGS PRIVATE swlu)
+    endif()
 endif()
 
 # Add static linking option
@@ -129,6 +163,7 @@ endif()
 # Sunway platform specific link options
 if(PLATFORM_SUNWAY)
     target_link_options(${PROJECT_NAME} PRIVATE -mhybrid)
+    target_link_options(RabbitBAM-CGS PRIVATE -mhybrid)
 endif()
 
 # OpenMP support (only for x86)
@@ -144,4 +179,11 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
     OUTPUT_NAME "RabbitBAM-X"
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
 )
+
+if(PLATFORM_SUNWAY)
+    set_target_properties(RabbitBAM-CGS PROPERTIES
+        OUTPUT_NAME "RabbitBAM-CGS"
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    )
+endif()
 
