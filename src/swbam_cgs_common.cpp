@@ -432,6 +432,7 @@ int ProcessSwBamCGS(CmdInfo *cmd_info) {
         reader.pos = sin->fp.bgzf->block_address;
         size_t writer_estimate = bam_to_sam ? input_size * 5 : input_size;
         InitMemWriterCGS(mem_writer, writer_estimate ? writer_estimate : 64 * 1024 * 1024);
+        // InitMemWriterCGS(mem_writer, 8ULL * 1024 * 1024 * 1024);
         printf("Initialized %s memory writer: %.2f MB\n",
                output_format == bam ? "BAM" : "SAM",
                mem_writer.capacity / 1024.0 / 1024.0);

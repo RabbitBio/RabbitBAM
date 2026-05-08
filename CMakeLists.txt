@@ -83,12 +83,21 @@ file(GLOB_RECURSE SRC_FILES "src/*.cpp")
 set(MAIN_SRC "${CMAKE_SOURCE_DIR}/src/main.cpp")
 set(CGS_MAIN_SRC "${CMAKE_SOURCE_DIR}/src/main_cgs.cpp")
 file(GLOB CGS_ONLY_SRC "src/*cgs*.cpp")
+file(GLOB MPI_ONLY_SRC "src/*mpi*.cpp")
 set(SINGLE_SRC_FILES ${SRC_FILES})
 list(REMOVE_ITEM SINGLE_SRC_FILES ${CGS_ONLY_SRC})
+list(REMOVE_ITEM SINGLE_SRC_FILES ${MPI_ONLY_SRC})
 set(CGS_SRC_FILES ${SRC_FILES})
 list(REMOVE_ITEM CGS_SRC_FILES ${MAIN_SRC})
+list(REMOVE_ITEM CGS_SRC_FILES ${MPI_ONLY_SRC})
+set(MPI_SRC_FILES ${SRC_FILES})
+list(REMOVE_ITEM MPI_SRC_FILES ${MAIN_SRC})
+list(REMOVE_ITEM MPI_SRC_FILES ${CGS_ONLY_SRC})
 
 if(PLATFORM_SUNWAY)
+    set(SUNWAY_MPI_ROOT "/usr/sw/mpi/mpi_20220608_SEA" CACHE PATH "Sunway MPI installation root")
+    set(SUNWAY_MPI_LIB_DIR "${SUNWAY_MPI_ROOT}/lib/single_static")
+
     # For Sunway, also compile slave code
     file(GLOB SLAVE_FILES "slave/*.cpp")
     file(GLOB SLAVE_C_FILES   "slave/*.c")
@@ -126,6 +135,11 @@ if(PLATFORM_SUNWAY)
     add_executable(RabbitBAM-CGS ${CGS_SRC_FILES} $<TARGET_OBJECTS:slave_cgs_objects>)
     target_compile_options(RabbitBAM-CGS PRIVATE ${HOST_FLAGS})
     target_compile_definitions(RabbitBAM-CGS PRIVATE PLATFORM_SUNWAY ENABLE_CGS_BAM2BAM ENABLE_CGS_BAM2SAM ENABLE_CGS_SAM2BAM)
+    add_executable(RabbitBAM-MPI ${MPI_SRC_FILES} $<TARGET_OBJECTS:slave_objects>)
+    target_compile_options(RabbitBAM-MPI PRIVATE ${HOST_FLAGS})
+    target_compile_definitions(RabbitBAM-MPI PRIVATE PLATFORM_SUNWAY ENABLE_MPI_BAM2BAM)
+    target_include_directories(RabbitBAM-MPI PRIVATE ${SUNWAY_MPI_ROOT}/include)
+    target_link_directories(RabbitBAM-MPI PRIVATE ${SUNWAY_MPI_LIB_DIR} /usr/sw/lib)
 else()
     # For x86, only compile src files
     add_executable(${PROJECT_NAME} ${SINGLE_SRC_FILES})
@@ -147,6 +161,20 @@ if(PLATFORM_SUNWAY)
         hts
         z
     )
+    target_link_libraries(RabbitBAM-MPI PRIVATE
+        pthread
+        rt
+        deflate
+        hts
+        z
+        mpicxx
+        mpi
+        swverbs_ft_perf
+        swutils
+        swtm
+        m
+        dl
+    )
 endif()
 
 # Link SWLU library if enabled
@@ -154,6 +182,7 @@ if(USE_SWLU)
     target_link_libraries(${PROJECT_NAME} PRIVATE swlu)
     if(PLATFORM_SUNWAY)
         target_link_libraries(RabbitBAM-CGS PRIVATE swlu)
+        target_link_libraries(RabbitBAM-MPI PRIVATE swlu)
     endif()
 endif()
 
@@ -164,6 +193,7 @@ endif()
 if(PLATFORM_SUNWAY)
     target_link_options(${PROJECT_NAME} PRIVATE -mhybrid)
     target_link_options(RabbitBAM-CGS PRIVATE -mhybrid)
+    target_link_options(RabbitBAM-MPI PRIVATE -mhybrid -Wl,-zmuldefs)
 endif()
 
 # OpenMP support (only for x86)
@@ -183,6 +213,10 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 if(PLATFORM_SUNWAY)
     set_target_properties(RabbitBAM-CGS PROPERTIES
         OUTPUT_NAME "RabbitBAM-CGS"
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    )
+    set_target_properties(RabbitBAM-MPI PROPERTIES
+        OUTPUT_NAME "RabbitBAM-MPI"
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     )
 endif()

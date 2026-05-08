@@ -1,6 +1,17 @@
 #ifndef H_GLOBALS
 #define H_GLOBALS
 
+// 修复神威平台从核缺失 max_align_t 的 编译Bug
+#if defined(__sw_slave__)
+#ifndef _MAX_ALIGN_T
+#define _MAX_ALIGN_T
+typedef struct {
+  long long __max_align_ll __attribute__((__aligned__(__alignof__(long long))));
+  long double __max_align_ld __attribute__((__aligned__(__alignof__(long double))));
+} max_align_t;
+#endif
+#endif
+
 #include <sys/time.h>
 #include <cstddef>
 

@@ -1,0 +1,41 @@
+# Data files / large datasets
+data*
+
+# Sunway build directories
+build_sunway*
+
+# Performance test outputs / directory
+performance_test/
+
+# Resources directory
+resources/
+
+# Common build artifacts
+build*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Object / library / binary files
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Logs and outputs
+*.log
+*.out
+*.err
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*~
+
+# IDE/editor files
+.vscode/
+.idea/

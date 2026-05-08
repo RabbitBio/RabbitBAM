@@ -38,7 +38,8 @@ const int FUSED_SAM2BAM_BAM_POOL_SIZE = 720999;
 const int CGS_NUM_CGS = 6;
 const int CGS_PES_PER_CG = 64;
 const int CGS_NB = CGS_NUM_CGS * CGS_PES_PER_CG;
-const int CGS_BAM2SAM_FORMAT_RECORDS_PER_CPE = 192;
+// const int CGS_BAM2SAM_FORMAT_RECORDS_PER_CPE = 192;
+const int CGS_BAM2SAM_FORMAT_RECORDS_PER_CPE = 900;
 const size_t CGS_SAM_CHUNK_SIZE = 512 * 1024;
 const size_t CGS_SAM_CHUNK_BUFFER_SIZE = CGS_SAM_CHUNK_SIZE + MAX_SAM_LINE_SIZE;
 const int CGS_SAM2BAM_MAX_BAMS_PER_CHUNK = 4096;
@@ -97,6 +98,22 @@ typedef struct {
     const sam_hdr_t *hdr;
     SamParseChunk chunks[64];            
 } SamParseBatch; 
+
+struct MpiSamParseChunk {
+    const char *src_ptr;
+    size_t src_len;
+    char *text_buf;
+    size_t text_len;
+    bam1_t *bams;
+    unsigned char *bam_data;
+    uint32_t *bam_lens;
+    int count;
+};
+
+struct MpiSamParseBatch {
+    const sam_hdr_t *hdr;
+    MpiSamParseChunk chunks[64];
+};
 
 typedef struct {
     const sam_hdr_t *hdr;

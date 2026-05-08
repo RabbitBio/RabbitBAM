@@ -1460,3 +1460,85 @@ extern "C" void slave_sam_parse_chunk(void *arg) {
     }
     chunk->count = valid_count;
 }
+
+extern "C" void slave_mpi_copy_and_count(void *arg) {
+    MpiSamParseBatch *batch = (MpiSamParseBatch *)arg;
+    int tid = _PEN;
+    MpiSamParseChunk *chunk = &batch->chunks[tid];
+
+    if (chunk->src_len == 0) {
+        chunk->text_len = 0;
+        chunk->count    = 0;
+        return;
+    }
+
+    memcpy(chunk->text_buf, chunk->src_ptr, chunk->src_len);
+    chunk->text_buf[chunk->src_len] = '\0';
+    chunk->text_len = chunk->src_len;
+
+    int count = 0;
+    char *p = chunk->text_buf;
+    char *end = chunk->text_buf + chunk->text_len;
+    while (p < end) {
+        char *line_end = p;
+        while (line_end < end && *line_end != '\n' && *line_end != '\0') line_end++;
+
+        int line_len = (int)(line_end - p);
+        if (line_len > 0 && p[line_len - 1] == '\r') line_len--;
+        if (line_len > 0) count++;
+
+        if (line_end < end && *line_end == '\n') line_end++;
+        p = line_end;
+    }
+    chunk->count = count;
+}
+
+extern "C" void slave_mpi_sam_parse_chunk(void *arg) {
+    MpiSamParseBatch *batch = (MpiSamParseBatch *)arg;
+    int tid = _PEN;
+    MpiSamParseChunk *chunk = &batch->chunks[tid];
+
+    if (chunk->text_len == 0 || chunk->count == 0) return;
+
+    int valid_count = 0;
+    char *ptr = chunk->text_buf;
+    char *end = chunk->text_buf + chunk->text_len;
+
+    while (ptr < end) {
+        char *eol = ptr;
+        while (eol < end && *eol != '\n' && *eol != '\0') eol++;
+
+        int line_len = (int)(eol - ptr);
+        kstring_t ks;
+        ks.s = ptr;
+        ks.l = line_len;
+        ks.m = line_len + 1;
+
+        if (ks.l > 0 && ks.s[ks.l - 1] == '\r') {
+            ks.l--;
+        }
+
+        if (ks.l > 0) {
+            char saved_char = ks.s[ks.l];
+            ks.s[ks.l] = '\0';
+
+            bam1_t *b = chunk->bams + valid_count;
+            b->data = chunk->bam_data + (size_t)valid_count * INIT_DATA_SIZE;
+            b->m_data = INIT_DATA_SIZE;
+            b->l_data = 0;
+            b->mempolicy = BAM_USER_OWNS_DATA;
+            int ret = sam_parse1(&ks, (sam_hdr_t *)batch->hdr, b);
+
+            ks.s[ks.l] = saved_char;
+
+            if (ret >= 0) {
+                chunk->bam_lens[valid_count] = (uint32_t)(b->l_data - b->core.l_extranul + 32);
+                valid_count++;
+            }
+        }
+
+        if (eol < end && *eol == '\n') eol++;
+        ptr = eol;
+    }
+    chunk->count = valid_count;
+}
