@@ -23,6 +23,7 @@ public:
     std::string ref_name_;
     int min_read_len_;
     int max_read_len_;
+    int compress_level_;
          
 };
 

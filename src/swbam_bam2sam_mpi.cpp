@@ -4,13 +4,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdint.h>
 
 #ifdef PLATFORM_SUNWAY
 #include <athread.h>
 #endif
 
 extern "C" {
-    void slave_decompress_bam2bam_passthrough();
+    void slave_mpi_decompress_bam2bam_passthrough();
     void slave_sam_format();
 }
 
@@ -152,7 +153,47 @@ void MpiInitEmptyBamToSamPara(Bam2BamPara *para, int block_id) {
     para->filter.max_read_len = -1;
     para->n_total_records = 0;
     para->n_kept_records = 0;
+    para->kept_total_len = 0;
     para->status = -1;
+    para->decomp_alloc_cycles = 0;
+    para->decomp_inflate_cycles = 0;
+    para->decomp_crc_cycles = 0;
+    para->decomp_parse_cycles = 0;
+    para->decomp_total_cycles = 0;
+}
+
+void MpiAccumulateDecompDetail(const Bam2BamPara *paras,
+                               int active_blocks,
+                               double decomp_wall,
+                               MpiBamToSamStats *stats) {
+    if (!stats || active_blocks <= 0 || decomp_wall <= 0.0) return;
+
+    const Bam2BamPara *critical = nullptr;
+    uint64_t critical_total = 0;
+    for (int b = 0; b < active_blocks; ++b) {
+        if (paras[b].decomp_total_cycles >= critical_total) {
+            critical_total = paras[b].decomp_total_cycles;
+            critical = &paras[b];
+        }
+    }
+    if (!critical || critical_total == 0) {
+        stats->t_decomp_other += decomp_wall;
+        return;
+    }
+
+    const double scale = decomp_wall / (double)critical_total;
+    const double alloc_time = scale * (double)critical->decomp_alloc_cycles;
+    const double inflate_time = scale * (double)critical->decomp_inflate_cycles;
+    const double crc_time = scale * (double)critical->decomp_crc_cycles;
+    const double parse_time = scale * (double)critical->decomp_parse_cycles;
+    double other_time = decomp_wall - alloc_time - inflate_time - crc_time - parse_time;
+    if (other_time < 0.0) other_time = 0.0;
+
+    stats->t_decomp_alloc += alloc_time;
+    stats->t_decomp_inflate += inflate_time;
+    stats->t_decomp_crc += crc_time;
+    stats->t_decomp_parse += parse_time;
+    stats->t_decomp_other += other_time;
 }
 
 } // namespace
@@ -253,10 +294,12 @@ int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
         }
 
         double decomp_t0 = GetTime();
-        __real_athread_spawn((void *)slave_decompress_bam2bam_passthrough, paras, 1);
+        __real_athread_spawn((void *)slave_mpi_decompress_bam2bam_passthrough, paras, 1);
         if (flush_pending_write() != 0) goto cleanup;
         athread_join();
-        stats->t_decomp += GetTime() - decomp_t0;
+        double decomp_wall = GetTime() - decomp_t0;
+        stats->t_decomp += decomp_wall;
+        MpiAccumulateDecompDetail(paras, n_blocks, decomp_wall, stats);
 
         for (int b = 0; b < n_blocks; ++b) {
             if (paras[b].status != 0) {

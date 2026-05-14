@@ -125,6 +125,12 @@ void InitEmptyCompParaCGS(Comp_Para *para, int block_id) {
     para->output_block = nullptr;
     para->output_size = 0;
     para->status = -1;
+    para->compress_level = 1;
+    para->compress_serialize_cycles = 0;
+    para->compress_alloc_cycles = 0;
+    para->compress_deflate_cycles = 0;
+    para->compress_footer_cycles = 0;
+    para->compress_total_cycles = 0;
 }
 
 int CheckCgsResources() {

@@ -224,6 +224,12 @@ void InitEmptyCompPara(Comp_Para *para, int block_id) {
     para->output_block = nullptr;
     para->output_size = 0;
     para->status = -1;
+    para->compress_level = 1;
+    para->compress_serialize_cycles = 0;
+    para->compress_alloc_cycles = 0;
+    para->compress_deflate_cycles = 0;
+    para->compress_footer_cycles = 0;
+    para->compress_total_cycles = 0;
 }
 
 } // namespace
@@ -1018,6 +1024,7 @@ void SwBam::FusedBamToBamOptimized(BamRead *read, BamComplete *complete, BamWrit
             comp_active[k].un_comp_size = (int)pack_workspace.plans[k].total_len;
             comp_active[k].output_size = 0;
             comp_active[k].status = 0;
+            comp_active[k].compress_level = 1;
         }
         for (int k = active_output_blocks; k < NB; ++k) {
             InitEmptyCompPara(&comp_active[k], k);
@@ -1235,6 +1242,7 @@ int SwBam::FusedBamToBamChecked(BamRead *read, BamComplete *complete, BamWriteCo
                 comp_active[k].un_comp_block = nullptr;
                 comp_active[k].output_size = 0;
                 comp_active[k].status = -1;
+                comp_active[k].compress_level = 1;
                 continue;
             }
             comp_active[k].block_id = k;
@@ -1244,6 +1252,7 @@ int SwBam::FusedBamToBamChecked(BamRead *read, BamComplete *complete, BamWriteCo
             comp_active[k].un_comp_block = write_complete->getBuffer(k);
             comp_active[k].output_size = 0;
             comp_active[k].status = 0;
+            comp_active[k].compress_level = 1;
         }
 
         __real_athread_spawn((void*)slave_compressfunc, comp_active, 1);
@@ -1733,6 +1742,7 @@ void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
                 comp_paras[i].un_comp_block = nullptr;
                 comp_paras[i].output_size = 0;
                 comp_paras[i].status = -1; // empty
+                comp_paras[i].compress_level = 1;
                 continue;
             }
             comp_paras[i].block_id = i;
@@ -1742,6 +1752,7 @@ void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
             comp_paras[i].un_comp_block = complete->getBuffer(i);
             comp_paras[i].output_size = 0;
             comp_paras[i].status = 0;
+            comp_paras[i].compress_level = 1;
         }
 
         //调用从核处理一块：解析，压缩成bgzf块
@@ -1837,6 +1848,7 @@ void SwBam::FusedSamToBam(BamWrite *write, BamWriteComplete *complete,
                 comp_active[k].un_comp_block = nullptr;
                 comp_active[k].output_size = 0;
                 comp_active[k].status = -1;
+                comp_active[k].compress_level = 1;
                 continue;
             }
             comp_active[k].block_id = k;
@@ -1846,6 +1858,7 @@ void SwBam::FusedSamToBam(BamWrite *write, BamWriteComplete *complete,
             comp_active[k].un_comp_block = complete->getBuffer(k);
             comp_active[k].output_size = 0;
             comp_active[k].status = 0;
+            comp_active[k].compress_level = 1;
         }
 
         ts = GetTime();
@@ -2055,6 +2068,7 @@ int SwBam::FusedSamToBamChecked(BamWriteComplete *complete, sam_hdr_t *h,
                 comp_active[k].un_comp_block = nullptr;
                 comp_active[k].output_size = 0;
                 comp_active[k].status = -1;
+                comp_active[k].compress_level = 1;
                 continue;
             }
             comp_active[k].block_id = k;
@@ -2064,6 +2078,7 @@ int SwBam::FusedSamToBamChecked(BamWriteComplete *complete, sam_hdr_t *h,
             comp_active[k].un_comp_block = complete->getBuffer(k);
             comp_active[k].output_size = 0;
             comp_active[k].status = 0;
+            comp_active[k].compress_level = 1;
         }
 
         __real_athread_spawn((void*)slave_compressfunc, comp_active, 1);

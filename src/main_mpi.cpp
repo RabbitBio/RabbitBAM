@@ -46,6 +46,7 @@ int main(int argc, char **argv) {
     run_all->add_option("--ref-name", cmd_info.ref_name_, "Keep reads mapped to the given reference name");
     run_all->add_option("--min-read-len", cmd_info.min_read_len_, "Keep reads with read length >= value");
     run_all->add_option("--max-read-len", cmd_info.max_read_len_, "Keep reads with read length <= value");
+    run_all->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
 
     CLI11_PARSE(app, argc, argv);
 
@@ -60,6 +61,14 @@ int main(int argc, char **argv) {
     }
     if (app.get_subcommands()[0]->get_name() != "run_all") {
         if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI only supports run_all.\n");
+        goto cleanup;
+    }
+    if (cmd_info.compress_level_ != 0 &&
+        cmd_info.compress_level_ != 1 &&
+        cmd_info.compress_level_ != 6) {
+        if (my_rank == 0) {
+            fprintf(stderr, "ERROR: --compress-level only supports 0, 1, or 6 in RabbitBAM-MPI.\n");
+        }
         goto cleanup;
     }
 

@@ -11,8 +11,8 @@
 #endif
 
 extern "C" {
-    void slave_decompress_filterfunc();
-    void slave_decompress_bam2bam_passthrough();
+    void slave_mpi_decompress_filterfunc();
+    void slave_mpi_decompress_bam2bam_passthrough();
     void slave_compressfunc();
 }
 
@@ -126,17 +126,95 @@ int MpiSealCurrentPackBlock(MpiFlatPackWorkspace *workspace) {
     return 0;
 }
 
-int MpiAppendRecordToWorkspace(MpiFlatPackWorkspace *workspace, bam1_t *record, uint32_t bam_len) {
-    const uint32_t packed_len = bam_len + 4;
-    if (packed_len > BGZF_BLOCK_SIZE) return -1;
-    if (workspace->current_records > 0 && workspace->current_len + packed_len > BGZF_BLOCK_SIZE) return 1;
-    if (workspace->total_records >= (int)workspace->records.size()) return -2;
-    if (workspace->current_records == 0) {
-        workspace->current_begin = workspace->records.data() + workspace->total_records;
+int MpiAppendRecordRangeToWorkspace(MpiFlatPackWorkspace *workspace,
+                                    bam1_t **records,
+                                    const uint32_t *bam_lens,
+                                    int n_records,
+                                    uint32_t total_len) {
+    if (n_records <= 0) return 0;
+
+    if (total_len > 0 &&
+        total_len <= BGZF_BLOCK_SIZE &&
+        (workspace->current_records == 0 ||
+         workspace->current_len + total_len <= BGZF_BLOCK_SIZE)) {
+        if (workspace->total_records + n_records > (int)workspace->records.size()) return -2;
+        if (workspace->current_records == 0) {
+            workspace->current_begin = workspace->records.data() + workspace->total_records;
+        }
+        memcpy(workspace->records.data() + workspace->total_records,
+               records,
+               (size_t)n_records * sizeof(bam1_t *));
+        workspace->total_records += n_records;
+        workspace->current_records += n_records;
+        workspace->current_len += total_len;
+        return 0;
     }
-    workspace->records[workspace->total_records++] = record;
-    workspace->current_records++;
-    workspace->current_len += packed_len;
+
+    int offset = 0;
+    while (offset < n_records) {
+        if (workspace->current_records == 0) {
+            workspace->current_begin = workspace->records.data() + workspace->total_records;
+        }
+
+        uint32_t room = BGZF_BLOCK_SIZE - workspace->current_len;
+        int take = 0;
+        uint32_t take_len = 0;
+        while (offset + take < n_records) {
+            uint32_t packed_len = bam_lens[offset + take] + 4;
+            if (packed_len > BGZF_BLOCK_SIZE) return -1;
+            if (take_len + packed_len > room) break;
+            take_len += packed_len;
+            take++;
+        }
+
+        if (take == 0) {
+            if (MpiSealCurrentPackBlock(workspace) != 0) return -3;
+            continue;
+        }
+        if (workspace->total_records + take > (int)workspace->records.size()) return -2;
+
+        memcpy(workspace->records.data() + workspace->total_records,
+               records + offset,
+               (size_t)take * sizeof(bam1_t *));
+        workspace->total_records += take;
+        workspace->current_records += take;
+        workspace->current_len += take_len;
+        offset += take;
+    }
+
+    return 0;
+}
+
+int MpiBuildPassthroughPlans(MpiFlatPackWorkspace *workspace,
+                             Bam2BamPara *paras,
+                             MpiBlockSet *un_blocks,
+                             int n_blocks) {
+    for (int b = 0; b < n_blocks; ++b) {
+        int n_records = paras[b].n_kept_records;
+        if (n_records <= 0) continue;
+
+        uint32_t total_len = paras[b].kept_total_len;
+        if (total_len == 0) total_len = un_blocks->blocks[b].length;
+        if (total_len > BGZF_BLOCK_SIZE) {
+            int ret = MpiAppendRecordRangeToWorkspace(workspace,
+                                                      paras[b].output_records,
+                                                      paras[b].bam_lens,
+                                                      n_records,
+                                                      total_len);
+            if (ret != 0) return ret;
+            continue;
+        }
+
+        if (workspace->current_records > 0 && MpiSealCurrentPackBlock(workspace) != 0) return -3;
+        if (workspace->active_blocks >= 64) return -3;
+        MpiPackedBlockPlan &plan = workspace->plans[workspace->active_blocks++];
+        plan.records = paras[b].output_records;
+        plan.n_records = n_records;
+        plan.total_len = total_len;
+        workspace->total_records += n_records;
+    }
+
+    if (workspace->current_records > 0 && MpiSealCurrentPackBlock(workspace) != 0) return -3;
     return 0;
 }
 
@@ -149,6 +227,80 @@ void MpiInitEmptyCompPara(Comp_Para *para, int block_id) {
     para->output_block = nullptr;
     para->output_size = 0;
     para->status = -1;
+    para->compress_level = 1;
+    para->compress_serialize_cycles = 0;
+    para->compress_alloc_cycles = 0;
+    para->compress_deflate_cycles = 0;
+    para->compress_footer_cycles = 0;
+    para->compress_total_cycles = 0;
+}
+
+void MpiAccumulateCompressDetail(const Comp_Para *paras,
+                                 int active_output_blocks,
+                                 double compress_wall,
+                                 MpiBamToBamStats *stats) {
+    if (!stats || active_output_blocks <= 0 || compress_wall <= 0.0) return;
+
+    const Comp_Para *critical = nullptr;
+    uint64_t critical_total = 0;
+    for (int k = 0; k < active_output_blocks; ++k) {
+        if (paras[k].compress_total_cycles >= critical_total) {
+            critical_total = paras[k].compress_total_cycles;
+            critical = &paras[k];
+        }
+    }
+    if (!critical || critical_total == 0) {
+        stats->t_compress_other += compress_wall;
+        return;
+    }
+
+    const double scale = compress_wall / (double)critical_total;
+    const double serialize_time = scale * (double)critical->compress_serialize_cycles;
+    const double alloc_time = scale * (double)critical->compress_alloc_cycles;
+    const double deflate_time = scale * (double)critical->compress_deflate_cycles;
+    const double footer_time = scale * (double)critical->compress_footer_cycles;
+    double other_time = compress_wall - serialize_time - alloc_time - deflate_time - footer_time;
+    if (other_time < 0.0) other_time = 0.0;
+
+    stats->t_compress_serialize += serialize_time;
+    stats->t_compress_alloc += alloc_time;
+    stats->t_compress_deflate += deflate_time;
+    stats->t_compress_footer += footer_time;
+    stats->t_compress_other += other_time;
+}
+
+void MpiAccumulateDecompDetail(const Bam2BamPara *paras,
+                               int active_blocks,
+                               double decomp_wall,
+                               MpiBamToBamStats *stats) {
+    if (!stats || active_blocks <= 0 || decomp_wall <= 0.0) return;
+
+    const Bam2BamPara *critical = nullptr;
+    uint64_t critical_total = 0;
+    for (int b = 0; b < active_blocks; ++b) {
+        if (paras[b].decomp_total_cycles >= critical_total) {
+            critical_total = paras[b].decomp_total_cycles;
+            critical = &paras[b];
+        }
+    }
+    if (!critical || critical_total == 0) {
+        stats->t_decomp_other += decomp_wall;
+        return;
+    }
+
+    const double scale = decomp_wall / (double)critical_total;
+    const double alloc_time = scale * (double)critical->decomp_alloc_cycles;
+    const double inflate_time = scale * (double)critical->decomp_inflate_cycles;
+    const double crc_time = scale * (double)critical->decomp_crc_cycles;
+    const double parse_time = scale * (double)critical->decomp_parse_cycles;
+    double other_time = decomp_wall - alloc_time - inflate_time - crc_time - parse_time;
+    if (other_time < 0.0) other_time = 0.0;
+
+    stats->t_decomp_alloc += alloc_time;
+    stats->t_decomp_inflate += inflate_time;
+    stats->t_decomp_crc += crc_time;
+    stats->t_decomp_parse += parse_time;
+    stats->t_decomp_other += other_time;
 }
 
 int MpiMemReadBlock(char *base, size_t size, size_t &pos, bam_block *block) {
@@ -170,6 +322,7 @@ int MpiMemReadBlock(char *base, size_t size, size_t &pos, bam_block *block) {
 
 int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      const BamFilterOptions &filter,
+                     int compress_level,
                      MpiBamToBamStats *stats) {
     const int NB = 64;
     const bool no_filter = bam_filter_is_noop(filter);
@@ -256,6 +409,12 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
             comp_active[k].un_comp_size = (int)pack_workspace.plans[k].total_len;
             comp_active[k].output_size = 0;
             comp_active[k].status = 0;
+            comp_active[k].compress_level = compress_level;
+            comp_active[k].compress_serialize_cycles = 0;
+            comp_active[k].compress_alloc_cycles = 0;
+            comp_active[k].compress_deflate_cycles = 0;
+            comp_active[k].compress_footer_cycles = 0;
+            comp_active[k].compress_total_cycles = 0;
         }
         for (int k = active_output_blocks; k < NB; ++k) {
             MpiInitEmptyCompPara(&comp_active[k], k);
@@ -267,7 +426,9 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         if (flush_pending() != 0) return -1;
         if (do_read_group(next_n_blocks) != 0) return -1;
         athread_join();
-        stats->t_compress += GetTime() - compress_t0;
+        double compress_wall = GetTime() - compress_t0;
+        stats->t_compress += compress_wall;
+        MpiAccumulateCompressDetail(comp_active, active_output_blocks, compress_wall, stats);
 
         // double comp_check_t0 = GetTime();
         for (int k = 0; k < active_output_blocks; ++k) {
@@ -305,6 +466,12 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
             paras[b].bam_lens = record_set.bam_lens + (size_t)b * MAX_RECORDS_PER_BLOCK;
             paras[b].n_total_records = 0;
             paras[b].n_kept_records = 0;
+            paras[b].kept_total_len = 0;
+            paras[b].decomp_alloc_cycles = 0;
+            paras[b].decomp_inflate_cycles = 0;
+            paras[b].decomp_crc_cycles = 0;
+            paras[b].decomp_parse_cycles = 0;
+            paras[b].decomp_total_cycles = 0;
             if (b < n_blocks) {
                 paras[b].input_block = &input_blocks.blocks[b];
                 paras[b].un_comp_block = &un_blocks.blocks[b];
@@ -318,11 +485,13 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         // stats->t_prepare_decomp += GetTime() - prepare_t0;
 
         double decomp_t0 = GetTime();
-        __real_athread_spawn((void *)(no_filter ? slave_decompress_bam2bam_passthrough
-                                                : slave_decompress_filterfunc),
+        __real_athread_spawn((void *)(no_filter ? slave_mpi_decompress_bam2bam_passthrough
+                                                : slave_mpi_decompress_filterfunc),
                              paras, 1);
         athread_join();
-        stats->t_decomp_filter += GetTime() - decomp_t0;
+        double decomp_wall = GetTime() - decomp_t0;
+        stats->t_decomp_filter += decomp_wall;
+        MpiAccumulateDecompDetail(paras, n_blocks, decomp_wall, stats);
 
         // double decomp_check_t0 = GetTime();
         for (int b = 0; b < n_blocks; ++b) {
@@ -341,31 +510,33 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
             stats->kept_records += paras[b].n_kept_records;
             stats->dropped_records += paras[b].n_total_records - paras[b].n_kept_records;
             stats->pack_records += paras[b].n_kept_records;
+        }
 
-            for (int r = 0; r < paras[b].n_kept_records; ++r) {
-                bam1_t *record = paras[b].output_records[r];
-                uint32_t bam_len = paras[b].bam_lens[r];
-                while (true) {
-                    int ret = MpiAppendRecordToWorkspace(&pack_workspace, record, bam_len);
-                    if (ret == 0) break;
-                    if (ret == -1) {
-                        fprintf(stderr, "ERROR: MPI bam2bam pack encountered an oversized BAM record.\n");
-                        return -1;
-                    }
-                    if (ret == -2) {
-                        fprintf(stderr, "ERROR: MPI bam2bam pack workspace capacity exceeded.\n");
-                        return -1;
-                    }
-                    if (MpiSealCurrentPackBlock(&pack_workspace) != 0) {
-                        fprintf(stderr, "ERROR: MPI bam2bam produced more than %d output blocks from one input group.\n",
-                                NB);
-                        return -1;
-                    }
-                }
+        int pack_ret = 0;
+        if (no_filter) {
+            pack_ret = MpiBuildPassthroughPlans(&pack_workspace, paras, &un_blocks, n_blocks);
+        } else {
+            for (int b = 0; b < n_blocks; ++b) {
+                pack_ret = MpiAppendRecordRangeToWorkspace(&pack_workspace,
+                                                           paras[b].output_records,
+                                                           paras[b].bam_lens,
+                                                           paras[b].n_kept_records,
+                                                           paras[b].kept_total_len);
+                if (pack_ret != 0) break;
+            }
+            if (pack_ret == 0 && MpiSealCurrentPackBlock(&pack_workspace) != 0) {
+                pack_ret = -3;
             }
         }
-        if (MpiSealCurrentPackBlock(&pack_workspace) != 0) {
-            fprintf(stderr, "ERROR: MPI bam2bam output block plan capacity exceeded.\n");
+        if (pack_ret != 0) {
+            if (pack_ret == -1) {
+                fprintf(stderr, "ERROR: MPI bam2bam pack encountered an oversized BAM record.\n");
+            } else if (pack_ret == -2) {
+                fprintf(stderr, "ERROR: MPI bam2bam pack workspace capacity exceeded.\n");
+            } else {
+                fprintf(stderr, "ERROR: MPI bam2bam produced more than %d output blocks from one input group.\n",
+                        NB);
+            }
             return -1;
         }
         stats->t_pack += GetTime() - pack_t0;

@@ -292,8 +292,8 @@ void bam_cigar2rqlens(int n_cigar, const uint32_t *cigar,
 
 
 
-  //----------------------------------------------------------------------------------------------
- // sam to bam 剩下需要的
+//----------------------------------------------------------------------------------------------
+// sam to bam 剩下需要的
 
  #define bam_cigar_type(o) (BAM_CIGAR_TYPE>>((o)<<1)&3) // bit 1: consume query; bit 2: consume reference
  #define bam_cigar_op(c) ((c)&BAM_CIGAR_MASK)
@@ -310,8 +310,8 @@ void bam_cigar2rqlens(int n_cigar, const uint32_t *cigar,
 
 
 
- //----------------------------------------------------------------------------------------------
- //bam to sam
+//----------------------------------------------------------------------------------------------
+//bam to sam
 // 进行标准的解压缩
 int bgzf_uncompress(uint8_t *dst, size_t *dlen,
                     const uint8_t *src, size_t slen,
@@ -1027,6 +1027,156 @@ int rabbit_bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen,
     return 0;
 }
 
+static inline unsigned long slave_cycle_now() {
+#ifdef PLATFORM_SUNWAY
+    unsigned long rpcc = 0;
+    asm volatile("rcsr %0, 4" : "=r"(rpcc));
+    return rpcc;
+#else
+    return 0;
+#endif
+}
+
+static struct libdeflate_compressor *g_slave_compressors[64] = {0};
+static int g_slave_compressor_levels[64] = {0};
+static struct libdeflate_decompressor *g_slave_decompressors[64] = {0};
+
+static inline struct libdeflate_compressor *slave_get_reused_compressor(
+        int id, int level, uint64_t *alloc_cycles) {
+    struct libdeflate_compressor *z = nullptr;
+    unsigned long t0 = 0;
+    if (id >= 0 && id < 64) {
+        z = g_slave_compressors[id];
+        if (z && g_slave_compressor_levels[id] == level) return z;
+        t0 = slave_cycle_now();
+        if (z) libdeflate_free_compressor(z);
+        z = libdeflate_alloc_compressor(level);
+        if (alloc_cycles) *alloc_cycles += (uint64_t)(slave_cycle_now() - t0);
+        if (z) {
+            g_slave_compressors[id] = z;
+            g_slave_compressor_levels[id] = level;
+        } else {
+            g_slave_compressors[id] = nullptr;
+            g_slave_compressor_levels[id] = 0;
+        }
+        return z;
+    }
+
+    t0 = slave_cycle_now();
+    z = libdeflate_alloc_compressor(level);
+    if (alloc_cycles) *alloc_cycles += (uint64_t)(slave_cycle_now() - t0);
+    return z;
+}
+
+static inline struct libdeflate_decompressor *slave_get_reused_decompressor(
+        int id, uint64_t *alloc_cycles) {
+    struct libdeflate_decompressor *z = nullptr;
+    unsigned long t0 = 0;
+    if (id >= 0 && id < 64) {
+        z = g_slave_decompressors[id];
+        if (z) return z;
+        t0 = slave_cycle_now();
+        z = libdeflate_alloc_decompressor();
+        if (alloc_cycles) *alloc_cycles += (uint64_t)(slave_cycle_now() - t0);
+        g_slave_decompressors[id] = z;
+        return z;
+    }
+
+    t0 = slave_cycle_now();
+    z = libdeflate_alloc_decompressor();
+    if (alloc_cycles) *alloc_cycles += (uint64_t)(slave_cycle_now() - t0);
+    return z;
+}
+
+int bgzf_uncompress_reuse(uint8_t *dst, size_t *dlen,
+                          const uint8_t *src, size_t slen,
+                          uint32_t expected_crc,
+                          struct libdeflate_decompressor *z,
+                          uint64_t *inflate_cycles,
+                          uint64_t *crc_cycles) {
+    if (!z) {
+        hts_log_error("Call to libdeflate_alloc_decompressor failed");
+        return -1;
+    }
+
+    unsigned long inflate_t0 = slave_cycle_now();
+    int ret = libdeflate_deflate_decompress(z, src, slen, dst, *dlen, dlen);
+    if (inflate_cycles) *inflate_cycles += (uint64_t)(slave_cycle_now() - inflate_t0);
+
+    if (ret != 0) {
+        hts_log_error("Inflate operation failed: %d", ret);
+        return -1;
+    }
+
+    unsigned long crc_t0 = slave_cycle_now();
+    uint32_t crc = libdeflate_crc32(0, (unsigned char *)dst, *dlen);
+    if (crc_cycles) *crc_cycles += (uint64_t)(slave_cycle_now() - crc_t0);
+    if (crc != expected_crc) {
+        hts_log_error("CRC32 checksum mismatch");
+        return -2;
+    }
+
+    return 0;
+}
+
+int block_decode_func_reuse(struct bam_block *comp, struct bam_block *un_comp,
+                            struct libdeflate_decompressor *z,
+                            uint64_t *inflate_cycles,
+                            uint64_t *crc_cycles) {
+    un_comp->pos = 0;
+    un_comp->length = BGZF_MAX_BLOCK_SIZE;
+    uint32_t crc = le_to_u32((uint8_t *)comp->data + comp->length - 8);
+    size_t un_comp_len = BGZF_MAX_BLOCK_SIZE;
+    int ret = bgzf_uncompress_reuse(un_comp->data, &un_comp_len,
+                                    comp->data + 18, comp->length - 18,
+                                    crc, z, inflate_cycles, crc_cycles);
+    un_comp->length = (unsigned int)un_comp_len;
+    if (ret != 0) un_comp->errcode |= BGZF_ERR_ZLIB;
+    return ret;
+}
+
+int rabbit_bgzf_compress_reuse(void *_dst, size_t *dlen,
+                               const void *src, size_t slen,
+                               int level,
+                               struct libdeflate_compressor *z,
+                               uint64_t *deflate_cycles,
+                               uint64_t *footer_cycles) {
+    if (slen == 0) return 0;
+    if (level != 0 && !z) return -1;
+
+    uint8_t *dst = (uint8_t *)_dst;
+
+    if (level == 0) {
+        if (*dlen < slen + 5 + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH) return -1;
+        dst[BLOCK_HEADER_LENGTH] = 1;
+        packInt16(&dst[BLOCK_HEADER_LENGTH + 1], (uint16_t)slen);
+        packInt16(&dst[BLOCK_HEADER_LENGTH + 3], (uint16_t)~(uint16_t)slen);
+        memcpy(dst + BLOCK_HEADER_LENGTH + 5, src, slen);
+        *dlen = slen + 5 + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
+    } else {
+        unsigned long deflate_t0 = slave_cycle_now();
+        size_t clen = libdeflate_deflate_compress(
+            z, src, slen, dst + BLOCK_HEADER_LENGTH,
+            *dlen - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH);
+        if (deflate_cycles) *deflate_cycles += (uint64_t)(slave_cycle_now() - deflate_t0);
+
+        if (clen <= 0) {
+            hts_log_error("Call to libdeflate_deflate_compress failed");
+            return -1;
+        }
+        *dlen = clen + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
+    }
+
+    unsigned long footer_t0 = slave_cycle_now();
+    memcpy(dst, g_magic, BLOCK_HEADER_LENGTH);
+    packInt16(&dst[16], *dlen - 1);
+    uint32_t crc = libdeflate_crc32(0, src, slen);
+    packInt32((uint8_t *)&dst[*dlen - 8], crc);
+    packInt32((uint8_t *)&dst[*dlen - 4], slen);
+    if (footer_cycles) *footer_cycles += (uint64_t)(slave_cycle_now() - footer_t0);
+    return 0;
+}
+
 int block_encode_func(bam_block *un_comp, bam_block *comp , int compress_level) {
     //int rabbit_write_deflate_block(BGZF *fp, bam_write_block *write_block) 
     size_t comp_size = BGZF_MAX_BLOCK_SIZE;
@@ -1147,6 +1297,7 @@ extern "C" void slave_decompress_filterfunc(Bam2BamPara paras[64]) {
 
     int total_count = 0;
     int kept_count = 0;
+    uint32_t kept_total_len = 0;
     int ret = -1;
 
     while (total_count < (int)MAX_RECORDS_PER_BLOCK) {
@@ -1157,14 +1308,17 @@ extern "C" void slave_decompress_filterfunc(Bam2BamPara paras[64]) {
 
         total_count++;
         if (bam_filter_matches(b, para->filter)) {
+            uint32_t bam_len = (uint32_t)(b->l_data - b->core.l_extranul + 32);
             para->output_records[kept_count] = b;
-            para->bam_lens[kept_count] = (uint32_t)(b->l_data - b->core.l_extranul + 32);
+            para->bam_lens[kept_count] = bam_len;
+            kept_total_len += bam_len + 4;
             kept_count++;
         }
     }
 
     para->n_total_records = total_count;
     para->n_kept_records = kept_count;
+    para->kept_total_len = kept_total_len;
 
     if (ret < -1) {
         para->status = -2;
@@ -1176,6 +1330,82 @@ extern "C" void slave_decompress_filterfunc(Bam2BamPara paras[64]) {
         return;
     }
 
+    para->status = 0;
+}
+
+extern "C" void slave_mpi_decompress_filterfunc(Bam2BamPara paras[64]) {
+    int id = _PEN;
+    Bam2BamPara *para = &paras[id];
+
+    para->decomp_alloc_cycles = 0;
+    para->decomp_inflate_cycles = 0;
+    para->decomp_crc_cycles = 0;
+    para->decomp_parse_cycles = 0;
+    para->decomp_total_cycles = 0;
+
+    bam_block *comp = para->input_block;
+    bam_block *un_comp = para->un_comp_block;
+    if (comp == NULL) {
+        return;
+    }
+
+    unsigned long total_t0 = slave_cycle_now();
+    struct libdeflate_decompressor *z =
+        slave_get_reused_decompressor(id, &para->decomp_alloc_cycles);
+    if (!z) {
+        para->status = -2;
+        para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+        return;
+    }
+
+    if (block_decode_func_reuse(comp, un_comp, z,
+                                &para->decomp_inflate_cycles,
+                                &para->decomp_crc_cycles) != 0) {
+        para->status = -2;
+        para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+        return;
+    }
+
+    int total_count = 0;
+    int kept_count = 0;
+    uint32_t kept_total_len = 0;
+    int ret = -1;
+
+    unsigned long parse_t0 = slave_cycle_now();
+    while (total_count < (int)MAX_RECORDS_PER_BLOCK) {
+        bam1_t *b = para->record_base ? para->record_base + total_count
+                                      : para->output_records[total_count];
+        ret = read_bam(un_comp, b, 0);
+        if (ret < 0) break;
+
+        total_count++;
+        if (bam_filter_matches(b, para->filter)) {
+            uint32_t bam_len = (uint32_t)(b->l_data - b->core.l_extranul + 32);
+            para->output_records[kept_count] = b;
+            para->bam_lens[kept_count] = bam_len;
+            kept_total_len += bam_len + 4;
+            kept_count++;
+        }
+    }
+    para->decomp_parse_cycles = (uint64_t)(slave_cycle_now() - parse_t0);
+
+    para->n_total_records = total_count;
+    para->n_kept_records = kept_count;
+    para->kept_total_len = kept_total_len;
+
+    if (ret < -1) {
+        para->status = -2;
+        para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+        return;
+    }
+
+    if (total_count == (int)MAX_RECORDS_PER_BLOCK && un_comp->pos < un_comp->length) {
+        para->status = -3;
+        para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+        return;
+    }
+
+    para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
     para->status = 0;
 }
 
@@ -1195,18 +1425,22 @@ extern "C" void slave_decompress_bam2bam_passthrough(Bam2BamPara paras[64]) {
     }
 
     int total_count = 0;
+    uint32_t kept_total_len = 0;
     int ret = -1;
     while (total_count < (int)MAX_RECORDS_PER_BLOCK) {
         bam1_t *b = para->output_records[total_count];
         ret = read_bam(un_comp, b, 0);
         if (ret < 0) break;
 
-        para->bam_lens[total_count] = (uint32_t)(b->l_data - b->core.l_extranul + 32);
+        uint32_t bam_len = (uint32_t)(b->l_data - b->core.l_extranul + 32);
+        para->bam_lens[total_count] = bam_len;
+        kept_total_len += bam_len + 4;
         total_count++;
     }
 
     para->n_total_records = total_count;
     para->n_kept_records = total_count;
+    para->kept_total_len = kept_total_len;
 
     if (ret < -1) {
         para->status = -2;
@@ -1218,6 +1452,75 @@ extern "C" void slave_decompress_bam2bam_passthrough(Bam2BamPara paras[64]) {
         return;
     }
 
+    para->status = 0;
+}
+
+extern "C" void slave_mpi_decompress_bam2bam_passthrough(Bam2BamPara paras[64]) {
+    int id = _PEN;
+    Bam2BamPara *para = &paras[id];
+
+    para->decomp_alloc_cycles = 0;
+    para->decomp_inflate_cycles = 0;
+    para->decomp_crc_cycles = 0;
+    para->decomp_parse_cycles = 0;
+    para->decomp_total_cycles = 0;
+
+    bam_block *comp = para->input_block;
+    bam_block *un_comp = para->un_comp_block;
+    if (comp == NULL) {
+        return;
+    }
+
+    unsigned long total_t0 = slave_cycle_now();
+    struct libdeflate_decompressor *z =
+        slave_get_reused_decompressor(id, &para->decomp_alloc_cycles);
+    if (!z) {
+        para->status = -2;
+        para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+        return;
+    }
+
+    if (block_decode_func_reuse(comp, un_comp, z,
+                                &para->decomp_inflate_cycles,
+                                &para->decomp_crc_cycles) != 0) {
+        para->status = -2;
+        para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+        return;
+    }
+
+    int total_count = 0;
+    uint32_t kept_total_len = 0;
+    int ret = -1;
+    unsigned long parse_t0 = slave_cycle_now();
+    while (total_count < (int)MAX_RECORDS_PER_BLOCK) {
+        bam1_t *b = para->output_records[total_count];
+        ret = read_bam(un_comp, b, 0);
+        if (ret < 0) break;
+
+        uint32_t bam_len = (uint32_t)(b->l_data - b->core.l_extranul + 32);
+        para->bam_lens[total_count] = bam_len;
+        kept_total_len += bam_len + 4;
+        total_count++;
+    }
+    para->decomp_parse_cycles = (uint64_t)(slave_cycle_now() - parse_t0);
+
+    para->n_total_records = total_count;
+    para->n_kept_records = total_count;
+    para->kept_total_len = kept_total_len;
+
+    if (ret < -1) {
+        para->status = -2;
+        para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+        return;
+    }
+
+    if (total_count == (int)MAX_RECORDS_PER_BLOCK && un_comp->pos < un_comp->length) {
+        para->status = -3;
+        para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+        return;
+    }
+
+    para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
     para->status = 0;
 }
 
@@ -1310,43 +1613,67 @@ extern "C" void sam_format(void *arg) {
 //sam2bam-------------------------------------------------------------------------------------------------------------------------------------------------
 
 extern "C" void slave_compressfunc(Comp_Para paras[64]) {
-    int id = _PEN;             // 从核号（0~63）
-    int compress_level = 1;    // 默认压缩等级为1
+    int id = _PEN;             
     Comp_Para* para = &paras[id];
 
-    // 忽略空任务
     if (para->status != 0 || para->input_records == nullptr || para->n_records == 0) return;
+    int compress_level = para->compress_level;
+    if (compress_level != 0 && compress_level != 1 && compress_level != 6) {
+        para->status = -2;
+        return;
+    }
 
     bam_block* uncompressed = para->un_comp_block;
-    //print_bam_block(uncompressed);
     bam_block* compressed = para->output_block;
-    //print_bam_block(compressed);
-    //这里只用到了data和pos两个字段
-    uncompressed->pos = 0;     //压缩时看这个作为实际的数据长度
+    uncompressed->pos = 0;     
     uncompressed->length = 0;  
     uncompressed->errcode = 0;
     uncompressed->block_id = 0;
     uncompressed->block_address = 0;
+    para->compress_serialize_cycles = 0;
+    para->compress_alloc_cycles = 0;
+    para->compress_deflate_cycles = 0;
+    para->compress_footer_cycles = 0;
+    para->compress_total_cycles = 0;
+    para->compress_level = compress_level;
 
     //1. 将 bam1_t 记录 逐个解析并写入 到 uncompressed 中
-    int a=0;
+    unsigned long total_t0 = slave_cycle_now();
+    unsigned long serialize_t0 = slave_cycle_now();
     for (int i = 0; i < para->n_records; i++) {
         bam1_t* b = para->input_records[i];
-        //print_bam1(b);
         writeBam1_to_block(uncompressed, b , 0);
     }
-    //print_bam_block(uncompressed);
-    //printf("Complete parsing with %d bam1_t!\n", para->n_records);
+    para->compress_serialize_cycles = (uint64_t)(slave_cycle_now() - serialize_t0);
 
     //2. 对 uncompressed 进行压缩
-    compressed->length = block_encode_func(uncompressed, compressed , compress_level); 
-    //print_bam_block(uncompressed);
-    //print_bam_block(compressed);
-    //printf("Complete the compression!\n");
+    struct libdeflate_compressor *z = nullptr;
+    if (compress_level != 0) {
+        z = slave_get_reused_compressor(id, compress_level, &para->compress_alloc_cycles);
+    }
+    if (compress_level != 0 && !z) {
+        para->status = -2;
+        para->compress_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+        return;
+    }
 
+    size_t comp_size = BGZF_MAX_BLOCK_SIZE;
+    int ret = rabbit_bgzf_compress_reuse(compressed->data, &comp_size,
+                                         uncompressed->data, uncompressed->pos,
+                                         compress_level,
+                                         z,
+                                         &para->compress_deflate_cycles,
+                                         &para->compress_footer_cycles);
+    compressed->length = ret == 0 ? (int)comp_size : -1;
+
+    if (compressed->length <= 0) {
+        para->status = -2;
+        para->compress_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+        return;
+    }
     para->output_size = compressed->length;
-    para->status = 0; // success
-
+    para->compress_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+    para->status = 0; 
 }
 
 extern "C" void slave_sam_parse(void *arg) {

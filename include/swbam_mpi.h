@@ -14,8 +14,18 @@ struct MpiBamToBamStats {
     long long bgzf_blocks;
     long long pack_records;
     double t_decomp_filter;
+    double t_decomp_alloc;
+    double t_decomp_inflate;
+    double t_decomp_crc;
+    double t_decomp_parse;
+    double t_decomp_other;
     double t_pack;
     double t_compress;
+    double t_compress_serialize;
+    double t_compress_alloc;
+    double t_compress_deflate;
+    double t_compress_footer;
+    double t_compress_other;
     double t_read;
     double t_write;
     double t_mpi_write;
@@ -37,6 +47,11 @@ struct MpiBamToSamStats {
     long long total_records;
     long long format_tiles;
     double t_decomp;
+    double t_decomp_alloc;
+    double t_decomp_inflate;
+    double t_decomp_crc;
+    double t_decomp_parse;
+    double t_decomp_other;
     double t_format;
     double t_collect;
     double t_read;
@@ -58,6 +73,11 @@ struct MpiSamToBamStats {
     double t_parse;
     double t_pack;
     double t_compress;
+    double t_compress_serialize;
+    double t_compress_alloc;
+    double t_compress_deflate;
+    double t_compress_footer;
+    double t_compress_other;
     double t_write;
     double t_gather;
     double t_fused_total;
@@ -73,12 +93,14 @@ int ProcessBamToBamMPI(CmdInfo *cmd_info);
 
 int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      const BamFilterOptions &filter,
+                     int compress_level,
                      MpiBamToBamStats *stats);
 int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
                      sam_hdr_t *hdr,
                      MpiBamToSamStats *stats);
 int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      sam_hdr_t *hdr,
+                     int compress_level,
                      MpiSamToBamStats *stats);
 
 int MpiWriteBlockToMem(MemWriter &w, bam_block *block);

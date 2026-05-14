@@ -13,4 +13,5 @@ CmdInfo::CmdInfo() {
     ref_name_ = "";
     min_read_len_ = -1;
     max_read_len_ = -1;
+    compress_level_ = 1;
 }

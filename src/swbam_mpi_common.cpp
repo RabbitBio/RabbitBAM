@@ -318,21 +318,32 @@ int MpiSplitSamRangesInMemory(const char *base, size_t size, long long body_star
     return 0;
 }
 
-int MpiAppendBgzfPayloadToMem(MemWriter &w, const unsigned char *src, size_t src_len) {
+int MpiAppendBgzfPayloadToMem(MemWriter &w, const unsigned char *src, size_t src_len,
+                              int compress_level) {
     if (src_len == 0) return 0;
     if (src_len > BGZF_BLOCK_SIZE) return -1;
+    if (compress_level != 0 && compress_level != 1 && compress_level != 6) return -1;
 
     unsigned char out[BGZF_MAX_BLOCK_SIZE];
-    struct libdeflate_compressor *compressor = libdeflate_alloc_compressor(1);
-    if (!compressor) return -1;
-    size_t clen = libdeflate_deflate_compress(
-        compressor, src, src_len,
-        out + BLOCK_HEADER_LENGTH,
-        BGZF_MAX_BLOCK_SIZE - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH);
-    libdeflate_free_compressor(compressor);
-    if (clen == 0) return -1;
-
-    size_t block_len = clen + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
+    size_t block_len = 0;
+    if (compress_level == 0) {
+        if (src_len + 5 + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH > BGZF_MAX_BLOCK_SIZE) return -1;
+        out[BLOCK_HEADER_LENGTH] = 1;
+        MpiPackLe16(out + BLOCK_HEADER_LENGTH + 1, (uint16_t)src_len);
+        MpiPackLe16(out + BLOCK_HEADER_LENGTH + 3, (uint16_t)~(uint16_t)src_len);
+        memcpy(out + BLOCK_HEADER_LENGTH + 5, src, src_len);
+        block_len = src_len + 5 + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
+    } else {
+        struct libdeflate_compressor *compressor = libdeflate_alloc_compressor(compress_level);
+        if (!compressor) return -1;
+        size_t clen = libdeflate_deflate_compress(
+            compressor, src, src_len,
+            out + BLOCK_HEADER_LENGTH,
+            BGZF_MAX_BLOCK_SIZE - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH);
+        libdeflate_free_compressor(compressor);
+        if (clen == 0) return -1;
+        block_len = clen + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
+    }
     if (block_len > BGZF_MAX_BLOCK_SIZE) return -1;
 
     memcpy(out, g_magic, BLOCK_HEADER_LENGTH);
@@ -343,7 +354,7 @@ int MpiAppendBgzfPayloadToMem(MemWriter &w, const unsigned char *src, size_t src
     return MpiWriteBytesToMem(w, (const char *)out, block_len);
 }
 
-int MpiBuildBamHeaderMemory(sam_hdr_t *hdr, char **data, size_t *size) {
+int MpiBuildBamHeaderMemory(sam_hdr_t *hdr, int compress_level, char **data, size_t *size) {
     *data = nullptr;
     *size = 0;
     if (!hdr) return -1;
@@ -376,7 +387,7 @@ int MpiBuildBamHeaderMemory(sam_hdr_t *hdr, char **data, size_t *size) {
     size_t pos = 0;
     while (pos < raw.size()) {
         size_t n = std::min((size_t)BGZF_BLOCK_SIZE, raw.size() - pos);
-        if (MpiAppendBgzfPayloadToMem(header_writer, raw.data() + pos, n) != 0) {
+        if (MpiAppendBgzfPayloadToMem(header_writer, raw.data() + pos, n, compress_level) != 0) {
             free(header_writer.data);
             return -1;
         }
@@ -413,11 +424,17 @@ void MpiPrintRankStats(int rank, int comm_size, const MpiBamToBamStats &stats, s
     snprintf(local_lines, sizeof(local_lines),
              "[rank %d] blocks=%lld groups=%lld records=%lld kept=%lld dropped=%lld bgzf=%lld body=%zu keep_ratio=%.6f\n"
              "[rank %d] decomp_filter_slave=%.3f  pack=%.3f  compress_stage=%.3f  read=%.3f  write=%.3f  mpi_write=%.3f\n"
+             "[rank %d] decomp_detail alloc=%.3f  inflate=%.3f  crc=%.3f  parse_filter=%.3f  other=%.3f\n"
+             "[rank %d] compress_detail serialize=%.3f  alloc=%.3f  deflate=%.3f  footer=%.3f  other=%.3f\n"
              "[rank %d] fused_total=%.6f  core_stage=%.6f\n",
              rank, stats.input_blocks, stats.group_count, stats.total_records,
              stats.kept_records, stats.dropped_records, stats.bgzf_blocks, body_size, keep_ratio,
              rank, stats.t_decomp_filter, stats.t_pack, stats.t_compress,
              stats.t_read, stats.t_write, stats.t_mpi_write,
+             rank, stats.t_decomp_alloc, stats.t_decomp_inflate,
+             stats.t_decomp_crc, stats.t_decomp_parse, stats.t_decomp_other,
+             rank, stats.t_compress_serialize, stats.t_compress_alloc,
+             stats.t_compress_deflate, stats.t_compress_footer, stats.t_compress_other,
              rank, stats.t_fused_total, core_stage);
     MpiPrintRankBufferedLines(rank, comm_size, local_lines);
 }
@@ -430,11 +447,14 @@ void MpiPrintRankBamToSamStats(int rank, int comm_size,
     snprintf(local_lines, sizeof(local_lines),
              "[rank %d] blocks=%lld groups=%lld records=%lld format_tiles=%lld body=%zu\n"
              "[rank %d] decomp_slave=%.3f  format_slave=%.3f  collect=%.3f  read=%.3f  write=%.3f  gather=%.3f\n"
+             "[rank %d] decomp_detail alloc=%.3f  inflate=%.3f  crc=%.3f  parse=%.3f  other=%.3f\n"
              "[rank %d] fused_total=%.6f  core_stage=%.6f  alloc_init=%.6f  free_workspace=%.6f\n",
              rank, stats.input_blocks, stats.group_count, stats.total_records,
              stats.format_tiles, body_size,
              rank, stats.t_decomp, stats.t_format, stats.t_collect,
              stats.t_read, stats.t_write, stats.t_gather,
+             rank, stats.t_decomp_alloc, stats.t_decomp_inflate,
+             stats.t_decomp_crc, stats.t_decomp_parse, stats.t_decomp_other,
              rank, stats.t_fused_total, core_stage,
              stats.t_alloc_init, stats.t_free_workspace);
     MpiPrintRankBufferedLines(rank, comm_size, local_lines);
@@ -445,21 +465,22 @@ void MpiPrintRankSamToBamStats(int rank, int comm_size,
                                size_t body_size) {
     char local_lines[4096] = {};
     double core_stage = stats.t_copy_count + stats.t_parse + stats.t_pack + stats.t_compress;
-    double measured_extra = stats.t_split + stats.t_alloc_init + stats.t_setup_reset +
-                            stats.t_compress_setup + stats.t_status_check +
-                            stats.t_free_workspace;
-    double residual = stats.t_fused_total - core_stage - measured_extra;
+    // double measured_extra = stats.t_split + stats.t_alloc_init + stats.t_setup_reset +
+    //                         stats.t_compress_setup + stats.t_status_check +
+    //                         stats.t_free_workspace;
+    // double residual = stats.t_fused_total - core_stage - measured_extra;
     snprintf(local_lines, sizeof(local_lines),
              "[rank %d] chunks=%lld chunk_groups=%lld records=%lld compress_groups=%lld bgzf=%lld body=%zu\n"
              "[rank %d] split=%.3f  copy_count_slave=%.3f  parse_slave=%.3f  pack=%.3f  compress_slave=%.3f  write=%.3f  gather=%.3f\n"
-             "[rank %d] fused_total=%.6f  core_stage=%.6f  setup_reset=%.6f  compress_setup=%.6f  status_check=%.6f  alloc_free=%.6f  residual=%.6f\n",
+             "[rank %d] compress_detail serialize=%.3f  alloc=%.3f  deflate=%.3f  footer=%.3f  other=%.3f\n"
+             "[rank %d] fused_total=%.6f  core_stage=%.6f\n",
              rank, stats.input_chunks, stats.chunk_groups, stats.total_records,
              stats.compress_groups, stats.bgzf_blocks, body_size,
              rank, stats.t_split, stats.t_copy_count, stats.t_parse,
              stats.t_pack, stats.t_compress, stats.t_write, stats.t_gather,
-             rank, stats.t_fused_total, core_stage,
-             stats.t_setup_reset, stats.t_compress_setup, stats.t_status_check,
-             stats.t_alloc_init + stats.t_free_workspace, residual);
+             rank, stats.t_compress_serialize, stats.t_compress_alloc,
+             stats.t_compress_deflate, stats.t_compress_footer, stats.t_compress_other,
+             rank, stats.t_fused_total, core_stage);
     MpiPrintRankBufferedLines(rank, comm_size, local_lines);
 }
 
@@ -483,7 +504,6 @@ int MpiWriteBytesToMem(MemWriter &w, const char *data, size_t len) {
 int ProcessSwBamMPI(CmdInfo *cmd_info) {
 
     //1.相关数据的初始化
-    //未计入t_total
     double t_init = GetTime();
 
     int rank = 0;
@@ -557,8 +577,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
     }
 
 
-    //2.把文件加载到所有rank的内存中，一共6份，每个rank一份，后续每个rank从内存中读取自己的部分进行处理
-    //不计入处理时间
+    //2.把文件加载到所有rank的内存中，一共6份，每个rank一份，后续每个rank从内存中读取自己的部分进行处理；不计入处理时间
     {
         double preload_t0 = GetTime();
         if (MpiLoadFileToMemory(cmd_info->in_file_name_, &input_file_mem, &input_file_size) != 0) {
@@ -626,6 +645,10 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 }
                 local_ok = 0;
             }
+            if (local_ok && bam_to_sam && cmd_info->compress_level_ != 1 && rank == 0) {
+                printf("NOTE: --compress-level=%d is ignored for MPI BAM2SAM because SAM output is plain text.\n",
+                       cmd_info->compress_level_);
+            }
             if (local_ok && bam_to_bam && !cmd_info->ref_name_.empty()) {
                 int ref_tid = sam_hdr_name2tid(hdr, cmd_info->ref_name_.c_str());
                 if (ref_tid < 0) {
@@ -674,6 +697,9 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             printf("Enable MPI %s mode (%d MPE + %d CPEs)!!!\n",
                    mode_name, comm_size, comm_size * 64);
             if (bam_to_bam && filter_requested) printf("Enable MPI BAM filtering options.\n");
+            if (bam_to_bam || sam_to_bam) {
+                printf("MPI BAM output compression level=%d\n", cmd_info->compress_level_);
+            }
 
             if (input_format == bam) {
                 if (MpiScanBgzfBlocksInMemory(input_file_mem, input_file_size, body_start,
@@ -795,12 +821,12 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 local_ok = 0;
             }
         } else if (sam_to_bam) {
-            if (FusedSamToBamMPI(reader, mem_writer, hdr, &sam2bam_stats) != 0) {
+            if (FusedSamToBamMPI(reader, mem_writer, hdr, cmd_info->compress_level_, &sam2bam_stats) != 0) {
                 fprintf(stderr, "[rank %d] ERROR: MPI sam2bam fused 1CG body failed.\n", rank);
                 local_ok = 0;
             }
         } else {
-            if (FusedBamToBamMPI(reader, mem_writer, filter, &stats) != 0) {
+            if (FusedBamToBamMPI(reader, mem_writer, filter, cmd_info->compress_level_, &stats) != 0) {
                 fprintf(stderr, "[rank %d] ERROR: MPI bam2bam fused 1CG body failed.\n", rank);
                 local_ok = 0;
             }
@@ -854,7 +880,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 final_size = (unsigned long long)output_body_start +
                              (unsigned long long)total_body_size;
             } else if (sam_to_bam) {
-                if (MpiBuildBamHeaderMemory(hdr, &bam_header_mem, &bam_header_size) != 0) {
+                if (MpiBuildBamHeaderMemory(hdr, cmd_info->compress_level_, &bam_header_mem, &bam_header_size) != 0) {
                     fprintf(stderr, "ERROR: failed to build MPI SAM2BAM output BAM header in memory.\n");
                     local_ok = 0;
                 }
@@ -992,8 +1018,13 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             };
             long long global_long_stats[4] = {};
             MPI_Reduce(local_long_stats, global_long_stats, 4, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-            double local_double_stats[10] = {
+            double local_double_stats[15] = {
                 sam_stats.t_decomp,
+                sam_stats.t_decomp_alloc,
+                sam_stats.t_decomp_inflate,
+                sam_stats.t_decomp_crc,
+                sam_stats.t_decomp_parse,
+                sam_stats.t_decomp_other,
                 sam_stats.t_format,
                 sam_stats.t_collect,
                 sam_stats.t_read,
@@ -1004,8 +1035,8 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 sam_stats.t_alloc_init,
                 sam_stats.t_free_workspace
             };
-            double global_double_stats[10] = {};
-            MPI_Reduce(local_double_stats, global_double_stats, 10, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+            double global_double_stats[15] = {};
+            MPI_Reduce(local_double_stats, global_double_stats, 15, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
             MpiPrintRankBamToSamStats(rank, comm_size, sam_stats, mem_writer.size);
             if (rank == 0) {
@@ -1013,11 +1044,14 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                        comm_size, global_long_stats[0], global_long_stats[1],
                        global_long_stats[2], global_long_stats[3], total_body_size);
                 printf("  decomp_slave_sum=%.3f  format_slave_sum=%.3f  collect_sum=%.3f  read_sum=%.3f  write_sum=%.3f  gather_sum=%.3f\n",
-                       global_double_stats[0], global_double_stats[1], global_double_stats[2],
-                       global_double_stats[3], global_double_stats[4], global_double_stats[5]);
+                       global_double_stats[0], global_double_stats[6], global_double_stats[7],
+                       global_double_stats[8], global_double_stats[9], global_double_stats[10]);
+                printf("  decomp_detail_sum alloc=%.3f  inflate=%.3f  crc=%.3f  parse=%.3f  other=%.3f\n",
+                       global_double_stats[1], global_double_stats[2], global_double_stats[3],
+                       global_double_stats[4], global_double_stats[5]);
                 printf("  fused_total_sum=%.3f  core_stage_sum=%.3f  alloc_init_sum=%.3f  free_workspace_sum=%.3f\n",
-                       global_double_stats[6], global_double_stats[7],
-                       global_double_stats[8], global_double_stats[9]);
+                       global_double_stats[11], global_double_stats[12],
+                       global_double_stats[13], global_double_stats[14]);
             }
         } else if (sam_to_bam) {
             long long local_long_stats[5] = {
@@ -1029,12 +1063,17 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             };
             long long global_long_stats[5] = {};
             MPI_Reduce(local_long_stats, global_long_stats, 5, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-            double local_double_stats[12] = {
+            double local_double_stats[17] = {
                 sam2bam_stats.t_split,
                 sam2bam_stats.t_copy_count,
                 sam2bam_stats.t_parse,
                 sam2bam_stats.t_pack,
                 sam2bam_stats.t_compress,
+                sam2bam_stats.t_compress_serialize,
+                sam2bam_stats.t_compress_alloc,
+                sam2bam_stats.t_compress_deflate,
+                sam2bam_stats.t_compress_footer,
+                sam2bam_stats.t_compress_other,
                 sam2bam_stats.t_write,
                 sam2bam_stats.t_gather,
                 sam2bam_stats.t_fused_total,
@@ -1043,8 +1082,8 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 sam2bam_stats.t_status_check,
                 sam2bam_stats.t_alloc_init + sam2bam_stats.t_free_workspace
             };
-            double global_double_stats[12] = {};
-            MPI_Reduce(local_double_stats, global_double_stats, 12, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+            double global_double_stats[17] = {};
+            MPI_Reduce(local_double_stats, global_double_stats, 17, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
             MpiPrintRankSamToBamStats(rank, comm_size, sam2bam_stats, mem_writer.size);
             if (rank == 0) {
@@ -1054,14 +1093,17 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                        total_body_size);
                 printf("  split_sum=%.3f  copy_count_slave_sum=%.3f  parse_slave_sum=%.3f  pack_sum=%.3f  compress_slave_sum=%.3f  write_sum=%.3f  gather_sum=%.3f\n",
                        global_double_stats[0], global_double_stats[1], global_double_stats[2],
-                       global_double_stats[3], global_double_stats[4], global_double_stats[5],
-                       global_double_stats[6]);
+                       global_double_stats[3], global_double_stats[4], global_double_stats[10],
+                       global_double_stats[11]);
+                printf("  compress_detail_sum serialize=%.3f  alloc=%.3f  deflate=%.3f  footer=%.3f  other=%.3f\n",
+                       global_double_stats[5], global_double_stats[6], global_double_stats[7],
+                       global_double_stats[8], global_double_stats[9]);
                 printf("  fused_total_sum=%.3f  core_stage_sum=%.3f  setup_reset_sum=%.3f  compress_setup_sum=%.3f  status_check_sum=%.3f  alloc_free_sum=%.3f\n",
-                       global_double_stats[7],
+                       global_double_stats[12],
                        global_double_stats[1] + global_double_stats[2] +
                        global_double_stats[3] + global_double_stats[4],
-                       global_double_stats[8], global_double_stats[9],
-                       global_double_stats[10], global_double_stats[11]);
+                       global_double_stats[13], global_double_stats[14],
+                       global_double_stats[15], global_double_stats[16]);
             }
         } else {
             long long local_long_stats[7] = {
@@ -1075,16 +1117,26 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             };
             long long global_long_stats[7] = {};
             MPI_Reduce(local_long_stats, global_long_stats, 7, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-            double local_double_stats[6] = {
+            double local_double_stats[16] = {
                 stats.t_decomp_filter,
+                stats.t_decomp_alloc,
+                stats.t_decomp_inflate,
+                stats.t_decomp_crc,
+                stats.t_decomp_parse,
+                stats.t_decomp_other,
                 stats.t_pack,
                 stats.t_compress,
+                stats.t_compress_serialize,
+                stats.t_compress_alloc,
+                stats.t_compress_deflate,
+                stats.t_compress_footer,
+                stats.t_compress_other,
                 stats.t_read,
                 stats.t_write,
                 stats.t_mpi_write
             };
-            double global_double_stats[6] = {};
-            MPI_Reduce(local_double_stats, global_double_stats, 6, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+            double global_double_stats[16] = {};
+            MPI_Reduce(local_double_stats, global_double_stats, 16, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
             double local_detail_stats[3] = {
                 stats.t_fused_total,
                 stats.t_decomp_filter + stats.t_pack + stats.t_compress,
@@ -1103,8 +1155,14 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                        global_long_stats[3], global_long_stats[4], global_long_stats[5],
                        total_body_size);
                 printf("  decomp_filter_slave_sum=%.3f  pack_sum=%.3f  compress_slave_sum=%.3f  read_sum=%.3f  write_sum=%.3f  mpi_write_sum=%.3f\n",
-                       global_double_stats[0], global_double_stats[1], global_double_stats[2],
-                       global_double_stats[3], global_double_stats[4], global_double_stats[5]);
+                       global_double_stats[0], global_double_stats[6], global_double_stats[7],
+                       global_double_stats[13], global_double_stats[14], global_double_stats[15]);
+                printf("  decomp_detail_sum alloc=%.3f  inflate=%.3f  crc=%.3f  parse_filter=%.3f  other=%.3f\n",
+                       global_double_stats[1], global_double_stats[2], global_double_stats[3],
+                       global_double_stats[4], global_double_stats[5]);
+                printf("  compress_detail_sum serialize=%.3f  alloc=%.3f  deflate=%.3f  footer=%.3f  other=%.3f\n",
+                       global_double_stats[8], global_double_stats[9], global_double_stats[10],
+                       global_double_stats[11], global_double_stats[12]);
                 printf("  fused_total_sum=%.3f  core_stage_sum=%.3f  prepare_decomp_sum=%.3f\n",
                        global_detail_stats[0], global_detail_stats[1], global_detail_stats[2]);
                 printf("  pack_records=%lld  keep_ratio=%.6f  filter_mode=%s\n",

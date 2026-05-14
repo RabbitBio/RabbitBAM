@@ -185,14 +185,79 @@ void MpiInitEmptyCompPara(Comp_Para *para, int block_id) {
     para->output_block = nullptr;
     para->output_size = 0;
     para->status = -1;
+    para->compress_level = 1;
+    para->compress_serialize_cycles = 0;
+    para->compress_alloc_cycles = 0;
+    para->compress_deflate_cycles = 0;
+    para->compress_footer_cycles = 0;
+    para->compress_total_cycles = 0;
+}
+
+void MpiAccumulateCompressDetail(const Comp_Para *paras,
+                                 int active_output_blocks,
+                                 double compress_wall,
+                                 MpiSamToBamStats *stats) {
+    if (!stats || active_output_blocks <= 0 || compress_wall <= 0.0) return;
+
+    const Comp_Para *critical = nullptr;
+    uint64_t critical_total = 0;
+    for (int k = 0; k < active_output_blocks; ++k) {
+        if (paras[k].compress_total_cycles >= critical_total) {
+            critical_total = paras[k].compress_total_cycles;
+            critical = &paras[k];
+        }
+    }
+    if (!critical || critical_total == 0) {
+        stats->t_compress_other += compress_wall;
+        return;
+    }
+
+    const double scale = compress_wall / (double)critical_total;
+    const double serialize_time = scale * (double)critical->compress_serialize_cycles;
+    const double alloc_time = scale * (double)critical->compress_alloc_cycles;
+    const double deflate_time = scale * (double)critical->compress_deflate_cycles;
+    const double footer_time = scale * (double)critical->compress_footer_cycles;
+    double other_time = compress_wall - serialize_time - alloc_time - deflate_time - footer_time;
+    if (other_time < 0.0) other_time = 0.0;
+
+    stats->t_compress_serialize += serialize_time;
+    stats->t_compress_alloc += alloc_time;
+    stats->t_compress_deflate += deflate_time;
+    stats->t_compress_footer += footer_time;
+    stats->t_compress_other += other_time;
+}
+
+size_t MpiRoundUpSize(size_t value, size_t align) {
+    if (align == 0) return value;
+    size_t rem = value % align;
+    if (rem == 0) return value;
+    size_t add = align - rem;
+    if (value > SIZE_MAX - add) return SIZE_MAX;
+    return value + add;
+}
+
+size_t MpiChooseSamChunkSize(size_t local_input_size) {
+    const size_t min_chunk = 128 * 1024;
+    const size_t max_chunk = SAM_CHUNK_SIZE;
+    const size_t align = 64 * 1024;
+
+    if (local_input_size == 0) return min_chunk;
+    size_t target = local_input_size / 64 + (local_input_size % 64 != 0);
+    if (target < min_chunk) target = min_chunk;
+    target = MpiRoundUpSize(target, align);
+    if (target < min_chunk) target = min_chunk;
+    if (target > max_chunk) target = max_chunk;
+    return target;
 }
 
 int MpiSplitSamChunks(MemReader &reader,
                       MpiSamParseBatch *batch,
+                      size_t chunk_size,
                       int *active_chunks,
                       int *max_chunk_len) {
     int count = 0;
     *max_chunk_len = 0;
+    if (chunk_size == 0) chunk_size = SAM_CHUNK_SIZE;
     for (int i = 0; i < 64; ++i) {
         MpiSamParseChunk *chunk = &batch->chunks[i];
         chunk->src_ptr = nullptr;
@@ -203,7 +268,8 @@ int MpiSplitSamChunks(MemReader &reader,
         if (reader.pos >= reader.size) continue;
 
         size_t start_pos = reader.pos;
-        size_t end_pos = start_pos + SAM_CHUNK_SIZE;
+        size_t remaining = reader.size - start_pos;
+        size_t end_pos = start_pos + (remaining > chunk_size ? chunk_size : remaining);
         if (end_pos < reader.size) {
             while (end_pos < reader.size && reader.base[end_pos] != '\n') end_pos++;
             if (end_pos < reader.size && reader.base[end_pos] == '\n') end_pos++;
@@ -232,13 +298,15 @@ int MpiSplitSamChunks(MemReader &reader,
 
 int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      sam_hdr_t *hdr,
+                     int compress_level,
                      MpiSamToBamStats *stats) {
     const int NB = 64;
     MpiSamToBamStats local_stats = {};
     if (!stats) stats = &local_stats;
     double fused_t0 = GetTime();
+    const size_t sam_chunk_size = MpiChooseSamChunkSize(reader.size);
 
-    double alloc_t0 = GetTime();
+    // double alloc_t0 = GetTime();
     MpiSamParseBatch *batch = (MpiSamParseBatch *)aligned_alloc_custom(64, sizeof(MpiSamParseBatch));
     char *batch_text_storage = (char *)aligned_alloc_custom(64, (size_t)NB * CHUNK_BUFFER_SIZE);
     uint32_t *batch_bam_lens_storage = (uint32_t *)aligned_alloc_custom(
@@ -270,7 +338,7 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         MpiFreeSamToBamBlockSet(&out_b);
         MpiFreeSamToBamRecordSet(&record_set);
         MpiFreePackWorkspace(&pack_workspace);
-        stats->t_alloc_init += GetTime() - alloc_t0;
+        // stats->t_alloc_init += GetTime() - alloc_t0;
         stats->t_fused_total += GetTime() - fused_t0;
         return -1;
     }
@@ -280,7 +348,7 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         MpiInitEmptyCompPara(&comp_a[i], i);
         MpiInitEmptyCompPara(&comp_b[i], i);
     }
-    stats->t_alloc_init += GetTime() - alloc_t0;
+    // stats->t_alloc_init += GetTime() - alloc_t0;
 
     Comp_Para *comp_active = comp_a;
     Comp_Para *comp_pending = comp_b;
@@ -311,7 +379,7 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
 
     auto do_compress = [&](int active_output_blocks) -> int {
         if (active_output_blocks <= 0) return 0;
-        double setup_t0 = GetTime();
+        // double setup_t0 = GetTime();
         for (int k = 0; k < active_output_blocks; ++k) {
             comp_active[k].block_id = k;
             comp_active[k].input_records = pack_workspace.plans[k].records;
@@ -321,29 +389,37 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
             comp_active[k].un_comp_size = (int)pack_workspace.plans[k].total_len;
             comp_active[k].output_size = 0;
             comp_active[k].status = 0;
+            comp_active[k].compress_level = compress_level;
+            comp_active[k].compress_serialize_cycles = 0;
+            comp_active[k].compress_alloc_cycles = 0;
+            comp_active[k].compress_deflate_cycles = 0;
+            comp_active[k].compress_footer_cycles = 0;
+            comp_active[k].compress_total_cycles = 0;
         }
         for (int k = active_output_blocks; k < NB; ++k) {
             MpiInitEmptyCompPara(&comp_active[k], k);
         }
-        stats->t_compress_setup += GetTime() - setup_t0;
+        // stats->t_compress_setup += GetTime() - setup_t0;
 
         double compress_t0 = GetTime();
         __real_athread_spawn((void *)slave_compressfunc, comp_active, 1);
         int flush_ret = flush_pending();
         athread_join();
-        stats->t_compress += GetTime() - compress_t0;
+        double compress_wall = GetTime() - compress_t0;
+        stats->t_compress += compress_wall;
+        MpiAccumulateCompressDetail(comp_active, active_output_blocks, compress_wall, stats);
         if (flush_ret != 0) return -1;
 
-        double check_t0 = GetTime();
+        // double check_t0 = GetTime();
         for (int k = 0; k < active_output_blocks; ++k) {
             if (comp_active[k].status != 0) {
-                stats->t_status_check += GetTime() - check_t0;
+                // stats->t_status_check += GetTime() - check_t0;
                 fprintf(stderr, "ERROR: MPI sam2bam compress failed on output block %d with status %d.\n",
                         k, comp_active[k].status);
                 return -1;
             }
         }
-        stats->t_status_check += GetTime() - check_t0;
+        // stats->t_status_check += GetTime() - check_t0;
 
         has_pending = true;
         std::swap(comp_active, comp_pending);
@@ -357,9 +433,9 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
     while (reader.pos < reader.size) {
         int active_chunks = 0;
         int local_max_chunk_len = 0;
-        double split_t0 = GetTime();
-        if (MpiSplitSamChunks(reader, batch, &active_chunks, &local_max_chunk_len) != 0) goto cleanup;
-        stats->t_split += GetTime() - split_t0;
+        // double split_t0 = GetTime();
+        if (MpiSplitSamChunks(reader, batch, sam_chunk_size, &active_chunks, &local_max_chunk_len) != 0) goto cleanup;
+        // stats->t_split += GetTime() - split_t0;
         if (active_chunks == 0) break;
         stats->input_chunks += active_chunks;
 
@@ -370,27 +446,27 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         stats->t_copy_count += GetTime() - copy_t0;
         if (flush_ret != 0) goto cleanup;
 
-        double check_t0 = GetTime();
+        // double check_t0 = GetTime();
         int requested_records = 0;
         for (int i = 0; i < active_chunks; ++i) {
             MpiSamParseChunk *chunk = &batch->chunks[i];
             if (chunk->count > MAX_BAMS_PER_CHUNK) {
-                stats->t_status_check += GetTime() - check_t0;
+                // stats->t_status_check += GetTime() - check_t0;
                 fprintf(stderr, "ERROR: MPI sam2bam chunk record limit exceeded. limit=%d actual=%d chunk=%d.\n",
                         MAX_BAMS_PER_CHUNK, chunk->count, i);
                 goto cleanup;
             }
             requested_records += chunk->count;
             if (requested_records > FUSED_SAM2BAM_BAM_POOL_SIZE) {
-                stats->t_status_check += GetTime() - check_t0;
+                // stats->t_status_check += GetTime() - check_t0;
                 fprintf(stderr, "ERROR: MPI sam2bam record pool exceeded. limit=%d actual=%d.\n",
                         FUSED_SAM2BAM_BAM_POOL_SIZE, requested_records);
                 goto cleanup;
             }
         }
-        stats->t_status_check += GetTime() - check_t0;
+        // stats->t_status_check += GetTime() - check_t0;
 
-        double setup_t0 = GetTime();
+        // double setup_t0 = GetTime();
         int offset = 0;
         for (int i = 0; i < active_chunks; ++i) {
             MpiSamParseChunk *chunk = &batch->chunks[i];
@@ -398,7 +474,7 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
             chunk->bam_data = record_set.data + (size_t)offset * INIT_DATA_SIZE;
             offset += chunk->count;
         }
-        stats->t_setup_reset += GetTime() - setup_t0;
+        // stats->t_setup_reset += GetTime() - setup_t0;
 
         double parse_t0 = GetTime();
         __real_athread_spawn((void *)slave_mpi_sam_parse_chunk, batch, 1);
@@ -449,7 +525,7 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
 
 cleanup:
     {
-        double free_t0 = GetTime();
+        // double free_t0 = GetTime();
         MpiDestroySamParseBatch(batch);
         if (batch) aligned_free_custom((unsigned char *)batch);
         if (batch_text_storage) aligned_free_custom((unsigned char *)batch_text_storage);
@@ -460,7 +536,7 @@ cleanup:
         MpiFreeSamToBamBlockSet(&out_b);
         MpiFreeSamToBamRecordSet(&record_set);
         MpiFreePackWorkspace(&pack_workspace);
-        stats->t_free_workspace += GetTime() - free_t0;
+        // stats->t_free_workspace += GetTime() - free_t0;
     }
     stats->t_fused_total += GetTime() - fused_t0;
     return ret_code;

@@ -170,7 +170,13 @@ struct Bam2BamPara {
     BamFilterOptions filter;
     int n_total_records;
     int n_kept_records;
+    uint32_t kept_total_len;
     int status;
+    uint64_t decomp_alloc_cycles;
+    uint64_t decomp_inflate_cycles;
+    uint64_t decomp_crc_cycles;
+    uint64_t decomp_parse_cycles;
+    uint64_t decomp_total_cycles;
 };
 
 struct CgsBamDecodePara {
@@ -248,6 +254,12 @@ struct Comp_Para {
     bam_block *output_block; 
     int output_size;     
     int status;          
+    int compress_level;
+    uint64_t compress_serialize_cycles;
+    uint64_t compress_alloc_cycles;
+    uint64_t compress_deflate_cycles;
+    uint64_t compress_footer_cycles;
+    uint64_t compress_total_cycles;
 };
 
 struct bam_block {
