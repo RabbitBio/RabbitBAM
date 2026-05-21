@@ -100,6 +100,13 @@ int MpiInitSamParseBatch(MpiSamParseBatch *batch,
         chunk->bams = nullptr;
         chunk->bam_data = nullptr;
         chunk->count = 0;
+        chunk->parse_fast_records = 0;
+        chunk->parse_fallback_records = 0;
+        chunk->parse_total_cycles = 0;
+        chunk->parse_core_cycles = 0;
+        chunk->parse_aux_cycles = 0;
+        chunk->parse_cg_cycles = 0;
+        chunk->parse_fallback_cycles = 0;
     }
     return 0;
 }
@@ -264,6 +271,13 @@ int MpiSplitSamChunks(MemReader &reader,
         chunk->src_len = 0;
         chunk->text_len = 0;
         chunk->count = 0;
+        chunk->parse_fast_records = 0;
+        chunk->parse_fallback_records = 0;
+        chunk->parse_total_cycles = 0;
+        chunk->parse_core_cycles = 0;
+        chunk->parse_aux_cycles = 0;
+        chunk->parse_cg_cycles = 0;
+        chunk->parse_fallback_cycles = 0;
 
         if (reader.pos >= reader.size) continue;
 
@@ -292,6 +306,40 @@ int MpiSplitSamChunks(MemReader &reader,
     }
     *active_chunks = count;
     return 0;
+}
+
+void MpiAccumulateSamParseDetail(MpiSamParseBatch *batch,
+                                 int active_chunks,
+                                 double parse_wall,
+                                 MpiSamToBamStats *stats) {
+    uint64_t max_cycles = 0;
+    MpiSamParseChunk *critical = nullptr;
+    for (int i = 0; i < active_chunks; ++i) {
+        MpiSamParseChunk *chunk = &batch->chunks[i];
+        if (chunk->parse_total_cycles > max_cycles) {
+            max_cycles = chunk->parse_total_cycles;
+            critical = chunk;
+        }
+    }
+    if (!critical || max_cycles == 0) {
+        stats->t_parse_other += parse_wall;
+        return;
+    }
+
+    double scale = parse_wall / (double)max_cycles;
+    double t_core = (double)critical->parse_core_cycles * scale;
+    double t_aux = (double)critical->parse_aux_cycles * scale;
+    double t_cg = (double)critical->parse_cg_cycles * scale;
+    double t_fallback = (double)critical->parse_fallback_cycles * scale;
+    double detail_sum = t_core + t_aux + t_cg + t_fallback;
+    double t_other = parse_wall - detail_sum;
+    if (t_other < 0.0) t_other = 0.0;
+
+    stats->t_parse_core += t_core;
+    stats->t_parse_aux += t_aux;
+    stats->t_parse_cg += t_cg;
+    stats->t_parse_fallback += t_fallback;
+    stats->t_parse_other += t_other;
 }
 
 } // namespace
@@ -403,11 +451,17 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
 
         double compress_t0 = GetTime();
         __real_athread_spawn((void *)slave_compressfunc, comp_active, 1);
+        #ifdef ENABLE_MASKING
         int flush_ret = flush_pending();
+        #endif
         athread_join();
         double compress_wall = GetTime() - compress_t0;
         stats->t_compress += compress_wall;
         MpiAccumulateCompressDetail(comp_active, active_output_blocks, compress_wall, stats);
+
+        #ifndef ENABLE_MASKING
+        int flush_ret = flush_pending();
+        #endif
         if (flush_ret != 0) return -1;
 
         // double check_t0 = GetTime();
@@ -441,9 +495,15 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
 
         double copy_t0 = GetTime();
         __real_athread_spawn((void *)slave_mpi_copy_and_count, batch, 1);
+        #ifdef ENABLE_MASKING
         int flush_ret = flush_pending();
+        #endif
         athread_join();
         stats->t_copy_count += GetTime() - copy_t0;
+
+        #ifndef ENABLE_MASKING
+        int flush_ret = flush_pending();
+        #endif
         if (flush_ret != 0) goto cleanup;
 
         // double check_t0 = GetTime();
@@ -479,7 +539,14 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         double parse_t0 = GetTime();
         __real_athread_spawn((void *)slave_mpi_sam_parse_chunk, batch, 1);
         athread_join();
-        stats->t_parse += GetTime() - parse_t0;
+        double parse_wall = GetTime() - parse_t0;
+        stats->t_parse += parse_wall;
+        MpiAccumulateSamParseDetail(batch, active_chunks, parse_wall, stats);
+        for (int i = 0; i < active_chunks; ++i) {
+            MpiSamParseChunk *chunk = &batch->chunks[i];
+            stats->parse_fast_records += chunk->parse_fast_records;
+            stats->parse_fallback_records += chunk->parse_fallback_records;
+        }
 
         double pack_t0 = GetTime();
         for (int i = 0; i < active_chunks; ++i) {

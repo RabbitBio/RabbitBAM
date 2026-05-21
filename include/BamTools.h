@@ -108,6 +108,13 @@ struct MpiSamParseChunk {
     unsigned char *bam_data;
     uint32_t *bam_lens;
     int count;
+    int parse_fast_records;
+    int parse_fallback_records;
+    uint64_t parse_total_cycles;
+    uint64_t parse_core_cycles;
+    uint64_t parse_aux_cycles;
+    uint64_t parse_cg_cycles;
+    uint64_t parse_fallback_cycles;
 };
 
 struct MpiSamParseBatch {

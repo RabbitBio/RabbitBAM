@@ -22,6 +22,14 @@
 
 #ifdef PLATFORM_SUNWAY
 #include <slave.h>
+static inline uint64_t mpi_slave_cycle_now() {
+    unsigned long counter = 0;
+    asm volatile("rcsr %0, 4" : "=r"(counter));
+    return (uint64_t)counter;
+}
+#define MPI_SLAVE_RPCC() mpi_slave_cycle_now()
+#else
+#define MPI_SLAVE_RPCC() 0
 #endif
 
  //----------------------------------------------------------------------------------------------
@@ -1796,12 +1804,26 @@ extern "C" void slave_mpi_copy_and_count(void *arg) {
     if (chunk->src_len == 0) {
         chunk->text_len = 0;
         chunk->count    = 0;
+        chunk->parse_fast_records = 0;
+        chunk->parse_fallback_records = 0;
+        chunk->parse_total_cycles = 0;
+        chunk->parse_core_cycles = 0;
+        chunk->parse_aux_cycles = 0;
+        chunk->parse_cg_cycles = 0;
+        chunk->parse_fallback_cycles = 0;
         return;
     }
 
     memcpy(chunk->text_buf, chunk->src_ptr, chunk->src_len);
     chunk->text_buf[chunk->src_len] = '\0';
     chunk->text_len = chunk->src_len;
+    chunk->parse_fast_records = 0;
+    chunk->parse_fallback_records = 0;
+    chunk->parse_total_cycles = 0;
+    chunk->parse_core_cycles = 0;
+    chunk->parse_aux_cycles = 0;
+    chunk->parse_cg_cycles = 0;
+    chunk->parse_fallback_cycles = 0;
 
     int count = 0;
     char *p = chunk->text_buf;
@@ -1825,11 +1847,20 @@ extern "C" void slave_mpi_sam_parse_chunk(void *arg) {
     int tid = _PEN;
     MpiSamParseChunk *chunk = &batch->chunks[tid];
 
+    chunk->parse_fast_records = 0;
+    chunk->parse_fallback_records = 0;
+    chunk->parse_total_cycles = 0;
+    chunk->parse_core_cycles = 0;
+    chunk->parse_aux_cycles = 0;
+    chunk->parse_cg_cycles = 0;
+    chunk->parse_fallback_cycles = 0;
     if (chunk->text_len == 0 || chunk->count == 0) return;
 
     int valid_count = 0;
     char *ptr = chunk->text_buf;
     char *end = chunk->text_buf + chunk->text_len;
+    MpiSamParseFastCache fast_cache;
+    memset(&fast_cache, 0, sizeof(fast_cache));
 
     while (ptr < end) {
         char *eol = ptr;
@@ -1854,11 +1885,50 @@ extern "C" void slave_mpi_sam_parse_chunk(void *arg) {
             b->m_data = INIT_DATA_SIZE;
             b->l_data = 0;
             b->mempolicy = BAM_USER_OWNS_DATA;
-            int ret = sam_parse1(&ks, (sam_hdr_t *)batch->hdr, b);
+            MpiSamParseFastTiming *timing_ptr = nullptr;
+#if MPI_SAM_PARSE_DETAIL
+            MpiSamParseFastTiming timing;
+            timing.core_cycles = 0;
+            timing.aux_cycles = 0;
+            timing.cg_cycles = 0;
+            timing_ptr = &timing;
+#endif
+            int ret = sam_parse1_mpi_fast(&ks, (sam_hdr_t *)batch->hdr, b, &fast_cache, timing_ptr);
+            int parsed_by_fast = (ret == 0);
+#if MPI_SAM_PARSE_DETAIL
+            uint64_t fallback_cycles = 0;
+#endif
+            if (ret != 0) {
+#if MPI_SAM_PARSE_DETAIL
+                uint64_t fallback_t0 = MPI_SLAVE_RPCC();
+#endif
+                b->data = chunk->bam_data + (size_t)valid_count * INIT_DATA_SIZE;
+                b->m_data = INIT_DATA_SIZE;
+                b->l_data = 0;
+                b->mempolicy = BAM_USER_OWNS_DATA;
+                ret = sam_parse1(&ks, (sam_hdr_t *)batch->hdr, b);
+#if MPI_SAM_PARSE_DETAIL
+                uint64_t fallback_t1 = MPI_SLAVE_RPCC();
+                fallback_cycles = fallback_t1 - fallback_t0;
+                chunk->parse_fallback_cycles += fallback_cycles;
+#endif
+            }
+#if MPI_SAM_PARSE_DETAIL
+            chunk->parse_core_cycles += timing.core_cycles;
+            chunk->parse_aux_cycles += timing.aux_cycles;
+            chunk->parse_cg_cycles += timing.cg_cycles;
+            chunk->parse_total_cycles += timing.core_cycles + timing.aux_cycles +
+                                         timing.cg_cycles + fallback_cycles;
+#endif
 
             ks.s[ks.l] = saved_char;
 
             if (ret >= 0) {
+                if (parsed_by_fast) {
+                    chunk->parse_fast_records++;
+                } else {
+                    chunk->parse_fallback_records++;
+                }
                 chunk->bam_lens[valid_count] = (uint32_t)(b->l_data - b->core.l_extranul + 32);
                 valid_count++;
             }

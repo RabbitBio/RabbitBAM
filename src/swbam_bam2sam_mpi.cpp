@@ -295,11 +295,17 @@ int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
 
         double decomp_t0 = GetTime();
         __real_athread_spawn((void *)slave_mpi_decompress_bam2bam_passthrough, paras, 1);
+        #ifdef ENABLE_MASKING
         if (flush_pending_write() != 0) goto cleanup;
+        #endif
         athread_join();
         double decomp_wall = GetTime() - decomp_t0;
         stats->t_decomp += decomp_wall;
         MpiAccumulateDecompDetail(paras, n_blocks, decomp_wall, stats);
+        
+        #ifndef ENABLE_MASKING
+        if (flush_pending_write() != 0) goto cleanup;
+        #endif
 
         for (int b = 0; b < n_blocks; ++b) {
             if (paras[b].status != 0) {
@@ -332,9 +338,15 @@ int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
             MpiResetSamFormatBatchMPI(fmt_cur, format_count);
             double format_t0 = GetTime();
             __real_athread_spawn((void *)slave_sam_format, fmt_cur, 1);
+            #ifdef ENABLE_MASKING
             if (do_read_group(&next_n_blocks) != 0) goto cleanup;
+            #endif
             athread_join();
             stats->t_format += GetTime() - format_t0;
+
+            #ifndef ENABLE_MASKING
+            if (do_read_group(&next_n_blocks) != 0) goto cleanup;
+            #endif
 
             std::swap(fmt_cur, fmt_prev);
             has_pending_write = true;

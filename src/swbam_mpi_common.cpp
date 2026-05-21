@@ -471,13 +471,18 @@ void MpiPrintRankSamToBamStats(int rank, int comm_size,
     // double residual = stats.t_fused_total - core_stage - measured_extra;
     snprintf(local_lines, sizeof(local_lines),
              "[rank %d] chunks=%lld chunk_groups=%lld records=%lld compress_groups=%lld bgzf=%lld body=%zu\n"
+             "[rank %d] parse_fast=%lld  parse_fallback=%lld\n"
              "[rank %d] split=%.3f  copy_count_slave=%.3f  parse_slave=%.3f  pack=%.3f  compress_slave=%.3f  write=%.3f  gather=%.3f\n"
+             "[rank %d] parse_detail core=%.3f  aux=%.3f  cg=%.3f  fallback=%.3f  other=%.3f\n"
              "[rank %d] compress_detail serialize=%.3f  alloc=%.3f  deflate=%.3f  footer=%.3f  other=%.3f\n"
              "[rank %d] fused_total=%.6f  core_stage=%.6f\n",
              rank, stats.input_chunks, stats.chunk_groups, stats.total_records,
              stats.compress_groups, stats.bgzf_blocks, body_size,
+             rank, stats.parse_fast_records, stats.parse_fallback_records,
              rank, stats.t_split, stats.t_copy_count, stats.t_parse,
              stats.t_pack, stats.t_compress, stats.t_write, stats.t_gather,
+             rank, stats.t_parse_core, stats.t_parse_aux,
+             stats.t_parse_cg, stats.t_parse_fallback, stats.t_parse_other,
              rank, stats.t_compress_serialize, stats.t_compress_alloc,
              stats.t_compress_deflate, stats.t_compress_footer, stats.t_compress_other,
              rank, stats.t_fused_total, core_stage);
@@ -1054,19 +1059,26 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                        global_double_stats[13], global_double_stats[14]);
             }
         } else if (sam_to_bam) {
-            long long local_long_stats[5] = {
+            long long local_long_stats[7] = {
                 sam2bam_stats.input_chunks,
                 sam2bam_stats.chunk_groups,
                 sam2bam_stats.total_records,
                 sam2bam_stats.compress_groups,
-                sam2bam_stats.bgzf_blocks
+                sam2bam_stats.bgzf_blocks,
+                sam2bam_stats.parse_fast_records,
+                sam2bam_stats.parse_fallback_records
             };
-            long long global_long_stats[5] = {};
-            MPI_Reduce(local_long_stats, global_long_stats, 5, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-            double local_double_stats[17] = {
+            long long global_long_stats[7] = {};
+            MPI_Reduce(local_long_stats, global_long_stats, 7, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+            double local_double_stats[22] = {
                 sam2bam_stats.t_split,
                 sam2bam_stats.t_copy_count,
                 sam2bam_stats.t_parse,
+                sam2bam_stats.t_parse_core,
+                sam2bam_stats.t_parse_aux,
+                sam2bam_stats.t_parse_cg,
+                sam2bam_stats.t_parse_fallback,
+                sam2bam_stats.t_parse_other,
                 sam2bam_stats.t_pack,
                 sam2bam_stats.t_compress,
                 sam2bam_stats.t_compress_serialize,
@@ -1082,8 +1094,9 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 sam2bam_stats.t_status_check,
                 sam2bam_stats.t_alloc_init + sam2bam_stats.t_free_workspace
             };
-            double global_double_stats[17] = {};
-            MPI_Reduce(local_double_stats, global_double_stats, 17, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+            double global_double_stats[22] = {};
+            MPI_Reduce(local_double_stats, global_double_stats, 22, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
 
             MpiPrintRankSamToBamStats(rank, comm_size, sam2bam_stats, mem_writer.size);
             if (rank == 0) {
@@ -1091,19 +1104,24 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                        comm_size, global_long_stats[0], global_long_stats[1],
                        global_long_stats[2], global_long_stats[3], global_long_stats[4],
                        total_body_size);
+                printf("  parse_fast_records=%lld  parse_fallback_records=%lld\n",
+                       global_long_stats[5], global_long_stats[6]);
                 printf("  split_sum=%.3f  copy_count_slave_sum=%.3f  parse_slave_sum=%.3f  pack_sum=%.3f  compress_slave_sum=%.3f  write_sum=%.3f  gather_sum=%.3f\n",
                        global_double_stats[0], global_double_stats[1], global_double_stats[2],
-                       global_double_stats[3], global_double_stats[4], global_double_stats[10],
-                       global_double_stats[11]);
+                       global_double_stats[8], global_double_stats[9], global_double_stats[15],
+                       global_double_stats[16]);
+                printf("  parse_detail_sum core=%.3f  aux=%.3f  cg=%.3f  fallback=%.3f  other=%.3f\n",
+                       global_double_stats[3], global_double_stats[4], global_double_stats[5],
+                       global_double_stats[6], global_double_stats[7]);
                 printf("  compress_detail_sum serialize=%.3f  alloc=%.3f  deflate=%.3f  footer=%.3f  other=%.3f\n",
-                       global_double_stats[5], global_double_stats[6], global_double_stats[7],
-                       global_double_stats[8], global_double_stats[9]);
+                       global_double_stats[10], global_double_stats[11], global_double_stats[12],
+                       global_double_stats[13], global_double_stats[14]);
                 printf("  fused_total_sum=%.3f  core_stage_sum=%.3f  setup_reset_sum=%.3f  compress_setup_sum=%.3f  status_check_sum=%.3f  alloc_free_sum=%.3f\n",
-                       global_double_stats[12],
+                       global_double_stats[17],
                        global_double_stats[1] + global_double_stats[2] +
-                       global_double_stats[3] + global_double_stats[4],
-                       global_double_stats[13], global_double_stats[14],
-                       global_double_stats[15], global_double_stats[16]);
+                       global_double_stats[8] + global_double_stats[9],
+                       global_double_stats[18], global_double_stats[19],
+                       global_double_stats[20], global_double_stats[21]);
             }
         } else {
             long long local_long_stats[7] = {

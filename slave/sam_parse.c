@@ -1,5 +1,34 @@
 #include "sam_parse.h"
 
+#ifdef PLATFORM_SUNWAY
+static inline uint64_t mpi_sam_parse_cycle_now(void) {
+    unsigned long counter = 0;
+    asm volatile("rcsr %0, 4" : "=r"(counter));
+    return (uint64_t)counter;
+}
+#define MPI_SAM_PARSE_RPCC() mpi_sam_parse_cycle_now()
+#else
+#define MPI_SAM_PARSE_RPCC() 0
+#endif
+
+#ifdef __GNUC__
+#define MPI_SAM_NOINLINE __attribute__((noinline))
+#else
+#define MPI_SAM_NOINLINE
+#endif
+
+#if MPI_SAM_PARSE_DETAIL
+#define MPI_SAM_PARSE_TIME_DECL(_name) uint64_t _name = MPI_SAM_PARSE_RPCC()
+#define MPI_SAM_PARSE_TIME_SET(_name) _name = MPI_SAM_PARSE_RPCC()
+#define MPI_SAM_PARSE_ACC(_timing, _field, _end, _start) \
+    do { if ((_timing)) (_timing)->_field += (_end) - (_start); } while (0)
+#else
+#define MPI_SAM_PARSE_TIME_DECL(_name) do { } while (0)
+#define MPI_SAM_PARSE_TIME_SET(_name) do { } while (0)
+#define MPI_SAM_PARSE_ACC(_timing, _field, _end, _start) do { } while (0)
+#endif
+
+
 //slave_sam_parse需要的------------------------------------------------------------------------------------------------------------
 
 int sam_realloc_bam_data(bam1_t *b, size_t desired)
@@ -2267,6 +2296,574 @@ static int bam_tag2cigar(bam1_t *b, int recal_bin, int give_warning) // return 0
     return 1;
 }
 
+
+static inline int mpi_sam_parse_uint_dec_field(const char *beg, const char *end,
+                                               uint64_t limit, uint64_t *out)
+{
+    if (beg >= end) return 0;
+    if (end - beg > 18) return 0;
+    uint64_t n = 0;
+    const unsigned char *p = (const unsigned char *)beg;
+    const unsigned char *q = (const unsigned char *)end;
+    while (p < q) {
+        unsigned int d = (unsigned int)(*p - '0');
+        if (d > 9) return 0;
+        n = n * 10 + d;
+        p++;
+    }
+    if (n > limit) return 0;
+    *out = n;
+    return 1;
+}
+
+static inline int mpi_sam_parse_int_dec_field(const char *beg, const char *end,
+                                              int64_t *out)
+{
+    if (beg >= end) return 0;
+    int neg = 0;
+    if (*beg == '-') {
+        neg = 1;
+        beg++;
+        if (beg >= end) return 0;
+    } else if (*beg == '+') {
+        return 0;
+    }
+    if (end - beg > 18) return 0;
+
+    uint64_t n = 0;
+    const unsigned char *p = (const unsigned char *)beg;
+    const unsigned char *q = (const unsigned char *)end;
+    while (p < q) {
+        unsigned int d = (unsigned int)(*p - '0');
+        if (d > 9) return 0;
+        n = n * 10 + d;
+        p++;
+    }
+    if (!neg && n > (uint64_t)INT64_MAX) return 0;
+
+    if (neg) {
+        *out = -(int64_t)n;
+    } else {
+        *out = (int64_t)n;
+    }
+    return 1;
+}
+
+static inline int mpi_sam_copy_minus33(uint8_t *to, const char *from, int32_t len)
+{
+#if HTS_ALLOW_UNALIGNED != 0 && ULONG_MAX == 0xffffffffffffffff
+    uint64_u *from8 = (uint64_u *)from;
+    uint64_u *to8 = (uint64_u *)to;
+    uint64_t uflow = 0;
+    size_t l8 = ((size_t)len) >> 3;
+    size_t i;
+    for (i = 0; i < l8; i++) {
+        to8[i] = from8[i] - 33 * 0x0101010101010101UL;
+        uflow |= to8[i];
+    }
+    for (i <<= 3; i < (size_t)len; ++i) {
+        to[i] = (uint8_t)from[i] - 33;
+        uflow |= to[i];
+    }
+    return (uflow & 0x8080808080808080UL) == 0;
+#else
+    uint8_t uflow = 0;
+    for (int32_t i = 0; i < len; ++i) {
+        to[i] = (uint8_t)from[i] - 33;
+        uflow |= to[i];
+    }
+    return (uflow & 0x80) == 0;
+#endif
+}
+
+static inline int mpi_sam_aux_has_space(bam1_t *b, size_t extra)
+{
+    return (size_t)b->l_data + extra <= (size_t)b->m_data;
+}
+
+static inline int mpi_sam_parse_aux_int(const char *beg, const char *end,
+                                        int *negative_branch,
+                                        int64_t *sval,
+                                        uint64_t *uval)
+{
+    if (beg >= end) return 0;
+    const char *p = beg;
+    *negative_branch = 0;
+    if (*p == '-') {
+        *negative_branch = 1;
+        p++;
+        if (p >= end) return 0;
+    } else if (*p == '+') {
+        return 0;
+    }
+
+    uint64_t n = 0;
+    int digits = 0;
+    while (p < end) {
+        unsigned int d = (unsigned int)(*p - '0');
+        if (d > 9) return 0;
+        if (++digits > 10) return 0;
+        n = n * 10 + d;
+        p++;
+    }
+    if (digits == 0) return 0;
+
+    if (*negative_branch) {
+        if (n > 2147483648ULL) return 0;
+        *sval = -(int64_t)n;
+    } else {
+        if (n > UINT32_MAX) return 0;
+        *uval = n;
+    }
+    return 1;
+}
+
+static int MPI_SAM_NOINLINE mpi_sam_aux_parse_fast(char *start, char *end, bam1_t *b)
+{
+    char *q = start;
+    while (q < end) {
+        if (end - q < 5) return 1;
+        if (q[0] < '!' || q[1] < '!') return 1;
+        if (q[2] != ':' || q[4] != ':') return 1;
+
+        char type = q[3];
+        char *value = q + 5;
+        uint8_t *out = b->data + b->l_data;
+        if (!mpi_sam_aux_has_space(b, 16)) return 1;
+        out[0] = (uint8_t)q[0];
+        out[1] = (uint8_t)q[1];
+        b->l_data += 2;
+
+        if (type == 'i' || type == 'I') {
+            char *value_end = value;
+            int neg = 0;
+            if (value_end < end && *value_end == '-') {
+                neg = 1;
+                value_end++;
+                if (value_end >= end || *value_end == '\t') return 1;
+            } else if (value_end < end && *value_end == '+') {
+                return 1;
+            }
+
+            uint64_t n = 0;
+            int digits = 0;
+            while (value_end < end && *value_end != '\t') {
+                unsigned int d = (unsigned int)(*value_end - '0');
+                if (d > 9) return 1;
+                if (++digits > 10) return 1;
+                n = n * 10 + d;
+                value_end++;
+            }
+            if (digits == 0) return 1;
+
+            if (neg) {
+                if (n > 2147483648ULL) return 1;
+                int64_t sx = -(int64_t)n;
+                if (sx >= INT8_MIN) {
+                    b->data[b->l_data++] = 'c';
+                    b->data[b->l_data++] = (uint8_t)(int8_t)sx;
+                } else if (sx >= INT16_MIN) {
+                    b->data[b->l_data++] = 's';
+                    i16_to_le((int16_t)sx, b->data + b->l_data);
+                    b->l_data += 2;
+                } else {
+                    b->data[b->l_data++] = 'i';
+                    i32_to_le((int32_t)sx, b->data + b->l_data);
+                    b->l_data += 4;
+                }
+            } else {
+                if (n > UINT32_MAX) return 1;
+                uint64_t ux = n;
+                if (ux <= UINT8_MAX) {
+                    b->data[b->l_data++] = 'C';
+                    b->data[b->l_data++] = (uint8_t)ux;
+                } else if (ux <= UINT16_MAX) {
+                    b->data[b->l_data++] = 'S';
+                    u16_to_le((uint16_t)ux, b->data + b->l_data);
+                    b->l_data += 2;
+                } else {
+                    b->data[b->l_data++] = 'I';
+                    u32_to_le((uint32_t)ux, b->data + b->l_data);
+                    b->l_data += 4;
+                }
+            }
+            q = value_end;
+        } else if (type == 'Z') {
+            b->data[b->l_data++] = 'Z';
+            if (!mpi_sam_aux_has_space(b, (size_t)(end - value) + 2)) return 1;
+            char *value_end = value;
+            uint8_t *dst = b->data + b->l_data;
+            while (value_end < end && *value_end != '\t') {
+                *dst++ = (uint8_t)*value_end++;
+            }
+            b->l_data = (int)(dst - b->data);
+            b->data[b->l_data++] = '\0';
+            q = value_end;
+        } else if (type == 'A' || type == 'a' || type == 'c' || type == 'C') {
+            char *value_end = value;
+            while (value_end < end && *value_end != '\t') value_end++;
+            if (value >= value_end) return 1;
+            b->data[b->l_data++] = 'A';
+            b->data[b->l_data++] = (uint8_t)*value;
+            q = value_end;
+        } else if (type == 'H') {
+            b->data[b->l_data++] = 'H';
+            if (!mpi_sam_aux_has_space(b, (size_t)(end - value) + 2)) return 1;
+            char *value_end = value;
+            uint8_t *dst = b->data + b->l_data;
+            while (value_end < end && *value_end != '\t') {
+                *dst++ = (uint8_t)*value_end++;
+            }
+            if (((size_t)(value_end - value) & 1) != 0) return 1;
+            b->l_data = (int)(dst - b->data);
+            b->data[b->l_data++] = '\0';
+            q = value_end;
+        } else if (type == 'f' || type == 'd') {
+            char *value_end = value;
+            while (value_end < end && *value_end != '\t') value_end++;
+            char saved = *value_end;
+            *value_end = '\0';
+            char *after = NULL;
+            double x = strtod(value, &after);
+            *value_end = saved;
+            if (after != value_end) return 1;
+            b->data[b->l_data++] = (uint8_t)type;
+            if (type == 'f') {
+                float_to_le(x, b->data + b->l_data);
+                b->l_data += sizeof(float);
+            } else {
+                double_to_le(x, b->data + b->l_data);
+                b->l_data += sizeof(double);
+            }
+            q = value_end;
+        } else {
+            return 1;
+        }
+
+        if (q < end) {
+            if (*q != '\t') return 1;
+            q++;
+        }
+    }
+    return 0;
+}
+
+static inline int mpi_sam_name_equal_cached(const char *cached, const char *beg, size_t len)
+{
+    switch (len) {
+    case 0: return 1;
+    case 1: return cached[0] == beg[0];
+    case 2: return cached[0] == beg[0] && cached[1] == beg[1];
+    case 3: return cached[0] == beg[0] && cached[1] == beg[1] &&
+                   cached[2] == beg[2];
+    case 4: return cached[0] == beg[0] && cached[1] == beg[1] &&
+                   cached[2] == beg[2] && cached[3] == beg[3];
+    case 5: return cached[0] == beg[0] && cached[1] == beg[1] &&
+                   cached[2] == beg[2] && cached[3] == beg[3] &&
+                   cached[4] == beg[4];
+    case 6: return cached[0] == beg[0] && cached[1] == beg[1] &&
+                   cached[2] == beg[2] && cached[3] == beg[3] &&
+                   cached[4] == beg[4] && cached[5] == beg[5];
+    case 7: return cached[0] == beg[0] && cached[1] == beg[1] &&
+                   cached[2] == beg[2] && cached[3] == beg[3] &&
+                   cached[4] == beg[4] && cached[5] == beg[5] &&
+                   cached[6] == beg[6];
+    case 8: return cached[0] == beg[0] && cached[1] == beg[1] &&
+                   cached[2] == beg[2] && cached[3] == beg[3] &&
+                   cached[4] == beg[4] && cached[5] == beg[5] &&
+                   cached[6] == beg[6] && cached[7] == beg[7];
+    default:
+        return memcmp(cached, beg, len) == 0;
+    }
+}
+
+static inline int mpi_sam_name2id_fast(sam_hdr_t *h, char *beg, char *end,
+                                       int *tid, MpiSamParseFastCache *cache,
+                                       int cache_slot)
+{
+    if (end - beg == 1 && beg[0] == '*') {
+        *tid = -1;
+        return 1;
+    }
+    if (h->n_targets == 0) return 0;
+
+    size_t len = (size_t)(end - beg);
+    if (cache && cache_slot >= 0 && cache_slot < 2 && len < sizeof(cache->name[cache_slot]) &&
+        cache->hdr[cache_slot] == h && cache->name_len[cache_slot] == (int)len &&
+        mpi_sam_name_equal_cached(cache->name[cache_slot], beg, len)) {
+        *tid = cache->tid[cache_slot];
+        return 1;
+    }
+
+    char saved = *end;
+    *end = '\0';
+    int id = bam_name2id(h, beg);
+    *end = saved;
+    if (id < -1) return 0;
+    if (cache && cache_slot >= 0 && cache_slot < 2 && len < sizeof(cache->name[cache_slot])) {
+        cache->hdr[cache_slot] = h;
+        cache->name_len[cache_slot] = (int)len;
+        cache->tid[cache_slot] = id;
+        memcpy(cache->name[cache_slot], beg, len);
+    }
+    *tid = id;
+    return 1;
+}
+
+static inline int mpi_sam_parse_cigar_fast(const char *beg, const char *end,
+                                           uint32_t *out_cigar,
+                                           uint32_t *n_cigar_out,
+                                           hts_pos_t *rlen_out,
+                                           hts_pos_t *qlen_out,
+                                           int *is_star)
+{
+    *n_cigar_out = 0;
+    *rlen_out = 0;
+    *qlen_out = 0;
+    *is_star = 0;
+
+    if (end - beg == 1 && beg[0] == '*') {
+        *is_star = 1;
+        return 1;
+    }
+    if (beg >= end) return 0;
+
+    if (end[-1] == 'M') {
+        const char *q = beg;
+        uint64_t len = 0;
+        int digits = 0;
+        int single_m = 1;
+        while (q < end - 1) {
+            unsigned int d = (unsigned int)(*q - '0');
+            if (d > 9 || ++digits > 9) {
+                single_m = 0;
+                break;
+            }
+            len = len * 10 + d;
+            q++;
+        }
+        if (single_m && digits > 0 && len < ((uint64_t)1 << 28)) {
+            out_cigar[0] = ((uint32_t)len << BAM_CIGAR_SHIFT) | BAM_CMATCH;
+            *n_cigar_out = 1;
+            *rlen_out = (hts_pos_t)len;
+            *qlen_out = (hts_pos_t)len;
+            return 1;
+        }
+    }
+
+    const char *p = beg;
+    uint32_t n_cigar = 0;
+    hts_pos_t rlen = 0;
+    hts_pos_t qlen = 0;
+    while (p < end) {
+        uint64_t len = 0;
+        int digits = 0;
+        if (*p < '0' || *p > '9') return 0;
+        do {
+            unsigned int d = (unsigned int)(*p - '0');
+            if (++digits > 9) return 0;
+            len = len * 10 + d;
+            p++;
+        } while (p < end && *p >= '0' && *p <= '9');
+        if (len >= ((uint64_t)1 << 28)) return 0;
+
+        if (p >= end) return 0;
+        int op = bam_cigar_table[(unsigned char)*p++];
+        if (op < 0) return 0;
+        if (n_cigar >= INT32_MAX) return 0;
+        out_cigar[n_cigar++] = ((uint32_t)len << BAM_CIGAR_SHIFT) | (uint32_t)op;
+
+        if (bam_cigar_type(op) & 1) {
+            if (qlen > HTS_POS_MAX - (hts_pos_t)len) return 0;
+            qlen += (hts_pos_t)len;
+        }
+        if (bam_cigar_type(op) & 2) {
+            if (rlen > HTS_POS_MAX - (hts_pos_t)len) return 0;
+            rlen += (hts_pos_t)len;
+        }
+    }
+
+    if (n_cigar == 0) return 0;
+    *n_cigar_out = n_cigar;
+    *rlen_out = rlen;
+    *qlen_out = qlen;
+    return 1;
+}
+
+int sam_parse1_mpi_fast(kstring_t *s, sam_hdr_t *h, bam1_t *b,
+                        MpiSamParseFastCache *cache,
+                        MpiSamParseFastTiming *timing)
+{
+    MPI_SAM_PARSE_TIME_DECL(core_t0);
+    char *fields[10];
+    char *field_ends[10];
+    char *line = s->s;
+    char *line_end = s->s + s->l;
+    char *p = line;
+
+    for (int i = 0; i < 10; ++i) {
+        fields[i] = p;
+        while (p < line_end && *p != '\t') p++;
+        if (p >= line_end) return 1;
+        field_ends[i] = p;
+        p++;
+    }
+    char *qual_start = p;
+
+    size_t qname_len = (size_t)(field_ends[0] - fields[0]);
+    if (qname_len == 0 || qname_len > 254) return 1;
+    size_t qname_stored = qname_len + 1;
+    int l_extranul = (int)((4 - (qname_stored & 3)) & 3);
+    size_t l_qname = qname_stored + (size_t)l_extranul;
+    if (l_qname > 255) return 1;
+
+    uint64_t u = 0;
+    if (field_ends[1] - fields[1] > 1 && fields[1][0] == '0') return 1;
+    if (!mpi_sam_parse_uint_dec_field(fields[1], field_ends[1], UINT16_MAX, &u)) return 1;
+    uint32_t flag = (uint32_t)u;
+
+    int tid = -1;
+    if (!mpi_sam_name2id_fast(h, fields[2], field_ends[2], &tid, cache, 0)) return 1;
+
+    const uint64_t hts_pos_limit = (uint64_t)HTS_POS_MAX;
+    if (!mpi_sam_parse_uint_dec_field(fields[3], field_ends[3], hts_pos_limit, &u)) return 1;
+    hts_pos_t pos = (hts_pos_t)u - 1;
+    if (pos < 0 && tid >= 0) tid = -1;
+    if (tid < 0) flag |= BAM_FUNMAP;
+
+    if (!mpi_sam_parse_uint_dec_field(fields[4], field_ends[4], UINT8_MAX, &u)) return 1;
+    uint32_t mapq = (uint32_t)u;
+
+    size_t cigar_text_len = (size_t)(field_ends[5] - fields[5]);
+    size_t max_cigar_ops = (cigar_text_len == 1 && fields[5][0] == '*') ? 0 : ((cigar_text_len + 1) >> 1);
+
+    size_t seq_len = (size_t)(field_ends[9] - fields[9]);
+    int seq_is_star = (seq_len == 1 && fields[9][0] == '*');
+    if (seq_len == 0) return 1;
+    size_t l_qseq = seq_is_star ? 0 : seq_len;
+    if (l_qseq > INT32_MAX) return 1;
+
+    if (qual_start >= line_end) return 1;
+    int qual_is_star = 0;
+    char *aux_start = line_end;
+    if (qual_start[0] == '*' &&
+        (qual_start + 1 == line_end || qual_start[1] == '\t')) {
+        qual_is_star = 1;
+        aux_start = (qual_start + 1 < line_end) ? qual_start + 2 : line_end;
+    } else {
+        if ((size_t)(line_end - qual_start) < l_qseq) return 1;
+        char *qual_end = qual_start + l_qseq;
+        if (qual_end < line_end && *qual_end != '\t') return 1;
+        aux_start = (qual_end < line_end) ? qual_end + 1 : line_end;
+    }
+
+    size_t aux_text_len = (size_t)(line_end - aux_start);
+    size_t estimated = l_qname + max_cigar_ops * sizeof(uint32_t) +
+                       ((l_qseq + 1) >> 1) + l_qseq + aux_text_len +
+                       (aux_text_len ? 16 : 0);
+    if (estimated > (size_t)b->m_data) return 1;
+
+    bam1_core_t *c = &b->core;
+    b->l_data = 0;
+
+    memcpy(b->data, fields[0], qname_len);
+    b->data[qname_len] = 0;
+    if (l_extranul) {
+        b->data[qname_len + 1] = 0;
+        if (l_extranul > 1) b->data[qname_len + 2] = 0;
+        if (l_extranul > 2) b->data[qname_len + 3] = 0;
+    }
+    b->l_data = (int)l_qname;
+    c->l_extranul = l_extranul;
+    c->l_qname = (uint8_t)l_qname;
+    c->flag = flag;
+    c->tid = tid;
+    c->pos = pos;
+    c->qual = mapq;
+
+    uint32_t n_cigar = 0;
+    hts_pos_t cigar_rlen = 0;
+    hts_pos_t cigar_qlen = 0;
+    int cigar_is_star = 0;
+    uint32_t *cigar_out = (uint32_t *)(b->data + b->l_data);
+    if (!mpi_sam_parse_cigar_fast(fields[5], field_ends[5], cigar_out,
+                                  &n_cigar, &cigar_rlen, &cigar_qlen,
+                                  &cigar_is_star)) {
+        return 1;
+    }
+    if (cigar_is_star) {
+        if (!(c->flag & BAM_FUNMAP)) c->flag |= BAM_FUNMAP;
+        cigar_rlen = 1;
+    } else {
+        b->l_data += (int)(n_cigar * sizeof(uint32_t));
+        if (!(c->flag & BAM_FUNMAP)) {
+            if (cigar_rlen == 0) cigar_rlen = 1;
+        } else {
+            cigar_rlen = 1;
+        }
+    }
+    c->n_cigar = n_cigar;
+    if (HTS_POS_MAX - cigar_rlen <= c->pos) return 1;
+    c->bin = hts_reg2bin(c->pos, c->pos + cigar_rlen, 14, 5);
+
+    if (field_ends[6] - fields[6] == 1 && fields[6][0] == '=') {
+        c->mtid = c->tid;
+    } else if (field_ends[6] - fields[6] == 1 && fields[6][0] == '*') {
+        c->mtid = -1;
+    } else {
+        if (!mpi_sam_name2id_fast(h, fields[6], field_ends[6], &c->mtid, cache, 1)) return 1;
+    }
+
+    if (!mpi_sam_parse_uint_dec_field(fields[7], field_ends[7], hts_pos_limit, &u)) return 1;
+    c->mpos = (hts_pos_t)u - 1;
+    if (c->mpos < 0 && c->mtid >= 0) c->mtid = -1;
+
+    int64_t isize = 0;
+    if (!mpi_sam_parse_int_dec_field(fields[8], field_ends[8], &isize)) return 1;
+    c->isize = isize;
+
+    if (!seq_is_star) {
+        if (n_cigar && cigar_qlen != (hts_pos_t)l_qseq) return 1;
+        c->l_qseq = (int32_t)l_qseq;
+        uint8_t *seq_out = b->data + b->l_data;
+        b->l_data += (int)((l_qseq + 1) >> 1);
+        size_t i = 0;
+        for (; i + 1 < l_qseq; i += 2) {
+            seq_out[i >> 1] = (seq_nt16_table[(unsigned char)fields[9][i]] << 4) |
+                              seq_nt16_table[(unsigned char)fields[9][i + 1]];
+        }
+        if (i < l_qseq) {
+            seq_out[i >> 1] = seq_nt16_table[(unsigned char)fields[9][i]] << 4;
+        }
+    } else {
+        c->l_qseq = 0;
+    }
+
+    uint8_t *qual_out = b->data + b->l_data;
+    b->l_data += c->l_qseq;
+    if (qual_is_star) {
+        memset(qual_out, 0xff, c->l_qseq);
+    } else {
+        if (!mpi_sam_copy_minus33(qual_out, qual_start, c->l_qseq)) return 1;
+    }
+
+    MPI_SAM_PARSE_TIME_DECL(aux_t0);
+    MPI_SAM_PARSE_ACC(timing, core_cycles, aux_t0, core_t0);
+    int aux_ret = mpi_sam_aux_parse_fast(aux_start, line_end, b);
+    MPI_SAM_PARSE_TIME_DECL(cg_t0);
+    MPI_SAM_PARSE_ACC(timing, aux_cycles, cg_t0, aux_t0);
+    if (aux_ret != 0) return aux_ret;
+    /*
+     * mpi_sam_aux_parse_fast() deliberately does not accept B-array tags.
+     * A valid CG tag is CG:B, so any record needing bam_tag2cigar() has
+     * already fallen back to sam_parse1().
+     */
+    MPI_SAM_PARSE_TIME_DECL(cg_t1);
+    MPI_SAM_PARSE_ACC(timing, cg_cycles, cg_t1, cg_t0);
+    return 0;
+}
+
+
 int sam_parse1(kstring_t *s, sam_hdr_t *h, bam1_t *b)
 {
 #define _read_token(_p) (_p); do { char *tab = strchr((_p), '\t'); if (!tab) goto err_ret; *tab = '\0'; (_p) = tab + 1; } while (0)
@@ -2447,4 +3044,3 @@ int sam_parse1(kstring_t *s, sam_hdr_t *h, bam1_t *b)
 err_ret:
     return -2;
 }
-

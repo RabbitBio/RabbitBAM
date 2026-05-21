@@ -5,6 +5,8 @@
 
 #include <cstddef>
 
+#define ENABLE_MASKING
+
 struct MpiBamToBamStats {
     long long input_blocks;
     long long group_count;
@@ -68,9 +70,16 @@ struct MpiSamToBamStats {
     long long total_records;
     long long compress_groups;
     long long bgzf_blocks;
+    long long parse_fast_records;
+    long long parse_fallback_records;
     double t_split;
     double t_copy_count;
     double t_parse;
+    double t_parse_core;
+    double t_parse_aux;
+    double t_parse_cg;
+    double t_parse_fallback;
+    double t_parse_other;
     double t_pack;
     double t_compress;
     double t_compress_serialize;

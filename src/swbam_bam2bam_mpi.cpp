@@ -423,12 +423,19 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
 
         double compress_t0 = GetTime();
         __real_athread_spawn((void *)slave_compressfunc, comp_active, 1);
+        #ifdef ENABLE_MASKING
         if (flush_pending() != 0) return -1;
         if (do_read_group(next_n_blocks) != 0) return -1;
+        #endif
         athread_join();
         double compress_wall = GetTime() - compress_t0;
         stats->t_compress += compress_wall;
         MpiAccumulateCompressDetail(comp_active, active_output_blocks, compress_wall, stats);
+        
+        #ifndef ENABLE_MASKING
+        if (flush_pending() != 0) return -1;
+        if (do_read_group(next_n_blocks) != 0) return -1;
+        #endif
 
         // double comp_check_t0 = GetTime();
         for (int k = 0; k < active_output_blocks; ++k) {
