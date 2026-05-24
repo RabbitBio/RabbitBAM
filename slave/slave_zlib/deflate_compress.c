@@ -2521,6 +2521,155 @@ deflate_compress_fastest(struct libdeflate_compressor * restrict c,
 		deflate_finish_block(c, os, in_block_begin,
 				     in_next - in_block_begin,
 				     c->p.f.sequences, in_next == in_end);
+		} while (in_next != in_end && !os->overflow);
+}
+
+static void
+deflate_compress_fastest_single_probe(struct libdeflate_compressor * restrict c,
+				      const u8 *in, size_t in_nbytes,
+				      struct deflate_output_bitstream *os)
+{
+	const u8 *in_next = in;
+	const u8 *in_end = in_next + in_nbytes;
+	const u8 *in_cur_base = in_next;
+	unsigned max_len = DEFLATE_MAX_MATCH_LEN;
+	u32 next_hash = 0;
+
+	ht_matchfinder_init(&c->p.f.ht_mf);
+
+	do {
+		const u8 * const in_block_begin = in_next;
+		const u8 * const in_max_block_end = choose_max_block_end(
+				in_next, in_end, FAST_SOFT_MAX_BLOCK_LENGTH);
+		struct deflate_sequence *seq = c->p.f.sequences;
+
+		deflate_begin_sequences(c, seq);
+
+		do {
+			u32 length;
+			u32 offset;
+			size_t remaining = in_end - in_next;
+
+			if (unlikely(remaining < DEFLATE_MAX_MATCH_LEN)) {
+				max_len = remaining;
+				if (max_len < HT_MATCHFINDER_REQUIRED_NBYTES) {
+					do {
+						deflate_choose_literal(c,
+							*in_next++, false, seq);
+					} while (--max_len);
+					break;
+				}
+			}
+			length = ht_matchfinder_longest_match_single_probe(
+							      &c->p.f.ht_mf,
+							      &in_cur_base,
+							      in_next,
+							      max_len,
+							      &next_hash,
+							      &offset);
+			if (length) {
+				deflate_choose_match(c, length, offset, false,
+						     &seq);
+				ht_matchfinder_skip_bytes_single_probe(
+							  &c->p.f.ht_mf,
+							  &in_cur_base,
+							  in_next + 1,
+							  in_end,
+							  length - 1,
+							  &next_hash);
+				in_next += length;
+			} else {
+				deflate_choose_literal(c, *in_next++, false,
+						       seq);
+			}
+		} while (in_next < in_max_block_end &&
+			 seq < &c->p.f.sequences[FAST_SEQ_STORE_LENGTH]);
+
+		deflate_finish_block(c, os, in_block_begin,
+				     in_next - in_block_begin,
+				     c->p.f.sequences, in_next == in_end);
+		} while (in_next != in_end && !os->overflow);
+}
+
+#ifndef RABBITBAM_LEVEL1_STRIDE2_MIN_MATCH
+#  define RABBITBAM_LEVEL1_STRIDE2_MIN_MATCH 5
+#endif
+
+static void
+deflate_compress_fastest_single_probe_stride2(
+				struct libdeflate_compressor * restrict c,
+				const u8 *in, size_t in_nbytes,
+				struct deflate_output_bitstream *os)
+{
+	const u8 *in_next = in;
+	const u8 *in_end = in_next + in_nbytes;
+	const u8 *in_cur_base = in_next;
+	unsigned max_len = DEFLATE_MAX_MATCH_LEN;
+	u32 next_hash = 0;
+
+	ht_matchfinder_init(&c->p.f.ht_mf);
+
+	do {
+		const u8 * const in_block_begin = in_next;
+		const u8 * const in_max_block_end = choose_max_block_end(
+				in_next, in_end, FAST_SOFT_MAX_BLOCK_LENGTH);
+		struct deflate_sequence *seq = c->p.f.sequences;
+
+		deflate_begin_sequences(c, seq);
+
+		do {
+			u32 length;
+			u32 offset;
+			size_t remaining = in_end - in_next;
+
+			if (unlikely(remaining < DEFLATE_MAX_MATCH_LEN)) {
+				max_len = remaining;
+				if (max_len < HT_MATCHFINDER_REQUIRED_NBYTES) {
+					do {
+						deflate_choose_literal(c,
+							*in_next++, false, seq);
+					} while (--max_len);
+					break;
+				}
+			}
+			length = ht_matchfinder_longest_match_single_probe(
+							      &c->p.f.ht_mf,
+							      &in_cur_base,
+							      in_next,
+							      max_len,
+							      &next_hash,
+							      &offset);
+			if (length) {
+				deflate_choose_match(c, length, offset, false,
+						     &seq);
+				if (length >= RABBITBAM_LEVEL1_STRIDE2_MIN_MATCH) {
+					ht_matchfinder_skip_bytes_single_probe_stride2_head6(
+							  &c->p.f.ht_mf,
+							  &in_cur_base,
+							  in_next + 1,
+							  in_end,
+							  length - 1,
+							  &next_hash);
+				} else {
+					ht_matchfinder_skip_bytes_single_probe(
+							  &c->p.f.ht_mf,
+							  &in_cur_base,
+							  in_next + 1,
+							  in_end,
+							  length - 1,
+							  &next_hash);
+				}
+				in_next += length;
+			} else {
+				deflate_choose_literal(c, *in_next++, false,
+						       seq);
+			}
+		} while (in_next < in_max_block_end &&
+			 seq < &c->p.f.sequences[FAST_SEQ_STORE_LENGTH]);
+
+		deflate_finish_block(c, os, in_block_begin,
+				     in_next - in_block_begin,
+				     c->p.f.sequences, in_next == in_end);
 	} while (in_next != in_end && !os->overflow);
 }
 
@@ -4077,6 +4226,37 @@ unsigned int
 libdeflate_get_compression_level(struct libdeflate_compressor *c)
 {
 	return c->compression_level;
+}
+
+LIBDEFLATEAPI void
+libdeflate_set_level1_nice_match_length(struct libdeflate_compressor *c,
+					unsigned nice_match_length)
+{
+	if (!c || c->compression_level != 1)
+		return;
+	if (nice_match_length < DEFLATE_MIN_MATCH_LEN)
+		nice_match_length = DEFLATE_MIN_MATCH_LEN;
+	else if (nice_match_length > DEFLATE_MAX_MATCH_LEN)
+		nice_match_length = DEFLATE_MAX_MATCH_LEN;
+	c->nice_match_length = nice_match_length;
+}
+
+LIBDEFLATEAPI void
+libdeflate_set_level1_single_probe(struct libdeflate_compressor *c, int enabled)
+{
+	if (!c || c->compression_level != 1)
+		return;
+	c->impl = enabled ? deflate_compress_fastest_single_probe :
+			    deflate_compress_fastest;
+}
+
+LIBDEFLATEAPI void
+libdeflate_set_level1_stride2_probe(struct libdeflate_compressor *c, int enabled)
+{
+	if (!c || c->compression_level != 1)
+		return;
+	c->impl = enabled ? deflate_compress_fastest_single_probe_stride2 :
+			    deflate_compress_fastest_single_probe;
 }
 
 LIBDEFLATEAPI size_t

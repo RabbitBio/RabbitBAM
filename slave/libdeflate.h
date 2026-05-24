@@ -115,6 +115,22 @@ libdeflate_deflate_compress_bound(struct libdeflate_compressor *compressor,
 				  size_t in_nbytes);
 
 /*
+ * RabbitBAM internal hook: tune the fastest DEFLATE parser for MPI CPE paths.
+ * This preserves DEFLATE correctness but may change compressed block bytes/size.
+ */
+LIBDEFLATEAPI void
+libdeflate_set_level1_nice_match_length(struct libdeflate_compressor *compressor,
+					unsigned nice_match_length);
+
+LIBDEFLATEAPI void
+libdeflate_set_level1_single_probe(struct libdeflate_compressor *compressor,
+				   int enabled);
+
+LIBDEFLATEAPI void
+libdeflate_set_level1_stride2_probe(struct libdeflate_compressor *compressor,
+				   int enabled);
+
+/*
  * Like libdeflate_deflate_compress(), but uses the zlib wrapper format instead
  * of raw DEFLATE.
  */

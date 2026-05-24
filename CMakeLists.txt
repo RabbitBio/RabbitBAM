@@ -102,6 +102,7 @@ if(PLATFORM_SUNWAY)
     file(GLOB SLAVE_FILES "slave/*.cpp")
     file(GLOB SLAVE_C_FILES   "slave/*.c")
     file(GLOB CGS_SLAVE_FILES "slave/*cgs*.cpp")
+    list(REMOVE_ITEM SLAVE_C_FILES "${CMAKE_SOURCE_DIR}/slave/slave_crc32_bench.c")
     set(SINGLE_SLAVE_FILES ${SLAVE_FILES})
     list(REMOVE_ITEM SINGLE_SLAVE_FILES ${CGS_SLAVE_FILES})
     # Include slave_zlib source files (compile with -mslave)
@@ -140,6 +141,24 @@ if(PLATFORM_SUNWAY)
     target_compile_definitions(RabbitBAM-MPI PRIVATE PLATFORM_SUNWAY ENABLE_MPI_BAM2BAM)
     target_include_directories(RabbitBAM-MPI PRIVATE ${SUNWAY_MPI_ROOT}/include)
     target_link_directories(RabbitBAM-MPI PRIVATE ${SUNWAY_MPI_LIB_DIR} /usr/sw/lib)
+
+    add_library(crc32_bench_slave_objects OBJECT slave/slave_crc32_bench.c)
+    target_compile_options(crc32_bench_slave_objects PRIVATE ${SLAVE_FLAGS})
+    target_include_directories(crc32_bench_slave_objects PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/ext/libdeflate-1.20
+        ${CMAKE_SOURCE_DIR}/slave
+        ${CMAKE_SOURCE_DIR}/slave/slave_zlib
+    )
+    target_compile_definitions(crc32_bench_slave_objects PRIVATE PLATFORM_SUNWAY)
+    add_executable(RabbitBAM-CRC32-Bench
+        bench/bench_crc32.cpp
+        $<TARGET_OBJECTS:crc32_bench_slave_objects>
+    )
+    target_compile_options(RabbitBAM-CRC32-Bench PRIVATE ${HOST_FLAGS})
+    target_include_directories(RabbitBAM-CRC32-Bench PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_link_directories(RabbitBAM-CRC32-Bench PRIVATE /usr/sw/lib)
+    target_compile_definitions(RabbitBAM-CRC32-Bench PRIVATE PLATFORM_SUNWAY)
 else()
     # For x86, only compile src files
     add_executable(${PROJECT_NAME} ${SINGLE_SRC_FILES})
@@ -175,6 +194,12 @@ if(PLATFORM_SUNWAY)
         m
         dl
     )
+    target_link_libraries(RabbitBAM-CRC32-Bench PRIVATE
+        pthread
+        rt
+        m
+        dl
+    )
 endif()
 
 # Link SWLU library if enabled
@@ -194,6 +219,7 @@ if(PLATFORM_SUNWAY)
     target_link_options(${PROJECT_NAME} PRIVATE -mhybrid)
     target_link_options(RabbitBAM-CGS PRIVATE -mhybrid)
     target_link_options(RabbitBAM-MPI PRIVATE -mhybrid -Wl,-zmuldefs)
+    target_link_options(RabbitBAM-CRC32-Bench PRIVATE -mhybrid)
 endif()
 
 # OpenMP support (only for x86)
@@ -219,5 +245,8 @@ if(PLATFORM_SUNWAY)
         OUTPUT_NAME "RabbitBAM-MPI"
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     )
+    set_target_properties(RabbitBAM-CRC32-Bench PROPERTIES
+        OUTPUT_NAME "RabbitBAM-CRC32-Bench"
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    )
 endif()
-

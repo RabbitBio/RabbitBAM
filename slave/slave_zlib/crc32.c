@@ -172,36 +172,149 @@
 #include "crc32_multipliers.h"
 #include "crc32_tables.h"
 
-/* This is the default implementation.  It uses the slice-by-8 method. */
+#if defined(PLATFORM_SUNWAY) && defined(RABBITBAM_ENABLE_SUNWAY_CRC16_LDM)
+#  include <slave.h>
+#  include <crts.h>
+#endif
+
 static u32 MAYBE_UNUSED
-crc32_slice8(u32 crc, const u8 *p, size_t len)
+crc32_slice8_table_impl(const u32 *table, u32 crc, const u8 *p, size_t len)
 {
 	const u8 * const end = p + len;
 	const u8 *end64;
 
 	for (; ((uintptr_t)p & 7) && p != end; p++)
-		crc = (crc >> 8) ^ crc32_slice8_table[(u8)crc ^ *p];
+		crc = (crc >> 8) ^ table[(u8)crc ^ *p];
 
 	end64 = p + ((end - p) & ~7);
 	for (; p != end64; p += 8) {
 		u32 v1 = le32_bswap(*(const u32 *)(p + 0));
 		u32 v2 = le32_bswap(*(const u32 *)(p + 4));
 
-		crc = crc32_slice8_table[0x700 + (u8)((crc ^ v1) >> 0)] ^
-		      crc32_slice8_table[0x600 + (u8)((crc ^ v1) >> 8)] ^
-		      crc32_slice8_table[0x500 + (u8)((crc ^ v1) >> 16)] ^
-		      crc32_slice8_table[0x400 + (u8)((crc ^ v1) >> 24)] ^
-		      crc32_slice8_table[0x300 + (u8)(v2 >> 0)] ^
-		      crc32_slice8_table[0x200 + (u8)(v2 >> 8)] ^
-		      crc32_slice8_table[0x100 + (u8)(v2 >> 16)] ^
-		      crc32_slice8_table[0x000 + (u8)(v2 >> 24)];
+		crc = table[0x700 + (u8)((crc ^ v1) >> 0)] ^
+		      table[0x600 + (u8)((crc ^ v1) >> 8)] ^
+		      table[0x500 + (u8)((crc ^ v1) >> 16)] ^
+		      table[0x400 + (u8)((crc ^ v1) >> 24)] ^
+		      table[0x300 + (u8)(v2 >> 0)] ^
+		      table[0x200 + (u8)(v2 >> 8)] ^
+		      table[0x100 + (u8)(v2 >> 16)] ^
+		      table[0x000 + (u8)(v2 >> 24)];
 	}
 
 	for (; p != end; p++)
-		crc = (crc >> 8) ^ crc32_slice8_table[(u8)crc ^ *p];
+		crc = (crc >> 8) ^ table[(u8)crc ^ *p];
 
 	return crc;
 }
+
+/* This is the default generic implementation.  It uses the slice-by-8 method. */
+static u32 MAYBE_UNUSED
+crc32_slice8(u32 crc, const u8 *p, size_t len)
+{
+	return crc32_slice8_table_impl(crc32_slice8_table, crc, p, len);
+}
+
+#if defined(PLATFORM_SUNWAY) && defined(RABBITBAM_ENABLE_SUNWAY_CRC16_LDM)
+#  define CRC32_SLICE16_TABLE_BYTES (16 * 256 * sizeof(u32))
+
+static u32 *crc32_slice16_ldm_table[64];
+static signed char crc32_slice16_ldm_state[64];
+static signed char crc32_slice16_ldm_enabled[64];
+
+LIBDEFLATEAPI void
+libdeflate_crc32_sunway_set_ldm_enabled(int enabled)
+{
+	int id = _MYID;
+
+	if ((unsigned)id < 64)
+		crc32_slice16_ldm_enabled[id] = enabled ? 1 : 0;
+}
+
+static void
+crc32_build_slice16_table(u32 *table)
+{
+	memcpy(table, crc32_slice8_table, 8 * 256 * sizeof(u32));
+	for (int slice = 8; slice < 16; slice++) {
+		u32 *dst = table + slice * 256;
+		const u32 *prev = table + (slice - 1) * 256;
+		for (int i = 0; i < 256; i++) {
+			u32 crc = prev[i];
+			dst[i] = (crc >> 8) ^ table[(u8)crc];
+		}
+	}
+}
+
+static const u32 *
+crc32_get_slice16_ldm_table(void)
+{
+	int id = _MYID;
+	u32 *table;
+
+	if ((unsigned)id >= 64)
+		return NULL;
+	if (crc32_slice16_ldm_state[id] < 0)
+		return NULL;
+
+	table = crc32_slice16_ldm_table[id];
+	if (table != NULL)
+		return table;
+	if (!crc32_slice16_ldm_enabled[id])
+		return NULL;
+
+	if (table == NULL) {
+		table = (u32 *)ldm_malloc(CRC32_SLICE16_TABLE_BYTES);
+		if (table == NULL) {
+			crc32_slice16_ldm_state[id] = -1;
+			return NULL;
+		}
+		crc32_build_slice16_table(table);
+		crc32_slice16_ldm_table[id] = table;
+		crc32_slice16_ldm_state[id] = 1;
+	}
+	return table;
+}
+
+static u32 MAYBE_UNUSED
+crc32_sunway_slice16_ldm(u32 crc, const u8 *p, size_t len)
+{
+	const u32 *table = crc32_get_slice16_ldm_table();
+	const u8 * const end = p + len;
+	const u8 *end128;
+
+	if (table == NULL)
+		return crc32_slice8(crc, p, len);
+
+	for (; ((uintptr_t)p & 7) && p != end; p++)
+		crc = (crc >> 8) ^ table[(u8)crc ^ *p];
+
+	end128 = p + ((end - p) & ~(size_t)15);
+	for (; p != end128; p += 16) {
+		u32 v0 = le32_bswap(*(const u32 *)(p + 0));
+		u32 v1 = le32_bswap(*(const u32 *)(p + 4));
+		u32 v2 = le32_bswap(*(const u32 *)(p + 8));
+		u32 v3 = le32_bswap(*(const u32 *)(p + 12));
+
+		crc = table[0xf00 + (u8)((crc ^ v0) >> 0)] ^
+		      table[0xe00 + (u8)((crc ^ v0) >> 8)] ^
+		      table[0xd00 + (u8)((crc ^ v0) >> 16)] ^
+		      table[0xc00 + (u8)((crc ^ v0) >> 24)] ^
+		      table[0xb00 + (u8)(v1 >> 0)] ^
+		      table[0xa00 + (u8)(v1 >> 8)] ^
+		      table[0x900 + (u8)(v1 >> 16)] ^
+		      table[0x800 + (u8)(v1 >> 24)] ^
+		      table[0x700 + (u8)(v2 >> 0)] ^
+		      table[0x600 + (u8)(v2 >> 8)] ^
+		      table[0x500 + (u8)(v2 >> 16)] ^
+		      table[0x400 + (u8)(v2 >> 24)] ^
+		      table[0x300 + (u8)(v3 >> 0)] ^
+		      table[0x200 + (u8)(v3 >> 8)] ^
+		      table[0x100 + (u8)(v3 >> 16)] ^
+		      table[0x000 + (u8)(v3 >> 24)];
+	}
+
+	return crc32_slice8_table_impl(table, crc, p, (size_t)(end - p));
+}
+#endif
 
 /*
  * This is a more lightweight generic implementation, which can be used as a
@@ -226,6 +339,10 @@ typedef u32 (*crc32_func_t)(u32 crc, const u8 *p, size_t len);
 #  include "arm/crc32_impl.h"
 #elif defined(ARCH_X86_32) || defined(ARCH_X86_64)
 #  include "x86/crc32_impl.h"
+#endif
+
+#if defined(PLATFORM_SUNWAY) && defined(RABBITBAM_ENABLE_SUNWAY_CRC16_LDM)
+#  define DEFAULT_IMPL crc32_sunway_slice16_ldm
 #endif
 
 #ifndef DEFAULT_IMPL

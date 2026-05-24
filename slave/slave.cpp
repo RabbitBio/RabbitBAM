@@ -20,6 +20,30 @@
 
 #include "sam_parse.h"
 
+#if defined(__GNUC__)
+#define RB_LIKELY(x) __builtin_expect(!!(x), 1)
+#define RB_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+#define RB_LIKELY(x) (x)
+#define RB_UNLIKELY(x) (x)
+#endif
+
+#if defined(PLATFORM_SUNWAY) && defined(RABBITBAM_ENABLE_SUNWAY_CRC16_LDM)
+extern "C" void libdeflate_crc32_sunway_set_ldm_enabled(int enabled);
+#endif
+
+#ifndef RABBITBAM_MPI_LEVEL1_NICE_LEN
+#define RABBITBAM_MPI_LEVEL1_NICE_LEN 4
+#endif
+
+#ifndef RABBITBAM_MPI_LEVEL1_SINGLE_PROBE
+#define RABBITBAM_MPI_LEVEL1_SINGLE_PROBE 1
+#endif
+
+#ifndef RABBITBAM_MPI_LEVEL1_STRIDE2_PROBE
+#define RABBITBAM_MPI_LEVEL1_STRIDE2_PROBE 1
+#endif
+
 #ifdef PLATFORM_SUNWAY
 #include <slave.h>
 static inline uint64_t mpi_slave_cycle_now() {
@@ -238,28 +262,49 @@ hts_pos_t bam_endpos(const bam1_t *b)
     return b->core.pos + rlen;
 }
 
+static inline int bam_aux_find_cg_bi(bam1_t *b, uint8_t **cg_type, uint32_t *cg_len)
+{
+    uint8_t *s = bam_get_aux(b);
+    uint8_t *end = b->data + b->l_data;
+
+    while (end - s >= 4) {
+        uint8_t *type = s + 2;
+        if (RB_UNLIKELY(s[0] == 'C' && s[1] == 'G')) {
+            if (RB_UNLIKELY(type[0] != 'B' || type[1] != 'I'))
+                return 0;
+            if (RB_UNLIKELY(end - type < 6))
+                return -1;
+            *cg_len = le_to_u32(type + 2);
+            if (RB_UNLIKELY((size_t)(end - (type + 6)) / 4 < *cg_len))
+                return -1;
+            *cg_type = type;
+            return 1;
+        }
+        s = skip_aux(type, end);
+        if (RB_UNLIKELY(s == NULL))
+            return -1;
+    }
+    return 0;
+}
+
 int bam_tag2cigar(bam1_t *b, int recal_bin,
                   int give_warning) // return 0 if CIGAR is untouched; 1 if CIGAR is updated with CG
 {
     bam1_core_t *c = &b->core;
     uint32_t cigar_st, n_cigar4, CG_st, CG_en, ori_len = b->l_data, *cigar0, CG_len, fake_bytes;
     uint8_t *CG;
+    int cg_ret;
 
     // test where there is a real CIGAR in the CG tag to move
-    if (c->n_cigar == 0 || c->tid < 0 || c->pos < 0) return 0;
+    if (RB_UNLIKELY(c->n_cigar == 0 || c->tid < 0 || c->pos < 0)) return 0;
     cigar0 = bam_get_cigar(b);
-    if (bam_cigar_op(cigar0[0]) != BAM_CSOFT_CLIP || bam_cigar_oplen(cigar0[0]) != c->l_qseq) return 0;
+    if (RB_LIKELY(bam_cigar_op(cigar0[0]) != BAM_CSOFT_CLIP ||
+                  bam_cigar_oplen(cigar0[0]) != c->l_qseq)) return 0;
     fake_bytes = c->n_cigar * 4;
-    int saved_errno = errno;
-    CG = bam_aux_get(b, "CG");
-    if (!CG) {
-        if (errno != ENOENT) return -1;  // Bad aux data
-        errno = saved_errno; // restore errno on expected no-CG-tag case
-        return 0;
-    }
-    if (CG[0] != 'B' || CG[1] != 'I') return 0; // not of type B,I
-    CG_len = le_to_u32(CG + 2);
-    if (CG_len < c->n_cigar || CG_len >= 1U << 29)
+    cg_ret = bam_aux_find_cg_bi(b, &CG, &CG_len);
+    if (RB_UNLIKELY(cg_ret < 0)) return -1;
+    if (RB_LIKELY(cg_ret == 0)) return 0;
+    if (RB_UNLIKELY(CG_len < c->n_cigar || CG_len >= 1U << 29))
         return 0; // don't move if the real CIGAR length is shorter than the fake cigar length
 
     // move from the CG tag to the right position
@@ -367,7 +412,8 @@ int block_decode_func(struct bam_block *comp, struct bam_block *un_comp) {
     un_comp->length = BGZF_MAX_BLOCK_SIZE;
     uint32_t crc = le_to_u32((uint8_t *) comp->data + comp->length - 8);                             //le_to_u32  hts_endian.h
     int ret = bgzf_uncompress(un_comp->data, reinterpret_cast<size_t *>(&un_comp->length),
-                              comp->data + 18, comp->length - 18, crc);
+                              comp->data + BLOCK_HEADER_LENGTH,
+                              comp->length - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH, crc);
     if (ret != 0) un_comp->errcode |= BGZF_ERR_ZLIB;
     return ret;
 }
@@ -382,30 +428,39 @@ int Rabbit_bgzf_read(struct bam_block *fq, void *data, unsigned int length) {
     return length;
 }
 
-// 从解压缩后的块中解析出一个 bam1_t 记录
-int read_bam(struct bam_block *fq, bam1_t *b, int is_be) {
-    if (fq->pos >= fq->length) return -1;
+static inline int read_bam_direct(struct bam_block *fq, bam1_t *b, int is_be,
+                                  int check_init_data_limit,
+                                  long long *actual_value,
+                                  long long *limit_value) {
+    if (RB_UNLIKELY(fq->pos >= fq->length)) return -1;
     bam1_core_t *c = &b->core;
-    int32_t block_len, ret, i;
+    unsigned int start = fq->pos;
+    unsigned int remaining = fq->length - start;
+    const uint8_t *record = fq->data + start;
+    const uint8_t *payload;
+    uint32_t raw_l_qname;
+    uint32_t rest_len;
+    int cigar_changed;
+    int32_t block_len, i;
     uint32_t x[8], new_l_data;
 
     b->l_data = 0;
 
-    if ((ret = Rabbit_bgzf_read(fq, &block_len, 4)) != 4) { //读取四个字节，转换成int
-        if (ret == 0) return -1; // normal end-of-file
-        else return -2; // truncated
-    }
-
+    if (RB_UNLIKELY(remaining < 4)) return -2;
+    memcpy(&block_len, record, 4);
     if (is_be) ed_swap_4p(&block_len);
-    if (block_len < 32) return -4;  // block_len includes core data
-    if (Rabbit_bgzf_read(fq, x, 32) != 32) return -3; //读取32个字节
+    if (RB_UNLIKELY(block_len < 32)) return -4;  // block_len includes core data
+    if (RB_UNLIKELY(remaining < 36)) return -3;
+    if (RB_UNLIKELY((uint64_t)block_len + 4 > (uint64_t)remaining)) return -4;
+
+    memcpy(x, record + 4, 32);
     if (is_be) { for (i = 0; i < 8; ++i) ed_swap_4p(x + i); }
     c->tid = x[0];
     c->pos = (int32_t) x[1];
     c->bin = x[2] >> 16;
     c->qual = x[2] >> 8 & 0xff;
     c->l_qname = x[2] & 0xff;
-    c->l_extranul = (c->l_qname % 4 != 0) ? (4 - c->l_qname % 4) : 0;
+    c->l_extranul = (-c->l_qname) & 3;
     c->flag = x[3] >> 16;
     c->n_cigar = x[3] & 0xffff;
     c->l_qseq = x[4];
@@ -413,35 +468,170 @@ int read_bam(struct bam_block *fq, bam1_t *b, int is_be) {
     c->mpos = (int32_t) x[6];
     c->isize = (int32_t) x[7];
 
+    raw_l_qname = c->l_qname;
     new_l_data = block_len - 32 + c->l_extranul;//block_len + c->l_extranul
-    if (new_l_data > INT_MAX || c->l_qseq < 0 || c->l_qname < 1) return -4;
-    if (((uint64_t) c->n_cigar << 2) + c->l_qname + c->l_extranul
-        + (((uint64_t) c->l_qseq + 1) >> 1) + c->l_qseq > (uint64_t) new_l_data)
+    if (RB_UNLIKELY(new_l_data > INT_MAX || c->l_qseq < 0 || raw_l_qname < 1)) return -4;
+    if (RB_UNLIKELY(((uint64_t) c->n_cigar << 2) + raw_l_qname + c->l_extranul
+        + (((uint64_t) c->l_qseq + 1) >> 1) + c->l_qseq > (uint64_t) new_l_data))
         return -4;
-    //在从核内存上开辟空间！！！！！！
-    //这里如果已经分配了最够大小的data空间，就不会再开辟了
-    //printf("The new_l_data is %u\n", new_l_data);
-    if (realloc_bam_data(b, new_l_data) < 0) return -4;
+    if (RB_UNLIKELY(check_init_data_limit && new_l_data > INIT_DATA_SIZE)) {
+        if (actual_value) *actual_value = new_l_data;
+        if (limit_value) *limit_value = INIT_DATA_SIZE;
+        return -5;
+    }
+    if (RB_UNLIKELY(new_l_data > b->m_data && realloc_bam_data(b, new_l_data) < 0)) return -4;
     b->l_data = new_l_data;
 
-    if (Rabbit_bgzf_read(fq, b->data, c->l_qname) != c->l_qname) return -4;
-    if (b->data[c->l_qname - 1] != '\0') { // Try to fix missing NUL termination
-        if (fixup_missing_qname_nul(b) < 0) return -4;
+    payload = record + 36;
+    if (c->l_extranul == 0 && payload[raw_l_qname - 1] == '\0') {
+        memcpy(b->data, payload, new_l_data);
+    } else {
+        int qname_has_nul = payload[raw_l_qname - 1] == '\0';
+        memcpy(b->data, payload, raw_l_qname);
+        if (RB_UNLIKELY(!qname_has_nul)) { // Try to fix missing NUL termination
+            if (RB_UNLIKELY(fixup_missing_qname_nul(b) < 0)) return -4;
+        }
+        switch (c->l_extranul) {
+        case 3:
+            b->data[c->l_qname + 2] = '\0';
+            /* fall through */
+        case 2:
+            b->data[c->l_qname + 1] = '\0';
+            /* fall through */
+        case 1:
+            b->data[c->l_qname] = '\0';
+            break;
+        default:
+            break;
+        }
+        c->l_qname += c->l_extranul;
+
+        rest_len = (uint32_t)block_len - 32 - raw_l_qname;
+        if (RB_UNLIKELY(b->l_data < c->l_qname || (uint64_t)c->l_qname + rest_len > (uint64_t)b->l_data))
+            return -4;
+        memcpy(b->data + c->l_qname, payload + raw_l_qname, rest_len);
     }
-    for (i = 0; i < c->l_extranul; ++i) b->data[c->l_qname + i] = '\0';
-    c->l_qname += c->l_extranul;
-    if (b->l_data < c->l_qname ||
-        Rabbit_bgzf_read(fq, b->data + c->l_qname, b->l_data - c->l_qname) != b->l_data - c->l_qname)
-        return -4;
+    fq->pos = start + 4 + (unsigned int)block_len;
+
     if (is_be) swap_data(c, b->l_data, b->data, 0);
-    if (bam_tag2cigar(b, 0, 0) < 0) return -4;
-    if (c->n_cigar > 0) { // recompute "bin" and check CIGAR-qlen consistency
+    cigar_changed = 0;
+    if (c->n_cigar != 0 && c->tid >= 0 && c->pos >= 0) {
+        uint32_t *cigar0 = bam_get_cigar(b);
+        if (bam_cigar_op(cigar0[0]) == BAM_CSOFT_CLIP &&
+            bam_cigar_oplen(cigar0[0]) == c->l_qseq) {
+            cigar_changed = bam_tag2cigar(b, 0, 0);
+            if (RB_UNLIKELY(cigar_changed < 0)) return -4;
+        }
+    }
+    if (cigar_changed > 0 && c->n_cigar > 0) {
         hts_pos_t rlen, qlen;
         bam_cigar2rqlens(c->n_cigar, bam_get_cigar(b), &rlen, &qlen);
         if ((b->core.flag & BAM_FUNMAP) || rlen == 0) rlen = 1;
         b->core.bin = hts_reg2bin(b->core.pos, b->core.pos + rlen, 14, 5);
-        // Sanity check for broken CIGAR alignments
-        if (c->l_qseq > 0 && !(c->flag & BAM_FUNMAP) && qlen != c->l_qseq) {
+        if (RB_UNLIKELY(c->l_qseq > 0 && !(c->flag & BAM_FUNMAP) && qlen != c->l_qseq)) {
+            hts_log_error("CIGAR and query sequence lengths differ for %s",
+                          bam_get_qname(b));
+            return -4;
+        }
+    }
+
+    return 4 + block_len;
+}
+
+// 从解压缩后的块中解析出一个 bam1_t 记录
+int read_bam(struct bam_block *fq, bam1_t *b, int is_be) {
+    return read_bam_direct(fq, b, is_be, 0, NULL, NULL);
+}
+
+static inline int read_bam_mpi_fast(struct bam_block *fq, bam1_t *b) {
+    if (RB_UNLIKELY(fq->pos >= fq->length)) return -1;
+    bam1_core_t *c = &b->core;
+    unsigned int start = fq->pos;
+    unsigned int remaining = fq->length - start;
+    const uint8_t *record = fq->data + start;
+    const uint8_t *payload;
+    uint32_t raw_l_qname;
+    uint32_t rest_len;
+    int32_t block_len;
+    uint32_t x[8], new_l_data;
+    int cigar_changed = 0;
+
+    b->l_data = 0;
+
+    if (RB_UNLIKELY(remaining < 4)) return -2;
+    memcpy(&block_len, record, 4);
+    if (RB_UNLIKELY(block_len < 32)) return -4;
+    if (RB_UNLIKELY(remaining < 36)) return -3;
+    if (RB_UNLIKELY((uint64_t)block_len + 4 > (uint64_t)remaining)) return -4;
+
+    memcpy(x, record + 4, 32);
+    c->tid = x[0];
+    c->pos = (int32_t)x[1];
+    c->bin = x[2] >> 16;
+    c->qual = x[2] >> 8 & 0xff;
+    c->l_qname = x[2] & 0xff;
+    c->l_extranul = (-c->l_qname) & 3;
+    c->flag = x[3] >> 16;
+    c->n_cigar = x[3] & 0xffff;
+    c->l_qseq = x[4];
+    c->mtid = x[5];
+    c->mpos = (int32_t)x[6];
+    c->isize = (int32_t)x[7];
+
+    raw_l_qname = c->l_qname;
+    new_l_data = block_len - 32 + c->l_extranul;
+    if (RB_UNLIKELY(new_l_data > INT_MAX || c->l_qseq < 0 || raw_l_qname < 1)) return -4;
+    if (RB_UNLIKELY(((uint64_t)c->n_cigar << 2) + raw_l_qname + c->l_extranul
+        + (((uint64_t)c->l_qseq + 1) >> 1) + c->l_qseq > (uint64_t)new_l_data))
+        return -4;
+    if (RB_UNLIKELY(new_l_data > b->m_data && realloc_bam_data(b, new_l_data) < 0)) return -4;
+    b->l_data = new_l_data;
+
+    payload = record + 36;
+    if (c->l_extranul == 0 && payload[raw_l_qname - 1] == '\0') {
+        memcpy(b->data, payload, new_l_data);
+    } else {
+        int qname_has_nul = payload[raw_l_qname - 1] == '\0';
+        memcpy(b->data, payload, raw_l_qname);
+        if (RB_UNLIKELY(!qname_has_nul)) {
+            if (RB_UNLIKELY(fixup_missing_qname_nul(b) < 0)) return -4;
+        }
+        switch (c->l_extranul) {
+        case 3:
+            b->data[c->l_qname + 2] = '\0';
+            /* fall through */
+        case 2:
+            b->data[c->l_qname + 1] = '\0';
+            /* fall through */
+        case 1:
+            b->data[c->l_qname] = '\0';
+            break;
+        default:
+            break;
+        }
+        c->l_qname += c->l_extranul;
+
+        rest_len = (uint32_t)block_len - 32 - raw_l_qname;
+        if (RB_UNLIKELY(b->l_data < c->l_qname || (uint64_t)c->l_qname + rest_len > (uint64_t)b->l_data))
+            return -4;
+        memcpy(b->data + c->l_qname, payload + raw_l_qname, rest_len);
+    }
+    fq->pos = start + 4 + (unsigned int)block_len;
+
+    if (c->n_cigar != 0 && c->tid >= 0 && c->pos >= 0) {
+        uint32_t *cigar0 = bam_get_cigar(b);
+        if (RB_UNLIKELY(bam_cigar_op(cigar0[0]) == BAM_CSOFT_CLIP &&
+                        bam_cigar_oplen(cigar0[0]) == c->l_qseq)) {
+            cigar_changed = bam_tag2cigar(b, 0, 0);
+            if (RB_UNLIKELY(cigar_changed < 0)) return -4;
+        }
+    }
+    if (cigar_changed > 0 && c->n_cigar > 0) {
+        hts_pos_t rlen, qlen;
+        bam_cigar2rqlens(c->n_cigar, bam_get_cigar(b), &rlen, &qlen);
+        if ((b->core.flag & BAM_FUNMAP) || rlen == 0) rlen = 1;
+        b->core.bin = hts_reg2bin(b->core.pos, b->core.pos + rlen, 14, 5);
+        if (RB_UNLIKELY(c->l_qseq > 0 && !(c->flag & BAM_FUNMAP) && qlen != c->l_qseq)) {
             hts_log_error("CIGAR and query sequence lengths differ for %s",
                           bam_get_qname(b));
             return -4;
@@ -453,70 +643,7 @@ int read_bam(struct bam_block *fq, bam1_t *b, int is_be) {
 
 static inline int read_bam_checked(struct bam_block *fq, bam1_t *b, int is_be,
                                    long long *actual_value, long long *limit_value) {
-    if (fq->pos >= fq->length) return -1;
-    bam1_core_t *c = &b->core;
-    int32_t block_len, ret, i;
-    uint32_t x[8], new_l_data;
-
-    b->l_data = 0;
-
-    if ((ret = Rabbit_bgzf_read(fq, &block_len, 4)) != 4) {
-        if (ret == 0) return -1;
-        return -2;
-    }
-
-    if (is_be) ed_swap_4p(&block_len);
-    if (block_len < 32) return -4;
-    if (Rabbit_bgzf_read(fq, x, 32) != 32) return -3;
-    if (is_be) { for (i = 0; i < 8; ++i) ed_swap_4p(x + i); }
-    c->tid = x[0];
-    c->pos = (int32_t)x[1];
-    c->bin = x[2] >> 16;
-    c->qual = x[2] >> 8 & 0xff;
-    c->l_qname = x[2] & 0xff;
-    c->l_extranul = (c->l_qname % 4 != 0) ? (4 - c->l_qname % 4) : 0;
-    c->flag = x[3] >> 16;
-    c->n_cigar = x[3] & 0xffff;
-    c->l_qseq = x[4];
-    c->mtid = x[5];
-    c->mpos = (int32_t)x[6];
-    c->isize = (int32_t)x[7];
-
-    new_l_data = block_len - 32 + c->l_extranul;
-    if (new_l_data > INT_MAX || c->l_qseq < 0 || c->l_qname < 1) return -4;
-    if (((uint64_t)c->n_cigar << 2) + c->l_qname + c->l_extranul
-        + (((uint64_t)c->l_qseq + 1) >> 1) + c->l_qseq > (uint64_t)new_l_data)
-        return -4;
-    if (new_l_data > INIT_DATA_SIZE) {
-        if (actual_value) *actual_value = new_l_data;
-        if (limit_value) *limit_value = INIT_DATA_SIZE;
-        return -5;
-    }
-    if (realloc_bam_data(b, new_l_data) < 0) return -4;
-    b->l_data = new_l_data;
-
-    if (Rabbit_bgzf_read(fq, b->data, c->l_qname) != c->l_qname) return -4;
-    if (b->data[c->l_qname - 1] != '\0') {
-        if (fixup_missing_qname_nul(b) < 0) return -4;
-    }
-    for (i = 0; i < c->l_extranul; ++i) b->data[c->l_qname + i] = '\0';
-    c->l_qname += c->l_extranul;
-    if (b->l_data < c->l_qname ||
-        Rabbit_bgzf_read(fq, b->data + c->l_qname, b->l_data - c->l_qname) != b->l_data - c->l_qname)
-        return -4;
-    if (is_be) swap_data(c, b->l_data, b->data, 0);
-    if (bam_tag2cigar(b, 0, 0) < 0) return -4;
-    if (c->n_cigar > 0) {
-        hts_pos_t rlen, qlen;
-        bam_cigar2rqlens(c->n_cigar, bam_get_cigar(b), &rlen, &qlen);
-        if ((b->core.flag & BAM_FUNMAP) || rlen == 0) rlen = 1;
-        b->core.bin = hts_reg2bin(b->core.pos, b->core.pos + rlen, 14, 5);
-        if (c->l_qseq > 0 && !(c->flag & BAM_FUNMAP) && qlen != c->l_qseq) {
-            hts_log_error("CIGAR and query sequence lengths differ for %s", bam_get_qname(b));
-            return -4;
-        }
-    }
-    return 4 + block_len;
+    return read_bam_direct(fq, b, is_be, 1, actual_value, limit_value);
 }
 
 // 打印 bam1_t
@@ -988,6 +1115,46 @@ int writeBam1_to_block(bam_block *&write_block, bam1_t *b , int is_be) {
     return ok ? 4 + block_len : -1;
 }
 
+static inline int writeBam1_to_block_mpi_fast(bam_block *write_block, bam1_t *b) {
+    const bam1_core_t *c = &b->core;
+    int raw_l_qname = c->l_qname - c->l_extranul;
+    uint32_t block_len;
+    uint32_t x[8];
+    uint8_t *dst;
+    uint32_t rest_len;
+
+    if (RB_UNLIKELY(raw_l_qname <= 0 || raw_l_qname > 255 ||
+                    c->n_cigar > 0xffff ||
+                    c->pos > INT_MAX ||
+                    c->mpos > INT_MAX ||
+                    c->isize < INT_MIN || c->isize > INT_MAX)) {
+        bam_block *wb = write_block;
+        return writeBam1_to_block(wb, b, 0);
+    }
+
+    block_len = b->l_data - c->l_extranul + 32;
+    if (RB_UNLIKELY((uint64_t)write_block->pos + 4 + block_len > BGZF_BLOCK_SIZE))
+        return -1;
+
+    x[0] = c->tid;
+    x[1] = c->pos;
+    x[2] = (uint32_t)c->bin << 16 | c->qual << 8 | (uint32_t)raw_l_qname;
+    x[3] = (uint32_t)c->flag << 16 | (c->n_cigar & 0xffff);
+    x[4] = c->l_qseq;
+    x[5] = c->mtid;
+    x[6] = c->mpos;
+    x[7] = c->isize;
+
+    dst = (uint8_t *)write_block->data + write_block->pos;
+    memcpy(dst, &block_len, 4);
+    memcpy(dst + 4, x, 32);
+    memcpy(dst + 36, b->data, (size_t)raw_l_qname);
+    rest_len = (uint32_t)(b->l_data - c->l_qname);
+    memcpy(dst + 36 + raw_l_qname, b->data + c->l_qname, rest_len);
+    write_block->pos += 4 + block_len;
+    return 4 + block_len;
+}
+
 int rabbit_bgzf_compress(void *_dst, size_t *dlen, const void *src, size_t slen, int level) {
     //写入一个EOF块，但是从核这里用不到，可以在主核写入
     if (slen == 0) {
@@ -1047,6 +1214,8 @@ static inline unsigned long slave_cycle_now() {
 
 static struct libdeflate_compressor *g_slave_compressors[64] = {0};
 static int g_slave_compressor_levels[64] = {0};
+static struct libdeflate_compressor *g_slave_mpi_compressors[64] = {0};
+static int g_slave_mpi_compressor_levels[64] = {0};
 static struct libdeflate_decompressor *g_slave_decompressors[64] = {0};
 
 static inline struct libdeflate_compressor *slave_get_reused_compressor(
@@ -1072,6 +1241,51 @@ static inline struct libdeflate_compressor *slave_get_reused_compressor(
 
     t0 = slave_cycle_now();
     z = libdeflate_alloc_compressor(level);
+    if (alloc_cycles) *alloc_cycles += (uint64_t)(slave_cycle_now() - t0);
+    return z;
+}
+
+static inline struct libdeflate_compressor *slave_get_reused_mpi_compressor(
+        int id, int level, uint64_t *alloc_cycles) {
+    struct libdeflate_compressor *z = nullptr;
+    unsigned long t0 = 0;
+    if (id >= 0 && id < 64) {
+        z = g_slave_mpi_compressors[id];
+        if (z && g_slave_mpi_compressor_levels[id] == level) return z;
+        t0 = slave_cycle_now();
+        if (z) libdeflate_free_compressor(z);
+        z = libdeflate_alloc_compressor(level);
+        if (level == 1 && z) {
+            libdeflate_set_level1_nice_match_length(z, RABBITBAM_MPI_LEVEL1_NICE_LEN);
+#if RABBITBAM_MPI_LEVEL1_SINGLE_PROBE
+            libdeflate_set_level1_single_probe(z, 1);
+#endif
+#if RABBITBAM_MPI_LEVEL1_STRIDE2_PROBE
+            libdeflate_set_level1_stride2_probe(z, 1);
+#endif
+        }
+        if (alloc_cycles) *alloc_cycles += (uint64_t)(slave_cycle_now() - t0);
+        if (z) {
+            g_slave_mpi_compressors[id] = z;
+            g_slave_mpi_compressor_levels[id] = level;
+        } else {
+            g_slave_mpi_compressors[id] = nullptr;
+            g_slave_mpi_compressor_levels[id] = 0;
+        }
+        return z;
+    }
+
+    t0 = slave_cycle_now();
+    z = libdeflate_alloc_compressor(level);
+    if (level == 1 && z) {
+        libdeflate_set_level1_nice_match_length(z, RABBITBAM_MPI_LEVEL1_NICE_LEN);
+#if RABBITBAM_MPI_LEVEL1_SINGLE_PROBE
+        libdeflate_set_level1_single_probe(z, 1);
+#endif
+#if RABBITBAM_MPI_LEVEL1_STRIDE2_PROBE
+        libdeflate_set_level1_stride2_probe(z, 1);
+#endif
+    }
     if (alloc_cycles) *alloc_cycles += (uint64_t)(slave_cycle_now() - t0);
     return z;
 }
@@ -1136,7 +1350,8 @@ int block_decode_func_reuse(struct bam_block *comp, struct bam_block *un_comp,
     uint32_t crc = le_to_u32((uint8_t *)comp->data + comp->length - 8);
     size_t un_comp_len = BGZF_MAX_BLOCK_SIZE;
     int ret = bgzf_uncompress_reuse(un_comp->data, &un_comp_len,
-                                    comp->data + 18, comp->length - 18,
+                                    comp->data + BLOCK_HEADER_LENGTH,
+                                    comp->length - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH,
                                     crc, z, inflate_cycles, crc_cycles);
     un_comp->length = (unsigned int)un_comp_len;
     if (ret != 0) un_comp->errcode |= BGZF_ERR_ZLIB;
@@ -1175,13 +1390,19 @@ int rabbit_bgzf_compress_reuse(void *_dst, size_t *dlen,
         *dlen = clen + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
     }
 
-    unsigned long footer_t0 = slave_cycle_now();
-    memcpy(dst, g_magic, BLOCK_HEADER_LENGTH);
-    packInt16(&dst[16], *dlen - 1);
-    uint32_t crc = libdeflate_crc32(0, src, slen);
-    packInt32((uint8_t *)&dst[*dlen - 8], crc);
-    packInt32((uint8_t *)&dst[*dlen - 4], slen);
-    if (footer_cycles) *footer_cycles += (uint64_t)(slave_cycle_now() - footer_t0);
+	unsigned long footer_t0 = slave_cycle_now();
+	memcpy(dst, g_magic, BLOCK_HEADER_LENGTH);
+	packInt16(&dst[16], *dlen - 1);
+#if defined(PLATFORM_SUNWAY) && defined(RABBITBAM_ENABLE_SUNWAY_CRC16_LDM)
+	libdeflate_crc32_sunway_set_ldm_enabled(level != 0 && z != nullptr);
+#endif
+	uint32_t crc = libdeflate_crc32(0, src, slen);
+#if defined(PLATFORM_SUNWAY) && defined(RABBITBAM_ENABLE_SUNWAY_CRC16_LDM)
+	libdeflate_crc32_sunway_set_ldm_enabled(0);
+#endif
+	packInt32((uint8_t *)&dst[*dlen - 8], crc);
+	packInt32((uint8_t *)&dst[*dlen - 4], slen);
+	if (footer_cycles) *footer_cycles += (uint64_t)(slave_cycle_now() - footer_t0);
     return 0;
 }
 
@@ -1228,7 +1449,7 @@ extern "C" void decompressfunc(Para paras[64]) {
     bam1_t* b = NULL;
     b = para->output_records[count]; 
     // print_bam1(b);
-    while(read_bam(un_comp, b, 0)>=0){
+    while(read_bam_mpi_fast(un_comp, b)>=0){
         // para->l_data_list[count] = b->l_data;
         // para->data_list[count] = b->data;
         count++;
@@ -1311,7 +1532,7 @@ extern "C" void slave_decompress_filterfunc(Bam2BamPara paras[64]) {
     while (total_count < (int)MAX_RECORDS_PER_BLOCK) {
         bam1_t *b = para->record_base ? para->record_base + total_count
                                       : para->output_records[total_count];
-        ret = read_bam(un_comp, b, 0);
+        ret = read_bam_mpi_fast(un_comp, b);
         if (ret < 0) break;
 
         total_count++;
@@ -1383,7 +1604,7 @@ extern "C" void slave_mpi_decompress_filterfunc(Bam2BamPara paras[64]) {
     while (total_count < (int)MAX_RECORDS_PER_BLOCK) {
         bam1_t *b = para->record_base ? para->record_base + total_count
                                       : para->output_records[total_count];
-        ret = read_bam(un_comp, b, 0);
+        ret = read_bam_mpi_fast(un_comp, b);
         if (ret < 0) break;
 
         total_count++;
@@ -1437,7 +1658,7 @@ extern "C" void slave_decompress_bam2bam_passthrough(Bam2BamPara paras[64]) {
     int ret = -1;
     while (total_count < (int)MAX_RECORDS_PER_BLOCK) {
         bam1_t *b = para->output_records[total_count];
-        ret = read_bam(un_comp, b, 0);
+        ret = read_bam_mpi_fast(un_comp, b);
         if (ret < 0) break;
 
         uint32_t bam_len = (uint32_t)(b->l_data - b->core.l_extranul + 32);
@@ -1502,7 +1723,7 @@ extern "C" void slave_mpi_decompress_bam2bam_passthrough(Bam2BamPara paras[64]) 
     unsigned long parse_t0 = slave_cycle_now();
     while (total_count < (int)MAX_RECORDS_PER_BLOCK) {
         bam1_t *b = para->output_records[total_count];
-        ret = read_bam(un_comp, b, 0);
+        ret = read_bam_mpi_fast(un_comp, b);
         if (ret < 0) break;
 
         uint32_t bam_len = (uint32_t)(b->l_data - b->core.l_extranul + 32);
@@ -1611,7 +1832,6 @@ extern "C" void sam_format(void *arg) {
     if (start >= total_tasks || start >= end) return;
 
     for (int i = start; i < end; i++) {
-        // sam_format1(batch->hdr, batch->bams[i], ks_out);
         sam_format1_append(batch->hdr, batch->bams[i], ks_out);
         kputc('\n', ks_out);
     }
@@ -1682,6 +1902,73 @@ extern "C" void slave_compressfunc(Comp_Para paras[64]) {
     para->output_size = compressed->length;
     para->compress_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
     para->status = 0; 
+}
+
+extern "C" void slave_mpi_compressfunc(Comp_Para paras[64]) {
+    int id = _PEN;
+    Comp_Para* para = &paras[id];
+
+    if (para->status != 0 || para->input_records == nullptr || para->n_records == 0) return;
+    int compress_level = para->compress_level;
+    if (compress_level != 0 && compress_level != 1 && compress_level != 6) {
+        para->status = -2;
+        return;
+    }
+
+    bam_block* uncompressed = para->un_comp_block;
+    bam_block* compressed = para->output_block;
+    uncompressed->pos = 0;
+    uncompressed->length = 0;
+    uncompressed->errcode = 0;
+    uncompressed->block_id = 0;
+    uncompressed->block_address = 0;
+    para->compress_serialize_cycles = 0;
+    para->compress_alloc_cycles = 0;
+    para->compress_deflate_cycles = 0;
+    para->compress_footer_cycles = 0;
+    para->compress_total_cycles = 0;
+    para->compress_level = compress_level;
+
+    unsigned long total_t0 = slave_cycle_now();
+    unsigned long serialize_t0 = slave_cycle_now();
+    for (int i = 0; i < para->n_records; i++) {
+        bam1_t* b = para->input_records[i];
+        if (RB_UNLIKELY(writeBam1_to_block_mpi_fast(uncompressed, b) < 0)) {
+            para->status = -2;
+            para->compress_serialize_cycles = (uint64_t)(slave_cycle_now() - serialize_t0);
+            para->compress_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+            return;
+        }
+    }
+    para->compress_serialize_cycles = (uint64_t)(slave_cycle_now() - serialize_t0);
+
+    struct libdeflate_compressor *z = nullptr;
+    if (compress_level != 0) {
+        z = slave_get_reused_mpi_compressor(id, compress_level, &para->compress_alloc_cycles);
+    }
+    if (compress_level != 0 && !z) {
+        para->status = -2;
+        para->compress_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+        return;
+    }
+
+    size_t comp_size = BGZF_MAX_BLOCK_SIZE;
+    int ret = rabbit_bgzf_compress_reuse(compressed->data, &comp_size,
+                                         uncompressed->data, uncompressed->pos,
+                                         compress_level,
+                                         z,
+                                         &para->compress_deflate_cycles,
+                                         &para->compress_footer_cycles);
+    compressed->length = ret == 0 ? (int)comp_size : -1;
+
+    if (compressed->length <= 0) {
+        para->status = -2;
+        para->compress_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+        return;
+    }
+    para->output_size = compressed->length;
+    para->compress_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
+    para->status = 0;
 }
 
 extern "C" void slave_sam_parse(void *arg) {

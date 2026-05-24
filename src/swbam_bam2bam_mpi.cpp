@@ -13,7 +13,7 @@
 extern "C" {
     void slave_mpi_decompress_filterfunc();
     void slave_mpi_decompress_bam2bam_passthrough();
-    void slave_compressfunc();
+    void slave_mpi_compressfunc();
 }
 
 namespace {
@@ -422,7 +422,7 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         // stats->t_compress_prepare += GetTime() - comp_prepare_t0;
 
         double compress_t0 = GetTime();
-        __real_athread_spawn((void *)slave_compressfunc, comp_active, 1);
+        __real_athread_spawn((void *)slave_mpi_compressfunc, comp_active, 1);
         #ifdef ENABLE_MASKING
         if (flush_pending() != 0) return -1;
         if (do_read_group(next_n_blocks) != 0) return -1;

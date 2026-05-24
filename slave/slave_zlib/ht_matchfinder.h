@@ -194,6 +194,55 @@ out:
 	return best_len;
 }
 
+static forceinline u32
+ht_matchfinder_longest_match_single_probe(struct ht_matchfinder * const mf,
+					  const u8 ** const in_base_p,
+					  const u8 * const in_next,
+					  const u32 max_len,
+					  u32 * const next_hash,
+					  u32 * const offset_ret)
+{
+	u32 best_len = 0;
+	const u8 *best_matchptr = in_next;
+	u32 cur_pos = in_next - *in_base_p;
+	const u8 *in_base;
+	mf_pos_t cutoff;
+	u32 hash;
+	u32 seq;
+	mf_pos_t cur_node;
+	const u8 *matchptr;
+
+	STATIC_ASSERT(HT_MATCHFINDER_MIN_MATCH_LEN == 4);
+
+	if (cur_pos == MATCHFINDER_WINDOW_SIZE) {
+		ht_matchfinder_slide_window(mf);
+		*in_base_p += MATCHFINDER_WINDOW_SIZE;
+		cur_pos = 0;
+	}
+	in_base = *in_base_p;
+	cutoff = cur_pos - MATCHFINDER_WINDOW_SIZE;
+
+	hash = *next_hash;
+	STATIC_ASSERT(HT_MATCHFINDER_REQUIRED_NBYTES == 5);
+	*next_hash = lz_hash(get_unaligned_le32(in_next + 1),
+			     HT_MATCHFINDER_HASH_ORDER);
+	seq = load_u32_unaligned(in_next);
+	prefetchw(&mf->hash_tab[*next_hash]);
+
+	cur_node = mf->hash_tab[hash][0];
+	mf->hash_tab[hash][0] = cur_pos;
+	if (cur_node <= cutoff)
+		goto out;
+	matchptr = &in_base[cur_node];
+	if (load_u32_unaligned(matchptr) == seq) {
+		best_len = lz_extend(in_next, matchptr, 4, max_len);
+		best_matchptr = matchptr;
+	}
+out:
+	*offset_ret = in_next - best_matchptr;
+	return best_len;
+}
+
 static forceinline void
 ht_matchfinder_skip_bytes(struct ht_matchfinder * const mf,
 			  const u8 ** const in_base_p,
@@ -226,6 +275,162 @@ ht_matchfinder_skip_bytes(struct ht_matchfinder * const mf,
 			       HT_MATCHFINDER_HASH_ORDER);
 		cur_pos++;
 	} while (--remaining);
+
+	prefetchw(&mf->hash_tab[hash]);
+	*next_hash = hash;
+}
+
+static forceinline void
+ht_matchfinder_skip_bytes_single_probe(struct ht_matchfinder * const mf,
+				       const u8 ** const in_base_p,
+				       const u8 *in_next,
+				       const u8 * const in_end,
+				       const u32 count,
+				       u32 * const next_hash)
+{
+	s32 cur_pos = in_next - *in_base_p;
+	u32 hash;
+	u32 remaining = count;
+
+	if (unlikely(count + HT_MATCHFINDER_REQUIRED_NBYTES > in_end - in_next))
+		return;
+
+	if (cur_pos + count - 1 >= MATCHFINDER_WINDOW_SIZE) {
+		ht_matchfinder_slide_window(mf);
+		*in_base_p += MATCHFINDER_WINDOW_SIZE;
+		cur_pos -= MATCHFINDER_WINDOW_SIZE;
+	}
+
+	hash = *next_hash;
+	do {
+		mf->hash_tab[hash][0] = cur_pos;
+		hash = lz_hash(get_unaligned_le32(++in_next),
+			       HT_MATCHFINDER_HASH_ORDER);
+		cur_pos++;
+	} while (--remaining);
+
+	prefetchw(&mf->hash_tab[hash]);
+	*next_hash = hash;
+}
+
+static forceinline void
+ht_matchfinder_skip_bytes_single_probe_stride2(struct ht_matchfinder * const mf,
+					       const u8 ** const in_base_p,
+					       const u8 *in_next,
+					       const u8 * const in_end,
+					       const u32 count,
+					       u32 * const next_hash)
+{
+	s32 cur_pos = in_next - *in_base_p;
+	u32 hash;
+	u32 remaining = count;
+
+	if (unlikely(count + HT_MATCHFINDER_REQUIRED_NBYTES > in_end - in_next))
+		return;
+
+	if (cur_pos + count - 1 >= MATCHFINDER_WINDOW_SIZE) {
+		ht_matchfinder_slide_window(mf);
+		*in_base_p += MATCHFINDER_WINDOW_SIZE;
+		cur_pos -= MATCHFINDER_WINDOW_SIZE;
+	}
+
+	hash = *next_hash;
+	while (remaining >= 2) {
+		mf->hash_tab[hash][0] = cur_pos;
+		in_next += 2;
+		cur_pos += 2;
+		remaining -= 2;
+		hash = lz_hash(get_unaligned_le32(in_next),
+			       HT_MATCHFINDER_HASH_ORDER);
+	}
+	if (remaining) {
+		mf->hash_tab[hash][0] = cur_pos;
+		hash = lz_hash(get_unaligned_le32(++in_next),
+			       HT_MATCHFINDER_HASH_ORDER);
+	}
+
+	prefetchw(&mf->hash_tab[hash]);
+	*next_hash = hash;
+}
+
+static forceinline void
+ht_matchfinder_skip_bytes_single_probe_stride2_head6(
+					       struct ht_matchfinder * const mf,
+					       const u8 ** const in_base_p,
+					       const u8 *in_next,
+					       const u8 * const in_end,
+					       const u32 count,
+					       u32 * const next_hash)
+{
+	s32 cur_pos = in_next - *in_base_p;
+	u32 hash;
+	u32 remaining = count;
+
+	if (unlikely(count + HT_MATCHFINDER_REQUIRED_NBYTES > in_end - in_next))
+		return;
+
+	if (cur_pos + count - 1 >= MATCHFINDER_WINDOW_SIZE) {
+		ht_matchfinder_slide_window(mf);
+		*in_base_p += MATCHFINDER_WINDOW_SIZE;
+		cur_pos -= MATCHFINDER_WINDOW_SIZE;
+	}
+
+	hash = *next_hash;
+	if (remaining) {
+		mf->hash_tab[hash][0] = cur_pos;
+		hash = lz_hash(get_unaligned_le32(++in_next),
+			       HT_MATCHFINDER_HASH_ORDER);
+		cur_pos++;
+		remaining--;
+	}
+	if (remaining) {
+		mf->hash_tab[hash][0] = cur_pos;
+		hash = lz_hash(get_unaligned_le32(++in_next),
+			       HT_MATCHFINDER_HASH_ORDER);
+		cur_pos++;
+		remaining--;
+	}
+	if (remaining) {
+		mf->hash_tab[hash][0] = cur_pos;
+		hash = lz_hash(get_unaligned_le32(++in_next),
+			       HT_MATCHFINDER_HASH_ORDER);
+		cur_pos++;
+		remaining--;
+	}
+	if (remaining) {
+		mf->hash_tab[hash][0] = cur_pos;
+		hash = lz_hash(get_unaligned_le32(++in_next),
+			       HT_MATCHFINDER_HASH_ORDER);
+		cur_pos++;
+		remaining--;
+	}
+	if (remaining) {
+		mf->hash_tab[hash][0] = cur_pos;
+		hash = lz_hash(get_unaligned_le32(++in_next),
+			       HT_MATCHFINDER_HASH_ORDER);
+		cur_pos++;
+		remaining--;
+	}
+	if (remaining) {
+		mf->hash_tab[hash][0] = cur_pos;
+		hash = lz_hash(get_unaligned_le32(++in_next),
+			       HT_MATCHFINDER_HASH_ORDER);
+		cur_pos++;
+		remaining--;
+	}
+	while (remaining >= 2) {
+		mf->hash_tab[hash][0] = cur_pos;
+		in_next += 2;
+		cur_pos += 2;
+		remaining -= 2;
+		hash = lz_hash(get_unaligned_le32(in_next),
+			       HT_MATCHFINDER_HASH_ORDER);
+	}
+	if (remaining) {
+		mf->hash_tab[hash][0] = cur_pos;
+		hash = lz_hash(get_unaligned_le32(++in_next),
+			       HT_MATCHFINDER_HASH_ORDER);
+	}
 
 	prefetchw(&mf->hash_tab[hash]);
 	*next_hash = hash;

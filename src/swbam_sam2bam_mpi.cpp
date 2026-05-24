@@ -13,7 +13,7 @@
 extern "C" {
     void slave_mpi_copy_and_count();
     void slave_mpi_sam_parse_chunk();
-    void slave_compressfunc();
+    void slave_mpi_compressfunc();
 }
 
 namespace {
@@ -450,7 +450,7 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         // stats->t_compress_setup += GetTime() - setup_t0;
 
         double compress_t0 = GetTime();
-        __real_athread_spawn((void *)slave_compressfunc, comp_active, 1);
+        __real_athread_spawn((void *)slave_mpi_compressfunc, comp_active, 1);
         #ifdef ENABLE_MASKING
         int flush_ret = flush_pending();
         #endif
