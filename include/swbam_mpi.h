@@ -99,6 +99,8 @@ struct MpiSamToBamStats {
 
 int ProcessSwBamMPI(CmdInfo *cmd_info);
 int ProcessBamToBamMPI(CmdInfo *cmd_info);
+int ProcessFlagstatMPI(CmdInfo *cmd_info);
+int ProcessStatsMPI(CmdInfo *cmd_info);
 
 int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      const BamFilterOptions &filter,

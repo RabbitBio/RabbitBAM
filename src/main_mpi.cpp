@@ -32,6 +32,7 @@ int main(int argc, char **argv) {
 #endif
 
     CmdInfo cmd_info;
+    bool stats_basic = false;
     CLI::App app("RabbitBAM-MPI");
 
     CLI::App *run_all = app.add_subcommand("run_all", "Run MPI conversion (BAM -> BAM, BAM -> SAM, and SAM -> BAM implemented)");
@@ -48,9 +49,22 @@ int main(int argc, char **argv) {
     run_all->add_option("--max-read-len", cmd_info.max_read_len_, "Keep reads with read length <= value");
     run_all->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
 
+    CLI::App *flagstat = app.add_subcommand("flagstat", "Run MPI BAM flagstat");
+    flagstat->add_option("-i,--inFile", cmd_info.in_file_name_, "input bam name")->required()->check(CLI::ExistingFile);
+    flagstat->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
+
+    CLI::App *stats = app.add_subcommand("stats", "Run MPI BAM stats");
+    stats->add_option("-i,--inFile", cmd_info.in_file_name_, "input bam name")->required()->check(CLI::ExistingFile);
+    stats->add_flag("--basic", stats_basic, "Only output samtools stats SN summary numbers")->default_val(false);
+    stats->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
+
     CLI11_PARSE(app, argc, argv);
 
     int exit_code = 1;
+    CLI::App *selected_command = nullptr;
+    bool is_run_all = false;
+    bool is_flagstat = false;
+    bool is_stats = false;
     if (app.get_subcommands().empty()) {
         if (my_rank == 0) fprintf(stderr, "ERROR: You should input one command.\n");
         goto cleanup;
@@ -59,11 +73,20 @@ int main(int argc, char **argv) {
         if (my_rank == 0) fprintf(stderr, "ERROR: You should input one command.\n");
         goto cleanup;
     }
-    if (app.get_subcommands()[0]->get_name() != "run_all") {
-        if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI only supports run_all.\n");
+    selected_command = app.get_subcommands()[0];
+    is_run_all = selected_command->get_name() == "run_all";
+    is_flagstat = selected_command->get_name() == "flagstat";
+    is_stats = selected_command->get_name() == "stats";
+    if (!is_run_all && !is_flagstat && !is_stats) {
+        if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI only supports run_all, flagstat, and stats.\n");
         goto cleanup;
     }
-    if (cmd_info.compress_level_ != 0 &&
+    if (is_stats && !stats_basic) {
+        if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI stats v1 requires --basic.\n");
+        goto cleanup;
+    }
+    if (is_run_all &&
+        cmd_info.compress_level_ != 0 &&
         cmd_info.compress_level_ != 1 &&
         cmd_info.compress_level_ != 6) {
         if (my_rank == 0) {
@@ -73,9 +96,12 @@ int main(int argc, char **argv) {
     }
 
     t1 = GetTime();
-    exit_code = ProcessSwBamMPI(&cmd_info);
+    exit_code = is_stats ? ProcessStatsMPI(&cmd_info)
+                          : (is_flagstat ? ProcessFlagstatMPI(&cmd_info) : ProcessSwBamMPI(&cmd_info));
     if (my_rank == 0) {
-        printf("ProcessSwBamMPI rank0 time is %lf--\n", GetTime() - t1);
+        printf("%s rank0 time is %lf--\n",
+               is_stats ? "ProcessStatsMPI" : (is_flagstat ? "ProcessFlagstatMPI" : "ProcessSwBamMPI"),
+               GetTime() - t1);
     }
 
 

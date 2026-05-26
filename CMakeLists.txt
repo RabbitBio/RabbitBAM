@@ -93,6 +93,11 @@ list(REMOVE_ITEM CGS_SRC_FILES ${MPI_ONLY_SRC})
 set(MPI_SRC_FILES ${SRC_FILES})
 list(REMOVE_ITEM MPI_SRC_FILES ${MAIN_SRC})
 list(REMOVE_ITEM MPI_SRC_FILES ${CGS_ONLY_SRC})
+list(APPEND MPI_SRC_FILES
+    "${CMAKE_SOURCE_DIR}/src/swbam_flagstat_mpi.cpp"
+    "${CMAKE_SOURCE_DIR}/src/swbam_stats_mpi.cpp"
+)
+list(REMOVE_DUPLICATES MPI_SRC_FILES)
 
 if(PLATFORM_SUNWAY)
     set(SUNWAY_MPI_ROOT "/usr/sw/mpi/mpi_20220608_SEA" CACHE PATH "Sunway MPI installation root")
