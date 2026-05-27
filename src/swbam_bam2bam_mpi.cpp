@@ -30,6 +30,9 @@ struct MpiRecordSet {
     bam1_t **ptrs;
     uint32_t *bam_lens;
     int capacity;
+    int records_per_block;
+    int n_blocks;
+    size_t arena_stride;
 };
 
 struct MpiPackedBlockPlan {
@@ -69,18 +72,26 @@ void MpiFreeBlockSet(MpiBlockSet *set) {
     set->n = 0;
 }
 
-int MpiAllocateRecordSet(MpiRecordSet *set, int total_records) {
+int MpiAllocateRecordSet(MpiRecordSet *set,
+                         int n_blocks,
+                         int records_per_block,
+                         size_t arena_stride) {
+    int total_records = n_blocks * records_per_block;
     set->capacity = total_records;
+    set->records_per_block = records_per_block;
+    set->n_blocks = n_blocks;
+    set->arena_stride = arena_stride;
     set->records = (bam1_t *)aligned_alloc_custom(64, (size_t)total_records * sizeof(bam1_t));
-    set->data = aligned_alloc_custom(64, (size_t)total_records * INIT_DATA_SIZE);
+    set->data = aligned_alloc_custom(64, (size_t)n_blocks * arena_stride);
     set->ptrs = (bam1_t **)aligned_alloc_custom(64, (size_t)total_records * sizeof(bam1_t *));
     set->bam_lens = (uint32_t *)aligned_alloc_custom(64, (size_t)total_records * sizeof(uint32_t));
     if (!set->records || !set->data || !set->ptrs || !set->bam_lens) return -1;
     memset(set->records, 0, (size_t)total_records * sizeof(bam1_t));
+    memset(set->data, 0, (size_t)n_blocks * arena_stride);
     memset(set->bam_lens, 0, (size_t)total_records * sizeof(uint32_t));
     for (int i = 0; i < total_records; ++i) {
-        set->records[i].data = set->data + (size_t)i * INIT_DATA_SIZE;
-        set->records[i].m_data = INIT_DATA_SIZE;
+        set->records[i].data = nullptr;
+        set->records[i].m_data = 0;
         set->records[i].l_data = 0;
         set->records[i].mempolicy = BAM_USER_OWNS_DATA;
         set->ptrs[i] = &set->records[i];
@@ -98,6 +109,9 @@ void MpiFreeRecordSet(MpiRecordSet *set) {
     set->ptrs = nullptr;
     set->bam_lens = nullptr;
     set->capacity = 0;
+    set->records_per_block = 0;
+    set->n_blocks = 0;
+    set->arena_stride = 0;
 }
 
 void MpiResetPackWorkspace(MpiFlatPackWorkspace *workspace) {
@@ -325,6 +339,8 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      int compress_level,
                      MpiBamToBamStats *stats) {
     const int NB = 64;
+    const int records_per_block = (int)MPI_RECORDS_PER_BLOCK;
+    const size_t block_arena_stride = MPI_BAM_BLOCK_ARENA_SIZE;
     const bool no_filter = bam_filter_is_noop(filter);
     double fused_t0 = GetTime();
 
@@ -345,11 +361,11 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         MpiAllocateBlockSet(&comp_un_b, NB) != 0 ||
         MpiAllocateBlockSet(&out_a, NB) != 0 ||
         MpiAllocateBlockSet(&out_b, NB) != 0 ||
-        MpiAllocateRecordSet(&record_set, NB * (int)MAX_RECORDS_PER_BLOCK) != 0) {
+        MpiAllocateRecordSet(&record_set, NB, records_per_block, block_arena_stride) != 0) {
         fprintf(stderr, "ERROR: failed to allocate MPI bam2bam 1CG workspace.\n");
         return -1;
     }
-    MpiInitPackWorkspace(&pack_workspace, NB * MAX_RECORDS_PER_BLOCK);
+    MpiInitPackWorkspace(&pack_workspace, (size_t)NB * records_per_block);
     for (int i = 0; i < NB; ++i) {
         MpiInitEmptyCompPara(&comp_a[i], i);
         MpiInitEmptyCompPara(&comp_b[i], i);
@@ -468,9 +484,17 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         for (int b = 0; b < NB; ++b) {
             paras[b].filter = filter;
             paras[b].block_id = b;
-            paras[b].output_records = record_set.ptrs + (size_t)b * MAX_RECORDS_PER_BLOCK;
-            paras[b].record_base = record_set.records + (size_t)b * MAX_RECORDS_PER_BLOCK;
-            paras[b].bam_lens = record_set.bam_lens + (size_t)b * MAX_RECORDS_PER_BLOCK;
+            paras[b].output_records = record_set.ptrs + (size_t)b * records_per_block;
+            paras[b].record_base = record_set.records + (size_t)b * records_per_block;
+            paras[b].bam_lens = record_set.bam_lens + (size_t)b * records_per_block;
+            paras[b].record_capacity = records_per_block;
+            paras[b].data_arena = record_set.data + (size_t)b * block_arena_stride;
+            paras[b].data_arena_capacity = block_arena_stride;
+            paras[b].data_arena_used = 0;
+            paras[b].record_index = 0;
+            paras[b].actual_value = 0;
+            paras[b].limit_value = 0;
+            paras[b].limit_id = BOUNDS_LIMIT_NONE;
             paras[b].n_total_records = 0;
             paras[b].n_kept_records = 0;
             paras[b].kept_total_len = 0;
@@ -503,8 +527,15 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         // double decomp_check_t0 = GetTime();
         for (int b = 0; b < n_blocks; ++b) {
             if (paras[b].status != 0) {
-                fprintf(stderr, "ERROR: MPI bam2bam decompress/filter failed on input block %d with status %d.\n",
-                        b, paras[b].status);
+                if (paras[b].status == -3) {
+                    fprintf(stderr,
+                            "ERROR: MPI bam2bam capacity exceeded on input block %d. limit_id=%d limit=%lld actual=%lld record=%d.\n",
+                            b, paras[b].limit_id, paras[b].limit_value,
+                            paras[b].actual_value, paras[b].record_index);
+                } else {
+                    fprintf(stderr, "ERROR: MPI bam2bam decompress/filter failed on input block %d with status %d.\n",
+                            b, paras[b].status);
+                }
                 return -1;
             }
         }

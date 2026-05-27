@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdint.h>
+#include <vector>
 
 #ifdef PLATFORM_SUNWAY
 #include <athread.h>
@@ -48,6 +49,15 @@ struct MpiSamToBamPackWorkspace {
     uint32_t current_len;
 };
 
+struct MpiSamChunkPiece {
+    int source_chunk;
+    char *text_buf;
+    size_t text_len;
+    int count;
+    size_t estimated_bam_data;
+    size_t max_line_len;
+};
+
 int MpiAllocateSamToBamBlockSet(MpiSamToBamBlockSet *set, int n) {
     set->n = n;
     set->blocks = (bam_block *)aligned_alloc_custom(64, (size_t)n * sizeof(bam_block));
@@ -72,8 +82,9 @@ void MpiFreeSamToBamBlockSet(MpiSamToBamBlockSet *set) {
 int MpiAllocateSamToBamRecordSet(MpiSamToBamRecordSet *set, int total_records) {
     set->capacity = total_records;
     set->records = (bam1_t *)aligned_alloc_custom(64, (size_t)total_records * sizeof(bam1_t));
-    set->data = aligned_alloc_custom(64, (size_t)total_records * INIT_DATA_SIZE);
-    if (!set->records || !set->data) return -1;
+    set->data = nullptr;
+    if (!set->records) return -1;
+    memset(set->records, 0, (size_t)total_records * sizeof(bam1_t));
     return 0;
 }
 
@@ -87,19 +98,32 @@ void MpiFreeSamToBamRecordSet(MpiSamToBamRecordSet *set) {
 
 int MpiInitSamParseBatch(MpiSamParseBatch *batch,
                          char *text_storage,
-                         uint32_t *bam_lens_storage) {
+                         uint32_t *bam_lens_storage,
+                         uint32_t *bam_offsets_storage) {
     memset(batch, 0, sizeof(MpiSamParseBatch));
-    if (!text_storage || !bam_lens_storage) return -1;
+    if (!text_storage || !bam_lens_storage || !bam_offsets_storage) return -1;
     for (int i = 0; i < 64; ++i) {
         MpiSamParseChunk *chunk = &batch->chunks[i];
         chunk->text_buf = text_storage + (size_t)i * CHUNK_BUFFER_SIZE;
+        chunk->text_buf_capacity = CHUNK_BUFFER_SIZE;
+        chunk->owns_text_buf = 0;
         chunk->bam_lens = bam_lens_storage + (size_t)i * MAX_BAMS_PER_CHUNK;
+        chunk->bam_offsets = bam_offsets_storage + (size_t)i * MAX_BAMS_PER_CHUNK;
         chunk->src_ptr = nullptr;
         chunk->src_len = 0;
         chunk->text_len = 0;
         chunk->bams = nullptr;
         chunk->bam_data = nullptr;
+        chunk->bam_data_capacity = 0;
+        chunk->bam_data_used = 0;
         chunk->count = 0;
+        chunk->status = 0;
+        chunk->record_index = 0;
+        chunk->actual_value = 0;
+        chunk->limit_value = 0;
+        chunk->limit_id = BOUNDS_LIMIT_NONE;
+        chunk->max_line_len = 0;
+        chunk->estimated_bam_data = 0;
         chunk->parse_fast_records = 0;
         chunk->parse_fallback_records = 0;
         chunk->parse_total_cycles = 0;
@@ -114,10 +138,14 @@ int MpiInitSamParseBatch(MpiSamParseBatch *batch,
 void MpiDestroySamParseBatch(MpiSamParseBatch *batch) {
     if (!batch) return;
     for (int i = 0; i < 64; ++i) {
+        if (batch->chunks[i].owns_text_buf && batch->chunks[i].text_buf) {
+            aligned_free_custom((unsigned char *)batch->chunks[i].text_buf);
+        }
         batch->chunks[i].text_buf = nullptr;
         batch->chunks[i].bams = nullptr;
         batch->chunks[i].bam_data = nullptr;
         batch->chunks[i].bam_lens = nullptr;
+        batch->chunks[i].bam_offsets = nullptr;
     }
 }
 
@@ -259,6 +287,7 @@ size_t MpiChooseSamChunkSize(size_t local_input_size) {
 
 int MpiSplitSamChunks(MemReader &reader,
                       MpiSamParseBatch *batch,
+                      char *text_storage,
                       size_t chunk_size,
                       int *active_chunks,
                       int *max_chunk_len) {
@@ -267,10 +296,24 @@ int MpiSplitSamChunks(MemReader &reader,
     if (chunk_size == 0) chunk_size = SAM_CHUNK_SIZE;
     for (int i = 0; i < 64; ++i) {
         MpiSamParseChunk *chunk = &batch->chunks[i];
+        if (chunk->owns_text_buf && chunk->text_buf) {
+            aligned_free_custom((unsigned char *)chunk->text_buf);
+        }
+        chunk->text_buf = text_storage + (size_t)i * CHUNK_BUFFER_SIZE;
+        chunk->text_buf_capacity = CHUNK_BUFFER_SIZE;
+        chunk->owns_text_buf = 0;
         chunk->src_ptr = nullptr;
         chunk->src_len = 0;
         chunk->text_len = 0;
         chunk->count = 0;
+        chunk->status = 0;
+        chunk->record_index = 0;
+        chunk->actual_value = 0;
+        chunk->limit_value = 0;
+        chunk->limit_id = BOUNDS_LIMIT_NONE;
+        chunk->max_line_len = 0;
+        chunk->estimated_bam_data = 0;
+        chunk->bam_data_used = 0;
         chunk->parse_fast_records = 0;
         chunk->parse_fallback_records = 0;
         chunk->parse_total_cycles = 0;
@@ -292,11 +335,17 @@ int MpiSplitSamChunks(MemReader &reader,
         }
 
         size_t read_len = end_pos - start_pos;
-        if (read_len + 1 > CHUNK_BUFFER_SIZE) {
-            fprintf(stderr,
-                    "ERROR: MPI SAM chunk exceeds buffer. limit=%zu actual=%zu chunk=%d.\n",
-                    (size_t)CHUNK_BUFFER_SIZE, read_len + 1, i);
-            return -1;
+        if (read_len + 1 > chunk->text_buf_capacity) {
+            size_t side_capacity = MpiRoundUpSize(read_len + 1, 64);
+            chunk->text_buf = (char *)aligned_alloc_custom(64, side_capacity);
+            if (!chunk->text_buf) {
+                fprintf(stderr,
+                        "ERROR: MPI SAM chunk side buffer allocation failed. actual=%zu chunk=%d.\n",
+                        read_len + 1, i);
+                return -1;
+            }
+            chunk->text_buf_capacity = side_capacity;
+            chunk->owns_text_buf = 1;
         }
         chunk->src_ptr = reader.base + start_pos;
         chunk->src_len = read_len;
@@ -342,6 +391,86 @@ void MpiAccumulateSamParseDetail(MpiSamParseBatch *batch,
     stats->t_parse_other += t_other;
 }
 
+int MpiBuildSamChunkPieces(MpiSamParseBatch *batch,
+                           int active_chunks,
+                           std::vector<MpiSamChunkPiece> *pieces) {
+    pieces->clear();
+    for (int i = 0; i < active_chunks; ++i) {
+        MpiSamParseChunk *chunk = &batch->chunks[i];
+        if (chunk->count <= 0 || chunk->text_len == 0) continue;
+        if (chunk->count <= MAX_BAMS_PER_CHUNK) {
+            MpiSamChunkPiece piece;
+            piece.source_chunk = i;
+            piece.text_buf = chunk->text_buf;
+            piece.text_len = chunk->text_len;
+            piece.count = chunk->count;
+            piece.estimated_bam_data = chunk->estimated_bam_data;
+            piece.max_line_len = chunk->max_line_len;
+            pieces->push_back(piece);
+            continue;
+        }
+
+        char *base = chunk->text_buf;
+        char *ptr = base;
+        char *end = base + chunk->text_len;
+        char *piece_begin = ptr;
+        int piece_count = 0;
+        int total_count = 0;
+        size_t piece_estimated = 0;
+        size_t piece_max_line = 0;
+        while (ptr < end) {
+            char *line_start = ptr;
+            char *line_end = ptr;
+            while (line_end < end && *line_end != '\n' && *line_end != '\0') line_end++;
+            int line_len = (int)(line_end - line_start);
+            if (line_len > 0 && line_start[line_len - 1] == '\r') line_len--;
+            bool nonempty = line_len > 0;
+
+            if (nonempty && piece_count == MAX_BAMS_PER_CHUNK) {
+                MpiSamChunkPiece piece;
+                piece.source_chunk = i;
+                piece.text_buf = piece_begin;
+                piece.text_len = (size_t)(line_start - piece_begin);
+                piece.count = piece_count;
+                piece.estimated_bam_data = piece_estimated;
+                piece.max_line_len = piece_max_line;
+                pieces->push_back(piece);
+                piece_begin = line_start;
+                piece_count = 0;
+                piece_estimated = 0;
+                piece_max_line = 0;
+            }
+
+            if (nonempty) {
+                piece_count++;
+                total_count++;
+                piece_estimated += (size_t)line_len + 64u;
+                if ((size_t)line_len > piece_max_line) piece_max_line = (size_t)line_len;
+            }
+
+            if (line_end < end && *line_end == '\n') line_end++;
+            ptr = line_end;
+        }
+        if (piece_count > 0) {
+            MpiSamChunkPiece piece;
+            piece.source_chunk = i;
+            piece.text_buf = piece_begin;
+            piece.text_len = (size_t)(end - piece_begin);
+            piece.count = piece_count;
+            piece.estimated_bam_data = piece_estimated;
+            piece.max_line_len = piece_max_line;
+            pieces->push_back(piece);
+        }
+        if (total_count != chunk->count) {
+            fprintf(stderr,
+                    "ERROR: MPI sam2bam chunk split count mismatch. chunk=%d counted=%d split=%d.\n",
+                    i, chunk->count, total_count);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 } // namespace
 
 int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
@@ -356,8 +485,11 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
 
     // double alloc_t0 = GetTime();
     MpiSamParseBatch *batch = (MpiSamParseBatch *)aligned_alloc_custom(64, sizeof(MpiSamParseBatch));
+    MpiSamParseBatch *parse_batch = (MpiSamParseBatch *)aligned_alloc_custom(64, sizeof(MpiSamParseBatch));
     char *batch_text_storage = (char *)aligned_alloc_custom(64, (size_t)NB * CHUNK_BUFFER_SIZE);
     uint32_t *batch_bam_lens_storage = (uint32_t *)aligned_alloc_custom(
+        64, (size_t)NB * MAX_BAMS_PER_CHUNK * sizeof(uint32_t));
+    uint32_t *batch_bam_offsets_storage = (uint32_t *)aligned_alloc_custom(
         64, (size_t)NB * MAX_BAMS_PER_CHUNK * sizeof(uint32_t));
     Comp_Para comp_a[NB], comp_b[NB];
     MpiSamToBamBlockSet comp_un_a = {};
@@ -367,8 +499,14 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
     MpiSamToBamRecordSet record_set = {};
     MpiSamToBamPackWorkspace pack_workspace = {};
 
-    if (!batch || !batch_text_storage || !batch_bam_lens_storage ||
-        MpiInitSamParseBatch(batch, batch_text_storage, batch_bam_lens_storage) != 0 ||
+    std::vector<unsigned char *> chunk_bam_arenas(NB, nullptr);
+    std::vector<size_t> chunk_bam_arena_caps(NB, 0);
+
+    if (parse_batch) memset(parse_batch, 0, sizeof(MpiSamParseBatch));
+
+    if (!batch || !parse_batch || !batch_text_storage || !batch_bam_lens_storage || !batch_bam_offsets_storage ||
+        MpiInitSamParseBatch(batch, batch_text_storage, batch_bam_lens_storage,
+                             batch_bam_offsets_storage) != 0 ||
         MpiAllocateSamToBamBlockSet(&comp_un_a, NB) != 0 ||
         MpiAllocateSamToBamBlockSet(&comp_un_b, NB) != 0 ||
         MpiAllocateSamToBamBlockSet(&out_a, NB) != 0 ||
@@ -377,9 +515,14 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         MpiAllocatePackWorkspace(&pack_workspace, FUSED_SAM2BAM_BAM_POOL_SIZE, NB) != 0) {
         fprintf(stderr, "ERROR: failed to allocate MPI sam2bam 1CG workspace.\n");
         MpiDestroySamParseBatch(batch);
+        for (int i = 0; i < NB; ++i) {
+            if (chunk_bam_arenas[i]) aligned_free_custom(chunk_bam_arenas[i]);
+        }
         if (batch) aligned_free_custom((unsigned char *)batch);
+        if (parse_batch) aligned_free_custom((unsigned char *)parse_batch);
         if (batch_text_storage) aligned_free_custom((unsigned char *)batch_text_storage);
         if (batch_bam_lens_storage) aligned_free_custom((unsigned char *)batch_bam_lens_storage);
+        if (batch_bam_offsets_storage) aligned_free_custom((unsigned char *)batch_bam_offsets_storage);
         MpiFreeSamToBamBlockSet(&comp_un_a);
         MpiFreeSamToBamBlockSet(&comp_un_b);
         MpiFreeSamToBamBlockSet(&out_a);
@@ -391,6 +534,28 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         return -1;
     }
     batch->hdr = hdr;
+    parse_batch->hdr = hdr;
+    for (int i = 0; i < NB; ++i) {
+        parse_batch->chunks[i].bam_lens = batch_bam_lens_storage + (size_t)i * MAX_BAMS_PER_CHUNK;
+        parse_batch->chunks[i].bam_offsets = batch_bam_offsets_storage + (size_t)i * MAX_BAMS_PER_CHUNK;
+    }
+    auto ensure_chunk_bam_arena = [&](int slot, MpiSamParseChunk *chunk, size_t required) -> int {
+        if (required < (size_t)INIT_DATA_SIZE) required = INIT_DATA_SIZE;
+        required = MpiRoundUpSize(required, 64);
+        if (chunk_bam_arena_caps[slot] >= required) {
+            chunk->bam_data = chunk_bam_arenas[slot];
+            chunk->bam_data_capacity = chunk_bam_arena_caps[slot];
+            return 0;
+        }
+        unsigned char *new_arena = aligned_alloc_custom(64, required);
+        if (!new_arena) return -1;
+        if (chunk_bam_arenas[slot]) aligned_free_custom(chunk_bam_arenas[slot]);
+        chunk_bam_arenas[slot] = new_arena;
+        chunk_bam_arena_caps[slot] = required;
+        chunk->bam_data = new_arena;
+        chunk->bam_data_capacity = required;
+        return 0;
+    };
 
     for (int i = 0; i < NB; ++i) {
         MpiInitEmptyCompPara(&comp_a[i], i);
@@ -488,7 +653,8 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         int active_chunks = 0;
         int local_max_chunk_len = 0;
         // double split_t0 = GetTime();
-        if (MpiSplitSamChunks(reader, batch, sam_chunk_size, &active_chunks, &local_max_chunk_len) != 0) goto cleanup;
+        if (MpiSplitSamChunks(reader, batch, batch_text_storage, sam_chunk_size,
+                              &active_chunks, &local_max_chunk_len) != 0) goto cleanup;
         // stats->t_split += GetTime() - split_t0;
         if (active_chunks == 0) break;
         stats->input_chunks += active_chunks;
@@ -506,84 +672,163 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         #endif
         if (flush_ret != 0) goto cleanup;
 
-        // double check_t0 = GetTime();
-        int requested_records = 0;
         for (int i = 0; i < active_chunks; ++i) {
             MpiSamParseChunk *chunk = &batch->chunks[i];
-            if (chunk->count > MAX_BAMS_PER_CHUNK) {
-                // stats->t_status_check += GetTime() - check_t0;
-                fprintf(stderr, "ERROR: MPI sam2bam chunk record limit exceeded. limit=%d actual=%d chunk=%d.\n",
-                        MAX_BAMS_PER_CHUNK, chunk->count, i);
-                goto cleanup;
-            }
-            requested_records += chunk->count;
-            if (requested_records > FUSED_SAM2BAM_BAM_POOL_SIZE) {
-                // stats->t_status_check += GetTime() - check_t0;
-                fprintf(stderr, "ERROR: MPI sam2bam record pool exceeded. limit=%d actual=%d.\n",
-                        FUSED_SAM2BAM_BAM_POOL_SIZE, requested_records);
+            if (chunk->status != 0) {
+                fprintf(stderr, "ERROR: MPI sam2bam copy/count failed. chunk=%d status=%d limit=%lld actual=%lld.\n",
+                        i, chunk->status, chunk->limit_value, chunk->actual_value);
                 goto cleanup;
             }
         }
-        // stats->t_status_check += GetTime() - check_t0;
 
-        // double setup_t0 = GetTime();
-        int offset = 0;
-        for (int i = 0; i < active_chunks; ++i) {
-            MpiSamParseChunk *chunk = &batch->chunks[i];
-            chunk->bams = record_set.records + offset;
-            chunk->bam_data = record_set.data + (size_t)offset * INIT_DATA_SIZE;
-            offset += chunk->count;
-        }
-        // stats->t_setup_reset += GetTime() - setup_t0;
+        std::vector<MpiSamChunkPiece> pieces;
+        if (MpiBuildSamChunkPieces(batch, active_chunks, &pieces) != 0) goto cleanup;
 
-        double parse_t0 = GetTime();
-        __real_athread_spawn((void *)slave_mpi_sam_parse_chunk, batch, 1);
-        athread_join();
-        double parse_wall = GetTime() - parse_t0;
-        stats->t_parse += parse_wall;
-        MpiAccumulateSamParseDetail(batch, active_chunks, parse_wall, stats);
-        for (int i = 0; i < active_chunks; ++i) {
-            MpiSamParseChunk *chunk = &batch->chunks[i];
-            stats->parse_fast_records += chunk->parse_fast_records;
-            stats->parse_fallback_records += chunk->parse_fallback_records;
-        }
+        for (size_t piece_start = 0; piece_start < pieces.size();) {
+            size_t piece_end = piece_start;
+            int wave_records = 0;
+            while (piece_end < pieces.size() && piece_end - piece_start < (size_t)NB) {
+                int next_count = pieces[piece_end].count;
+                if (wave_records > 0 &&
+                    wave_records + next_count > FUSED_SAM2BAM_BAM_POOL_SIZE) {
+                    break;
+                }
+                wave_records += next_count;
+                piece_end++;
+            }
+            if (piece_end == piece_start) {
+                fprintf(stderr, "ERROR: MPI sam2bam failed to form a non-empty subgroup.\n");
+                goto cleanup;
+            }
 
-        double pack_t0 = GetTime();
-        for (int i = 0; i < active_chunks; ++i) {
-            MpiSamParseChunk *chunk = &batch->chunks[i];
-            for (int j = 0; j < chunk->count; ++j) {
-                bam1_t *b = chunk->bams + j;
-                uint32_t bam_len = chunk->bam_lens[j];
-                stats->total_records++;
-                while (true) {
-                    int ret = MpiAppendRecordToPackWorkspace(&pack_workspace, b, bam_len);
-                    if (ret == 0) break;
-                    if (ret == -1) {
-                        fprintf(stderr, "ERROR: MPI sam2bam pack encountered an oversized BAM record.\n");
+            int offset = 0;
+            int wave_chunks = (int)(piece_end - piece_start);
+            for (int i = 0; i < NB; ++i) {
+                MpiSamParseChunk *chunk = &parse_batch->chunks[i];
+                chunk->status = 0;
+                chunk->parse_fast_records = 0;
+                chunk->parse_fallback_records = 0;
+                chunk->parse_total_cycles = 0;
+                chunk->parse_core_cycles = 0;
+                chunk->parse_aux_cycles = 0;
+                chunk->parse_cg_cycles = 0;
+                chunk->parse_fallback_cycles = 0;
+                chunk->bam_data_used = 0;
+                chunk->record_index = 0;
+                chunk->actual_value = 0;
+                chunk->limit_value = 0;
+                chunk->limit_id = BOUNDS_LIMIT_NONE;
+                if (i < wave_chunks) {
+                    const MpiSamChunkPiece &piece = pieces[piece_start + (size_t)i];
+                    chunk->text_buf = piece.text_buf;
+                    chunk->text_buf_capacity = piece.text_len;
+                    chunk->owns_text_buf = 0;
+                    chunk->text_len = piece.text_len;
+                    chunk->count = piece.count;
+                    chunk->estimated_bam_data = piece.estimated_bam_data;
+                    chunk->max_line_len = piece.max_line_len;
+                    chunk->bams = record_set.records + offset;
+                    size_t need = chunk->text_len + (size_t)chunk->count * 96u + 4096u;
+                    if (chunk->estimated_bam_data > need) need = chunk->estimated_bam_data + 4096u;
+                    if (ensure_chunk_bam_arena(i, chunk, need) != 0) {
+                        fprintf(stderr, "ERROR: MPI sam2bam failed to allocate BAM arena for parse slot %d.\n", i);
                         goto cleanup;
                     }
-                    if (ret == -2) {
-                        fprintf(stderr, "ERROR: MPI sam2bam pack workspace capacity exceeded.\n");
+                    offset += chunk->count;
+                } else {
+                    chunk->count = 0;
+                    chunk->text_len = 0;
+                    chunk->text_buf = nullptr;
+                    chunk->text_buf_capacity = 0;
+                    chunk->owns_text_buf = 0;
+                    chunk->bams = nullptr;
+                    chunk->bam_data = nullptr;
+                    chunk->bam_data_capacity = 0;
+                    chunk->estimated_bam_data = 0;
+                    chunk->max_line_len = 0;
+                }
+            }
+
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                double parse_t0 = GetTime();
+                __real_athread_spawn((void *)slave_mpi_sam_parse_chunk, parse_batch, 1);
+                athread_join();
+                double parse_wall = GetTime() - parse_t0;
+                stats->t_parse += parse_wall;
+                MpiAccumulateSamParseDetail(parse_batch, wave_chunks, parse_wall, stats);
+
+                bool need_retry = false;
+                for (int i = 0; i < wave_chunks; ++i) {
+                    MpiSamParseChunk *chunk = &parse_batch->chunks[i];
+                    if (chunk->status == -3 &&
+                        chunk->limit_id == BOUNDS_LIMIT_INIT_DATA_SIZE &&
+                        attempt == 0) {
+                        size_t grow_to = chunk->bam_data_capacity * 2u;
+                        size_t actual_need = (size_t)chunk->actual_value + 4096u;
+                        if (grow_to < actual_need) grow_to = actual_need;
+                        if (ensure_chunk_bam_arena(i, chunk, grow_to) != 0) {
+                            fprintf(stderr, "ERROR: MPI sam2bam failed to grow BAM arena for parse slot %d.\n", i);
+                            goto cleanup;
+                        }
+                        need_retry = true;
+                    } else if (chunk->status != 0) {
+                        fprintf(stderr, "ERROR: MPI sam2bam parse failed. chunk=%d status=%d limit=%lld actual=%lld.\n",
+                                i, chunk->status, chunk->limit_value, chunk->actual_value);
                         goto cleanup;
                     }
-                    if (MpiSealCurrentPackBlock(&pack_workspace) != 0) {
-                        fprintf(stderr, "ERROR: MPI sam2bam output block plan capacity exceeded.\n");
-                        goto cleanup;
-                    }
-                    if (pack_workspace.active_blocks == NB) {
-                        stats->t_pack += GetTime() - pack_t0;
-                        if (do_compress(NB) != 0) goto cleanup;
-                        pack_t0 = GetTime();
+                }
+                if (!need_retry) break;
+                for (int i = 0; i < wave_chunks; ++i) {
+                    parse_batch->chunks[i].count = pieces[piece_start + (size_t)i].count;
+                    parse_batch->chunks[i].text_len = pieces[piece_start + (size_t)i].text_len;
+                    parse_batch->chunks[i].bam_data_used = 0;
+                }
+            }
+
+            for (int i = 0; i < wave_chunks; ++i) {
+                MpiSamParseChunk *chunk = &parse_batch->chunks[i];
+                stats->parse_fast_records += chunk->parse_fast_records;
+                stats->parse_fallback_records += chunk->parse_fallback_records;
+            }
+
+            double pack_t0 = GetTime();
+            for (int i = 0; i < wave_chunks; ++i) {
+                MpiSamParseChunk *chunk = &parse_batch->chunks[i];
+                for (int j = 0; j < chunk->count; ++j) {
+                    bam1_t *b = chunk->bams + j;
+                    uint32_t bam_len = chunk->bam_lens[j];
+                    stats->total_records++;
+                    while (true) {
+                        int ret = MpiAppendRecordToPackWorkspace(&pack_workspace, b, bam_len);
+                        if (ret == 0) break;
+                        if (ret == -1) {
+                            fprintf(stderr, "ERROR: MPI sam2bam pack encountered an oversized BAM record.\n");
+                            goto cleanup;
+                        }
+                        if (ret == -2) {
+                            fprintf(stderr, "ERROR: MPI sam2bam pack workspace capacity exceeded.\n");
+                            goto cleanup;
+                        }
+                        if (MpiSealCurrentPackBlock(&pack_workspace) != 0) {
+                            fprintf(stderr, "ERROR: MPI sam2bam output block plan capacity exceeded.\n");
+                            goto cleanup;
+                        }
+                        if (pack_workspace.active_blocks == NB) {
+                            stats->t_pack += GetTime() - pack_t0;
+                            if (do_compress(NB) != 0) goto cleanup;
+                            pack_t0 = GetTime();
+                        }
                     }
                 }
             }
+            if (MpiSealCurrentPackBlock(&pack_workspace) != 0) {
+                fprintf(stderr, "ERROR: MPI sam2bam final output block plan capacity exceeded.\n");
+                goto cleanup;
+            }
+            stats->t_pack += GetTime() - pack_t0;
+            if (pack_workspace.active_blocks > 0 && do_compress(pack_workspace.active_blocks) != 0) goto cleanup;
+            piece_start = piece_end;
         }
-        if (MpiSealCurrentPackBlock(&pack_workspace) != 0) {
-            fprintf(stderr, "ERROR: MPI sam2bam final output block plan capacity exceeded.\n");
-            goto cleanup;
-        }
-        stats->t_pack += GetTime() - pack_t0;
-        if (pack_workspace.active_blocks > 0 && do_compress(pack_workspace.active_blocks) != 0) goto cleanup;
         stats->chunk_groups++;
     }
 
@@ -594,9 +839,14 @@ cleanup:
     {
         // double free_t0 = GetTime();
         MpiDestroySamParseBatch(batch);
+        for (int i = 0; i < NB; ++i) {
+            if (chunk_bam_arenas[i]) aligned_free_custom(chunk_bam_arenas[i]);
+        }
         if (batch) aligned_free_custom((unsigned char *)batch);
+        if (parse_batch) aligned_free_custom((unsigned char *)parse_batch);
         if (batch_text_storage) aligned_free_custom((unsigned char *)batch_text_storage);
         if (batch_bam_lens_storage) aligned_free_custom((unsigned char *)batch_bam_lens_storage);
+        if (batch_bam_offsets_storage) aligned_free_custom((unsigned char *)batch_bam_offsets_storage);
         MpiFreeSamToBamBlockSet(&comp_un_a);
         MpiFreeSamToBamBlockSet(&comp_un_b);
         MpiFreeSamToBamBlockSet(&out_a);

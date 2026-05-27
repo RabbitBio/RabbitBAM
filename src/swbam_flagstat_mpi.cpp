@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -16,7 +17,7 @@
 #include <mpi.h>
 
 extern "C" {
-    void slave_mpi_decompress_bam2bam_passthrough();
+    void slave_mpi_flagstat_count();
 }
 
 namespace {
@@ -73,14 +74,6 @@ struct MpiFlagstatBlockSet {
     bam_block *blocks;
     unsigned char *data;
     int n;
-};
-
-struct MpiFlagstatRecordSet {
-    bam1_t *records;
-    unsigned char *data;
-    bam1_t **ptrs;
-    uint32_t *bam_lens;
-    int capacity;
 };
 
 bool MpiFlagstatIsBamLikeFormat(int format) {
@@ -229,37 +222,6 @@ void MpiFlagstatFreeBlockSet(MpiFlagstatBlockSet *set) {
     set->n = 0;
 }
 
-int MpiFlagstatAllocateRecordSet(MpiFlagstatRecordSet *set, int total_records) {
-    set->capacity = total_records;
-    set->records = (bam1_t *)aligned_alloc_custom(64, (size_t)total_records * sizeof(bam1_t));
-    set->data = aligned_alloc_custom(64, (size_t)total_records * INIT_DATA_SIZE);
-    set->ptrs = (bam1_t **)aligned_alloc_custom(64, (size_t)total_records * sizeof(bam1_t *));
-    set->bam_lens = (uint32_t *)aligned_alloc_custom(64, (size_t)total_records * sizeof(uint32_t));
-    if (!set->records || !set->data || !set->ptrs || !set->bam_lens) return -1;
-    memset(set->records, 0, (size_t)total_records * sizeof(bam1_t));
-    memset(set->bam_lens, 0, (size_t)total_records * sizeof(uint32_t));
-    for (int i = 0; i < total_records; ++i) {
-        set->records[i].data = set->data + (size_t)i * INIT_DATA_SIZE;
-        set->records[i].m_data = INIT_DATA_SIZE;
-        set->records[i].l_data = 0;
-        set->records[i].mempolicy = BAM_USER_OWNS_DATA;
-        set->ptrs[i] = &set->records[i];
-    }
-    return 0;
-}
-
-void MpiFlagstatFreeRecordSet(MpiFlagstatRecordSet *set) {
-    if (set->records) aligned_free_custom((unsigned char *)set->records);
-    if (set->data) aligned_free_custom(set->data);
-    if (set->ptrs) aligned_free_custom((unsigned char *)set->ptrs);
-    if (set->bam_lens) aligned_free_custom((unsigned char *)set->bam_lens);
-    set->records = nullptr;
-    set->data = nullptr;
-    set->ptrs = nullptr;
-    set->bam_lens = nullptr;
-    set->capacity = 0;
-}
-
 int MpiFlagstatMemReadBlock(char *base, size_t size, size_t &pos, bam_block *block) {
     if (pos >= size) return -1;
     if (pos + BLOCK_HEADER_LENGTH > size) return -1;
@@ -288,13 +250,13 @@ BamFilterOptions MpiFlagstatNoFilter() {
     return filter;
 }
 
-void MpiFlagstatAccumulateDecompDetail(const Bam2BamPara *paras,
+void MpiFlagstatAccumulateDecompDetail(const MpiFlagstatCountPara *paras,
                                        int active_blocks,
                                        double decomp_wall,
                                        MpiFlagstatStats *stats) {
     if (!stats || active_blocks <= 0 || decomp_wall <= 0.0) return;
 
-    const Bam2BamPara *critical = nullptr;
+    const MpiFlagstatCountPara *critical = nullptr;
     uint64_t critical_total = 0;
     for (int b = 0; b < active_blocks; ++b) {
         if (paras[b].decomp_total_cycles >= critical_total) {
@@ -358,6 +320,14 @@ void MpiFlagstatAddRecord(const bam1_t *record, MpiFlagstatCounts *counts) {
         if (is_mapped && !mate_mapped) {
             counts->values[FLAGSTAT_SINGLETONS][bucket]++;
         }
+    }
+}
+
+void MpiFlagstatMergeSlice(const MpiFlagstatCountSlice &slice,
+                           MpiFlagstatCounts *counts) {
+    for (int i = 0; i < FLAGSTAT_COUNTER_COUNT; ++i) {
+        counts->values[i][0] += slice.values[i][0];
+        counts->values[i][1] += slice.values[i][1];
     }
 }
 
@@ -459,18 +429,25 @@ int FusedFlagstatMPI(MemReader &reader,
                      MpiFlagstatStats *stats) {
     double fused_t0 = GetTime();
     int ret = -1;
-    Bam2BamPara paras[kFlagstatNB];
-    MpiFlagstatBlockSet input_blocks = {};
-    MpiFlagstatBlockSet un_blocks = {};
-    MpiFlagstatRecordSet record_set = {};
-    BamFilterOptions no_filter = MpiFlagstatNoFilter();
-    int next_n_blocks = 0;
+    MpiFlagstatCountPara paras[kFlagstatNB];
+    MpiFlagstatBlockSet input_a = {};
+    MpiFlagstatBlockSet input_b = {};
+    MpiFlagstatBlockSet un_a = {};
+    MpiFlagstatBlockSet un_b = {};
+    MpiFlagstatCountSlice *count_slices = nullptr;
+    unsigned char *scratch_data = nullptr;
+    const size_t scratch_stride = MPI_BAM_BLOCK_ARENA_SIZE;
+    MpiFlagstatBlockSet *cur_input = nullptr;
+    MpiFlagstatBlockSet *next_input = nullptr;
+    MpiFlagstatBlockSet *cur_un = nullptr;
+    MpiFlagstatBlockSet *next_un = nullptr;
+    int n_blocks = 0;
 
-    auto do_read_group = [&](int *n_blocks) -> int {
+    auto do_read_group = [&](MpiFlagstatBlockSet *input_blocks, int *n_blocks) -> int {
         double read_t0 = GetTime();
         int count = 0;
         for (int b = 0; b < kFlagstatNB; ++b) {
-            bam_block *blk = &input_blocks.blocks[b];
+            bam_block *blk = &input_blocks->blocks[b];
             int read_ret = MpiFlagstatMemReadBlock(reader.base, reader.size, reader.pos, blk);
             if (read_ret < 0 || blk->length == 28) break;
             blk->block_id = b;
@@ -485,40 +462,48 @@ int FusedFlagstatMPI(MemReader &reader,
     if (counts) memset(counts, 0, sizeof(*counts));
     if (stats) memset(stats, 0, sizeof(*stats));
 
-    if (MpiFlagstatAllocateBlockSet(&input_blocks, kFlagstatNB) != 0 ||
-        MpiFlagstatAllocateBlockSet(&un_blocks, kFlagstatNB) != 0 ||
-        MpiFlagstatAllocateRecordSet(&record_set,
-                                     kFlagstatNB * (int)MAX_RECORDS_PER_BLOCK) != 0) {
+    count_slices = (MpiFlagstatCountSlice *)aligned_alloc_custom(
+        64, (size_t)kFlagstatNB * sizeof(MpiFlagstatCountSlice));
+    scratch_data = aligned_alloc_custom(64, (size_t)kFlagstatNB * scratch_stride);
+    if (MpiFlagstatAllocateBlockSet(&input_a, kFlagstatNB) != 0 ||
+        MpiFlagstatAllocateBlockSet(&input_b, kFlagstatNB) != 0 ||
+        MpiFlagstatAllocateBlockSet(&un_a, kFlagstatNB) != 0 ||
+        MpiFlagstatAllocateBlockSet(&un_b, kFlagstatNB) != 0 ||
+        !count_slices || !scratch_data) {
         fprintf(stderr, "ERROR: failed to allocate MPI flagstat workspace.\n");
         goto cleanup;
     }
 
-    if (do_read_group(&next_n_blocks) != 0) goto cleanup;
-    while (next_n_blocks > 0) {
-        int n_blocks = next_n_blocks;
-        next_n_blocks = 0;
+    cur_input = &input_a;
+    next_input = &input_b;
+    cur_un = &un_a;
+    next_un = &un_b;
+    if (do_read_group(cur_input, &n_blocks) != 0) goto cleanup;
+    while (n_blocks > 0) {
+        memset(count_slices, 0, (size_t)kFlagstatNB * sizeof(MpiFlagstatCountSlice));
         if (stats) {
             stats->input_blocks += n_blocks;
             stats->group_count++;
         }
 
         for (int b = 0; b < kFlagstatNB; ++b) {
-            paras[b].filter = no_filter;
             paras[b].block_id = b;
-            paras[b].output_records = record_set.ptrs + (size_t)b * MAX_RECORDS_PER_BLOCK;
-            paras[b].record_base = record_set.records + (size_t)b * MAX_RECORDS_PER_BLOCK;
-            paras[b].bam_lens = record_set.bam_lens + (size_t)b * MAX_RECORDS_PER_BLOCK;
+            paras[b].scratch_data = scratch_data + (size_t)b * scratch_stride;
+            paras[b].scratch_capacity = scratch_stride;
+            paras[b].counts = &count_slices[b];
             paras[b].n_total_records = 0;
-            paras[b].n_kept_records = 0;
-            paras[b].kept_total_len = 0;
+            paras[b].record_index = 0;
+            paras[b].actual_value = 0;
+            paras[b].limit_value = 0;
+            paras[b].limit_id = BOUNDS_LIMIT_NONE;
             paras[b].decomp_alloc_cycles = 0;
             paras[b].decomp_inflate_cycles = 0;
             paras[b].decomp_crc_cycles = 0;
             paras[b].decomp_parse_cycles = 0;
             paras[b].decomp_total_cycles = 0;
             if (b < n_blocks) {
-                paras[b].input_block = &input_blocks.blocks[b];
-                paras[b].un_comp_block = &un_blocks.blocks[b];
+                paras[b].input_block = &cur_input->blocks[b];
+                paras[b].un_comp_block = &cur_un->blocks[b];
                 paras[b].status = 0;
             } else {
                 paras[b].input_block = nullptr;
@@ -528,9 +513,16 @@ int FusedFlagstatMPI(MemReader &reader,
         }
 
         double decomp_t0 = GetTime();
-        __real_athread_spawn((void *)slave_mpi_decompress_bam2bam_passthrough, paras, 1);
+        __real_athread_spawn((void *)slave_mpi_flagstat_count, paras, 1);
+        int next_n_blocks = 0;
+        #ifdef ENABLE_MASKING
+        if (do_read_group(next_input, &next_n_blocks) != 0) goto cleanup;
+        #endif
         athread_join();
         double decomp_wall = GetTime() - decomp_t0;
+        #ifndef ENABLE_MASKING
+        if (do_read_group(next_input, &next_n_blocks) != 0) goto cleanup;
+        #endif
         if (stats) {
             stats->t_decomp += decomp_wall;
             MpiFlagstatAccumulateDecompDetail(paras, n_blocks, decomp_wall, stats);
@@ -538,8 +530,15 @@ int FusedFlagstatMPI(MemReader &reader,
 
         for (int b = 0; b < n_blocks; ++b) {
             if (paras[b].status != 0) {
-                fprintf(stderr, "ERROR: MPI flagstat decompress failed on input block %d with status %d.\n",
-                        b, paras[b].status);
+                if (paras[b].status == -3) {
+                    fprintf(stderr,
+                            "ERROR: MPI flagstat capacity exceeded on input block %d. limit_id=%d limit=%lld actual=%lld record=%d.\n",
+                            b, paras[b].limit_id, paras[b].limit_value,
+                            paras[b].actual_value, paras[b].record_index);
+                } else {
+                    fprintf(stderr, "ERROR: MPI flagstat count failed on input block %d with status %d.\n",
+                            b, paras[b].status);
+                }
                 goto cleanup;
             }
         }
@@ -547,22 +546,25 @@ int FusedFlagstatMPI(MemReader &reader,
         double count_t0 = GetTime();
         for (int b = 0; b < n_blocks; ++b) {
             if (stats) stats->total_records += paras[b].n_total_records;
-            for (int r = 0; r < paras[b].n_total_records; ++r) {
-                MpiFlagstatAddRecord(paras[b].output_records[r], counts);
-            }
+            MpiFlagstatMergeSlice(count_slices[b], counts);
         }
         if (stats) stats->t_count += GetTime() - count_t0;
 
-        if (do_read_group(&next_n_blocks) != 0) goto cleanup;
+        std::swap(cur_input, next_input);
+        std::swap(cur_un, next_un);
+        n_blocks = next_n_blocks;
     }
 
     ret = 0;
 
 cleanup:
     if (stats) stats->t_fused_total = GetTime() - fused_t0;
-    MpiFlagstatFreeRecordSet(&record_set);
-    MpiFlagstatFreeBlockSet(&input_blocks);
-    MpiFlagstatFreeBlockSet(&un_blocks);
+    if (count_slices) aligned_free_custom((unsigned char *)count_slices);
+    if (scratch_data) aligned_free_custom(scratch_data);
+    MpiFlagstatFreeBlockSet(&input_a);
+    MpiFlagstatFreeBlockSet(&input_b);
+    MpiFlagstatFreeBlockSet(&un_a);
+    MpiFlagstatFreeBlockSet(&un_b);
     return ret;
 }
 
@@ -762,7 +764,7 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
                    global_stats.input_blocks,
                    global_stats.group_count,
                    global_stats.total_records);
-            printf("  read_sum=%.3f  decomp_sum=%.3f  count_sum=%.3f  fused_total_sum=%.3f\n",
+            printf("  read_sum=%.3f  decomp_sum=%.3f  merge_sum=%.3f  fused_total_sum=%.3f\n",
                    global_stats.t_read,
                    global_stats.t_decomp,
                    global_stats.t_count,

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -17,7 +18,7 @@
 #include <mpi.h>
 
 extern "C" {
-    void slave_mpi_decompress_bam2bam_passthrough();
+    void slave_mpi_stats_basic_count();
 }
 
 namespace {
@@ -132,14 +133,6 @@ struct MpiStatsBlockSet {
     bam_block *blocks;
     unsigned char *data;
     int n;
-};
-
-struct MpiStatsRecordSet {
-    bam1_t *records;
-    unsigned char *data;
-    bam1_t **ptrs;
-    uint32_t *bam_lens;
-    int capacity;
 };
 
 bool MpiStatsIsBamLikeFormat(int format) {
@@ -288,37 +281,6 @@ void MpiStatsFreeBlockSet(MpiStatsBlockSet *set) {
     set->n = 0;
 }
 
-int MpiStatsAllocateRecordSet(MpiStatsRecordSet *set, int total_records) {
-    set->capacity = total_records;
-    set->records = (bam1_t *)aligned_alloc_custom(64, (size_t)total_records * sizeof(bam1_t));
-    set->data = aligned_alloc_custom(64, (size_t)total_records * INIT_DATA_SIZE);
-    set->ptrs = (bam1_t **)aligned_alloc_custom(64, (size_t)total_records * sizeof(bam1_t *));
-    set->bam_lens = (uint32_t *)aligned_alloc_custom(64, (size_t)total_records * sizeof(uint32_t));
-    if (!set->records || !set->data || !set->ptrs || !set->bam_lens) return -1;
-    memset(set->records, 0, (size_t)total_records * sizeof(bam1_t));
-    memset(set->bam_lens, 0, (size_t)total_records * sizeof(uint32_t));
-    for (int i = 0; i < total_records; ++i) {
-        set->records[i].data = set->data + (size_t)i * INIT_DATA_SIZE;
-        set->records[i].m_data = INIT_DATA_SIZE;
-        set->records[i].l_data = 0;
-        set->records[i].mempolicy = BAM_USER_OWNS_DATA;
-        set->ptrs[i] = &set->records[i];
-    }
-    return 0;
-}
-
-void MpiStatsFreeRecordSet(MpiStatsRecordSet *set) {
-    if (set->records) aligned_free_custom((unsigned char *)set->records);
-    if (set->data) aligned_free_custom(set->data);
-    if (set->ptrs) aligned_free_custom((unsigned char *)set->ptrs);
-    if (set->bam_lens) aligned_free_custom((unsigned char *)set->bam_lens);
-    set->records = nullptr;
-    set->data = nullptr;
-    set->ptrs = nullptr;
-    set->bam_lens = nullptr;
-    set->capacity = 0;
-}
-
 int MpiStatsMemReadBlock(char *base, size_t size, size_t &pos, bam_block *block) {
     if (pos >= size) return -1;
     if (pos + BLOCK_HEADER_LENGTH > size) return -1;
@@ -347,13 +309,13 @@ BamFilterOptions MpiStatsNoFilter() {
     return filter;
 }
 
-void MpiStatsAccumulateDecompDetail(const Bam2BamPara *paras,
+void MpiStatsAccumulateDecompDetail(const MpiStatsBasicCountPara *paras,
                                     int active_blocks,
                                     double decomp_wall,
                                     MpiStatsPerf *stats) {
     if (!stats || active_blocks <= 0 || decomp_wall <= 0.0) return;
 
-    const Bam2BamPara *critical = nullptr;
+    const MpiStatsBasicCountPara *critical = nullptr;
     uint64_t critical_total = 0;
     for (int b = 0; b < active_blocks; ++b) {
         if (paras[b].decomp_total_cycles >= critical_total) {
@@ -619,6 +581,47 @@ void MpiStatsAddRecord(bam1_t *record,
     MpiStatsUpdateSort(record, sort_state);
 }
 
+void MpiStatsMergeSlice(const MpiStatsBasicCountSlice &slice,
+                        MpiBasicStatsCounts *counts) {
+    for (int i = 0; i < STATS_LONG_COUNT; ++i) {
+        if (i == STATS_MAX_LEN || i == STATS_MAX_LEN_1ST || i == STATS_MAX_LEN_2ND) {
+            if (slice.values[i] > counts->values[i]) counts->values[i] = slice.values[i];
+            continue;
+        }
+        counts->values[i] += slice.values[i];
+    }
+    for (int i = 0; i < kStatsInsertBins; ++i) {
+        counts->isize_inward[i] += slice.isize_inward[i];
+        counts->isize_outward[i] += slice.isize_outward[i];
+        counts->isize_other[i] += slice.isize_other[i];
+    }
+    for (int i = 0; i < ORIENT_DIAG_COUNT; ++i) {
+        counts->orient_diag[i] += slice.orient_diag[i];
+    }
+}
+
+void MpiStatsMergeBlockSort(const MpiStatsBlockSortState &block_sort,
+                            MpiStatsSortState *rank_sort) {
+    if (!block_sort.has_coord) return;
+    if (!rank_sort->has_coord) {
+        rank_sort->has_coord = 1;
+        rank_sort->first_tid = block_sort.first_tid;
+        rank_sort->first_pos = block_sort.first_pos;
+        rank_sort->last_tid = block_sort.last_tid;
+        rank_sort->last_pos = block_sort.last_pos;
+        if (!block_sort.sorted) rank_sort->sorted = 0;
+        return;
+    }
+    if (block_sort.first_tid < rank_sort->last_tid ||
+        (block_sort.first_tid == rank_sort->last_tid &&
+         block_sort.first_pos < rank_sort->last_pos)) {
+        rank_sort->sorted = 0;
+    }
+    if (!block_sort.sorted) rank_sort->sorted = 0;
+    rank_sort->last_tid = block_sort.last_tid;
+    rank_sort->last_pos = block_sort.last_pos;
+}
+
 void MpiStatsReducePerf(const MpiStatsPerf &local_stats, MpiStatsPerf *global_stats) {
     long long local_long[3] = {
         local_stats.input_blocks,
@@ -882,18 +885,25 @@ int FusedStatsMPI(MemReader &reader,
                   int collect_diag) {
     double fused_t0 = GetTime();
     int ret = -1;
-    Bam2BamPara paras[kStatsNB];
-    MpiStatsBlockSet input_blocks = {};
-    MpiStatsBlockSet un_blocks = {};
-    MpiStatsRecordSet record_set = {};
-    BamFilterOptions no_filter = MpiStatsNoFilter();
-    int next_n_blocks = 0;
+    MpiStatsBasicCountPara paras[kStatsNB];
+    MpiStatsBlockSet input_a = {};
+    MpiStatsBlockSet input_b = {};
+    MpiStatsBlockSet un_a = {};
+    MpiStatsBlockSet un_b = {};
+    MpiStatsBasicCountSlice *count_slices = nullptr;
+    unsigned char *scratch_data = nullptr;
+    const size_t scratch_stride = MPI_BAM_BLOCK_ARENA_SIZE;
+    MpiStatsBlockSet *cur_input = nullptr;
+    MpiStatsBlockSet *next_input = nullptr;
+    MpiStatsBlockSet *cur_un = nullptr;
+    MpiStatsBlockSet *next_un = nullptr;
+    int n_blocks = 0;
 
-    auto do_read_group = [&](int *n_blocks) -> int {
+    auto do_read_group = [&](MpiStatsBlockSet *input_blocks, int *n_blocks) -> int {
         double read_t0 = GetTime();
         int count = 0;
         for (int b = 0; b < kStatsNB; ++b) {
-            bam_block *blk = &input_blocks.blocks[b];
+            bam_block *blk = &input_blocks->blocks[b];
             int read_ret = MpiStatsMemReadBlock(reader.base, reader.size, reader.pos, blk);
             if (read_ret < 0 || blk->length == 28) break;
             blk->block_id = b;
@@ -914,39 +924,53 @@ int FusedStatsMPI(MemReader &reader,
         sort_state->last_tid = -1;
     }
 
-    if (MpiStatsAllocateBlockSet(&input_blocks, kStatsNB) != 0 ||
-        MpiStatsAllocateBlockSet(&un_blocks, kStatsNB) != 0 ||
-        MpiStatsAllocateRecordSet(&record_set, kStatsNB * (int)MAX_RECORDS_PER_BLOCK) != 0) {
+    count_slices = (MpiStatsBasicCountSlice *)aligned_alloc_custom(
+        64, (size_t)kStatsNB * sizeof(MpiStatsBasicCountSlice));
+    scratch_data = aligned_alloc_custom(64, (size_t)kStatsNB * scratch_stride);
+    if (MpiStatsAllocateBlockSet(&input_a, kStatsNB) != 0 ||
+        MpiStatsAllocateBlockSet(&input_b, kStatsNB) != 0 ||
+        MpiStatsAllocateBlockSet(&un_a, kStatsNB) != 0 ||
+        MpiStatsAllocateBlockSet(&un_b, kStatsNB) != 0 ||
+        !count_slices || !scratch_data) {
         fprintf(stderr, "ERROR: failed to allocate MPI stats workspace.\n");
         goto cleanup;
     }
+    memset(count_slices, 0, (size_t)kStatsNB * sizeof(MpiStatsBasicCountSlice));
 
-    if (do_read_group(&next_n_blocks) != 0) goto cleanup;
-    while (next_n_blocks > 0) {
-        int n_blocks = next_n_blocks;
-        next_n_blocks = 0;
+    cur_input = &input_a;
+    next_input = &input_b;
+    cur_un = &un_a;
+    next_un = &un_b;
+    if (do_read_group(cur_input, &n_blocks) != 0) goto cleanup;
+    while (n_blocks > 0) {
         if (perf) {
             perf->input_blocks += n_blocks;
             perf->group_count++;
         }
 
         for (int b = 0; b < kStatsNB; ++b) {
-            paras[b].filter = no_filter;
             paras[b].block_id = b;
-            paras[b].output_records = record_set.ptrs + (size_t)b * MAX_RECORDS_PER_BLOCK;
-            paras[b].record_base = record_set.records + (size_t)b * MAX_RECORDS_PER_BLOCK;
-            paras[b].bam_lens = record_set.bam_lens + (size_t)b * MAX_RECORDS_PER_BLOCK;
+            paras[b].scratch_data = scratch_data + (size_t)b * scratch_stride;
+            paras[b].scratch_capacity = scratch_stride;
+            paras[b].counts = &count_slices[b];
+            paras[b].collect_diag = collect_diag;
             paras[b].n_total_records = 0;
-            paras[b].n_kept_records = 0;
-            paras[b].kept_total_len = 0;
+            paras[b].record_index = 0;
+            paras[b].actual_value = 0;
+            paras[b].limit_value = 0;
+            paras[b].limit_id = BOUNDS_LIMIT_NONE;
+            memset(&paras[b].sort_state, 0, sizeof(paras[b].sort_state));
+            paras[b].sort_state.sorted = 1;
+            paras[b].sort_state.first_tid = -1;
+            paras[b].sort_state.last_tid = -1;
             paras[b].decomp_alloc_cycles = 0;
             paras[b].decomp_inflate_cycles = 0;
             paras[b].decomp_crc_cycles = 0;
             paras[b].decomp_parse_cycles = 0;
             paras[b].decomp_total_cycles = 0;
             if (b < n_blocks) {
-                paras[b].input_block = &input_blocks.blocks[b];
-                paras[b].un_comp_block = &un_blocks.blocks[b];
+                paras[b].input_block = &cur_input->blocks[b];
+                paras[b].un_comp_block = &cur_un->blocks[b];
                 paras[b].status = 0;
             } else {
                 paras[b].input_block = nullptr;
@@ -956,9 +980,16 @@ int FusedStatsMPI(MemReader &reader,
         }
 
         double decomp_t0 = GetTime();
-        __real_athread_spawn((void *)slave_mpi_decompress_bam2bam_passthrough, paras, 1);
+        __real_athread_spawn((void *)slave_mpi_stats_basic_count, paras, 1);
+        int next_n_blocks = 0;
+        #ifdef ENABLE_MASKING
+        if (do_read_group(next_input, &next_n_blocks) != 0) goto cleanup;
+        #endif
         athread_join();
         double decomp_wall = GetTime() - decomp_t0;
+        #ifndef ENABLE_MASKING
+        if (do_read_group(next_input, &next_n_blocks) != 0) goto cleanup;
+        #endif
         if (perf) {
             perf->t_decomp += decomp_wall;
             MpiStatsAccumulateDecompDetail(paras, n_blocks, decomp_wall, perf);
@@ -966,8 +997,15 @@ int FusedStatsMPI(MemReader &reader,
 
         for (int b = 0; b < n_blocks; ++b) {
             if (paras[b].status != 0) {
-                fprintf(stderr, "ERROR: MPI stats decompress failed on input block %d with status %d.\n",
-                        b, paras[b].status);
+                if (paras[b].status == -3) {
+                    fprintf(stderr,
+                            "ERROR: MPI stats capacity exceeded on input block %d. limit_id=%d limit=%lld actual=%lld record=%d.\n",
+                            b, paras[b].limit_id, paras[b].limit_value,
+                            paras[b].actual_value, paras[b].record_index);
+                } else {
+                    fprintf(stderr, "ERROR: MPI stats count failed on input block %d with status %d.\n",
+                            b, paras[b].status);
+                }
                 goto cleanup;
             }
         }
@@ -975,22 +1013,33 @@ int FusedStatsMPI(MemReader &reader,
         double count_t0 = GetTime();
         for (int b = 0; b < n_blocks; ++b) {
             if (perf) perf->total_records += paras[b].n_total_records;
-            for (int r = 0; r < paras[b].n_total_records; ++r) {
-                MpiStatsAddRecord(paras[b].output_records[r], counts, sort_state, collect_diag);
-            }
+            if (sort_state) MpiStatsMergeBlockSort(paras[b].sort_state, sort_state);
         }
         if (perf) perf->t_count += GetTime() - count_t0;
 
-        if (do_read_group(&next_n_blocks) != 0) goto cleanup;
+        std::swap(cur_input, next_input);
+        std::swap(cur_un, next_un);
+        n_blocks = next_n_blocks;
+    }
+
+    if (counts) {
+        double count_t0 = GetTime();
+        for (int b = 0; b < kStatsNB; ++b) {
+            MpiStatsMergeSlice(count_slices[b], counts);
+        }
+        if (perf) perf->t_count += GetTime() - count_t0;
     }
 
     ret = 0;
 
 cleanup:
     if (perf) perf->t_fused_total = GetTime() - fused_t0;
-    MpiStatsFreeRecordSet(&record_set);
-    MpiStatsFreeBlockSet(&input_blocks);
-    MpiStatsFreeBlockSet(&un_blocks);
+    if (count_slices) aligned_free_custom((unsigned char *)count_slices);
+    if (scratch_data) aligned_free_custom(scratch_data);
+    MpiStatsFreeBlockSet(&input_a);
+    MpiStatsFreeBlockSet(&input_b);
+    MpiStatsFreeBlockSet(&un_a);
+    MpiStatsFreeBlockSet(&un_b);
     return ret;
 }
 
@@ -1232,7 +1281,7 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
                    global_perf.input_blocks,
                    global_perf.group_count,
                    global_perf.total_records);
-            printf("  read_sum=%.3f  decomp_sum=%.3f  count_sum=%.3f  fused_total_sum=%.3f\n",
+            printf("  read_sum=%.3f  decomp_sum=%.3f  merge_sum=%.3f  fused_total_sum=%.3f\n",
                    global_perf.t_read,
                    global_perf.t_decomp,
                    global_perf.t_count,

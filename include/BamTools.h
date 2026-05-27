@@ -25,14 +25,16 @@
 #define BLOCK_FOOTER_LENGTH 8
 
 
-const size_t MAX_RECORDS_PER_BLOCK = 1024;   //每块最大bam1_t数量，暂定1024块
+const size_t MAX_RECORDS_PER_BLOCK = 1024;   // legacy fast path per-BGZF block record capacity
+const size_t MPI_RECORDS_PER_BLOCK = 2048;   // MPI runtime per-BGZF block record capacity
 #define MAX_SAM_LINE_SIZE 8192   // 8 KB     //一条sam文本的最大长度
 #define BATCH_PER_CORE 1024
 #define BATCH_SIZE (64 * BATCH_PER_CORE)     //一个批次的大小
 const size_t MAX_SAM_FORMAT_CORE_BUFFER_SIZE = MAX_SAM_LINE_SIZE * ((BATCH_SIZE / 64) + 1); //每一个核要承担的sam格式化输出缓冲区大小，预留一些空间以防万一
 
-const size_t INIT_DATA_SIZE = 1024;           //bam1_t 的data最大长度 暂定1KB
-const int FUSED_SAM2BAM_BAM_POOL_SIZE = 720999; 
+const size_t INIT_DATA_SIZE = 1024;           // short-read fast-path estimate; MPI uses arenas
+const int FUSED_SAM2BAM_BAM_POOL_SIZE = 720999;  // SAM2BAM subgroup record capacity
+const size_t MPI_BAM_BLOCK_ARENA_SIZE = BGZF_MAX_BLOCK_SIZE * 2;
 
 
 const int CGS_NUM_CGS = 6;
@@ -51,10 +53,14 @@ const size_t CGS_SAM_FORMAT_CORE_BUFFER_SIZE =
 #define CHUNK_BUFFER_SIZE (5 * 1024 * 1024)      
 #define MAX_BAMS_PER_CHUNK 12110              // 4MB最多包含的记录数
 
+typedef struct bam_block bam_block;
+
 typedef struct {
     const sam_hdr_t *hdr;
     bam1_t *bams[BATCH_SIZE];
     kstring_t core_out_lines[64];  
+    int status[64];
+    size_t required_capacity[64];
     int count;   
 } SamFormatBatch;
 
@@ -69,6 +75,154 @@ enum BoundsLimitId {
     BOUNDS_LIMIT_BGZF_RECORD_SIZE,
     BOUNDS_LIMIT_MAX_SAM_FORMAT_CORE_BUFFER_SIZE,
     BOUNDS_LIMIT_GENERIC_RUNTIME_ERROR
+};
+
+enum MpiFlagstatCounterIdShared {
+    RB_FLAGSTAT_TOTAL = 0,
+    RB_FLAGSTAT_PRIMARY,
+    RB_FLAGSTAT_SECONDARY,
+    RB_FLAGSTAT_SUPPLEMENTARY,
+    RB_FLAGSTAT_DUPLICATES,
+    RB_FLAGSTAT_PRIMARY_DUPLICATES,
+    RB_FLAGSTAT_MAPPED,
+    RB_FLAGSTAT_PRIMARY_MAPPED,
+    RB_FLAGSTAT_PAIRED,
+    RB_FLAGSTAT_READ1,
+    RB_FLAGSTAT_READ2,
+    RB_FLAGSTAT_PROPERLY_PAIRED,
+    RB_FLAGSTAT_PAIR_MAPPED,
+    RB_FLAGSTAT_SINGLETONS,
+    RB_FLAGSTAT_DIFF_CHR,
+    RB_FLAGSTAT_DIFF_CHR_MAPQ5,
+    RB_FLAGSTAT_COUNTER_COUNT
+};
+
+struct MpiFlagstatCountSlice {
+    long long values[RB_FLAGSTAT_COUNTER_COUNT][2];
+};
+
+struct MpiFlagstatCountPara {
+    int block_id;
+    bam_block *input_block;
+    bam_block *un_comp_block;
+    unsigned char *scratch_data;
+    size_t scratch_capacity;
+    MpiFlagstatCountSlice *counts;
+    int n_total_records;
+    int status;
+    int record_index;
+    long long actual_value;
+    long long limit_value;
+    int limit_id;
+    uint64_t decomp_alloc_cycles;
+    uint64_t decomp_inflate_cycles;
+    uint64_t decomp_crc_cycles;
+    uint64_t decomp_parse_cycles;
+    uint64_t decomp_total_cycles;
+};
+
+const int RB_MPI_STATS_MAX_INSERT_SIZE = 8000;
+const int RB_MPI_STATS_INSERT_BINS = RB_MPI_STATS_MAX_INSERT_SIZE + 1;
+
+enum MpiStatsLongIdShared {
+    RB_STATS_NREADS_1ST = 0,
+    RB_STATS_NREADS_2ND,
+    RB_STATS_NREADS_OTHER,
+    RB_STATS_NREADS_FILTERED,
+    RB_STATS_NREADS_DUP,
+    RB_STATS_NREADS_UNMAPPED,
+    RB_STATS_NREADS_SINGLE_MAPPED,
+    RB_STATS_NREADS_PAIRED_AND_MAPPED,
+    RB_STATS_NREADS_PROPERLY_PAIRED,
+    RB_STATS_NREADS_PAIRED_TECH,
+    RB_STATS_NREADS_ANOMALOUS,
+    RB_STATS_NREADS_MQ0,
+    RB_STATS_NREADS_QCFAILED,
+    RB_STATS_NREADS_SECONDARY,
+    RB_STATS_NREADS_SUPPLEMENTARY,
+    RB_STATS_TOTAL_LEN,
+    RB_STATS_TOTAL_LEN_1ST,
+    RB_STATS_TOTAL_LEN_2ND,
+    RB_STATS_TOTAL_LEN_DUP,
+    RB_STATS_NBASES_MAPPED,
+    RB_STATS_NBASES_MAPPED_CIGAR,
+    RB_STATS_NBASES_TRIMMED,
+    RB_STATS_NMISMATCHES,
+    RB_STATS_MAX_LEN,
+    RB_STATS_MAX_LEN_1ST,
+    RB_STATS_MAX_LEN_2ND,
+    RB_STATS_SUM_QUAL,
+    RB_STATS_LONG_COUNT
+};
+
+enum MpiStatsOrientDiagIdShared {
+    RB_ORIENT_DIAG_REF_IN = 0,
+    RB_ORIENT_DIAG_REF_OUT,
+    RB_ORIENT_DIAG_REF_OTHER,
+    RB_ORIENT_DIAG_DOC_IN,
+    RB_ORIENT_DIAG_DOC_OUT,
+    RB_ORIENT_DIAG_DOC_OTHER,
+    RB_ORIENT_DIAG_REF_IN_LT_READ,
+    RB_ORIENT_DIAG_REF_IN_LT_2READ,
+    RB_ORIENT_DIAG_REF_IN_GE_2READ,
+    RB_ORIENT_DIAG_REF_OUT_LT_READ,
+    RB_ORIENT_DIAG_REF_OUT_LT_2READ,
+    RB_ORIENT_DIAG_REF_OUT_GE_2READ,
+    RB_ORIENT_DIAG_POS_NEG_STRAND_NEG,
+    RB_ORIENT_DIAG_POS_NEG_STRAND_POS,
+    RB_ORIENT_DIAG_POS_ZERO_STRAND_NEG,
+    RB_ORIENT_DIAG_POS_ZERO_STRAND_POS,
+    RB_ORIENT_DIAG_POS_POS_STRAND_NEG,
+    RB_ORIENT_DIAG_POS_POS_STRAND_POS,
+    RB_ORIENT_DIAG_READ1_LEFT,
+    RB_ORIENT_DIAG_READ1_RIGHT,
+    RB_ORIENT_DIAG_READ1_SAME_POS,
+    RB_ORIENT_DIAG_READ2_LEFT,
+    RB_ORIENT_DIAG_READ2_RIGHT,
+    RB_ORIENT_DIAG_READ2_SAME_POS,
+    RB_ORIENT_DIAG_ISIZE_NEG,
+    RB_ORIENT_DIAG_ISIZE_ZERO,
+    RB_ORIENT_DIAG_ISIZE_POS,
+    RB_ORIENT_DIAG_COUNT
+};
+
+struct MpiStatsBasicCountSlice {
+    long long values[RB_STATS_LONG_COUNT];
+    long long isize_inward[RB_MPI_STATS_INSERT_BINS];
+    long long isize_outward[RB_MPI_STATS_INSERT_BINS];
+    long long isize_other[RB_MPI_STATS_INSERT_BINS];
+    long long orient_diag[RB_ORIENT_DIAG_COUNT];
+};
+
+struct MpiStatsBlockSortState {
+    long long has_coord;
+    long long sorted;
+    long long first_tid;
+    long long first_pos;
+    long long last_tid;
+    long long last_pos;
+};
+
+struct MpiStatsBasicCountPara {
+    int block_id;
+    bam_block *input_block;
+    bam_block *un_comp_block;
+    unsigned char *scratch_data;
+    size_t scratch_capacity;
+    MpiStatsBasicCountSlice *counts;
+    MpiStatsBlockSortState sort_state;
+    int collect_diag;
+    int n_total_records;
+    int status;
+    int record_index;
+    long long actual_value;
+    long long limit_value;
+    int limit_id;
+    uint64_t decomp_alloc_cycles;
+    uint64_t decomp_inflate_cycles;
+    uint64_t decomp_crc_cycles;
+    uint64_t decomp_parse_cycles;
+    uint64_t decomp_total_cycles;
 };
 
 struct BoundsCheckError {
@@ -103,11 +257,23 @@ struct MpiSamParseChunk {
     const char *src_ptr;
     size_t src_len;
     char *text_buf;
+    size_t text_buf_capacity;
+    int owns_text_buf;
     size_t text_len;
     bam1_t *bams;
     unsigned char *bam_data;
+    size_t bam_data_capacity;
+    size_t bam_data_used;
+    uint32_t *bam_offsets;
     uint32_t *bam_lens;
     int count;
+    int status;
+    int record_index;
+    long long actual_value;
+    long long limit_value;
+    int limit_id;
+    size_t max_line_len;
+    size_t estimated_bam_data;
     int parse_fast_records;
     int parse_fallback_records;
     uint64_t parse_total_cycles;
@@ -142,9 +308,6 @@ struct MemWriter {
     size_t capacity;
 };
 
-typedef struct bam_block bam_block;
-
-
 struct Para {
     int block_id;       
 
@@ -174,11 +337,19 @@ struct Bam2BamPara {
     bam1_t **output_records;
     bam1_t *record_base;
     uint32_t *bam_lens;
+    int record_capacity;
+    unsigned char *data_arena;
+    size_t data_arena_capacity;
+    size_t data_arena_used;
     BamFilterOptions filter;
     int n_total_records;
     int n_kept_records;
     uint32_t kept_total_len;
     int status;
+    int record_index;
+    long long actual_value;
+    long long limit_value;
+    int limit_id;
     uint64_t decomp_alloc_cycles;
     uint64_t decomp_inflate_cycles;
     uint64_t decomp_crc_cycles;
