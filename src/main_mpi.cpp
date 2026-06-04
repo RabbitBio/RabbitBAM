@@ -58,6 +58,13 @@ int main(int argc, char **argv) {
     stats->add_flag("--basic", stats_basic, "Only output samtools stats SN summary numbers")->default_val(false);
     stats->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
 
+    CLI::App *sort = app.add_subcommand("sort", "Run MPI BAM coordinate sort");
+    sort->add_option("-i,--inFile", cmd_info.in_file_name_, "input bam name")->required()->check(CLI::ExistingFile);
+    sort->add_option("-o,--outFile", cmd_info.out_file_name_, "output bam name")->required();
+    sort->add_option("-m,--memory", cmd_info.sort_memory_, "Sort memory limit per MPI rank, e.g. 4G or 4096M");
+    sort->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
+    sort->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
+
     CLI11_PARSE(app, argc, argv);
 
     int exit_code = 1;
@@ -65,6 +72,7 @@ int main(int argc, char **argv) {
     bool is_run_all = false;
     bool is_flagstat = false;
     bool is_stats = false;
+    bool is_sort = false;
     if (app.get_subcommands().empty()) {
         if (my_rank == 0) fprintf(stderr, "ERROR: You should input one command.\n");
         goto cleanup;
@@ -77,15 +85,16 @@ int main(int argc, char **argv) {
     is_run_all = selected_command->get_name() == "run_all";
     is_flagstat = selected_command->get_name() == "flagstat";
     is_stats = selected_command->get_name() == "stats";
-    if (!is_run_all && !is_flagstat && !is_stats) {
-        if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI only supports run_all, flagstat, and stats.\n");
+    is_sort = selected_command->get_name() == "sort";
+    if (!is_run_all && !is_flagstat && !is_stats && !is_sort) {
+        if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI only supports run_all, flagstat, stats, and sort.\n");
         goto cleanup;
     }
     if (is_stats && !stats_basic) {
         if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI stats v1 requires --basic.\n");
         goto cleanup;
     }
-    if (is_run_all &&
+    if ((is_run_all || is_sort) &&
         cmd_info.compress_level_ != 0 &&
         cmd_info.compress_level_ != 1 &&
         cmd_info.compress_level_ != 6) {
@@ -96,11 +105,13 @@ int main(int argc, char **argv) {
     }
 
     t1 = GetTime();
-    exit_code = is_stats ? ProcessStatsMPI(&cmd_info)
-                          : (is_flagstat ? ProcessFlagstatMPI(&cmd_info) : ProcessSwBamMPI(&cmd_info));
+    exit_code = is_sort ? ProcessSortMPI(&cmd_info)
+                         : (is_stats ? ProcessStatsMPI(&cmd_info)
+                                     : (is_flagstat ? ProcessFlagstatMPI(&cmd_info) : ProcessSwBamMPI(&cmd_info)));
     if (my_rank == 0) {
         printf("%s rank0 time is %lf--\n",
-               is_stats ? "ProcessStatsMPI" : (is_flagstat ? "ProcessFlagstatMPI" : "ProcessSwBamMPI"),
+               is_sort ? "ProcessSortMPI" :
+               (is_stats ? "ProcessStatsMPI" : (is_flagstat ? "ProcessFlagstatMPI" : "ProcessSwBamMPI")),
                GetTime() - t1);
     }
 

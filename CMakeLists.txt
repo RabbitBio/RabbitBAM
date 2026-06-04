@@ -96,6 +96,8 @@ list(REMOVE_ITEM MPI_SRC_FILES ${CGS_ONLY_SRC})
 list(APPEND MPI_SRC_FILES
     "${CMAKE_SOURCE_DIR}/src/swbam_flagstat_mpi.cpp"
     "${CMAKE_SOURCE_DIR}/src/swbam_stats_mpi.cpp"
+    "${CMAKE_SOURCE_DIR}/src/swbam_sort_mpi.cpp"
+    "${CMAKE_SOURCE_DIR}/src/swbam_sort_fused_mpi.cpp"
 )
 list(REMOVE_DUPLICATES MPI_SRC_FILES)
 
@@ -110,6 +112,8 @@ if(PLATFORM_SUNWAY)
     list(REMOVE_ITEM SLAVE_C_FILES "${CMAKE_SOURCE_DIR}/slave/slave_crc32_bench.c")
     set(SINGLE_SLAVE_FILES ${SLAVE_FILES})
     list(REMOVE_ITEM SINGLE_SLAVE_FILES ${CGS_SLAVE_FILES})
+    list(APPEND SINGLE_SLAVE_FILES "${CMAKE_SOURCE_DIR}/slave/slave_sort_mpi.cpp")
+    list(REMOVE_DUPLICATES SINGLE_SLAVE_FILES)
     # Include slave_zlib source files (compile with -mslave)
     # Only files in slave_zlib directory, not subdirectories
     file(GLOB SLAVE_ZLIB_FILES "slave/slave_zlib/*.c")

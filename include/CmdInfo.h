@@ -24,7 +24,8 @@ public:
     int min_read_len_;
     int max_read_len_;
     int compress_level_;
-         
+    std::string sort_memory_;
+
 };
 
 #endif //CMDINFO_H

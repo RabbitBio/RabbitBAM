@@ -97,10 +97,38 @@ struct MpiSamToBamStats {
     double t_free_workspace;
 };
 
+struct MpiSortStats {
+    long long input_blocks;
+    long long local_records;
+    long long received_records;
+    long long sample_records;
+    long long bgzf_blocks;
+    double t_extract;
+    double t_extract_alloc;
+    double t_extract_inflate;
+    double t_extract_crc;
+    double t_extract_parse;
+    double t_extract_other;
+    double t_local_sort;
+    double t_sample;
+    double t_partition;
+    double t_exchange;
+    double t_final_sort;
+    double t_compress;
+    double t_compress_pack;
+    double t_compress_alloc;
+    double t_compress_deflate;
+    double t_compress_footer;
+    double t_compress_other;
+    double t_write;
+    double t_fused_total;
+};
+
 int ProcessSwBamMPI(CmdInfo *cmd_info);
 int ProcessBamToBamMPI(CmdInfo *cmd_info);
 int ProcessFlagstatMPI(CmdInfo *cmd_info);
 int ProcessStatsMPI(CmdInfo *cmd_info);
+int ProcessSortMPI(CmdInfo *cmd_info);
 
 int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      const BamFilterOptions &filter,
@@ -113,6 +141,13 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      sam_hdr_t *hdr,
                      int compress_level,
                      MpiSamToBamStats *stats);
+int FusedBamSortMPI(MemReader &reader, MemWriter &mem_writer,
+                    long long global_block_begin,
+                    int rank,
+                    int comm_size,
+                    int compress_level,
+                    size_t memory_limit,
+                    MpiSortStats *stats);
 
 int MpiWriteBlockToMem(MemWriter &w, bam_block *block);
 int MpiWriteBytesToMem(MemWriter &w, const char *data, size_t len);

@@ -225,6 +225,55 @@ struct MpiStatsBasicCountPara {
     uint64_t decomp_total_cycles;
 };
 
+struct MpiSortRecordMetaShared {
+    int32_t tid;
+    int32_t pos;
+    uint16_t flag;
+    uint16_t pad;
+    uint32_t raw_len;
+    uint32_t pad2;
+    uint64_t raw_offset;
+    uint64_t global_order;
+};
+
+struct MpiSortExtractPara {
+    int block_id;
+    bam_block *input_block;
+    bam_block *un_comp_block;
+    unsigned char *raw_arena;
+    size_t raw_capacity;
+    size_t raw_used;
+    MpiSortRecordMetaShared *records;
+    int record_capacity;
+    int n_records;
+    long long global_block_index;
+    int status;
+    int record_index;
+    long long actual_value;
+    long long limit_value;
+    int limit_id;
+    uint64_t decomp_alloc_cycles;
+    uint64_t decomp_inflate_cycles;
+    uint64_t decomp_crc_cycles;
+    uint64_t decomp_parse_cycles;
+    uint64_t decomp_total_cycles;
+};
+
+struct MpiSortRawCompressPara {
+    int block_id;
+    bam_block *un_comp_block;
+    int un_comp_size;
+    bam_block *output_block;
+    int output_size;
+    int status;
+    int compress_level;
+    uint64_t compress_pack_cycles;
+    uint64_t compress_alloc_cycles;
+    uint64_t compress_deflate_cycles;
+    uint64_t compress_footer_cycles;
+    uint64_t compress_total_cycles;
+};
+
 struct BoundsCheckError {
     const char *pipeline;
     const char *stage;

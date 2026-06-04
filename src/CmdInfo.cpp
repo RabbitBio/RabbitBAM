@@ -14,4 +14,5 @@ CmdInfo::CmdInfo() {
     min_read_len_ = -1;
     max_read_len_ = -1;
     compress_level_ = 1;
+    sort_memory_ = "";
 }

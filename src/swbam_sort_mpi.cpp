@@ -1,0 +1,912 @@
+#include "swbam_mpi.h"
+
+#include <algorithm>
+#include <cctype>
+#include <climits>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdint.h>
+#include <string>
+#include <sys/types.h>
+#include <vector>
+
+#include <libdeflate.h>
+#include <mpi.h>
+
+namespace {
+
+const int kSortExchangeChunk = 64 * 1024 * 1024;
+
+const unsigned char kSortBgzfEofBlock[28] = {
+    0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
+    0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00
+};
+
+uint16_t MpiSortReadLe16(const unsigned char *p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+uint32_t MpiSortReadLe32(const unsigned char *p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+void MpiSortPackLe16(unsigned char *p, uint16_t value) {
+    p[0] = (unsigned char)(value & 0xff);
+    p[1] = (unsigned char)((value >> 8) & 0xff);
+}
+
+void MpiSortPackLe32(unsigned char *p, uint32_t value) {
+    p[0] = (unsigned char)(value & 0xff);
+    p[1] = (unsigned char)((value >> 8) & 0xff);
+    p[2] = (unsigned char)((value >> 16) & 0xff);
+    p[3] = (unsigned char)((value >> 24) & 0xff);
+}
+
+void MpiSortVectorPutLe32(std::vector<unsigned char> *out, uint32_t value) {
+    unsigned char buf[4];
+    MpiSortPackLe32(buf, value);
+    out->insert(out->end(), buf, buf + 4);
+}
+
+bool MpiSortIsBamLikeFormat(int format) {
+    return format == bam || format == binary_format;
+}
+
+int MpiSortNormalizeFormat(int format) {
+    return MpiSortIsBamLikeFormat(format) ? bam : format;
+}
+
+int MpiSortAllRanksOk(int local_ok) {
+    int global_ok = 0;
+    MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+    return global_ok;
+}
+
+double MpiSortReduceMaxCost(double local_cost) {
+    double max_cost = 0.0;
+    MPI_Reduce(&local_cost, &max_cost, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    return max_cost;
+}
+
+int MpiSortLoadFileToMemory(const std::string &path, char **data, size_t *size) {
+    *data = nullptr;
+    *size = 0;
+    FILE *fp = fopen(path.c_str(), "rb");
+    if (!fp) return -1;
+    if (fseeko(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return -1;
+    }
+    off_t end = ftello(fp);
+    if (end < 0 || fseeko(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return -1;
+    }
+    if ((unsigned long long)end > (unsigned long long)SIZE_MAX) {
+        fclose(fp);
+        return -1;
+    }
+    *size = (size_t)end;
+    *data = *size ? (char *)malloc(*size) : nullptr;
+    if (*size > 0 && !*data) {
+        fclose(fp);
+        return -1;
+    }
+    if (*size > 0 && fread(*data, 1, *size, fp) != *size) {
+        fclose(fp);
+        free(*data);
+        *data = nullptr;
+        *size = 0;
+        return -1;
+    }
+    fclose(fp);
+    return 0;
+}
+
+int MpiSortDumpMemoryToFile(const std::string &path, const char *data, size_t size) {
+    FILE *fp = fopen(path.c_str(), "wb");
+    if (!fp) return -1;
+    size_t written = 0;
+    while (written < size) {
+        size_t n = fwrite(data + written, 1, size - written, fp);
+        if (n == 0) {
+            fclose(fp);
+            return -1;
+        }
+        written += n;
+    }
+    return fclose(fp) == 0 ? 0 : -1;
+}
+
+int MpiSortSendBytes(int dst, int tag, const char *data, long long len) {
+    long long sent = 0;
+    while (sent < len) {
+        int chunk = (int)std::min<long long>(len - sent, INT_MAX);
+        if (MPI_Send((void *)(data + sent), chunk, MPI_BYTE, dst, tag, MPI_COMM_WORLD) != MPI_SUCCESS) {
+            return -1;
+        }
+        sent += chunk;
+    }
+    return 0;
+}
+
+int MpiSortRecvBytes(int src, int tag, char *data, long long len) {
+    long long received = 0;
+    while (received < len) {
+        int chunk = (int)std::min<long long>(len - received, INT_MAX);
+        MPI_Status status;
+        if (MPI_Recv(data + received, chunk, MPI_BYTE, src, tag, MPI_COMM_WORLD, &status) != MPI_SUCCESS) {
+            return -1;
+        }
+        received += chunk;
+    }
+    return 0;
+}
+
+int MpiSortInitMemWriter(MemWriter &w, size_t cap) {
+    if (cap == 0) cap = 64 * 1024 * 1024;
+    w.data = (char *)malloc(cap);
+    w.capacity = w.data ? cap : 0;
+    w.size = 0;
+    return w.data ? 0 : -1;
+}
+
+int MpiSortSendRecvBytes(int send_to, const char *send_data, long long send_len,
+                         int recv_from, char *recv_data, long long recv_len,
+                         int tag) {
+    long long sent = 0;
+    long long received = 0;
+    char dummy = 0;
+    while (sent < send_len || received < recv_len) {
+        int send_chunk = 0;
+        int recv_chunk = 0;
+        if (sent < send_len) {
+            send_chunk = (int)std::min<long long>(send_len - sent, kSortExchangeChunk);
+        }
+        if (received < recv_len) {
+            recv_chunk = (int)std::min<long long>(recv_len - received, kSortExchangeChunk);
+        }
+        MPI_Status status;
+        const char *send_ptr = send_chunk > 0 ? send_data + sent : &dummy;
+        char *recv_ptr = recv_chunk > 0 ? recv_data + received : &dummy;
+        if (MPI_Sendrecv((void *)send_ptr, send_chunk, MPI_BYTE, send_to, tag,
+                         recv_ptr, recv_chunk, MPI_BYTE, recv_from, tag,
+                         MPI_COMM_WORLD, &status) != MPI_SUCCESS) {
+            return -1;
+        }
+        sent += send_chunk;
+        received += recv_chunk;
+    }
+    return 0;
+}
+
+int MpiSortScanBgzfBlocksInMemory(const char *base, size_t size, long long body_start,
+                                  std::vector<long long> *offsets,
+                                  std::vector<long long> *lengths) {
+    if (!base || body_start < 0 || (unsigned long long)body_start > (unsigned long long)size) return -1;
+    long long pos = body_start;
+    while ((unsigned long long)pos < (unsigned long long)size) {
+        if ((unsigned long long)pos + BLOCK_HEADER_LENGTH > (unsigned long long)size) return -1;
+        const unsigned char *header = (const unsigned char *)(base + pos);
+        int block_len = (int)MpiSortReadLe16(header + 16) + 1;
+        if (block_len <= 0 || (unsigned long long)pos + (unsigned long long)block_len > (unsigned long long)size) {
+            return -1;
+        }
+        bool is_eof = block_len == (int)sizeof(kSortBgzfEofBlock) &&
+                      memcmp(base + pos, kSortBgzfEofBlock, sizeof(kSortBgzfEofBlock)) == 0;
+        if (is_eof) break;
+        offsets->push_back(pos);
+        lengths->push_back(block_len);
+        pos += block_len;
+    }
+    return 0;
+}
+
+int MpiSortSelectBlockRangeFromMemory(char *base, size_t input_size,
+                                      const std::vector<long long> &offsets,
+                                      const std::vector<long long> &lengths,
+                                      long long begin,
+                                      long long end,
+                                      char **data,
+                                      size_t *size) {
+    *data = nullptr;
+    *size = 0;
+    if (begin >= end) return 0;
+    long long start = offsets[(size_t)begin];
+    long long stop = offsets[(size_t)(end - 1)] + lengths[(size_t)(end - 1)];
+    if (start < 0 || stop < start || (unsigned long long)stop > (unsigned long long)input_size) return -1;
+    *data = base + start;
+    *size = (size_t)(stop - start);
+    return 0;
+}
+
+int MpiSortAppendBgzfPayloadToMem(MemWriter &w,
+                                  const unsigned char *src,
+                                  size_t src_len,
+                                  int compress_level,
+                                  struct libdeflate_compressor *compressor) {
+    if (src_len == 0) return 0;
+    if (src_len > BGZF_BLOCK_SIZE) return -1;
+    if (compress_level != 0 && compress_level != 1 && compress_level != 6) return -1;
+    if (compress_level != 0 && !compressor) return -1;
+
+    unsigned char out[BGZF_MAX_BLOCK_SIZE];
+    size_t block_len = 0;
+    if (compress_level == 0) {
+        if (src_len + 5 + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH > BGZF_MAX_BLOCK_SIZE) return -1;
+        out[BLOCK_HEADER_LENGTH] = 1;
+        MpiSortPackLe16(out + BLOCK_HEADER_LENGTH + 1, (uint16_t)src_len);
+        MpiSortPackLe16(out + BLOCK_HEADER_LENGTH + 3, (uint16_t)~(uint16_t)src_len);
+        memcpy(out + BLOCK_HEADER_LENGTH + 5, src, src_len);
+        block_len = src_len + 5 + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
+    } else {
+        size_t clen = libdeflate_deflate_compress(
+            compressor, src, src_len,
+            out + BLOCK_HEADER_LENGTH,
+            BGZF_MAX_BLOCK_SIZE - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH);
+        if (clen == 0) return -1;
+        block_len = clen + BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH;
+    }
+    if (block_len > BGZF_MAX_BLOCK_SIZE) return -1;
+
+    memcpy(out, g_magic, BLOCK_HEADER_LENGTH);
+    MpiSortPackLe16(out + 16, (uint16_t)(block_len - 1));
+    uint32_t crc = libdeflate_crc32(0, src, src_len);
+    MpiSortPackLe32(out + block_len - 8, crc);
+    MpiSortPackLe32(out + block_len - 4, (uint32_t)src_len);
+    return MpiWriteBytesToMem(w, (const char *)out, block_len);
+}
+
+int MpiSortBuildBamHeaderMemory(sam_hdr_t *hdr, int compress_level, char **data, size_t *size) {
+    *data = nullptr;
+    *size = 0;
+    if (!hdr) return -1;
+
+    const char *text = sam_hdr_str(hdr);
+    size_t text_len = sam_hdr_length(hdr);
+    if (text_len > 0 && !text) return -1;
+    if ((unsigned long long)text_len > (unsigned long long)UINT32_MAX) return -1;
+    if (hdr->n_targets < 0) return -1;
+
+    std::vector<unsigned char> raw;
+    raw.reserve(12 + text_len + (size_t)hdr->n_targets * 32);
+    const unsigned char magic[4] = {'B', 'A', 'M', 1};
+    raw.insert(raw.end(), magic, magic + 4);
+    MpiSortVectorPutLe32(&raw, (uint32_t)text_len);
+    if (text_len > 0) raw.insert(raw.end(), text, text + text_len);
+    MpiSortVectorPutLe32(&raw, (uint32_t)hdr->n_targets);
+    for (int32_t i = 0; i < hdr->n_targets; ++i) {
+        if (!hdr->target_name || !hdr->target_name[i] || !hdr->target_len) return -1;
+        size_t name_len = strlen(hdr->target_name[i]) + 1;
+        if ((unsigned long long)name_len > (unsigned long long)UINT32_MAX) return -1;
+        MpiSortVectorPutLe32(&raw, (uint32_t)name_len);
+        raw.insert(raw.end(), hdr->target_name[i], hdr->target_name[i] + name_len);
+        MpiSortVectorPutLe32(&raw, hdr->target_len[i]);
+    }
+
+    MemWriter header_writer = {};
+    if (MpiSortInitMemWriter(header_writer, raw.size() + 64 * 1024) != 0) return -1;
+    struct libdeflate_compressor *compressor =
+        compress_level == 0 ? nullptr : libdeflate_alloc_compressor(compress_level);
+    if (compress_level != 0 && !compressor) {
+        free(header_writer.data);
+        return -1;
+    }
+    size_t pos = 0;
+    while (pos < raw.size()) {
+        size_t n = std::min((size_t)BGZF_BLOCK_SIZE, raw.size() - pos);
+        if (MpiSortAppendBgzfPayloadToMem(header_writer, raw.data() + pos, n,
+                                          compress_level, compressor) != 0) {
+            if (compressor) libdeflate_free_compressor(compressor);
+            free(header_writer.data);
+            return -1;
+        }
+        pos += n;
+    }
+    if (compressor) libdeflate_free_compressor(compressor);
+    *data = header_writer.data;
+    *size = header_writer.size;
+    return 0;
+}
+
+int MpiSortParseMemoryLimit(const std::string &text, size_t *bytes) {
+    *bytes = 0;
+    if (text.empty()) return 0;
+    const char *s = text.c_str();
+    char *end = nullptr;
+    unsigned long long value = strtoull(s, &end, 10);
+    if (end == s) return -1;
+    while (*end && isspace((unsigned char)*end)) end++;
+    unsigned long long mult = 1;
+    if (*end) {
+        char c = (char)tolower((unsigned char)*end);
+        if (c == 'k') mult = 1024ull;
+        else if (c == 'm') mult = 1024ull * 1024ull;
+        else if (c == 'g') mult = 1024ull * 1024ull * 1024ull;
+        else if (c == 't') mult = 1024ull * 1024ull * 1024ull * 1024ull;
+        else return -1;
+        end++;
+        if (*end == 'b' || *end == 'B') end++;
+        while (*end && isspace((unsigned char)*end)) end++;
+        if (*end) return -1;
+    }
+    if (value != 0 && mult > ULLONG_MAX / value) return -1;
+    unsigned long long result = value * mult;
+    if (result > (unsigned long long)SIZE_MAX) return -1;
+    *bytes = (size_t)result;
+    return 0;
+}
+
+int MpiSortCheckMemoryLimit(size_t limit, size_t estimate, int rank, const char *stage) {
+    if (limit == 0 || estimate <= limit) return 0;
+    fprintf(stderr,
+            "[rank %d] ERROR: MPI sort v1 requires enough memory; external merge is not implemented. "
+            "stage=%s estimate=%zu limit=%zu\n",
+            rank, stage, estimate, limit);
+    return -1;
+}
+
+int MpiSortUpdateHeaderCoordinate(sam_hdr_t *hdr) {
+    if (!hdr) return -1;
+    if (sam_hdr_update_hd(hdr, "SO", "coordinate") < 0) {
+        if (sam_hdr_add_line(hdr, "HD", "VN", "1.6", "SO", "coordinate", NULL) < 0) {
+            return -1;
+        }
+    }
+    (void)sam_hdr_remove_tag_hd(hdr, "GO");
+    (void)sam_hdr_remove_tag_hd(hdr, "SS");
+    return 0;
+}
+
+void MpiSortPrintRankStats(int rank, int comm_size,
+                           const MpiSortStats &stats,
+                           size_t body_size) {
+    char local_lines[4096] = {};
+    snprintf(local_lines, sizeof(local_lines),
+             "[rank %d] blocks=%lld local_records=%lld received_records=%lld samples=%lld bgzf=%lld body=%zu\n"
+             "[rank %d] extract=%.3f local_sort=%.3f sample=%.3f partition=%.3f exchange=%.3f final_sort=%.3f compress=%.3f write=%.3f\n"
+             "[rank %d] extract_detail alloc=%.3f inflate=%.3f crc=%.3f parse=%.3f other=%.3f\n"
+             "[rank %d] compress_detail pack=%.3f alloc=%.3f deflate=%.3f footer=%.3f other=%.3f\n"
+             "[rank %d] fused_total=%.6f core_stage=%.6f\n",
+             rank, stats.input_blocks, stats.local_records, stats.received_records,
+             stats.sample_records, stats.bgzf_blocks, body_size,
+             rank, stats.t_extract, stats.t_local_sort, stats.t_sample,
+             stats.t_partition, stats.t_exchange, stats.t_final_sort,
+             stats.t_compress, stats.t_write,
+             rank, stats.t_extract_alloc, stats.t_extract_inflate, stats.t_extract_crc,
+             stats.t_extract_parse, stats.t_extract_other,
+             rank, stats.t_compress_pack, stats.t_compress_alloc, stats.t_compress_deflate,
+             stats.t_compress_footer, stats.t_compress_other,
+             rank, stats.t_fused_total,
+             stats.t_extract + stats.t_local_sort + stats.t_partition +
+             stats.t_exchange + stats.t_final_sort + stats.t_compress);
+
+    const int kLineBytes = 4096;
+    std::vector<char> gathered;
+    if (rank == 0) gathered.resize((size_t)comm_size * kLineBytes);
+    MPI_Gather(local_lines, kLineBytes, MPI_CHAR,
+               rank == 0 ? gathered.data() : nullptr, kLineBytes, MPI_CHAR,
+               0, MPI_COMM_WORLD);
+    if (rank == 0) {
+        for (int r = 0; r < comm_size; ++r) {
+            fputs(gathered.data() + (size_t)r * kLineBytes, stdout);
+        }
+        fflush(stdout);
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+}
+
+} // namespace
+
+int ProcessSortMPI(CmdInfo *cmd_info) {
+
+    //1.相关数据的初始化
+    double t_init = GetTime();
+
+    int rank = 0;
+    int comm_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
+
+    int exit_code = 1;
+    int local_ok = 1;
+    samFile *sin = nullptr;
+    sam_hdr_t *hdr = nullptr;
+    hFILE *input_mem_hfile = nullptr;
+    char *input_file_mem = nullptr;
+    size_t input_file_size = 0;
+    char *rank_input_mem = nullptr;
+    char *bam_header_mem = nullptr;
+    size_t bam_header_size = 0;
+    char *simulated_write_mem = nullptr;
+    char *output_file_mem = nullptr;
+    size_t output_file_size = 0;
+    size_t output_body_start = 0;
+    size_t simulated_write_size = 0;
+    MemReader reader = {};
+    MemWriter mem_writer = {};
+    MpiSortStats stats = {};
+    std::vector<long long> block_offsets;
+    std::vector<long long> block_lengths;
+    std::vector<long long> body_sizes;
+    std::vector<long long> body_prefixes;
+    long long body_start = 0;
+    long long n_blocks = 0;
+    long long local_block_begin = 0;
+    long long local_block_end = 0;
+    long long local_body_size = 0;
+    long long local_prefix = 0;
+    long long total_body_size = 0;
+    size_t memory_limit = 0;
+    volatile unsigned long long simulated_write_guard = 0;
+
+    if (MpiSortParseMemoryLimit(cmd_info->sort_memory_, &memory_limit) != 0) {
+        if (rank == 0) fprintf(stderr, "ERROR: invalid sort memory limit '%s'.\n", cmd_info->sort_memory_.c_str());
+        local_ok = 0;
+    }
+    if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+
+    {
+        double init_cost = GetTime() - t_init;
+        double init_cost_max = MpiSortReduceMaxCost(init_cost);
+        if (rank == 0) printf("111Complete the initialization cost %lf-----\n", init_cost_max);
+    }
+
+
+    //2.把文件加载到所有rank的内存中，一共6份，每个rank一份，后续每个rank从内存中读取自己的部分进行处理，
+    //不计入处理时间
+    {
+        double preload_t0 = GetTime();
+        if (MpiSortLoadFileToMemory(cmd_info->in_file_name_, &input_file_mem, &input_file_size) != 0) {
+            fprintf(stderr, "[rank %d] ERROR: cannot preload input %s into memory\n",
+                    rank, cmd_info->in_file_name_.c_str());
+            local_ok = 0;
+        }
+        double preload_cost = GetTime() - preload_t0;
+        double preload_cost_max = MpiSortReduceMaxCost(preload_cost);
+        if (rank == 0 && local_ok) printf("222Complete the memory cost %lf--\n", preload_cost_max);
+    }
+    if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+
+
+    //3.从内存创建 HTSlib 输入句柄并读取 BAM header，顺便判断输入输出格式是否合法，
+    //记录BAM/SAM body的起始位置
+    {
+        double header_t0 = GetTime();
+        input_mem_hfile = hopen("mem:", "rb:", input_file_mem, input_file_size);
+        if (!input_mem_hfile) {
+            fprintf(stderr, "[rank %d] ERROR: cannot open preloaded BAM memory for %s\n",
+                    rank, cmd_info->in_file_name_.c_str());
+            local_ok = 0;
+        }
+        if (local_ok) {
+            sin = (samFile *)hts_hopen(input_mem_hfile, "data", "rb");
+            if (!sin) {
+                fprintf(stderr, "[rank %d] ERROR: cannot create HTS input handle from memory\n", rank);
+                if (hclose(input_mem_hfile) != 0) {
+                    fprintf(stderr, "[rank %d] ERROR: closing failed HTS memory handle failed.\n", rank);
+                }
+                input_mem_hfile = nullptr;
+                input_file_mem = nullptr;
+                input_file_size = 0;
+                local_ok = 0;
+            } else {
+                input_mem_hfile = nullptr;
+            }
+        }
+        if (local_ok) {
+            hdr = sam_hdr_read(sin);
+            if (!hdr) {
+                fprintf(stderr, "[rank %d] ERROR: cannot read header from %s\n",
+                        rank, cmd_info->in_file_name_.c_str());
+                local_ok = 0;
+            }
+        }
+        if (local_ok) {
+            //sort v1 目前只支持 BAM 输入，不支持 SAM/CRAM
+            int input_format = MpiSortNormalizeFormat(sin->format.format);
+            if (input_format != bam) {
+                if (rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI sort v1 only supports BAM input.\n");
+                local_ok = 0;
+            }
+        }
+        if (local_ok) {
+            body_start = (long long)sin->fp.bgzf->block_address;
+            if (body_start < 0 || (unsigned long long)body_start > (unsigned long long)input_file_size) {
+                fprintf(stderr, "[rank %d] ERROR: invalid BAM body start offset %lld.\n", rank, body_start);
+                local_ok = 0;
+            }
+        }
+        double header_cost = GetTime() - header_t0;
+        double header_cost_max = MpiSortReduceMaxCost(header_cost);
+        if (rank == 0 && local_ok) printf("333Complete the head cost %lf---\n", header_cost_max);
+    }
+    if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+
+
+    //4.核心处理阶段
+    {
+        double body_total_t0 = GetTime();
+        double body_t0 = GetTime();
+
+        //4.1 rank 0 扫描 BGZF blocks
+        double stage41_t0 = GetTime();
+        if (rank == 0) {
+            printf("Enable MPI BAM SORT mode (%d MPE + %d CPEs)!!!\n",
+                   comm_size, comm_size * 64);
+            printf("MPI BAM output compression level=%d\n", cmd_info->compress_level_);
+            if (MpiSortScanBgzfBlocksInMemory(input_file_mem, input_file_size, body_start,
+                                              &block_offsets, &block_lengths) != 0) {
+                fprintf(stderr, "ERROR: failed to scan input BGZF blocks.\n");
+                local_ok = 0;
+            }
+            n_blocks = (long long)block_offsets.size();
+            if (local_ok && n_blocks > (long long)INT_MAX) {
+                fprintf(stderr, "ERROR: too many BGZF blocks for MPI_Bcast in RabbitBAM-MPI sort v1.\n");
+                local_ok = 0;
+            }
+            if (local_ok) {
+                printf("MPI BAM scan complete. data_blocks=%lld body_start=%lld header_end=%lld\n",
+                       n_blocks, body_start, (long long)sin->fp.bgzf->block_address);
+            }
+        }
+
+        //把 block 信息广播给所有 rank
+        MPI_Bcast(&local_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (!local_ok) goto cleanup;
+        MPI_Bcast(&body_start, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&n_blocks, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+        if (rank != 0) {
+            block_offsets.resize((size_t)n_blocks);
+            block_lengths.resize((size_t)n_blocks);
+        }
+        if (n_blocks > 0) {
+            MPI_Bcast(block_offsets.data(), (int)n_blocks, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+            MPI_Bcast(block_lengths.data(), (int)n_blocks, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+        }
+
+        //按 rank 切分 block 范围，每个 rank 直接使用预加载输入内存中的连续窗口
+        local_block_begin = n_blocks * rank / comm_size;
+        local_block_end = n_blocks * (rank + 1) / comm_size;
+        size_t rank_input_size = 0;
+        if (MpiSortSelectBlockRangeFromMemory(input_file_mem, input_file_size,
+                                              block_offsets, block_lengths,
+                                              local_block_begin, local_block_end,
+                                              &rank_input_mem, &rank_input_size) != 0) {
+            fprintf(stderr, "[rank %d] ERROR: failed to select assigned BGZF block range [%lld, %lld).\n",
+                    rank, local_block_begin, local_block_end);
+            local_ok = 0;
+        }
+        double stage41_cost = GetTime() - stage41_t0;
+        double stage41_cost_max = MpiSortReduceMaxCost(stage41_cost);
+        if (rank == 0 && local_ok) {
+            printf("Complete the 4.1 scan/split/broadcast/select cost %lf\n", stage41_cost_max);
+        }
+        if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+
+        //4.2 初始化每个rank的局部内存 reader 和 writer
+        double stage42_t0 = GetTime();
+        reader.base = rank_input_mem;
+        reader.size = rank_input_size;
+        reader.pos = 0;
+        {
+            size_t writer_capacity = rank_input_size ? rank_input_size : 64 * 1024 * 1024;
+            if (MpiSortInitMemWriter(mem_writer, writer_capacity) != 0) {
+                fprintf(stderr, "[rank %d] ERROR: failed to allocate MPI sort memory writer.\n", rank);
+                local_ok = 0;
+            }
+        }
+        int stage42_ok = MpiSortAllRanksOk(local_ok);
+        double stage42_cost = GetTime() - stage42_t0;
+        double stage42_cost_max = MpiSortReduceMaxCost(stage42_cost);
+        if (rank == 0 && stage42_ok) {
+            printf("Complete the 4.2 init reader/writer cost %lf\n", stage42_cost_max);
+        }
+        if (!stage42_ok) goto cleanup;
+
+        //4.3 核心处理：FusedBamSortMPI
+        double fused_t0 = GetTime();
+        if (FusedBamSortMPI(reader, mem_writer, local_block_begin, rank, comm_size,
+                            cmd_info->compress_level_, memory_limit, &stats) != 0) {
+            fprintf(stderr, "[rank %d] ERROR: MPI BAM sort fused body failed.\n", rank);
+            local_ok = 0;
+        }
+        int global_ok = MpiSortAllRanksOk(local_ok);
+        double fused_cost = GetTime() - fused_t0;
+        double fused_cost_max = MpiSortReduceMaxCost(fused_cost);
+        if (rank == 0 && global_ok) {
+            printf("Complete the 4.3 FusedBamSortMPI cost %lf\n", fused_cost_max);
+        }
+        if (!global_ok) goto cleanup;
+
+        //4.4 收集每个 rank 的输出大小
+        double stage44_t0 = GetTime();
+        local_body_size = (long long)mem_writer.size;
+        body_sizes.assign((size_t)comm_size, 0);
+        body_prefixes.assign((size_t)comm_size, 0);
+        MPI_Allgather(&local_body_size, 1, MPI_LONG_LONG,
+                      body_sizes.data(), 1, MPI_LONG_LONG, MPI_COMM_WORLD);
+        local_prefix = 0;
+        total_body_size = 0;
+        for (int i = 0; i < comm_size; ++i) {
+            body_prefixes[(size_t)i] = total_body_size;
+            if (i < rank) local_prefix += body_sizes[(size_t)i];
+            total_body_size += body_sizes[(size_t)i];
+        }
+        double stage44_cost = GetTime() - stage44_t0;
+        double stage44_cost_max = MpiSortReduceMaxCost(stage44_cost);
+        if (rank == 0) printf("Complete the 4.4 gather body sizes cost %lf\n", stage44_cost_max);
+
+        //4.5a 处理输出 header 和整体布局，这部分计入处理时间
+        double stage45_header_t0 = GetTime();
+        long long output_body_start_ll = 0;
+        long long output_file_size_ll = 0;
+        if (rank == 0) {
+            if (MpiSortUpdateHeaderCoordinate(hdr) != 0) {
+                fprintf(stderr, "ERROR: failed to update BAM header SO:coordinate for sort output.\n");
+                local_ok = 0;
+            }
+            if (local_ok &&
+                MpiSortBuildBamHeaderMemory(hdr, cmd_info->compress_level_,
+                                            &bam_header_mem, &bam_header_size) != 0) {
+                fprintf(stderr, "ERROR: failed to build MPI SORT output BAM header in memory.\n");
+                local_ok = 0;
+            }
+            if (local_ok) {
+                unsigned long long final_size = (unsigned long long)bam_header_size +
+                                               (unsigned long long)total_body_size +
+                                               (unsigned long long)sizeof(kSortBgzfEofBlock);
+                if (final_size > (unsigned long long)SIZE_MAX ||
+                    final_size > (unsigned long long)LLONG_MAX ||
+                    (unsigned long long)bam_header_size > (unsigned long long)LLONG_MAX) {
+                    fprintf(stderr, "ERROR: MPI sort output buffer would exceed addressable memory.\n");
+                    local_ok = 0;
+                } else {
+                    output_body_start = bam_header_size;
+                    output_file_size = (size_t)final_size;
+                    output_body_start_ll = (long long)output_body_start;
+                    output_file_size_ll = (long long)output_file_size;
+                }
+            }
+        }
+        int stage45_header_ok = MpiSortAllRanksOk(local_ok);
+        MPI_Bcast(&output_body_start_ll, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+        MPI_Bcast(&output_file_size_ll, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+        if (stage45_header_ok) {
+            output_body_start = (size_t)output_body_start_ll;
+            output_file_size = (size_t)output_file_size_ll;
+        }
+        double stage45_header_cost = GetTime() - stage45_header_t0;
+        double stage45_header_cost_max = MpiSortReduceMaxCost(stage45_header_cost);
+        if (rank == 0 && stage45_header_ok) {
+            printf("Complete the 4.5a header/layout cost %lf\n", stage45_header_cost_max);
+        }
+        if (!stage45_header_ok) goto cleanup;
+
+        //4.5b 分配每个 rank 的本地模拟写内存，这部分不计入处理时间
+        double stage45_malloc_t0 = GetTime();
+        simulated_write_size = (local_body_size > 0) ? (size_t)local_body_size : 0;
+        if (rank == 0) {
+            if (output_body_start > SIZE_MAX - simulated_write_size) {
+                fprintf(stderr, "[rank %d] ERROR: simulated output memory estimate overflow.\n", rank);
+                local_ok = 0;
+            } else {
+                simulated_write_size += output_body_start;
+            }
+        }
+        if (local_ok && simulated_write_size > 0) {
+            simulated_write_mem = (char *)malloc(simulated_write_size);
+            if (!simulated_write_mem) {
+                fprintf(stderr, "[rank %d] ERROR: failed to allocate simulated output memory. size=%zu\n",
+                        rank, simulated_write_size);
+                local_ok = 0;
+            }
+        }
+        int stage45_malloc_ok = MpiSortAllRanksOk(local_ok);
+        double stage45_malloc_cost = GetTime() - stage45_malloc_t0;
+        double stage45_malloc_cost_max = MpiSortReduceMaxCost(stage45_malloc_cost);
+        if (rank == 0 && stage45_malloc_ok) {
+            printf("Complete the 4.5b malloc simulated write memory cost %lf\n", stage45_malloc_cost_max);
+        }
+        if (!stage45_malloc_ok) goto cleanup;
+
+        //4.6 各 rank 根据逻辑偏移模拟写入高速磁盘内存，只统计 memcpy 时间
+        double sim_write_t0 = GetTime();
+        size_t simulated_pos = 0;
+        if (rank == 0 && output_body_start > 0) {
+            memcpy(simulated_write_mem + simulated_pos, bam_header_mem, bam_header_size);
+            simulated_pos += bam_header_size;
+        }
+        if (local_body_size > 0) {
+            memcpy(simulated_write_mem + simulated_pos, mem_writer.data, (size_t)local_body_size);
+            simulated_pos += (size_t)local_body_size;
+        }
+        if (simulated_pos > 0) {
+            unsigned char *guard_ptr = (unsigned char *)simulated_write_mem;
+            simulated_write_guard += guard_ptr[0];
+            simulated_write_guard += guard_ptr[simulated_pos - 1];
+        }
+        double sim_write_cost = GetTime() - sim_write_t0;
+        stats.t_write += sim_write_cost;
+        global_ok = MpiSortAllRanksOk(local_ok);
+        double stage46_cost_max = MpiSortReduceMaxCost(sim_write_cost);
+        if (rank == 0 && global_ok) {
+            printf("Complete the 4.6 simulated header/body distributed write cost %lf\n", stage46_cost_max);
+        }
+        if (simulated_write_guard == (unsigned long long)-1 && rank < 0) {
+            fprintf(stderr, "unused simulated write guard %llu\n", simulated_write_guard);
+        }
+        if (!global_ok) goto cleanup;
+
+        double body_cost = GetTime() - body_t0;
+        (void)body_cost;
+        if (rank == 0 && global_ok) {
+            double body_counted_cost = stage41_cost_max + stage42_cost_max +
+                                       fused_cost_max + stage44_cost_max +
+                                       stage45_header_cost_max + stage46_cost_max;
+            printf("Complete the total (4.1~4.6) cost %lf-----\n", body_counted_cost);
+        }
+
+        //4.7 全局同步，统计每个 rank 的处理时间和统计数据，rank 0 汇总并打印最终统计结果
+        double stage47_t0 = GetTime();
+        long long local_long_stats[5] = {
+            stats.input_blocks,
+            stats.local_records,
+            stats.received_records,
+            stats.sample_records,
+            stats.bgzf_blocks
+        };
+        long long global_long_stats[5] = {};
+        MPI_Reduce(local_long_stats, global_long_stats, 5, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        double local_double_stats[9] = {
+            stats.t_extract,
+            stats.t_local_sort,
+            stats.t_sample,
+            stats.t_partition,
+            stats.t_exchange,
+            stats.t_final_sort,
+            stats.t_compress,
+            stats.t_write,
+            stats.t_fused_total
+        };
+        double global_double_stats[9] = {};
+        MPI_Reduce(local_double_stats, global_double_stats, 9, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
+        MpiSortPrintRankStats(rank, comm_size, stats, mem_writer.size);
+        if (rank == 0) {
+            printf("FusedBamSortMPI finished. ranks=%d in_blocks=%lld local_records=%lld received_records=%lld samples=%lld bgzf_blocks=%lld body_bytes=%lld\n",
+                   comm_size, global_long_stats[0], global_long_stats[1],
+                   global_long_stats[2], global_long_stats[3], global_long_stats[4],
+                   total_body_size);
+            printf("  extract_sum=%.3f  local_sort_sum=%.3f  sample_sum=%.3f  partition_sum=%.3f  exchange_sum=%.3f  final_sort_sum=%.3f  compress_sum=%.3f  write_sum=%.3f\n",
+                   global_double_stats[0], global_double_stats[1],
+                   global_double_stats[2], global_double_stats[3],
+                   global_double_stats[4], global_double_stats[5],
+                   global_double_stats[6], global_double_stats[7]);
+            printf("  fused_total_sum=%.3f  core_stage_sum=%.3f\n",
+                   global_double_stats[8],
+                   global_double_stats[0] + global_double_stats[1] +
+                   global_double_stats[3] + global_double_stats[4] +
+                   global_double_stats[5] + global_double_stats[6]);
+        }
+        double stage47_cost = GetTime() - stage47_t0;
+        double stage47_cost_max = MpiSortReduceMaxCost(stage47_cost);
+        if (rank == 0 && global_ok) {
+            printf("Complete the 4.7 rank stats reduce/print cost %lf\n", stage47_cost_max);
+        }
+
+        double body_total_cost = GetTime() - body_total_t0;
+        double body_total_cost_max = MpiSortReduceMaxCost(body_total_cost);
+        if (rank == 0 && global_ok) {
+            printf("444Complete the total body cost %lf\n", body_total_cost_max);
+        }
+    }
+
+
+    //5. rank 0 为验证结果汇总输出内存并写入文件，不计入处理时间
+    {
+        double verify_alloc_t0 = GetTime();
+        if (rank == 0) {
+            output_file_mem = output_file_size ? (char *)malloc(output_file_size) : nullptr;
+            if (output_file_size > 0 && !output_file_mem) {
+                fprintf(stderr, "ERROR: failed to allocate final MPI sort output buffer.\n");
+                local_ok = 0;
+            }
+            if (local_ok && bam_header_size > 0) {
+                memcpy(output_file_mem, bam_header_mem, bam_header_size);
+            }
+        }
+        double verify_alloc_cost = GetTime() - verify_alloc_t0;
+        double verify_alloc_cost_max = MpiSortReduceMaxCost(verify_alloc_cost);
+        if (rank == 0 && local_ok) {
+            printf("555Prepare verification output memory cost %lf--\n", verify_alloc_cost_max);
+        }
+        if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+
+        double verify_gather_t0 = GetTime();
+        if (rank == 0) {
+            if (local_body_size > 0) {
+                memcpy(output_file_mem + output_body_start + local_prefix,
+                       mem_writer.data, (size_t)local_body_size);
+            }
+            for (int src = 1; src < comm_size; ++src) {
+                long long recv_size = body_sizes[(size_t)src];
+                if (recv_size <= 0) continue;
+                if (MpiSortRecvBytes(src, 0,
+                                     output_file_mem + output_body_start + body_prefixes[(size_t)src],
+                                     recv_size) != 0) {
+                    fprintf(stderr, "ERROR: failed to gather MPI sort rank %d body into output memory.\n", src);
+                    local_ok = 0;
+                    break;
+                }
+            }
+            if (local_ok) {
+                memcpy(output_file_mem + output_body_start + total_body_size,
+                       kSortBgzfEofBlock, sizeof(kSortBgzfEofBlock));
+            }
+        } else if (local_body_size > 0) {
+            if (MpiSortSendBytes(0, 0, mem_writer.data, local_body_size) != 0) {
+                fprintf(stderr, "[rank %d] ERROR: failed to send sort output body to rank 0.\n", rank);
+                local_ok = 0;
+            }
+        }
+        double verify_gather_cost = GetTime() - verify_gather_t0;
+        double verify_gather_cost_max = MpiSortReduceMaxCost(verify_gather_cost);
+        if (rank == 0 && local_ok) {
+            printf("555Gather verification output memory cost %lf--\n", verify_gather_cost_max);
+        }
+        if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+
+        double dump_t0 = 0.0;
+        double dump_cost = 0.0;
+        if (rank == 0) {
+            dump_t0 = GetTime();
+            if (MpiSortDumpMemoryToFile(cmd_info->out_file_name_, output_file_mem, output_file_size) != 0) {
+                fprintf(stderr, "ERROR: failed to dump MPI sort output memory to %s\n",
+                        cmd_info->out_file_name_.c_str());
+                local_ok = 0;
+            }
+            dump_cost = GetTime() - dump_t0;
+        }
+        double dump_cost_max = MpiSortReduceMaxCost(dump_cost);
+        if (rank == 0 && local_ok) printf("555Dump memory to output file cost %lf--\n", dump_cost_max);
+        if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+    }
+
+    exit_code = 0;
+
+
+    //6. 清理资源
+cleanup:
+    {
+        double close_t0 = GetTime();
+        if (mem_writer.data) free(mem_writer.data);
+        if (output_file_mem) free(output_file_mem);
+        if (bam_header_mem) free(bam_header_mem);
+        if (simulated_write_mem) free(simulated_write_mem);
+        if (hdr) sam_hdr_destroy(hdr);
+        if (sin) {
+            int ret = hts_close(sin);
+            if (ret < 0) fprintf(stderr, "[rank %d] ERROR: closing input failed.\n", rank);
+            input_file_mem = nullptr;
+        } else if (input_mem_hfile) {
+            if (hclose(input_mem_hfile) != 0) {
+                fprintf(stderr, "[rank %d] ERROR: closing memory hFILE failed.\n", rank);
+            }
+            input_file_mem = nullptr;
+        } else if (input_file_mem) {
+            free(input_file_mem);
+            input_file_mem = nullptr;
+        }
+        double close_cost = GetTime() - close_t0;
+        double close_cost_max = MpiSortReduceMaxCost(close_cost);
+        if (rank == 0) printf("666close the files cost %lf-----\n", close_cost_max);
+    }
+    return exit_code;
+}
