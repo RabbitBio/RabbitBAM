@@ -367,10 +367,23 @@ int MpiSortUpdateHeaderCoordinate(sam_hdr_t *hdr) {
 void MpiSortPrintRankStats(int rank, int comm_size,
                            const MpiSortStats &stats,
                            size_t body_size) {
-    char local_lines[4096] = {};
+    const double core_stage =
+        stats.t_setup + stats.t_extract_read_unhidden +
+        stats.t_extract + stats.t_extract_prepare + stats.t_extract_merge +
+        stats.t_local_sort + stats.t_sample + stats.t_partition +
+        stats.t_exchange + stats.t_offset_fix + stats.t_final_sort +
+        stats.t_compress + stats.t_status_check + stats.t_cleanup;
+    const double unaccounted = stats.t_fused_total - core_stage;
+    const long long bucket_total_raw =
+        stats.bucket_self_raw_bytes + stats.bucket_remote_raw_bytes;
+    const double bucket_self_raw_ratio =
+        bucket_total_raw > 0 ? 100.0 * (double)stats.bucket_self_raw_bytes / (double)bucket_total_raw : 0.0;
+    char local_lines[8192] = {};
     snprintf(local_lines, sizeof(local_lines),
              "[rank %d] blocks=%lld local_records=%lld received_records=%lld samples=%lld bgzf=%lld body=%zu\n"
              "[rank %d] extract=%.3f local_sort=%.3f sample=%.3f partition=%.3f exchange=%.3f final_sort=%.3f compress=%.3f write=%.3f\n"
+             "[rank %d] pipeline_detail setup=%.3f read=%.3f read_unhidden=%.3f extract_prepare=%.3f extract_merge=%.3f bucket_count=%.3f bucket_pack=%.3f mpi_exchange=%.3f offset_fix=%.3f status=%.3f cleanup=%.3f unaccounted=%.3f\n"
+             "[rank %d] bucket_dist self_records=%lld remote_records=%lld self_raw=%lld remote_raw=%lld self_raw_ratio=%.2f%%\n"
              "[rank %d] extract_detail alloc=%.3f inflate=%.3f crc=%.3f parse=%.3f other=%.3f\n"
              "[rank %d] compress_detail pack=%.3f alloc=%.3f deflate=%.3f footer=%.3f other=%.3f\n"
              "[rank %d] fused_total=%.6f core_stage=%.6f\n",
@@ -379,15 +392,20 @@ void MpiSortPrintRankStats(int rank, int comm_size,
              rank, stats.t_extract, stats.t_local_sort, stats.t_sample,
              stats.t_partition, stats.t_exchange, stats.t_final_sort,
              stats.t_compress, stats.t_write,
+             rank, stats.t_setup, stats.t_extract_read, stats.t_extract_read_unhidden,
+             stats.t_extract_prepare, stats.t_extract_merge,
+             stats.t_bucket_count, stats.t_bucket_pack, stats.t_mpi_exchange,
+             stats.t_offset_fix, stats.t_status_check, stats.t_cleanup, unaccounted,
+             rank, stats.bucket_self_records, stats.bucket_remote_records,
+             stats.bucket_self_raw_bytes, stats.bucket_remote_raw_bytes,
+             bucket_self_raw_ratio,
              rank, stats.t_extract_alloc, stats.t_extract_inflate, stats.t_extract_crc,
              stats.t_extract_parse, stats.t_extract_other,
              rank, stats.t_compress_pack, stats.t_compress_alloc, stats.t_compress_deflate,
              stats.t_compress_footer, stats.t_compress_other,
-             rank, stats.t_fused_total,
-             stats.t_extract + stats.t_local_sort + stats.t_partition +
-             stats.t_exchange + stats.t_final_sort + stats.t_compress);
+             rank, stats.t_fused_total, core_stage);
 
-    const int kLineBytes = 4096;
+    const int kLineBytes = 8192;
     std::vector<char> gathered;
     if (rank == 0) gathered.resize((size_t)comm_size * kLineBytes);
     MPI_Gather(local_lines, kLineBytes, MPI_CHAR,
@@ -755,28 +773,43 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
 
         //4.7 全局同步，统计每个 rank 的处理时间和统计数据，rank 0 汇总并打印最终统计结果
         double stage47_t0 = GetTime();
-        long long local_long_stats[5] = {
+        long long local_long_stats[9] = {
             stats.input_blocks,
             stats.local_records,
             stats.received_records,
             stats.sample_records,
-            stats.bgzf_blocks
+            stats.bgzf_blocks,
+            stats.bucket_self_records,
+            stats.bucket_remote_records,
+            stats.bucket_self_raw_bytes,
+            stats.bucket_remote_raw_bytes
         };
-        long long global_long_stats[5] = {};
-        MPI_Reduce(local_long_stats, global_long_stats, 5, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-        double local_double_stats[9] = {
+        long long global_long_stats[9] = {};
+        MPI_Reduce(local_long_stats, global_long_stats, 9, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        double local_double_stats[20] = {
+            stats.t_setup,
+            stats.t_extract_read,
+            stats.t_extract_read_unhidden,
             stats.t_extract,
+            stats.t_extract_prepare,
+            stats.t_extract_merge,
             stats.t_local_sort,
             stats.t_sample,
             stats.t_partition,
+            stats.t_bucket_count,
+            stats.t_bucket_pack,
             stats.t_exchange,
+            stats.t_mpi_exchange,
+            stats.t_offset_fix,
             stats.t_final_sort,
             stats.t_compress,
             stats.t_write,
+            stats.t_status_check,
+            stats.t_cleanup,
             stats.t_fused_total
         };
-        double global_double_stats[9] = {};
-        MPI_Reduce(local_double_stats, global_double_stats, 9, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+        double global_double_stats[20] = {};
+        MPI_Reduce(local_double_stats, global_double_stats, 20, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
         MpiSortPrintRankStats(rank, comm_size, stats, mem_writer.size);
         if (rank == 0) {
@@ -785,15 +818,34 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
                    global_long_stats[2], global_long_stats[3], global_long_stats[4],
                    total_body_size);
             printf("  extract_sum=%.3f  local_sort_sum=%.3f  sample_sum=%.3f  partition_sum=%.3f  exchange_sum=%.3f  final_sort_sum=%.3f  compress_sum=%.3f  write_sum=%.3f\n",
-                   global_double_stats[0], global_double_stats[1],
-                   global_double_stats[2], global_double_stats[3],
+                   global_double_stats[3], global_double_stats[6],
+                   global_double_stats[7], global_double_stats[8],
+                   global_double_stats[11], global_double_stats[14],
+                   global_double_stats[15], global_double_stats[16]);
+            printf("  pipeline_detail_sum setup=%.3f read=%.3f read_unhidden=%.3f extract_prepare=%.3f extract_merge=%.3f bucket_count=%.3f bucket_pack=%.3f mpi_exchange=%.3f offset_fix=%.3f status=%.3f cleanup=%.3f\n",
+                   global_double_stats[0], global_double_stats[1], global_double_stats[2],
                    global_double_stats[4], global_double_stats[5],
-                   global_double_stats[6], global_double_stats[7]);
-            printf("  fused_total_sum=%.3f  core_stage_sum=%.3f\n",
-                   global_double_stats[8],
-                   global_double_stats[0] + global_double_stats[1] +
-                   global_double_stats[3] + global_double_stats[4] +
-                   global_double_stats[5] + global_double_stats[6]);
+                   global_double_stats[9], global_double_stats[10],
+                   global_double_stats[12], global_double_stats[13],
+                   global_double_stats[17], global_double_stats[18]);
+            const long long global_bucket_raw = global_long_stats[7] + global_long_stats[8];
+            const double global_self_raw_ratio =
+                global_bucket_raw > 0 ? 100.0 * (double)global_long_stats[7] / (double)global_bucket_raw : 0.0;
+            printf("  bucket_dist_sum self_records=%lld remote_records=%lld self_raw=%lld remote_raw=%lld self_raw_ratio=%.2f%%\n",
+                   global_long_stats[5], global_long_stats[6],
+                   global_long_stats[7], global_long_stats[8],
+                   global_self_raw_ratio);
+            const double core_stage_sum =
+                global_double_stats[0] + global_double_stats[2] +
+                global_double_stats[3] + global_double_stats[4] +
+                global_double_stats[5] + global_double_stats[6] +
+                global_double_stats[7] + global_double_stats[8] +
+                global_double_stats[11] + global_double_stats[13] +
+                global_double_stats[14] + global_double_stats[15] +
+                global_double_stats[17] + global_double_stats[18];
+            printf("  fused_total_sum=%.3f  core_stage_sum=%.3f  unaccounted_sum=%.3f\n",
+                   global_double_stats[19], core_stage_sum,
+                   global_double_stats[19] - core_stage_sum);
         }
         double stage47_cost = GetTime() - stage47_t0;
         double stage47_cost_max = MpiSortReduceMaxCost(stage47_cost);

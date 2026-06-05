@@ -103,7 +103,16 @@ struct MpiSortStats {
     long long received_records;
     long long sample_records;
     long long bgzf_blocks;
+    long long bucket_self_records;
+    long long bucket_remote_records;
+    long long bucket_self_raw_bytes;
+    long long bucket_remote_raw_bytes;
+    double t_setup;
     double t_extract;
+    double t_extract_read;
+    double t_extract_read_unhidden;
+    double t_extract_prepare;
+    double t_extract_merge;
     double t_extract_alloc;
     double t_extract_inflate;
     double t_extract_crc;
@@ -112,7 +121,11 @@ struct MpiSortStats {
     double t_local_sort;
     double t_sample;
     double t_partition;
+    double t_bucket_count;
+    double t_bucket_pack;
     double t_exchange;
+    double t_mpi_exchange;
+    double t_offset_fix;
     double t_final_sort;
     double t_compress;
     double t_compress_pack;
@@ -121,6 +134,8 @@ struct MpiSortStats {
     double t_compress_footer;
     double t_compress_other;
     double t_write;
+    double t_status_check;
+    double t_cleanup;
     double t_fused_total;
 };
 
