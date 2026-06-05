@@ -620,16 +620,6 @@ int MpiSortChooseSplitters(const std::vector<MpiSortKey> &local_samples,
     return 0;
 }
 
-int MpiSortFindBucket(const MpiSortRecordMeta &record,
-                      const std::vector<MpiSortKey> &splitters) {
-    int bucket = 0;
-    while (bucket < (int)splitters.size() &&
-           MpiSortCompareMetaKey(record, splitters[(size_t)bucket]) > 0) {
-        bucket++;
-    }
-    return bucket;
-}
-
 // MPI 分布式排序里的数据重分发阶段
 int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
                            const MpiSortRawBuffer &local_raw,
@@ -638,6 +628,7 @@ int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
                            int comm_size,
                            std::vector<MpiSortRecordMeta> *recv_records,
                            std::vector<unsigned char> *recv_raw,
+                           std::vector<long long> *recv_source_counts,
                            double *bucket_count_time,
                            double *bucket_pack_time,
                            double *exchange_time,
@@ -657,10 +648,16 @@ int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
     std::vector<long long> recv_meta_counts((size_t)comm_size, 0);
     std::vector<long long> send_raw_counts((size_t)comm_size, 0);
     std::vector<long long> recv_raw_counts((size_t)comm_size, 0);
+    int current_bucket = 0;
+    const int n_splitters = (int)splitters.size();
     for (size_t i = 0; i < local_records.size(); ++i) {
         const MpiSortRecordMeta &src = local_records[i];
         if ((unsigned long long)src.raw_offset + src.raw_len > (unsigned long long)local_raw.size) return -1;
-        int bucket = MpiSortFindBucket(src, splitters);
+        while (current_bucket < n_splitters &&
+               MpiSortCompareMetaKey(src, splitters[(size_t)current_bucket]) > 0) {
+            current_bucket++;
+        }
+        int bucket = current_bucket;
         bucket_ids[i] = bucket;
         record_meta_in_bucket[i] = (uint64_t)send_meta_counts[(size_t)bucket];
         record_raw_in_bucket[i] = (uint64_t)send_raw_counts[(size_t)bucket];
@@ -832,6 +829,9 @@ int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
         }
     }
     *offset_fix_time += GetTime() - offset_t0;
+    if (recv_source_counts) {
+        *recv_source_counts = recv_meta_counts;
+    }
 
     // 显式释放大容量发送缓冲，使析构/释放成本进入日志，而不是落在未计时区间。
     double cleanup_t0 = GetTime();
@@ -839,6 +839,41 @@ int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
     std::vector<MpiSortRecordMeta>().swap(send_meta);
     std::vector<unsigned char>().swap(send_raw);
     *cleanup_time += GetTime() - cleanup_t0;
+    return 0;
+}
+
+int MpiSortKWayMergeReceivedRecords(const std::vector<long long> &source_counts,
+                                    std::vector<MpiSortRecordMeta> *records) {
+    if (!records || records->empty()) return 0;
+    if (source_counts.empty()) return -1;
+
+    size_t total = 0;
+    std::vector<size_t> begin(source_counts.size(), 0);
+    std::vector<size_t> end(source_counts.size(), 0);
+    std::vector<size_t> cursor(source_counts.size(), 0);
+    for (size_t i = 0; i < source_counts.size(); ++i) {
+        if (source_counts[i] < 0) return -1;
+        begin[i] = total;
+        cursor[i] = total;
+        total += (size_t)source_counts[i];
+        end[i] = total;
+    }
+    if (total != records->size()) return -1;
+
+    std::vector<MpiSortRecordMeta> merged(records->size());
+    MpiSortMetaLess less;
+    for (size_t out = 0; out < merged.size(); ++out) {
+        int best = -1;
+        for (size_t src = 0; src < source_counts.size(); ++src) {
+            if (cursor[src] >= end[src]) continue;
+            if (best < 0 || less((*records)[cursor[src]], (*records)[cursor[(size_t)best]])) {
+                best = (int)src;
+            }
+        }
+        if (best < 0) return -1;
+        merged[out] = (*records)[cursor[(size_t)best]++];
+    }
+    records->swap(merged);
     return 0;
 }
 
@@ -1034,6 +1069,7 @@ int FusedBamSortMPI(MemReader &reader,
     std::vector<MpiSortKey> splitters;
     std::vector<MpiSortRecordMeta> received_records;
     std::vector<unsigned char> received_raw;
+    std::vector<long long> received_source_counts;
 
     if (reader.size > 0) {
         if (MpiSortRawReserve(&local_raw, reader.size * 2) != 0) {
@@ -1088,6 +1124,7 @@ int FusedBamSortMPI(MemReader &reader,
     long long bucket_remote_raw_bytes = 0;
     if (MpiSortExchangeBuckets(local_records, local_raw, splitters, rank, comm_size,
                                &received_records, &received_raw,
+                               &received_source_counts,
                                &bucket_count_time, &bucket_pack_time,
                                &exchange_time, &offset_fix_time,
                                &exchange_cleanup_time,
@@ -1120,7 +1157,10 @@ int FusedBamSortMPI(MemReader &reader,
 
     //6. 对收到的全局数据再排序
     t0 = GetTime();
-    std::sort(received_records.begin(), received_records.end(), MpiSortMetaLess());
+    if (MpiSortKWayMergeReceivedRecords(received_source_counts, &received_records) != 0) {
+        fprintf(stderr, "[rank %d] ERROR: MPI sort k-way merge failed.\n", rank);
+        return -1;
+    }
     stats->t_final_sort += GetTime() - t0;
 
     //7. 把排序后的 records 重新压缩成 BGZF body
