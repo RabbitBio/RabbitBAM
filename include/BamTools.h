@@ -300,6 +300,28 @@ struct MpiSortBucketPackPara {
     uint64_t total_cycles;
 };
 
+struct MpiSortRangePackPara {
+    int core_id;
+    const MpiSortRecordMetaShared *local_records;
+    const unsigned char *local_raw;
+    size_t local_raw_size;
+    const uint64_t *record_raw_offsets;
+    MpiSortRecordMetaShared *send_meta;
+    unsigned char *send_raw;
+    uint64_t send_meta_capacity;
+    uint64_t send_raw_capacity;
+    size_t record_begin;
+    size_t record_end;
+    size_t output_record_begin;
+    int status;
+    int record_index;
+    long long actual_value;
+    long long limit_value;
+    int limit_id;
+    uint64_t pack_cycles;
+    uint64_t total_cycles;
+};
+
 struct BoundsCheckError {
     const char *pipeline;
     const char *stage;

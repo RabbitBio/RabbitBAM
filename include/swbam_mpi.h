@@ -98,15 +98,25 @@ struct MpiSamToBamStats {
 };
 
 struct MpiSortStats {
+    long long sort_mode;
     long long input_blocks;
     long long local_records;
     long long received_records;
     long long sample_records;
     long long bgzf_blocks;
+    long long external_runs;
+    long long external_segments;
     long long bucket_self_records;
     long long bucket_remote_records;
     long long bucket_self_raw_bytes;
     long long bucket_remote_raw_bytes;
+    long long temp_read_bytes;
+    long long temp_write_bytes;
+    long long tracked_peak_bytes;
+    long long run_arena_bytes;
+    long long merge_fan_in;
+    long long consolidation_passes;
+    long long cpe_calibration_cycles;
     double t_setup;
     double t_extract;
     double t_extract_read;
@@ -125,9 +135,26 @@ struct MpiSortStats {
     double t_bucket_pack;
     double t_exchange;
     double t_mpi_exchange;
+    double t_mpi_simulated;
     double t_offset_fix;
     double t_final_sort;
+    double t_temp_write_sim;
+    double t_temp_read_sim;
+    double t_temp_write_actual;
+    double t_temp_read_actual;
+    double t_temp_open_actual;
+    double t_run_sort;
+    double t_run_bucket;
+    double t_run_exchange;
+    double t_run_merge;
+    double t_merge_unhidden;
+    double t_merge_simulated;
+    double t_merge_temp_read_sim;
+    double t_consolidation_simulated;
+    double t_consolidation_temp_read_sim;
+    double t_consolidation_temp_write_sim;
     double t_compress;
+    double t_compress_simulated;
     double t_compress_pack;
     double t_compress_alloc;
     double t_compress_deflate;
@@ -137,6 +164,8 @@ struct MpiSortStats {
     double t_status_check;
     double t_cleanup;
     double t_fused_total;
+    double t_fused_actual;
+    double t_cpe_calibration_wall;
 };
 
 int ProcessSwBamMPI(CmdInfo *cmd_info);
@@ -163,6 +192,14 @@ int FusedBamSortMPI(MemReader &reader, MemWriter &mem_writer,
                     int compress_level,
                     size_t memory_limit,
                     MpiSortStats *stats);
+int FusedBamExternalSortMPI(MemReader &reader, MemWriter &mem_writer,
+                            long long global_block_begin,
+                            int rank,
+                            int comm_size,
+                            int compress_level,
+                            size_t memory_limit,
+                            const char *temp_prefix,
+                            MpiSortStats *stats);
 
 int MpiWriteBlockToMem(MemWriter &w, bam_block *block);
 int MpiWriteBytesToMem(MemWriter &w, const char *data, size_t len);

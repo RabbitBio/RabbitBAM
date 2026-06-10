@@ -1,10 +1,17 @@
 #include "swbam_mpi.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <limits>
 #include <stdint.h>
+#include <string>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 #include <vector>
 
 #include <mpi.h>
@@ -17,6 +24,7 @@ extern "C" {
     void slave_mpi_sort_extract_raw();
     void slave_mpi_sort_compress_payload();
     void slave_mpi_sort_bucket_pack();
+    void slave_mpi_sort_range_pack();
 }
 
 namespace {
@@ -174,7 +182,7 @@ MpiSortKey MpiSortKeyFromMeta(const MpiSortRecordMeta &m) {
 int MpiSortCheckMemoryLimit(size_t limit, size_t estimate, int rank, const char *stage) {
     if (limit == 0 || estimate <= limit) return 0;
     fprintf(stderr,
-            "[rank %d] ERROR: sort v1 requires enough memory for %s. estimate=%zu limit=%zu; external merge is not implemented.\n",
+            "[rank %d] ERROR: MPI sort memory mode exceeded -m during %s. estimate=%zu limit=%zu; use a smaller -m to force external mode or increase -m.\n",
             rank, stage, estimate, limit);
     return -1;
 }
@@ -303,6 +311,8 @@ void MpiSortAccumulateExtractDetail(const MpiSortExtractPara *paras,
         stats->t_extract_other += wall;
         return;
     }
+    stats->cpe_calibration_cycles += (long long)critical_total;
+    stats->t_cpe_calibration_wall += wall;
     const double scale = wall / (double)critical_total;
     double alloc_time = scale * (double)critical->decomp_alloc_cycles;
     double inflate_time = scale * (double)critical->decomp_inflate_cycles;
@@ -346,6 +356,31 @@ void MpiSortAccumulateCompressDetail(const MpiSortRawCompressPara *paras,
     stats->t_compress_deflate += deflate_time;
     stats->t_compress_footer += footer_time;
     stats->t_compress_other += other_time;
+}
+
+uint64_t MpiSortCompressCriticalCycles(const MpiSortRawCompressPara *paras,
+                                       int active_blocks) {
+    uint64_t critical_total = 0;
+    for (int b = 0; b < active_blocks; ++b) {
+        critical_total =
+            std::max(critical_total, paras[b].compress_total_cycles);
+    }
+    return critical_total;
+}
+
+double MpiSortEstimateCompressSeconds(const MpiSortRawCompressPara *paras,
+                                      int active_blocks,
+                                      double fallback_wall,
+                                      const MpiSortStats *stats) {
+    const uint64_t critical_cycles =
+        MpiSortCompressCriticalCycles(paras, active_blocks);
+    if (critical_cycles > 0 && stats->cpe_calibration_cycles > 0 &&
+        stats->t_cpe_calibration_wall > 0.0) {
+        return (double)critical_cycles *
+               stats->t_cpe_calibration_wall /
+               (double)stats->cpe_calibration_cycles;
+    }
+    return fallback_wall;
 }
 
 // CPE 批量提取 BAM records
@@ -1049,6 +1084,2066 @@ int MpiSortCompressSortedRecordsCpe(const std::vector<MpiSortRecordMeta> &record
     return ret;
 }
 
+struct MpiSortExternalRunRange {
+    size_t byte_begin;
+    size_t byte_end;
+    long long global_block_begin;
+    int block_count;
+};
+
+struct MpiSortExternalRun {
+    std::vector<MpiSortRecordMeta> records;
+    std::vector<unsigned char> raw;
+};
+
+struct MpiSortExternalReceivedBatch {
+    std::vector<MpiSortRecordMeta> records;
+    std::vector<unsigned char> raw;
+};
+
+struct MpiSortExternalSegment {
+    const MpiSortRecordMeta *records_begin;
+    const MpiSortRecordMeta *records_end;
+    const unsigned char *raw;
+    size_t raw_size;
+    size_t record_count;
+};
+
+struct MpiSortMergeCursor {
+    const MpiSortRecordMeta *current;
+    const MpiSortRecordMeta *end;
+    const unsigned char *raw;
+    size_t raw_size;
+};
+
+class MpiSortLoserTree {
+public:
+    explicit MpiSortLoserTree(std::vector<MpiSortMergeCursor> cursors)
+        : cursors_(std::move(cursors)),
+          losers_(cursors_.size(), (int)cursors_.size()),
+          sentinel_((int)cursors_.size()) {
+        for (int i = (int)cursors_.size() - 1; i >= 0; --i) {
+            Adjust(i);
+        }
+    }
+
+    bool empty() const {
+        if (cursors_.empty()) return true;
+        int winner = losers_[0];
+        return winner == sentinel_ || !Active(winner);
+    }
+
+    const MpiSortMergeCursor &winner() const {
+        return cursors_[(size_t)losers_[0]];
+    }
+
+    void advance() {
+        int winner = losers_[0];
+        cursors_[(size_t)winner].current++;
+        Adjust(winner);
+    }
+
+private:
+    bool Active(int player) const {
+        return player >= 0 && player < sentinel_ &&
+               cursors_[(size_t)player].current < cursors_[(size_t)player].end;
+    }
+
+    bool Greater(int lhs, int rhs) const {
+        if (lhs == sentinel_) return false;
+        if (rhs == sentinel_) return true;
+        const bool lhs_active = Active(lhs);
+        const bool rhs_active = Active(rhs);
+        if (!lhs_active || !rhs_active) {
+            if (lhs_active != rhs_active) return !lhs_active;
+            return lhs > rhs;
+        }
+        MpiSortMetaLess less;
+        const MpiSortRecordMeta &a = *cursors_[(size_t)lhs].current;
+        const MpiSortRecordMeta &b = *cursors_[(size_t)rhs].current;
+        if (less(b, a)) return true;
+        if (less(a, b)) return false;
+        return lhs > rhs;
+    }
+
+    void Adjust(int player) {
+        int parent = (player + sentinel_) >> 1;
+        while (parent > 0) {
+            if (Greater(player, losers_[(size_t)parent])) {
+                std::swap(player, losers_[(size_t)parent]);
+            }
+            parent >>= 1;
+        }
+        losers_[0] = player;
+    }
+
+    std::vector<MpiSortMergeCursor> cursors_;
+    std::vector<int> losers_;
+    int sentinel_;
+};
+
+size_t MpiSortEstimateBlockMemory(uint32_t isize) {
+    size_t n = (size_t)(isize / 64u) + 1u;
+    if (n > (size_t)MPI_RECORDS_PER_BLOCK) n = (size_t)MPI_RECORDS_PER_BLOCK;
+    return (size_t)isize + n * sizeof(MpiSortRecordMeta);
+}
+
+size_t MpiSortExternalRunBudget(size_t memory_limit) {
+    if (memory_limit == 0) return (size_t)-1 / 4;
+    size_t budget = memory_limit / 3;
+    if (budget < 256 * 1024 && memory_limit >= 256 * 1024) budget = 256 * 1024;
+    if (budget == 0) budget = memory_limit;
+    return budget;
+}
+
+int MpiSortBuildExternalRunRanges(MemReader &reader,
+                                  long long global_block_begin,
+                                  size_t memory_limit,
+                                  std::vector<MpiSortExternalRunRange> *ranges) {
+    ranges->clear();
+    const size_t run_budget = MpiSortExternalRunBudget(memory_limit);
+    size_t pos = 0;
+    size_t run_begin = 0;
+    size_t run_estimate = 0;
+    int run_blocks = 0;
+    long long block_index = 0;
+    long long run_global_begin = global_block_begin;
+
+    while (pos < reader.size) {
+        if (pos + BLOCK_HEADER_LENGTH > reader.size) return -1;
+        uint16_t bsize16 = MpiSortReadLe16((const unsigned char *)reader.base + pos + 16);
+        size_t bsize = (size_t)bsize16 + 1u;
+        if (bsize == 28) break;
+        if (bsize < BLOCK_HEADER_LENGTH || pos + bsize > reader.size) return -1;
+        uint32_t isize = MpiSortReadLe32((const unsigned char *)reader.base + pos + bsize - 4);
+        if (isize > BGZF_MAX_BLOCK_SIZE) return -1;
+        size_t block_estimate = MpiSortEstimateBlockMemory(isize);
+
+        if (run_blocks > 0 && run_estimate + block_estimate > run_budget) {
+            MpiSortExternalRunRange range;
+            range.byte_begin = run_begin;
+            range.byte_end = pos;
+            range.global_block_begin = run_global_begin;
+            range.block_count = run_blocks;
+            ranges->push_back(range);
+            run_begin = pos;
+            run_global_begin = global_block_begin + block_index;
+            run_estimate = 0;
+            run_blocks = 0;
+        }
+
+        if (run_blocks == 0 && block_estimate > run_budget) {
+            fprintf(stderr,
+                    "ERROR: MPI sort external run needs at least one BGZF block in memory. block_estimate=%zu budget=%zu limit=%zu\n",
+                    block_estimate, run_budget, memory_limit);
+            return -2;
+        }
+
+        run_estimate += block_estimate;
+        run_blocks++;
+        pos += bsize;
+        block_index++;
+    }
+
+    if (run_blocks > 0) {
+        MpiSortExternalRunRange range;
+        range.byte_begin = run_begin;
+        range.byte_end = pos;
+        range.global_block_begin = run_global_begin;
+        range.block_count = run_blocks;
+        ranges->push_back(range);
+    }
+    return 0;
+}
+
+int MpiSortStoreExternalRun(const std::vector<MpiSortRecordMeta> &records,
+                            const MpiSortRawBuffer &raw,
+                            MpiSortExternalRun *run,
+                            MpiSortStats *stats) {
+    double t0 = GetTime();
+    run->records.assign(records.begin(), records.end());
+    run->raw.assign(raw.data, raw.data + raw.size);
+    stats->t_temp_write_sim += GetTime() - t0;
+    return 0;
+}
+
+int MpiSortReadExternalRun(const MpiSortExternalRun &run,
+                           std::vector<MpiSortRecordMeta> *records,
+                           MpiSortRawBuffer *raw,
+                           MpiSortStats *stats) {
+    double t0 = GetTime();
+    *records = run.records;
+    if (MpiSortRawReserve(raw, run.raw.size()) != 0) return -1;
+    if (!run.raw.empty()) memcpy(raw->data, run.raw.data(), run.raw.size());
+    raw->size = run.raw.size();
+    stats->t_temp_read_sim += GetTime() - t0;
+    return 0;
+}
+
+int MpiSortAppendReceivedSegments(std::vector<MpiSortRecordMeta> *recv_records,
+                                  std::vector<unsigned char> *recv_raw,
+                                  const std::vector<long long> &source_counts,
+                                  std::vector<MpiSortExternalReceivedBatch> *batches,
+                                  std::vector<MpiSortExternalSegment> *segments,
+                                  MpiSortStats *stats) {
+    if (!recv_records || !recv_raw || !batches || !segments) return -1;
+
+    size_t meta_begin = 0;
+    for (size_t src = 0; src < source_counts.size(); ++src) {
+        if (source_counts[src] < 0) return -1;
+        size_t count = (size_t)source_counts[src];
+        size_t meta_end = meta_begin + count;
+        if (meta_end > recv_records->size()) return -1;
+        if (count == 0) {
+            meta_begin = meta_end;
+            continue;
+        }
+
+        for (size_t i = meta_begin; i < meta_end; ++i) {
+            const MpiSortRecordMeta &rec = (*recv_records)[i];
+            uint64_t end = rec.raw_offset + (uint64_t)rec.raw_len;
+            if (end > recv_raw->size()) return -1;
+        }
+        meta_begin = meta_end;
+    }
+    if (meta_begin != recv_records->size()) return -1;
+
+    MpiSortExternalReceivedBatch batch;
+    batch.records = std::move(*recv_records);
+    batch.raw = std::move(*recv_raw);
+    batches->push_back(std::move(batch));
+    const MpiSortExternalReceivedBatch &stored = batches->back();
+
+    meta_begin = 0;
+    for (size_t src = 0; src < source_counts.size(); ++src) {
+        size_t count = (size_t)source_counts[src];
+        if (count > 0) {
+            MpiSortExternalSegment seg;
+            seg.records_begin = stored.records.data() + meta_begin;
+            seg.records_end = seg.records_begin + count;
+            seg.raw = stored.raw.data();
+            seg.raw_size = stored.raw.size();
+            seg.record_count = count;
+            segments->push_back(seg);
+        }
+        meta_begin += count;
+    }
+    (void)stats;
+    return 0;
+}
+
+int MpiSortPreparePayloadBatchFromSegments(MpiSortLoserTree *tree,
+                                           MpiSortBlockSet *payload_blocks,
+                                           MpiSortBlockSet *output_blocks,
+                                           MpiSortRawCompressPara *paras,
+                                           int compress_level,
+                                           int *active_blocks) {
+    if (!tree) return -1;
+
+    int active = 0;
+    while (!tree->empty() && active < kSortCpeBlocks) {
+        bam_block *payload = &payload_blocks->blocks[active];
+        payload->pos = 0;
+        payload->length = 0;
+        payload->errcode = 0;
+        payload->block_id = active;
+
+        while (!tree->empty()) {
+            const MpiSortMergeCursor &cur = tree->winner();
+            const MpiSortRecordMeta &rec = *cur.current;
+            if (rec.raw_len > BGZF_BLOCK_SIZE) return -1;
+            if ((unsigned long long)rec.raw_offset + rec.raw_len >
+                (unsigned long long)cur.raw_size) return -1;
+            if (payload->pos > 0 && payload->pos + rec.raw_len > BGZF_BLOCK_SIZE) {
+                break;
+            }
+            memcpy(payload->data + payload->pos,
+                   cur.raw + rec.raw_offset, rec.raw_len);
+            payload->pos += rec.raw_len;
+            payload->length = payload->pos;
+            tree->advance();
+        }
+        if (payload->pos == 0) return -1;
+
+        paras[active].block_id = active;
+        paras[active].un_comp_block = payload;
+        paras[active].un_comp_size = (int)payload->pos;
+        paras[active].output_block = &output_blocks->blocks[active];
+        paras[active].output_size = 0;
+        paras[active].status = 0;
+        paras[active].compress_level = compress_level;
+        paras[active].compress_pack_cycles = 0;
+        paras[active].compress_alloc_cycles = 0;
+        paras[active].compress_deflate_cycles = 0;
+        paras[active].compress_footer_cycles = 0;
+        paras[active].compress_total_cycles = 0;
+        active++;
+    }
+    for (int i = active; i < kSortCpeBlocks; ++i) {
+        MpiSortInitEmptyRawCompressPara(&paras[i], i);
+    }
+    *active_blocks = active;
+    return 0;
+}
+
+int MpiSortCompressExternalSegmentsCpe(const std::vector<MpiSortExternalReceivedBatch> &batches,
+                                       const std::vector<MpiSortExternalSegment> &segments,
+                                       MemWriter &mem_writer,
+                                       int compress_level,
+                                       MpiSortStats *stats) {
+    double setup_t0 = GetTime();
+    MpiSortBlockSet payload_a = {}, payload_b = {}, out_a = {}, out_b = {};
+    MpiSortRawCompressPara paras_a[kSortCpeBlocks], paras_b[kSortCpeBlocks];
+    if (MpiSortAllocateBlockSet(&payload_a, kSortCpeBlocks) != 0 ||
+        MpiSortAllocateBlockSet(&payload_b, kSortCpeBlocks) != 0 ||
+        MpiSortAllocateBlockSet(&out_a, kSortCpeBlocks) != 0 ||
+        MpiSortAllocateBlockSet(&out_b, kSortCpeBlocks) != 0) {
+        fprintf(stderr, "ERROR: failed to allocate MPI sort external compress workspace.\n");
+        MpiSortFreeBlockSet(&payload_a);
+        MpiSortFreeBlockSet(&payload_b);
+        MpiSortFreeBlockSet(&out_a);
+        MpiSortFreeBlockSet(&out_b);
+        return -1;
+    }
+    for (int i = 0; i < kSortCpeBlocks; ++i) {
+        MpiSortInitEmptyRawCompressPara(&paras_a[i], i);
+        MpiSortInitEmptyRawCompressPara(&paras_b[i], i);
+    }
+
+    std::vector<MpiSortMergeCursor> cursors;
+    cursors.reserve(segments.size());
+    for (size_t i = 0; i < segments.size(); ++i) {
+        if (segments[i].record_count > 0) {
+            MpiSortMergeCursor cur;
+            cur.current = segments[i].records_begin;
+            cur.end = segments[i].records_end;
+            cur.raw = segments[i].raw;
+            cur.raw_size = segments[i].raw_size;
+            cursors.push_back(cur);
+        }
+    }
+    MpiSortLoserTree tree(std::move(cursors));
+
+    MpiSortBlockSet *payload_active = &payload_a;
+    MpiSortBlockSet *payload_pending = &payload_b;
+    MpiSortBlockSet *out_active = &out_a;
+    MpiSortBlockSet *out_pending = &out_b;
+    MpiSortRawCompressPara *paras_active = paras_a;
+    MpiSortRawCompressPara *paras_pending = paras_b;
+    bool has_pending = false;
+
+    auto flush_pending = [&]() -> int {
+        if (!has_pending) return 0;
+        double t0 = GetTime();
+        for (int i = 0; i < kSortCpeBlocks; ++i) {
+            if (paras_pending[i].status == 0 && paras_pending[i].output_block) {
+                if (MpiWriteBlockToMem(mem_writer, paras_pending[i].output_block) != 0) return -1;
+                stats->bgzf_blocks++;
+            }
+            MpiSortInitEmptyRawCompressPara(&paras_pending[i], i);
+        }
+        has_pending = false;
+        stats->t_write += GetTime() - t0;
+        return 0;
+    };
+
+    int active_blocks = 0;
+    double merge_t0 = GetTime();
+    stats->t_setup += GetTime() - setup_t0;
+
+    if (MpiSortPreparePayloadBatchFromSegments(&tree,
+                                               payload_active, out_active,
+                                               paras_active, compress_level, &active_blocks) != 0) {
+        MpiSortFreeBlockSet(&payload_a);
+        MpiSortFreeBlockSet(&payload_b);
+        MpiSortFreeBlockSet(&out_a);
+        MpiSortFreeBlockSet(&out_b);
+        return -1;
+    }
+    double merge_wall = GetTime() - merge_t0;
+    stats->t_final_sort += merge_wall;
+    stats->t_run_merge += merge_wall;
+    stats->t_merge_unhidden += merge_wall;
+
+    int ret_code = 0;
+    while (active_blocks > 0) {
+        int next_active_blocks = 0;
+        double t0 = GetTime();
+        __real_athread_spawn((void *)slave_mpi_sort_compress_payload, paras_active, 1);
+        if (flush_pending() != 0) {
+            athread_join();
+            ret_code = -1;
+            break;
+        }
+        merge_t0 = GetTime();
+        if (MpiSortPreparePayloadBatchFromSegments(&tree,
+                                                   payload_pending, out_pending,
+                                                   paras_pending, compress_level, &next_active_blocks) != 0) {
+            athread_join();
+            ret_code = -1;
+            break;
+        }
+        merge_wall = GetTime() - merge_t0;
+        stats->t_final_sort += merge_wall;
+        stats->t_run_merge += merge_wall;
+        athread_join();
+        double wall = GetTime() - t0;
+        stats->t_compress += wall;
+        MpiSortAccumulateCompressDetail(paras_active, active_blocks, wall, stats);
+
+        double status_t0 = GetTime();
+        for (int i = 0; i < active_blocks; ++i) {
+            if (paras_active[i].status != 0) {
+                fprintf(stderr, "ERROR: MPI sort external raw compress failed on block %d with status %d.\n",
+                        i, paras_active[i].status);
+                ret_code = -1;
+                break;
+            }
+        }
+        stats->t_status_check += GetTime() - status_t0;
+        if (ret_code != 0) break;
+
+        has_pending = active_blocks > 0;
+        std::swap(payload_active, payload_pending);
+        std::swap(out_active, out_pending);
+        std::swap(paras_active, paras_pending);
+        active_blocks = next_active_blocks;
+    }
+
+    int ret = ret_code == 0 ? flush_pending() : ret_code;
+    double cleanup_t0 = GetTime();
+    MpiSortFreeBlockSet(&payload_a);
+    MpiSortFreeBlockSet(&payload_b);
+    MpiSortFreeBlockSet(&out_a);
+    MpiSortFreeBlockSet(&out_b);
+    stats->t_cleanup += GetTime() - cleanup_t0;
+    return ret;
+}
+
+const size_t kSortStrictControlReserve = 16ull * 1024ull * 1024ull;
+const size_t kSortStrictSimScratch = 8ull * 1024ull * 1024ull;
+const size_t kSortStrictMetaBuffer = 64ull * 1024ull;
+const size_t kSortStrictRawBuffer = 256ull * 1024ull;
+const size_t kSortStrictConsolidateRaw = 4ull * 1024ull * 1024ull;
+const size_t kSortStrictConsolidateMeta = 2ull * 1024ull * 1024ull;
+const int kSortStrictTagHeader = 7200;
+const int kSortStrictTagMeta = 7201;
+const int kSortStrictTagRaw = 7202;
+const int kSortStrictTagSimHeader = 7210;
+const int kSortStrictTagSimMeta = 7211;
+const int kSortStrictTagSimRaw = 7212;
+
+struct MpiSortMemoryTracker {
+    size_t limit;
+    size_t current;
+    size_t peak;
+
+    explicit MpiSortMemoryTracker(size_t memory_limit)
+        : limit(memory_limit), current(0), peak(0) {}
+
+    bool acquire(size_t bytes) {
+        if (bytes > SIZE_MAX - current) return false;
+        if (limit != 0 && current + bytes > limit) return false;
+        current += bytes;
+        if (current > peak) peak = current;
+        return true;
+    }
+
+    void release(size_t bytes) {
+        current = bytes > current ? 0 : current - bytes;
+    }
+};
+
+struct MpiSortStrictBuffer {
+    unsigned char *data;
+    size_t size;
+
+    MpiSortStrictBuffer() : data(nullptr), size(0) {}
+};
+
+int MpiSortStrictAlloc(MpiSortMemoryTracker *tracker,
+                       size_t bytes,
+                       MpiSortStrictBuffer *buffer) {
+    buffer->data = nullptr;
+    buffer->size = 0;
+    if (bytes == 0) return 0;
+    if (!tracker->acquire(bytes)) return -1;
+    buffer->data = aligned_alloc_custom(64, bytes);
+    if (!buffer->data) {
+        tracker->release(bytes);
+        return -1;
+    }
+    buffer->size = bytes;
+    return 0;
+}
+
+void MpiSortStrictFree(MpiSortMemoryTracker *tracker,
+                       MpiSortStrictBuffer *buffer) {
+    if (buffer->data) aligned_free_custom(buffer->data);
+    tracker->release(buffer->size);
+    buffer->data = nullptr;
+    buffer->size = 0;
+}
+
+struct MpiSortStrictTempStore {
+    int runs_fd;
+    int segments_fd;
+    off_t runs_end;
+    off_t segments_end;
+
+    MpiSortStrictTempStore()
+        : runs_fd(-1), segments_fd(-1), runs_end(0), segments_end(0) {}
+};
+
+struct MpiSortStrictExtent {
+    int fd;
+    off_t meta_offset;
+    off_t raw_offset;
+    uint64_t record_count;
+    uint64_t raw_size;
+};
+
+struct MpiSortStrictRun {
+    MpiSortStrictExtent extent;
+};
+
+struct MpiSortStrictSegment {
+    std::vector<MpiSortStrictExtent> extents;
+    uint64_t record_count;
+    uint64_t raw_size;
+
+    MpiSortStrictSegment() : record_count(0), raw_size(0) {}
+};
+
+std::string MpiSortStrictTempRoot(const char *temp_prefix) {
+    std::string root = temp_prefix && temp_prefix[0] ? temp_prefix : "./rabbitbam-sort";
+    struct stat st;
+    if (stat(root.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+        if (!root.empty() && root[root.size() - 1] != '/') root += '/';
+        root += "rabbitbam-sort";
+    }
+    return root;
+}
+
+int MpiSortStrictOpenTemp(const char *temp_prefix,
+                          int rank,
+                          MpiSortStrictTempStore *store) {
+    const std::string root = MpiSortStrictTempRoot(temp_prefix);
+    const long pid = (long)getpid();
+    for (int attempt = 0; attempt < 1000; ++attempt) {
+        char run_path[4096];
+        char segment_path[4096];
+        snprintf(run_path, sizeof(run_path), "%s.%ld.%d.%d.runs.tmp",
+                 root.c_str(), pid, rank, attempt);
+        snprintf(segment_path, sizeof(segment_path), "%s.%ld.%d.%d.segments.tmp",
+                 root.c_str(), pid, rank, attempt);
+        int run_fd = open(run_path, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (run_fd < 0) {
+            if (errno == EEXIST) continue;
+            fprintf(stderr, "[rank %d] ERROR: cannot create sort temp file %s: %s\n",
+                    rank, run_path, strerror(errno));
+            return -1;
+        }
+        int segment_fd = open(segment_path, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (segment_fd < 0) {
+            int saved_errno = errno;
+            close(run_fd);
+            unlink(run_path);
+            if (saved_errno == EEXIST) continue;
+            fprintf(stderr, "[rank %d] ERROR: cannot create sort temp file %s: %s\n",
+                    rank, segment_path, strerror(saved_errno));
+            return -1;
+        }
+        int unlink_run_ret = unlink(run_path);
+        int unlink_segment_ret = unlink(segment_path);
+        if (unlink_run_ret != 0 || unlink_segment_ret != 0) {
+            int saved_errno = errno;
+            close(run_fd);
+            close(segment_fd);
+            if (unlink_run_ret != 0) unlink(run_path);
+            if (unlink_segment_ret != 0) unlink(segment_path);
+            fprintf(stderr, "[rank %d] ERROR: cannot unlink open sort temp files: %s\n",
+                    rank, strerror(saved_errno));
+            return -1;
+        }
+        store->runs_fd = run_fd;
+        store->segments_fd = segment_fd;
+        store->runs_end = 0;
+        store->segments_end = 0;
+        return 0;
+    }
+    fprintf(stderr, "[rank %d] ERROR: exhausted unique sort temp file attempts.\n", rank);
+    return -1;
+}
+
+void MpiSortStrictCloseTemp(MpiSortStrictTempStore *store) {
+    if (store->runs_fd >= 0) close(store->runs_fd);
+    if (store->segments_fd >= 0) close(store->segments_fd);
+    store->runs_fd = -1;
+    store->segments_fd = -1;
+}
+
+void MpiSortStrictSimulateCopy(const void *src,
+                               size_t bytes,
+                               unsigned char *scratch,
+                               size_t scratch_size,
+                               double *counter) {
+    if (!src || bytes == 0 || !scratch || scratch_size == 0) return;
+    double t0 = GetTime();
+    const unsigned char *p = (const unsigned char *)src;
+    size_t pos = 0;
+    volatile unsigned char guard = 0;
+    while (pos < bytes) {
+        size_t n = std::min(scratch_size, bytes - pos);
+        memcpy(scratch, p + pos, n);
+        guard ^= scratch[0];
+        guard ^= scratch[n - 1];
+        pos += n;
+    }
+    if (guard == 255 && bytes == 0) scratch[0] = guard;
+    *counter += GetTime() - t0;
+}
+
+int MpiSortStrictPwriteAll(int fd,
+                           const void *data,
+                           size_t bytes,
+                           off_t offset,
+                           MpiSortStats *stats) {
+    const unsigned char *p = (const unsigned char *)data;
+    size_t done = 0;
+    double t0 = GetTime();
+    while (done < bytes) {
+        size_t request = std::min(
+            bytes - done, (size_t)std::numeric_limits<ssize_t>::max());
+        ssize_t n = pwrite(fd, p + done, request, offset + (off_t)done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            fprintf(stderr, "ERROR: sort temp pwrite failed: %s\n", strerror(errno));
+            stats->t_temp_write_actual += GetTime() - t0;
+            return -1;
+        }
+        done += (size_t)n;
+    }
+    stats->t_temp_write_actual += GetTime() - t0;
+    stats->temp_write_bytes += (long long)bytes;
+    return 0;
+}
+
+int MpiSortStrictPreadAll(int fd,
+                          void *data,
+                          size_t bytes,
+                          off_t offset,
+                          MpiSortStats *stats) {
+    unsigned char *p = (unsigned char *)data;
+    size_t done = 0;
+    double t0 = GetTime();
+    while (done < bytes) {
+        size_t request = std::min(
+            bytes - done, (size_t)std::numeric_limits<ssize_t>::max());
+        ssize_t n = pread(fd, p + done, request, offset + (off_t)done);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            fprintf(stderr, "ERROR: sort temp pread failed or reached EOF: %s\n",
+                    n < 0 ? strerror(errno) : "short read");
+            stats->t_temp_read_actual += GetTime() - t0;
+            return -1;
+        }
+        done += (size_t)n;
+    }
+    stats->t_temp_read_actual += GetTime() - t0;
+    stats->temp_read_bytes += (long long)bytes;
+    return 0;
+}
+
+int MpiSortStrictAppendExtent(int fd,
+                              off_t *file_end,
+                              const MpiSortRecordMeta *records,
+                              size_t record_count,
+                              const unsigned char *raw,
+                              size_t raw_size,
+                              unsigned char *sim_scratch,
+                              size_t sim_scratch_size,
+                              MpiSortStats *stats,
+                              MpiSortStrictExtent *extent) {
+    const size_t meta_bytes = record_count * sizeof(MpiSortRecordMeta);
+    extent->fd = fd;
+    extent->meta_offset = *file_end;
+    extent->record_count = (uint64_t)record_count;
+    extent->raw_size = (uint64_t)raw_size;
+    if (MpiSortStrictPwriteAll(fd, records, meta_bytes, *file_end, stats) != 0) return -1;
+    MpiSortStrictSimulateCopy(records, meta_bytes, sim_scratch, sim_scratch_size,
+                              &stats->t_temp_write_sim);
+    *file_end += (off_t)meta_bytes;
+    extent->raw_offset = *file_end;
+    if (MpiSortStrictPwriteAll(fd, raw, raw_size, *file_end, stats) != 0) return -1;
+    MpiSortStrictSimulateCopy(raw, raw_size, sim_scratch, sim_scratch_size,
+                              &stats->t_temp_write_sim);
+    *file_end += (off_t)raw_size;
+    return 0;
+}
+
+struct MpiSortStrictRunArena {
+    unsigned char *data;
+    size_t capacity;
+    size_t raw_used;
+    size_t meta_begin;
+    size_t record_count;
+
+    MpiSortStrictRunArena()
+        : data(nullptr), capacity(0), raw_used(0), meta_begin(0), record_count(0) {}
+
+    void reset() {
+        raw_used = 0;
+        meta_begin = capacity - capacity % sizeof(MpiSortRecordMeta);
+        record_count = 0;
+    }
+
+    MpiSortRecordMeta *records() {
+        return (MpiSortRecordMeta *)(data + meta_begin);
+    }
+
+    bool can_append(size_t raw_bytes, size_t records_count) const {
+        if (records_count > SIZE_MAX / sizeof(MpiSortRecordMeta)) return false;
+        size_t meta_bytes = records_count * sizeof(MpiSortRecordMeta);
+        if (meta_bytes > meta_begin) return false;
+        size_t new_meta_begin = meta_begin - meta_bytes;
+        return raw_bytes <= new_meta_begin - raw_used;
+    }
+};
+
+int MpiSortStrictAppendBlock(MpiSortStrictRunArena *arena,
+                             const unsigned char *raw,
+                             size_t raw_size,
+                             uint64_t source_raw_base,
+                             const MpiSortRecordMeta *records,
+                             size_t record_count) {
+    if (!arena->can_append(raw_size, record_count)) return 1;
+    size_t new_meta_begin = arena->meta_begin -
+                            record_count * sizeof(MpiSortRecordMeta);
+    MpiSortRecordMeta *dst =
+        (MpiSortRecordMeta *)(arena->data + new_meta_begin);
+    for (size_t i = 0; i < record_count; ++i) {
+        if (records[i].raw_offset < source_raw_base ||
+            records[i].raw_offset - source_raw_base + records[i].raw_len > raw_size) {
+            return -1;
+        }
+        dst[i] = records[i];
+        dst[i].raw_offset = (uint64_t)arena->raw_used +
+                            records[i].raw_offset - source_raw_base;
+    }
+    memcpy(arena->data + arena->raw_used, raw, raw_size);
+    arena->raw_used += raw_size;
+    arena->meta_begin = new_meta_begin;
+    arena->record_count += record_count;
+    return 0;
+}
+
+void MpiSortStrictMakeSamples(const MpiSortRecordMeta *records,
+                              size_t record_count,
+                              int comm_size,
+                              std::vector<MpiSortKey> *samples) {
+    if (!records || record_count == 0) return;
+    size_t target = (size_t)comm_size * kSortSampleFactor;
+    size_t n = std::min(target, record_count);
+    for (size_t i = 0; i < n; ++i) {
+        size_t idx = ((i + 1) * record_count) / (n + 1);
+        if (idx >= record_count) idx = record_count - 1;
+        samples->push_back(MpiSortKeyFromMeta(records[idx]));
+    }
+}
+
+int MpiSortStrictAppendSortedRun(MpiSortStrictRunArena *arena,
+                                 MpiSortStrictTempStore *store,
+                                 unsigned char *sim_scratch,
+                                 size_t sim_scratch_size,
+                                 MpiSortStats *stats,
+                                 MpiSortStrictExtent *extent) {
+    if (!sim_scratch || sim_scratch_size == 0) return -1;
+    MpiSortRecordMeta *records = arena->records();
+    const size_t meta_bytes =
+        arena->record_count * sizeof(MpiSortRecordMeta);
+    const size_t raw_capacity =
+        ((sim_scratch_size * 3 / 4) / 64) * 64;
+    const size_t remaining = sim_scratch_size - raw_capacity;
+    const size_t meta_region_bytes =
+        ((remaining * 3 / 4) / 64) * 64;
+    const size_t prefix_offset = raw_capacity + meta_region_bytes;
+    const size_t prefix_region_bytes = sim_scratch_size - prefix_offset;
+    const size_t meta_capacity =
+        meta_region_bytes / sizeof(MpiSortRecordMeta);
+    const size_t prefix_capacity =
+        prefix_region_bytes / sizeof(uint64_t);
+    const size_t record_capacity =
+        std::min(meta_capacity, prefix_capacity);
+    if (raw_capacity < BGZF_MAX_BLOCK_SIZE || record_capacity == 0) {
+        return -1;
+    }
+    unsigned char *packed_raw = sim_scratch;
+    MpiSortRecordMeta *packed_records =
+        (MpiSortRecordMeta *)(sim_scratch + raw_capacity);
+    uint64_t *prefix =
+        (uint64_t *)(sim_scratch + prefix_offset);
+
+    extent->fd = store->runs_fd;
+    extent->meta_offset = store->runs_end;
+    extent->raw_offset = store->runs_end + (off_t)meta_bytes;
+    extent->record_count = (uint64_t)arena->record_count;
+    extent->raw_size = (uint64_t)arena->raw_used;
+
+    uint64_t output_raw = 0;
+    size_t begin = 0;
+    while (begin < arena->record_count) {
+        size_t end = begin;
+        size_t chunk_raw_bytes = 0;
+        while (end < arena->record_count &&
+               end - begin < record_capacity) {
+            const size_t raw_len = records[end].raw_len;
+            if (raw_len > raw_capacity - chunk_raw_bytes) break;
+            prefix[end - begin] = (uint64_t)chunk_raw_bytes;
+            chunk_raw_bytes += raw_len;
+            end++;
+        }
+        if (end == begin) {
+            return -1;
+        }
+
+        const size_t count = end - begin;
+        MpiSortRangePackPara paras[kSortCpeBlocks];
+        for (int c = 0; c < kSortCpeBlocks; ++c) {
+            const size_t c_begin =
+                begin + count * (size_t)c / kSortCpeBlocks;
+            const size_t c_end =
+                begin + count * (size_t)(c + 1) / kSortCpeBlocks;
+            paras[c].core_id = c;
+            paras[c].local_records = records;
+            paras[c].local_raw = arena->data;
+            paras[c].local_raw_size = arena->raw_used;
+            paras[c].record_raw_offsets = prefix;
+            paras[c].send_meta = packed_records;
+            paras[c].send_raw = packed_raw;
+            paras[c].send_meta_capacity = meta_capacity;
+            paras[c].send_raw_capacity = raw_capacity;
+            paras[c].record_begin = c_begin;
+            paras[c].record_end = c_end;
+            paras[c].output_record_begin = c_begin - begin;
+            paras[c].status = 0;
+            paras[c].record_index = 0;
+            paras[c].actual_value = 0;
+            paras[c].limit_value = 0;
+            paras[c].limit_id = BOUNDS_LIMIT_NONE;
+            paras[c].pack_cycles = 0;
+            paras[c].total_cycles = 0;
+        }
+
+        double pack_t0 = GetTime();
+        __real_athread_spawn((void *)slave_mpi_sort_range_pack, paras, 1);
+        athread_join();
+        stats->t_temp_write_sim += GetTime() - pack_t0;
+        for (int c = 0; c < kSortCpeBlocks; ++c) {
+            if (paras[c].status != 0) return -1;
+        }
+
+        double fix_t0 = GetTime();
+        for (size_t i = 0; i < count; ++i) {
+            records[begin + i] = packed_records[i];
+            records[begin + i].raw_offset += output_raw;
+        }
+        stats->t_temp_write_sim += GetTime() - fix_t0;
+
+        if (MpiSortStrictPwriteAll(
+                store->runs_fd, packed_raw, chunk_raw_bytes,
+                extent->raw_offset + (off_t)output_raw, stats) != 0) {
+            return -1;
+        }
+        output_raw += chunk_raw_bytes;
+        begin = end;
+    }
+    if (output_raw != arena->raw_used) return -1;
+    if (MpiSortStrictPwriteAll(
+            store->runs_fd, records, meta_bytes,
+            extent->meta_offset, stats) != 0) {
+        return -1;
+    }
+    MpiSortStrictSimulateCopy(
+        records, meta_bytes, sim_scratch, sim_scratch_size,
+        &stats->t_temp_write_sim);
+    store->runs_end =
+        extent->raw_offset + (off_t)output_raw;
+    return 0;
+}
+
+int MpiSortStrictSpillRun(MpiSortStrictRunArena *arena,
+                          MpiSortStrictTempStore *store,
+                          unsigned char *sim_scratch,
+                          size_t sim_scratch_size,
+                          int comm_size,
+                          std::vector<MpiSortStrictRun> *runs,
+                          std::vector<MpiSortKey> *samples,
+                          MpiSortStats *stats) {
+    if (arena->record_count == 0) return 0;
+    double t0 = GetTime();
+    std::sort(arena->records(), arena->records() + arena->record_count,
+              MpiSortMetaLess());
+    double wall = GetTime() - t0;
+    stats->t_local_sort += wall;
+    stats->t_run_sort += wall;
+    MpiSortStrictMakeSamples(arena->records(), arena->record_count,
+                             comm_size, samples);
+    MpiSortStrictRun run;
+    if (MpiSortStrictAppendSortedRun(
+            arena, store, sim_scratch, sim_scratch_size,
+            stats, &run.extent) != 0) {
+        return -1;
+    }
+    runs->push_back(run);
+    arena->reset();
+    return 0;
+}
+
+size_t MpiSortStrictExtractWorkspaceBytes() {
+    return 2ull * kSortCpeBlocks *
+               (sizeof(bam_block) + (size_t)BGZF_MAX_BLOCK_SIZE) +
+           (size_t)kSortCpeBlocks * MPI_RECORDS_PER_BLOCK *
+               sizeof(MpiSortRecordMeta);
+}
+
+int MpiSortStrictGenerateRuns(MemReader &reader,
+                              long long global_block_begin,
+                              int rank,
+                              int comm_size,
+                              MpiSortStrictRunArena *arena,
+                              MpiSortStrictTempStore *store,
+                              unsigned char *sim_scratch,
+                              size_t sim_scratch_size,
+                              MpiSortMemoryTracker *tracker,
+                              std::vector<MpiSortStrictRun> *runs,
+                              std::vector<MpiSortKey> *samples,
+                              MpiSortStats *stats) {
+    const size_t workspace_bytes = MpiSortStrictExtractWorkspaceBytes();
+    if (!tracker->acquire(workspace_bytes)) {
+        fprintf(stderr,
+                "[rank %d] ERROR: -m cannot hold the minimum external extract workspace. required_at_least=%zu limit=%zu\n",
+                rank, tracker->current + workspace_bytes, tracker->limit);
+        return -1;
+    }
+    MpiSortExtractWorkspace ws = {};
+    if (MpiSortAllocateExtractWorkspace(&ws, kSortCpeBlocks,
+                                        (int)MPI_RECORDS_PER_BLOCK, 0) != 0) {
+        tracker->release(workspace_bytes);
+        return -1;
+    }
+    MpiSortExtractPara paras[kSortCpeBlocks];
+    size_t local_block = 0;
+    int ret = 0;
+    while (reader.pos < reader.size) {
+        int n_blocks = 0;
+        double read_t0 = GetTime();
+        for (int b = 0; b < kSortCpeBlocks; ++b) {
+            bam_block *block = &ws.input_blocks.blocks[b];
+            int n = MpiSortMemReadBlock(reader.base, reader.size, reader.pos, block);
+            if (n < 0 || block->length == 28) break;
+            block->block_id = b;
+            n_blocks++;
+        }
+        double read_wall = GetTime() - read_t0;
+        stats->t_extract_read += read_wall;
+        stats->t_extract_read_unhidden += read_wall;
+        if (n_blocks == 0) break;
+        stats->input_blocks += n_blocks;
+
+        double prepare_t0 = GetTime();
+        for (int b = 0; b < kSortCpeBlocks; ++b) {
+            uint32_t isize = b < n_blocks ? MpiSortBgzfISize(&ws.input_blocks.blocks[b]) : 0;
+            if (b < n_blocks && isize > BGZF_MAX_BLOCK_SIZE) {
+                fprintf(stderr, "[rank %d] ERROR: invalid BGZF ISIZE=%u.\n", rank, isize);
+                ret = -1;
+                break;
+            }
+            if (b < n_blocks) {
+                ws.un_blocks.blocks[b].data =
+                    ws.un_blocks.data + (size_t)b * BGZF_MAX_BLOCK_SIZE;
+                ws.un_blocks.blocks[b].length = (int)isize;
+                ws.un_blocks.blocks[b].pos = 0;
+                ws.un_blocks.blocks[b].errcode = 0;
+            }
+            paras[b].block_id = b;
+            paras[b].input_block = b < n_blocks ? &ws.input_blocks.blocks[b] : nullptr;
+            paras[b].un_comp_block = b < n_blocks ? &ws.un_blocks.blocks[b] : nullptr;
+            paras[b].raw_arena = b < n_blocks ? ws.un_blocks.blocks[b].data : nullptr;
+            paras[b].raw_capacity = b < n_blocks ? (size_t)isize : 0;
+            paras[b].raw_used = 0;
+            paras[b].raw_base_offset = (uint64_t)b * BGZF_MAX_BLOCK_SIZE;
+            paras[b].records = ws.records + (size_t)b * MPI_RECORDS_PER_BLOCK;
+            paras[b].record_capacity = (int)MPI_RECORDS_PER_BLOCK;
+            paras[b].n_records = 0;
+            paras[b].global_block_index =
+                global_block_begin + (long long)local_block + b;
+            paras[b].status = b < n_blocks ? 0 : -1;
+            paras[b].record_index = 0;
+            paras[b].actual_value = 0;
+            paras[b].limit_value = 0;
+            paras[b].limit_id = BOUNDS_LIMIT_NONE;
+            paras[b].decomp_alloc_cycles = 0;
+            paras[b].decomp_inflate_cycles = 0;
+            paras[b].decomp_crc_cycles = 0;
+            paras[b].decomp_parse_cycles = 0;
+            paras[b].decomp_total_cycles = 0;
+        }
+        stats->t_extract_prepare += GetTime() - prepare_t0;
+        if (ret != 0) break;
+
+        double extract_t0 = GetTime();
+        __real_athread_spawn((void *)slave_mpi_sort_extract_raw, paras, 1);
+        athread_join();
+        double extract_wall = GetTime() - extract_t0;
+        stats->t_extract += extract_wall;
+        MpiSortAccumulateExtractDetail(paras, n_blocks, extract_wall, stats);
+
+        for (int b = 0; b < n_blocks; ++b) {
+            if (paras[b].status != 0) {
+                if (paras[b].status == -4) {
+                    fprintf(stderr,
+                            "[rank %d] ERROR: sort assumes BAM records do not cross BGZF blocks; global_block=%lld.\n",
+                            rank, global_block_begin + (long long)local_block + b);
+                } else {
+                    fprintf(stderr,
+                            "[rank %d] ERROR: external sort extract failed. global_block=%lld status=%d limit=%lld actual=%lld\n",
+                            rank, global_block_begin + (long long)local_block + b,
+                            paras[b].status, paras[b].limit_value, paras[b].actual_value);
+                }
+                ret = -1;
+                break;
+            }
+            const size_t block_raw = paras[b].raw_used;
+            const size_t block_records = (size_t)paras[b].n_records;
+            const uint64_t block_base = (uint64_t)b * BGZF_MAX_BLOCK_SIZE;
+            double append_t0 = GetTime();
+            int append_ret = MpiSortStrictAppendBlock(
+                arena, ws.un_blocks.blocks[b].data, block_raw, block_base,
+                ws.records + (size_t)b * MPI_RECORDS_PER_BLOCK,
+                block_records);
+            stats->t_extract_merge += GetTime() - append_t0;
+            if (append_ret == 1 && arena->record_count > 0) {
+                if (MpiSortStrictSpillRun(arena, store, sim_scratch,
+                                          sim_scratch_size, comm_size,
+                                          runs, samples, stats) != 0) {
+                    ret = -1;
+                    break;
+                }
+                append_t0 = GetTime();
+                append_ret = MpiSortStrictAppendBlock(
+                    arena, ws.un_blocks.blocks[b].data, block_raw, block_base,
+                    ws.records + (size_t)b * MPI_RECORDS_PER_BLOCK,
+                    block_records);
+                stats->t_extract_merge += GetTime() - append_t0;
+            }
+            if (append_ret != 0) {
+                size_t minimum = kSortStrictControlReserve + kSortStrictSimScratch +
+                                 workspace_bytes + block_raw +
+                                 block_records * sizeof(MpiSortRecordMeta);
+                fprintf(stderr,
+                        "[rank %d] ERROR: one BGZF block cannot fit in the external run arena. minimum_memory=%zu limit=%zu block_raw=%zu records=%zu\n",
+                        rank, minimum, tracker->limit, block_raw, block_records);
+                ret = -1;
+                break;
+            }
+            stats->local_records += (long long)block_records;
+        }
+        if (ret != 0) break;
+        local_block += (size_t)n_blocks;
+    }
+    if (ret == 0 &&
+        MpiSortStrictSpillRun(arena, store, sim_scratch, sim_scratch_size,
+                              comm_size, runs, samples, stats) != 0) {
+        ret = -1;
+    }
+    MpiSortFreeExtractWorkspace(&ws);
+    tracker->release(workspace_bytes);
+    return ret;
+}
+
+int MpiSortStrictLoadRun(const MpiSortStrictRun &run,
+                         MpiSortStrictRunArena *arena,
+                         MpiSortStrictTempStore *store,
+                         unsigned char *sim_scratch,
+                         size_t sim_scratch_size,
+                         MpiSortStats *stats) {
+    arena->reset();
+    size_t count = (size_t)run.extent.record_count;
+    size_t raw_size = (size_t)run.extent.raw_size;
+    size_t meta_bytes = count * sizeof(MpiSortRecordMeta);
+    if (!arena->can_append(raw_size, count)) return -1;
+    arena->meta_begin -= meta_bytes;
+    arena->record_count = count;
+    arena->raw_used = raw_size;
+    if (MpiSortStrictPreadAll(run.extent.fd, arena->records(), meta_bytes,
+                              run.extent.meta_offset, stats) != 0 ||
+        MpiSortStrictPreadAll(run.extent.fd, arena->data, raw_size,
+                              run.extent.raw_offset, stats) != 0) {
+        return -1;
+    }
+    MpiSortStrictSimulateCopy(arena->records(), meta_bytes, sim_scratch,
+                              sim_scratch_size, &stats->t_temp_read_sim);
+    MpiSortStrictSimulateCopy(arena->data, raw_size, sim_scratch,
+                              sim_scratch_size, &stats->t_temp_read_sim);
+    (void)store;
+    return 0;
+}
+
+struct MpiSortStrictExchangeWorkspace {
+    MpiSortStrictBuffer send_meta_buffer;
+    MpiSortStrictBuffer recv_meta_buffer;
+    MpiSortStrictBuffer send_raw_buffer;
+    MpiSortStrictBuffer recv_raw_buffer;
+    MpiSortStrictBuffer prefix_buffer;
+    size_t meta_capacity;
+    size_t raw_capacity;
+    size_t prefix_capacity;
+
+    MpiSortStrictExchangeWorkspace()
+        : meta_capacity(0), raw_capacity(0), prefix_capacity(0) {}
+};
+
+int MpiSortStrictAllocateExchange(MpiSortMemoryTracker *tracker,
+                                  size_t budget,
+                                  MpiSortStrictExchangeWorkspace *ws) {
+    size_t raw_each = budget * 3 / 8;
+    size_t meta_each = budget / 16;
+    size_t prefix_bytes = budget - 2 * raw_each - 2 * meta_each;
+    if (raw_each < BGZF_MAX_BLOCK_SIZE ||
+        meta_each < 64 * sizeof(MpiSortRecordMeta) ||
+        prefix_bytes < 64 * sizeof(uint64_t)) {
+        return -1;
+    }
+    if (MpiSortStrictAlloc(tracker, raw_each, &ws->send_raw_buffer) != 0 ||
+        MpiSortStrictAlloc(tracker, raw_each, &ws->recv_raw_buffer) != 0 ||
+        MpiSortStrictAlloc(tracker, meta_each, &ws->send_meta_buffer) != 0 ||
+        MpiSortStrictAlloc(tracker, meta_each, &ws->recv_meta_buffer) != 0 ||
+        MpiSortStrictAlloc(tracker, prefix_bytes, &ws->prefix_buffer) != 0) {
+        MpiSortStrictFree(tracker, &ws->send_meta_buffer);
+        MpiSortStrictFree(tracker, &ws->recv_meta_buffer);
+        MpiSortStrictFree(tracker, &ws->send_raw_buffer);
+        MpiSortStrictFree(tracker, &ws->recv_raw_buffer);
+        MpiSortStrictFree(tracker, &ws->prefix_buffer);
+        return -1;
+    }
+    ws->meta_capacity = meta_each / sizeof(MpiSortRecordMeta);
+    ws->raw_capacity = raw_each;
+    ws->prefix_capacity = prefix_bytes / sizeof(uint64_t);
+    return 0;
+}
+
+void MpiSortStrictFreeExchange(MpiSortMemoryTracker *tracker,
+                               MpiSortStrictExchangeWorkspace *ws) {
+    MpiSortStrictFree(tracker, &ws->send_meta_buffer);
+    MpiSortStrictFree(tracker, &ws->recv_meta_buffer);
+    MpiSortStrictFree(tracker, &ws->send_raw_buffer);
+    MpiSortStrictFree(tracker, &ws->recv_raw_buffer);
+    MpiSortStrictFree(tracker, &ws->prefix_buffer);
+}
+
+size_t MpiSortStrictChunkEnd(const MpiSortRecordMeta *records,
+                             size_t begin,
+                             size_t end,
+                             size_t meta_capacity,
+                             size_t prefix_capacity,
+                             size_t raw_capacity,
+                             size_t *raw_bytes) {
+    const size_t record_limit = std::min(meta_capacity, prefix_capacity);
+    size_t pos = begin;
+    size_t raw = 0;
+    while (pos < end && pos - begin < record_limit) {
+        if (records[pos].raw_len > raw_capacity - raw) break;
+        raw += records[pos].raw_len;
+        pos++;
+    }
+    *raw_bytes = raw;
+    return pos;
+}
+
+int MpiSortStrictPackRange(const MpiSortRecordMeta *records,
+                           size_t record_count,
+                           const unsigned char *raw,
+                           size_t raw_size,
+                           size_t begin,
+                           size_t end,
+                           MpiSortStrictExchangeWorkspace *ws,
+                           MpiSortStats *stats) {
+    const size_t count = end - begin;
+    uint64_t *prefix = (uint64_t *)ws->prefix_buffer.data;
+    size_t raw_pos = 0;
+    for (size_t i = 0; i < count; ++i) {
+        prefix[i] = (uint64_t)raw_pos;
+        raw_pos += records[begin + i].raw_len;
+    }
+    if (count > ws->meta_capacity || count > ws->prefix_capacity ||
+        raw_pos > ws->raw_capacity) {
+        return -1;
+    }
+    MpiSortRangePackPara paras[kSortCpeBlocks];
+    for (int c = 0; c < kSortCpeBlocks; ++c) {
+        size_t c_begin = begin + count * (size_t)c / kSortCpeBlocks;
+        size_t c_end = begin + count * (size_t)(c + 1) / kSortCpeBlocks;
+        paras[c].core_id = c;
+        paras[c].local_records = records;
+        paras[c].local_raw = raw;
+        paras[c].local_raw_size = raw_size;
+        paras[c].record_raw_offsets = prefix;
+        paras[c].send_meta = (MpiSortRecordMeta *)ws->send_meta_buffer.data;
+        paras[c].send_raw = ws->send_raw_buffer.data;
+        paras[c].send_meta_capacity = ws->meta_capacity;
+        paras[c].send_raw_capacity = ws->raw_capacity;
+        paras[c].record_begin = c_begin;
+        paras[c].record_end = c_end;
+        paras[c].output_record_begin = c_begin - begin;
+        paras[c].status = 0;
+        paras[c].record_index = 0;
+        paras[c].actual_value = 0;
+        paras[c].limit_value = 0;
+        paras[c].limit_id = BOUNDS_LIMIT_NONE;
+        paras[c].pack_cycles = 0;
+        paras[c].total_cycles = 0;
+    }
+    double t0 = GetTime();
+    __real_athread_spawn((void *)slave_mpi_sort_range_pack, paras, 1);
+    athread_join();
+    stats->t_bucket_pack += GetTime() - t0;
+    for (int c = 0; c < kSortCpeBlocks; ++c) {
+        if (paras[c].status != 0) return -1;
+    }
+    (void)record_count;
+    return 0;
+}
+
+int MpiSortStrictAppendReceivedChunk(MpiSortStrictTempStore *store,
+                                     const MpiSortRecordMeta *records,
+                                     size_t record_count,
+                                     const unsigned char *raw,
+                                     size_t raw_size,
+                                     unsigned char *sim_scratch,
+                                     size_t sim_scratch_size,
+                                     MpiSortStats *stats,
+                                     MpiSortStrictSegment *segment) {
+    MpiSortStrictExtent extent;
+    if (MpiSortStrictAppendExtent(store->segments_fd, &store->segments_end,
+                                  records, record_count, raw, raw_size,
+                                  sim_scratch, sim_scratch_size,
+                                  stats, &extent) != 0) {
+        return -1;
+    }
+    segment->extents.push_back(extent);
+    segment->record_count += record_count;
+    segment->raw_size += raw_size;
+    return 0;
+}
+
+int MpiSortStrictExchangeRuns(const std::vector<MpiSortStrictRun> &runs,
+                              const std::vector<MpiSortKey> &splitters,
+                              MpiSortStrictRunArena *arena,
+                              MpiSortStrictExchangeWorkspace *ws,
+                              MpiSortStrictTempStore *store,
+                              unsigned char *sim_scratch,
+                              size_t sim_scratch_size,
+                              int rank,
+                              int comm_size,
+                              std::vector<MpiSortStrictSegment> *segments,
+                              MpiSortStats *stats) {
+    long long local_runs = (long long)runs.size();
+    long long max_runs = 0;
+    MPI_Allreduce(&local_runs, &max_runs, 1, MPI_LONG_LONG, MPI_MAX,
+                  MPI_COMM_WORLD);
+    for (long long round = 0; round < max_runs; ++round) {
+        arena->reset();
+        int load_ok = 1;
+        if (round < local_runs &&
+            MpiSortStrictLoadRun(runs[(size_t)round], arena, store,
+                                 sim_scratch, sim_scratch_size, stats) != 0) {
+            load_ok = 0;
+        }
+        int global_load_ok = 0;
+        MPI_Allreduce(&load_ok, &global_load_ok, 1, MPI_INT, MPI_MIN,
+                      MPI_COMM_WORLD);
+        if (!global_load_ok) {
+            return -1;
+        }
+        MpiSortRecordMeta *records = arena->records();
+        size_t record_count = arena->record_count;
+        std::vector<size_t> bounds((size_t)comm_size + 1, record_count);
+        std::vector<size_t> bucket_raw_bytes((size_t)comm_size, 0);
+        bounds[0] = 0;
+        double count_t0 = GetTime();
+        size_t pos = 0;
+        for (int bucket = 0; bucket < comm_size - 1; ++bucket) {
+            while (pos < record_count &&
+                   MpiSortCompareMetaKey(records[pos], splitters[(size_t)bucket]) <= 0) {
+                pos++;
+            }
+            bounds[(size_t)bucket + 1] = pos;
+        }
+        bounds[(size_t)comm_size] = record_count;
+        double count_wall = GetTime() - count_t0;
+        stats->t_bucket_count += count_wall;
+
+        for (int bucket = 0; bucket < comm_size; ++bucket) {
+            size_t braw = 0;
+            for (size_t i = bounds[(size_t)bucket];
+                 i < bounds[(size_t)bucket + 1]; ++i) {
+                braw += records[i].raw_len;
+            }
+            bucket_raw_bytes[(size_t)bucket] = braw;
+            long long n = (long long)(bounds[(size_t)bucket + 1] -
+                                      bounds[(size_t)bucket]);
+            if (bucket == rank) {
+                stats->bucket_self_records += n;
+                stats->bucket_self_raw_bytes += (long long)braw;
+            } else {
+                stats->bucket_remote_records += n;
+                stats->bucket_remote_raw_bytes += (long long)braw;
+            }
+        }
+
+        double exchange_round_t0 = GetTime();
+        int round_io_ok = 1;
+        for (int step = 0; step < comm_size; ++step) {
+            int send_to = (rank + step) % comm_size;
+            int recv_from = (rank - step + comm_size) % comm_size;
+            size_t send_pos = bounds[(size_t)send_to];
+            size_t send_end = bounds[(size_t)send_to + 1];
+            MpiSortStrictSegment received_segment;
+
+            if (step == 0) {
+                if (send_pos < send_end) {
+                    if (round >= local_runs) return -1;
+                    const MpiSortStrictExtent &run_extent =
+                        runs[(size_t)round].extent;
+                    MpiSortStrictExtent self_extent = run_extent;
+                    self_extent.meta_offset +=
+                        (off_t)(send_pos * sizeof(MpiSortRecordMeta));
+                    self_extent.record_count =
+                        (uint64_t)(send_end - send_pos);
+                    received_segment.extents.push_back(self_extent);
+                    received_segment.record_count +=
+                        self_extent.record_count;
+                    received_segment.raw_size +=
+                        bucket_raw_bytes[(size_t)rank];
+                }
+            } else {
+                bool send_done = send_pos >= send_end;
+                bool recv_done = false;
+                while (!send_done || !recv_done) {
+                    size_t send_raw_bytes = 0;
+                    size_t send_chunk_end = send_pos;
+                    if (!send_done) {
+                        send_chunk_end = MpiSortStrictChunkEnd(
+                            records, send_pos, send_end, ws->meta_capacity,
+                            ws->prefix_capacity, ws->raw_capacity,
+                            &send_raw_bytes);
+                        if (send_chunk_end == send_pos ||
+                            MpiSortStrictPackRange(records, record_count,
+                                                   arena->data, arena->raw_used,
+                                                   send_pos, send_chunk_end,
+                                                   ws, stats) != 0) {
+                            return -1;
+                        }
+                    }
+                    unsigned long long send_header[3] = {
+                        (unsigned long long)(send_chunk_end - send_pos),
+                        (unsigned long long)send_raw_bytes,
+                        send_chunk_end >= send_end ? 1ull : 0ull
+                    };
+                    unsigned long long recv_header[3] = {};
+                    MPI_Status mpi_status;
+                    double mpi_actual_t0 = GetTime();
+                    MPI_Sendrecv(send_header, 3, MPI_UNSIGNED_LONG_LONG,
+                                 send_to, kSortStrictTagHeader,
+                                 recv_header, 3, MPI_UNSIGNED_LONG_LONG,
+                                 recv_from, kSortStrictTagHeader,
+                                 MPI_COMM_WORLD, &mpi_status);
+                    size_t recv_count = (size_t)recv_header[0];
+                    size_t recv_raw_bytes = (size_t)recv_header[1];
+                    if (recv_count > ws->meta_capacity ||
+                        recv_raw_bytes > ws->raw_capacity) {
+                        return -1;
+                    }
+                    if (MpiSortSendRecvBytes(
+                            send_to, (char *)ws->send_meta_buffer.data,
+                            (long long)(send_header[0] * sizeof(MpiSortRecordMeta)),
+                            recv_from, (char *)ws->recv_meta_buffer.data,
+                            (long long)(recv_count * sizeof(MpiSortRecordMeta)),
+                            kSortStrictTagMeta) != 0 ||
+                        MpiSortSendRecvBytes(
+                            send_to, (char *)ws->send_raw_buffer.data,
+                            (long long)send_raw_bytes,
+                            recv_from, (char *)ws->recv_raw_buffer.data,
+                            (long long)recv_raw_bytes,
+                            kSortStrictTagRaw) != 0) {
+                        return -1;
+                    }
+                    stats->t_mpi_exchange += GetTime() - mpi_actual_t0;
+
+                    // Repeat the same transfer before either side writes its
+                    // received chunk. This isolates MPI cost from temp-file
+                    // stalls that otherwise propagate to the peer.
+                    unsigned long long sim_recv_header[3] = {};
+                    double mpi_sim_t0 = GetTime();
+                    MPI_Sendrecv(send_header, 3, MPI_UNSIGNED_LONG_LONG,
+                                 send_to, kSortStrictTagSimHeader,
+                                 sim_recv_header, 3, MPI_UNSIGNED_LONG_LONG,
+                                 recv_from, kSortStrictTagSimHeader,
+                                 MPI_COMM_WORLD, &mpi_status);
+                    if (sim_recv_header[0] != recv_header[0] ||
+                        sim_recv_header[1] != recv_header[1] ||
+                        sim_recv_header[2] != recv_header[2]) {
+                        return -1;
+                    }
+                    if (MpiSortSendRecvBytes(
+                            send_to, (char *)ws->send_meta_buffer.data,
+                            (long long)(send_header[0] *
+                                        sizeof(MpiSortRecordMeta)),
+                            recv_from, (char *)ws->recv_meta_buffer.data,
+                            (long long)(recv_count *
+                                        sizeof(MpiSortRecordMeta)),
+                            kSortStrictTagSimMeta) != 0 ||
+                        MpiSortSendRecvBytes(
+                            send_to, (char *)ws->send_raw_buffer.data,
+                            (long long)send_raw_bytes,
+                            recv_from, (char *)ws->recv_raw_buffer.data,
+                            (long long)recv_raw_bytes,
+                            kSortStrictTagSimRaw) != 0) {
+                        return -1;
+                    }
+                    stats->t_mpi_simulated += GetTime() - mpi_sim_t0;
+                    if (round_io_ok && recv_count > 0 &&
+                        MpiSortStrictAppendReceivedChunk(
+                            store, (MpiSortRecordMeta *)ws->recv_meta_buffer.data,
+                            recv_count, ws->recv_raw_buffer.data,
+                            recv_raw_bytes, sim_scratch, sim_scratch_size,
+                            stats, &received_segment) != 0) {
+                        round_io_ok = 0;
+                    }
+                    send_pos = send_chunk_end;
+                    send_done = send_header[2] != 0;
+                    recv_done = recv_header[2] != 0;
+                }
+            }
+            if (round_io_ok && received_segment.record_count > 0) {
+                stats->received_records +=
+                    (long long)received_segment.record_count;
+                segments->push_back(std::move(received_segment));
+            }
+        }
+        double exchange_wall = GetTime() - exchange_round_t0;
+        stats->t_exchange += exchange_wall;
+        int global_round_io_ok = 0;
+        MPI_Allreduce(&round_io_ok, &global_round_io_ok, 1, MPI_INT,
+                      MPI_MIN, MPI_COMM_WORLD);
+        if (!global_round_io_ok) return -1;
+    }
+    stats->t_partition = stats->t_bucket_count + stats->t_bucket_pack;
+    stats->t_run_bucket = stats->t_partition;
+    stats->t_run_exchange = stats->t_exchange;
+    return 0;
+}
+
+struct MpiSortStrictCursor {
+    const MpiSortStrictSegment *segment;
+    size_t extent_index;
+    uint64_t extent_record_pos;
+    MpiSortRecordMeta *meta_buffer;
+    size_t meta_capacity;
+    size_t meta_count;
+    size_t meta_pos;
+    unsigned char *raw_buffer;
+    size_t raw_capacity;
+    uint64_t raw_buffer_begin;
+    size_t raw_buffer_size;
+    bool active;
+
+    MpiSortStrictCursor()
+        : segment(nullptr), extent_index(0), extent_record_pos(0),
+          meta_buffer(nullptr), meta_capacity(0), meta_count(0), meta_pos(0),
+          raw_buffer(nullptr), raw_capacity(0), raw_buffer_begin(0),
+          raw_buffer_size(0), active(false) {}
+};
+
+int MpiSortStrictCursorLoadMeta(MpiSortStrictCursor *cursor,
+                                MpiSortStrictTempStore *store,
+                                unsigned char *sim_scratch,
+                                size_t sim_scratch_size,
+                                MpiSortStats *stats) {
+    cursor->active = false;
+    while (cursor->extent_index < cursor->segment->extents.size()) {
+        const MpiSortStrictExtent &extent =
+            cursor->segment->extents[cursor->extent_index];
+        if (cursor->extent_record_pos >= extent.record_count) {
+            cursor->extent_index++;
+            cursor->extent_record_pos = 0;
+            cursor->raw_buffer_size = 0;
+            continue;
+        }
+        size_t count = (size_t)std::min<uint64_t>(
+            extent.record_count - cursor->extent_record_pos,
+            cursor->meta_capacity);
+        size_t bytes = count * sizeof(MpiSortRecordMeta);
+        off_t offset = extent.meta_offset +
+            (off_t)(cursor->extent_record_pos * sizeof(MpiSortRecordMeta));
+        if (MpiSortStrictPreadAll(extent.fd, cursor->meta_buffer,
+                                  bytes, offset, stats) != 0) {
+            return -1;
+        }
+        MpiSortStrictSimulateCopy(cursor->meta_buffer, bytes, sim_scratch,
+                                  sim_scratch_size, &stats->t_temp_read_sim);
+        cursor->meta_count = count;
+        cursor->meta_pos = 0;
+        cursor->active = true;
+        (void)store;
+        return 0;
+    }
+    (void)store;
+    return 0;
+}
+
+int MpiSortStrictCursorInit(MpiSortStrictCursor *cursor,
+                            const MpiSortStrictSegment *segment,
+                            MpiSortRecordMeta *meta_buffer,
+                            size_t meta_capacity,
+                            unsigned char *raw_buffer,
+                            size_t raw_capacity,
+                            MpiSortStrictTempStore *store,
+                            unsigned char *sim_scratch,
+                            size_t sim_scratch_size,
+                            MpiSortStats *stats) {
+    cursor->segment = segment;
+    cursor->meta_buffer = meta_buffer;
+    cursor->meta_capacity = meta_capacity;
+    cursor->raw_buffer = raw_buffer;
+    cursor->raw_capacity = raw_capacity;
+    return MpiSortStrictCursorLoadMeta(cursor, store, sim_scratch,
+                                       sim_scratch_size, stats);
+}
+
+const MpiSortRecordMeta &MpiSortStrictCursorMeta(
+        const MpiSortStrictCursor &cursor) {
+    return cursor.meta_buffer[cursor.meta_pos];
+}
+
+int MpiSortStrictCursorRaw(MpiSortStrictCursor *cursor,
+                           MpiSortStrictTempStore *store,
+                           unsigned char *sim_scratch,
+                           size_t sim_scratch_size,
+                           MpiSortStats *stats,
+                           const unsigned char **raw_ptr) {
+    const MpiSortRecordMeta &meta = MpiSortStrictCursorMeta(*cursor);
+    const MpiSortStrictExtent &extent =
+        cursor->segment->extents[cursor->extent_index];
+    uint64_t raw_end = meta.raw_offset + meta.raw_len;
+    if (raw_end > extent.raw_size || meta.raw_len > cursor->raw_capacity) {
+        return -1;
+    }
+    if (cursor->raw_buffer_size == 0 ||
+        meta.raw_offset < cursor->raw_buffer_begin ||
+        raw_end > cursor->raw_buffer_begin + cursor->raw_buffer_size) {
+        cursor->raw_buffer_begin = meta.raw_offset;
+        cursor->raw_buffer_size = (size_t)std::min<uint64_t>(
+            cursor->raw_capacity, extent.raw_size - meta.raw_offset);
+        if (MpiSortStrictPreadAll(
+                extent.fd, cursor->raw_buffer,
+                cursor->raw_buffer_size,
+                extent.raw_offset + (off_t)meta.raw_offset, stats) != 0) {
+            return -1;
+        }
+        MpiSortStrictSimulateCopy(cursor->raw_buffer,
+                                  cursor->raw_buffer_size,
+                                  sim_scratch, sim_scratch_size,
+                                  &stats->t_temp_read_sim);
+    }
+    *raw_ptr = cursor->raw_buffer +
+        (size_t)(meta.raw_offset - cursor->raw_buffer_begin);
+    (void)store;
+    return 0;
+}
+
+int MpiSortStrictCursorAdvance(MpiSortStrictCursor *cursor,
+                               MpiSortStrictTempStore *store,
+                               unsigned char *sim_scratch,
+                               size_t sim_scratch_size,
+                               MpiSortStats *stats) {
+    cursor->meta_pos++;
+    cursor->extent_record_pos++;
+    if (cursor->meta_pos < cursor->meta_count) return 0;
+    return MpiSortStrictCursorLoadMeta(cursor, store, sim_scratch,
+                                       sim_scratch_size, stats);
+}
+
+class MpiSortStrictLoserTree {
+public:
+    explicit MpiSortStrictLoserTree(std::vector<MpiSortStrictCursor> *cursors)
+        : cursors_(cursors), losers_(cursors->size(), (int)cursors->size()),
+          sentinel_((int)cursors->size()) {
+        for (int i = sentinel_ - 1; i >= 0; --i) Adjust(i);
+    }
+
+    bool empty() const {
+        int winner = losers_.empty() ? sentinel_ : losers_[0];
+        return winner == sentinel_ || !Active(winner);
+    }
+
+    int winner_index() const {
+        return losers_[0];
+    }
+
+    void replay(int player) {
+        Adjust(player);
+    }
+
+private:
+    bool Active(int player) const {
+        return player >= 0 && player < sentinel_ &&
+               (*cursors_)[(size_t)player].active;
+    }
+
+    bool Greater(int lhs, int rhs) const {
+        if (lhs == sentinel_) return false;
+        if (rhs == sentinel_) return true;
+        bool lhs_active = Active(lhs);
+        bool rhs_active = Active(rhs);
+        if (lhs_active != rhs_active) return !lhs_active;
+        if (!lhs_active) return lhs > rhs;
+        MpiSortMetaLess less;
+        const MpiSortRecordMeta &a =
+            MpiSortStrictCursorMeta((*cursors_)[(size_t)lhs]);
+        const MpiSortRecordMeta &b =
+            MpiSortStrictCursorMeta((*cursors_)[(size_t)rhs]);
+        if (less(b, a)) return true;
+        if (less(a, b)) return false;
+        return lhs > rhs;
+    }
+
+    void Adjust(int player) {
+        int parent = (player + sentinel_) >> 1;
+        while (parent > 0) {
+            if (Greater(player, losers_[(size_t)parent])) {
+                std::swap(player, losers_[(size_t)parent]);
+            }
+            parent >>= 1;
+        }
+        if (!losers_.empty()) losers_[0] = player;
+    }
+
+    std::vector<MpiSortStrictCursor> *cursors_;
+    std::vector<int> losers_;
+    int sentinel_;
+};
+
+size_t MpiSortStrictCompressWorkspaceBytes() {
+    return 4ull * kSortCpeBlocks *
+           (sizeof(bam_block) + (size_t)BGZF_MAX_BLOCK_SIZE);
+}
+
+int MpiSortStrictBuildCursors(
+        const std::vector<MpiSortStrictSegment> &segments,
+        size_t begin,
+        size_t end,
+        MpiSortStrictBuffer *cursor_memory,
+        MpiSortStrictTempStore *store,
+        unsigned char *sim_scratch,
+        size_t sim_scratch_size,
+        MpiSortStats *stats,
+        std::vector<MpiSortStrictCursor> *cursors) {
+    const size_t meta_capacity =
+        kSortStrictMetaBuffer / sizeof(MpiSortRecordMeta);
+    const size_t stride = kSortStrictMetaBuffer + kSortStrictRawBuffer;
+    cursors->clear();
+    cursors->reserve(end - begin);
+    for (size_t i = begin; i < end; ++i) {
+        if (segments[i].record_count == 0) continue;
+        size_t slot = cursors->size();
+        unsigned char *base = cursor_memory->data + slot * stride;
+        MpiSortStrictCursor cursor;
+        if (MpiSortStrictCursorInit(
+                &cursor, &segments[i],
+                (MpiSortRecordMeta *)base, meta_capacity,
+                base + kSortStrictMetaBuffer, kSortStrictRawBuffer,
+                store, sim_scratch, sim_scratch_size, stats) != 0) {
+            return -1;
+        }
+        cursors->push_back(cursor);
+    }
+    return 0;
+}
+
+int MpiSortStrictMergeGroupToTemp(
+        const std::vector<MpiSortStrictSegment> &segments,
+        size_t begin,
+        size_t end,
+        MpiSortStrictBuffer *cursor_memory,
+        MpiSortStrictBuffer *output_meta_memory,
+        MpiSortStrictBuffer *output_raw_memory,
+        MpiSortStrictTempStore *store,
+        unsigned char *sim_scratch,
+        size_t sim_scratch_size,
+        MpiSortStats *stats,
+        MpiSortStrictSegment *output) {
+    std::vector<MpiSortStrictCursor> cursors;
+    if (MpiSortStrictBuildCursors(segments, begin, end, cursor_memory,
+                                  store, sim_scratch, sim_scratch_size,
+                                  stats, &cursors) != 0) {
+        return -1;
+    }
+    MpiSortStrictLoserTree tree(&cursors);
+    MpiSortRecordMeta *out_meta =
+        (MpiSortRecordMeta *)output_meta_memory->data;
+    size_t meta_capacity =
+        output_meta_memory->size / sizeof(MpiSortRecordMeta);
+    size_t meta_count = 0;
+    size_t raw_used = 0;
+    auto flush = [&]() -> int {
+        if (meta_count == 0) return 0;
+        int ret = MpiSortStrictAppendReceivedChunk(
+            store, out_meta, meta_count, output_raw_memory->data, raw_used,
+            sim_scratch, sim_scratch_size, stats, output);
+        meta_count = 0;
+        raw_used = 0;
+        return ret;
+    };
+    while (!tree.empty()) {
+        int winner = tree.winner_index();
+        MpiSortStrictCursor &cursor = cursors[(size_t)winner];
+        const MpiSortRecordMeta meta = MpiSortStrictCursorMeta(cursor);
+        const unsigned char *raw_ptr = nullptr;
+        if (MpiSortStrictCursorRaw(&cursor, store, sim_scratch,
+                                   sim_scratch_size, stats, &raw_ptr) != 0) {
+            return -1;
+        }
+        if (meta_count == meta_capacity ||
+            meta.raw_len > output_raw_memory->size - raw_used) {
+            if (flush() != 0) return -1;
+        }
+        if (meta.raw_len > output_raw_memory->size) return -1;
+        out_meta[meta_count] = meta;
+        out_meta[meta_count].raw_offset = raw_used;
+        memcpy(output_raw_memory->data + raw_used, raw_ptr, meta.raw_len);
+        raw_used += meta.raw_len;
+        meta_count++;
+        if (MpiSortStrictCursorAdvance(&cursor, store, sim_scratch,
+                                       sim_scratch_size, stats) != 0) {
+            return -1;
+        }
+        tree.replay(winner);
+    }
+    return flush();
+}
+
+int MpiSortStrictConsolidate(
+        std::vector<MpiSortStrictSegment> *segments,
+        size_t fan_in,
+        MpiSortMemoryTracker *tracker,
+        MpiSortStrictTempStore *store,
+        unsigned char *sim_scratch,
+        size_t sim_scratch_size,
+        MpiSortStats *stats) {
+    if (segments->size() <= fan_in) return 0;
+    const size_t cursor_bytes =
+        fan_in * (kSortStrictMetaBuffer + kSortStrictRawBuffer);
+    MpiSortStrictBuffer cursor_memory;
+    MpiSortStrictBuffer output_meta;
+    MpiSortStrictBuffer output_raw;
+    if (MpiSortStrictAlloc(tracker, cursor_bytes, &cursor_memory) != 0 ||
+        MpiSortStrictAlloc(tracker, kSortStrictConsolidateMeta,
+                           &output_meta) != 0 ||
+        MpiSortStrictAlloc(tracker, kSortStrictConsolidateRaw,
+                           &output_raw) != 0) {
+        MpiSortStrictFree(tracker, &cursor_memory);
+        MpiSortStrictFree(tracker, &output_meta);
+        MpiSortStrictFree(tracker, &output_raw);
+        return -1;
+    }
+    while (segments->size() > fan_in) {
+        std::vector<MpiSortStrictSegment> next;
+        next.reserve((segments->size() + fan_in - 1) / fan_in);
+        double read_actual_before = stats->t_temp_read_actual;
+        double write_actual_before = stats->t_temp_write_actual;
+        double read_sim_before = stats->t_temp_read_sim;
+        double write_sim_before = stats->t_temp_write_sim;
+        double t0 = GetTime();
+        for (size_t begin = 0; begin < segments->size(); begin += fan_in) {
+            size_t end = std::min(segments->size(), begin + fan_in);
+            MpiSortStrictSegment merged;
+            if (MpiSortStrictMergeGroupToTemp(
+                    *segments, begin, end, &cursor_memory,
+                    &output_meta, &output_raw, store,
+                    sim_scratch, sim_scratch_size, stats, &merged) != 0) {
+                MpiSortStrictFree(tracker, &cursor_memory);
+                MpiSortStrictFree(tracker, &output_meta);
+                MpiSortStrictFree(tracker, &output_raw);
+                return -1;
+            }
+            next.push_back(std::move(merged));
+        }
+        double wall = GetTime() - t0;
+        double actual_io =
+            (stats->t_temp_read_actual - read_actual_before) +
+            (stats->t_temp_write_actual - write_actual_before);
+        double simulated_wall = wall - actual_io;
+        if (simulated_wall < 0.0) simulated_wall = 0.0;
+        stats->t_run_merge += wall;
+        stats->t_consolidation_simulated += simulated_wall;
+        stats->t_consolidation_temp_read_sim +=
+            stats->t_temp_read_sim - read_sim_before;
+        stats->t_consolidation_temp_write_sim +=
+            stats->t_temp_write_sim - write_sim_before;
+        stats->consolidation_passes++;
+        segments->swap(next);
+    }
+    MpiSortStrictFree(tracker, &cursor_memory);
+    MpiSortStrictFree(tracker, &output_meta);
+    MpiSortStrictFree(tracker, &output_raw);
+    return 0;
+}
+
+int MpiSortStrictPreparePayloadBatch(
+        MpiSortStrictLoserTree *tree,
+        std::vector<MpiSortStrictCursor> *cursors,
+        MpiSortStrictTempStore *store,
+        unsigned char *sim_scratch,
+        size_t sim_scratch_size,
+        MpiSortBlockSet *payload_blocks,
+        MpiSortBlockSet *output_blocks,
+        MpiSortRawCompressPara *paras,
+        int compress_level,
+        MpiSortStats *stats,
+        int *active_blocks) {
+    int active = 0;
+    while (!tree->empty() && active < kSortCpeBlocks) {
+        bam_block *payload = &payload_blocks->blocks[active];
+        payload->pos = 0;
+        payload->length = 0;
+        payload->errcode = 0;
+        payload->block_id = active;
+        while (!tree->empty()) {
+            int winner = tree->winner_index();
+            MpiSortStrictCursor &cursor = (*cursors)[(size_t)winner];
+            const MpiSortRecordMeta meta = MpiSortStrictCursorMeta(cursor);
+            if (meta.raw_len > BGZF_BLOCK_SIZE) return -1;
+            if (payload->pos > 0 &&
+                payload->pos + meta.raw_len > BGZF_BLOCK_SIZE) {
+                break;
+            }
+            const unsigned char *raw_ptr = nullptr;
+            if (MpiSortStrictCursorRaw(&cursor, store, sim_scratch,
+                                       sim_scratch_size, stats,
+                                       &raw_ptr) != 0) {
+                return -1;
+            }
+            memcpy(payload->data + payload->pos, raw_ptr, meta.raw_len);
+            payload->pos += meta.raw_len;
+            payload->length = payload->pos;
+            if (MpiSortStrictCursorAdvance(&cursor, store, sim_scratch,
+                                           sim_scratch_size, stats) != 0) {
+                return -1;
+            }
+            tree->replay(winner);
+        }
+        if (payload->pos == 0) return -1;
+        paras[active].block_id = active;
+        paras[active].un_comp_block = payload;
+        paras[active].un_comp_size = (int)payload->pos;
+        paras[active].output_block = &output_blocks->blocks[active];
+        paras[active].output_size = 0;
+        paras[active].status = 0;
+        paras[active].compress_level = compress_level;
+        paras[active].compress_pack_cycles = 0;
+        paras[active].compress_alloc_cycles = 0;
+        paras[active].compress_deflate_cycles = 0;
+        paras[active].compress_footer_cycles = 0;
+        paras[active].compress_total_cycles = 0;
+        active++;
+    }
+    for (int i = active; i < kSortCpeBlocks; ++i) {
+        MpiSortInitEmptyRawCompressPara(&paras[i], i);
+    }
+    *active_blocks = active;
+    return 0;
+}
+
+int MpiSortStrictMergeCompress(
+        const std::vector<MpiSortStrictSegment> &segments,
+        MpiSortMemoryTracker *tracker,
+        MpiSortStrictTempStore *store,
+        unsigned char *sim_scratch,
+        size_t sim_scratch_size,
+        MemWriter &mem_writer,
+        int compress_level,
+        MpiSortStats *stats) {
+    const size_t cursor_stride =
+        kSortStrictMetaBuffer + kSortStrictRawBuffer;
+    const size_t cursor_bytes = segments.size() * cursor_stride;
+    const size_t compress_bytes = MpiSortStrictCompressWorkspaceBytes();
+    MpiSortStrictBuffer cursor_memory;
+    bool compress_acquired = tracker->acquire(compress_bytes);
+    if (!compress_acquired ||
+        MpiSortStrictAlloc(tracker, cursor_bytes, &cursor_memory) != 0) {
+        if (compress_acquired) tracker->release(compress_bytes);
+        return -1;
+    }
+    MpiSortBlockSet payload_a = {}, payload_b = {}, out_a = {}, out_b = {};
+    MpiSortRawCompressPara paras_a[kSortCpeBlocks], paras_b[kSortCpeBlocks];
+    if (MpiSortAllocateBlockSet(&payload_a, kSortCpeBlocks) != 0 ||
+        MpiSortAllocateBlockSet(&payload_b, kSortCpeBlocks) != 0 ||
+        MpiSortAllocateBlockSet(&out_a, kSortCpeBlocks) != 0 ||
+        MpiSortAllocateBlockSet(&out_b, kSortCpeBlocks) != 0) {
+        MpiSortStrictFree(tracker, &cursor_memory);
+        tracker->release(compress_bytes);
+        return -1;
+    }
+    for (int i = 0; i < kSortCpeBlocks; ++i) {
+        MpiSortInitEmptyRawCompressPara(&paras_a[i], i);
+        MpiSortInitEmptyRawCompressPara(&paras_b[i], i);
+    }
+    std::vector<MpiSortStrictCursor> cursors;
+    double merge_read_actual_before = stats->t_temp_read_actual;
+    double merge_read_sim_before = stats->t_temp_read_sim;
+    double merge_t0 = GetTime();
+    if (MpiSortStrictBuildCursors(segments, 0, segments.size(),
+                                  &cursor_memory, store,
+                                  sim_scratch, sim_scratch_size,
+                                  stats, &cursors) != 0) {
+        MpiSortFreeBlockSet(&payload_a);
+        MpiSortFreeBlockSet(&payload_b);
+        MpiSortFreeBlockSet(&out_a);
+        MpiSortFreeBlockSet(&out_b);
+        MpiSortStrictFree(tracker, &cursor_memory);
+        tracker->release(compress_bytes);
+        return -1;
+    }
+    double merge_wall = GetTime() - merge_t0;
+    double merge_actual_io =
+        stats->t_temp_read_actual - merge_read_actual_before;
+    double merge_simulated = merge_wall - merge_actual_io;
+    if (merge_simulated < 0.0) merge_simulated = 0.0;
+    stats->t_final_sort += merge_wall;
+    stats->t_run_merge += merge_wall;
+    stats->t_merge_simulated += merge_simulated;
+    stats->t_merge_temp_read_sim +=
+        stats->t_temp_read_sim - merge_read_sim_before;
+    stats->t_merge_unhidden += merge_simulated;
+    MpiSortStrictLoserTree tree(&cursors);
+    MpiSortBlockSet *payload_active = &payload_a;
+    MpiSortBlockSet *payload_pending = &payload_b;
+    MpiSortBlockSet *out_active = &out_a;
+    MpiSortBlockSet *out_pending = &out_b;
+    MpiSortRawCompressPara *paras_active = paras_a;
+    MpiSortRawCompressPara *paras_pending = paras_b;
+    bool has_pending = false;
+    auto flush_pending = [&]() -> int {
+        if (!has_pending) return 0;
+        double t0 = GetTime();
+        for (int i = 0; i < kSortCpeBlocks; ++i) {
+            if (paras_pending[i].status == 0 &&
+                paras_pending[i].output_block) {
+                if (MpiWriteBlockToMem(mem_writer,
+                                       paras_pending[i].output_block) != 0) {
+                    return -1;
+                }
+                stats->bgzf_blocks++;
+            }
+            MpiSortInitEmptyRawCompressPara(&paras_pending[i], i);
+        }
+        has_pending = false;
+        stats->t_write += GetTime() - t0;
+        return 0;
+    };
+
+    int active_blocks = 0;
+    merge_read_actual_before = stats->t_temp_read_actual;
+    merge_read_sim_before = stats->t_temp_read_sim;
+    merge_t0 = GetTime();
+    if (MpiSortStrictPreparePayloadBatch(
+            &tree, &cursors, store, sim_scratch, sim_scratch_size,
+            payload_active, out_active, paras_active,
+            compress_level, stats, &active_blocks) != 0) {
+        MpiSortFreeBlockSet(&payload_a);
+        MpiSortFreeBlockSet(&payload_b);
+        MpiSortFreeBlockSet(&out_a);
+        MpiSortFreeBlockSet(&out_b);
+        MpiSortStrictFree(tracker, &cursor_memory);
+        tracker->release(compress_bytes);
+        return -1;
+    }
+    merge_wall = GetTime() - merge_t0;
+    merge_actual_io = stats->t_temp_read_actual - merge_read_actual_before;
+    merge_simulated = merge_wall - merge_actual_io;
+    if (merge_simulated < 0.0) merge_simulated = 0.0;
+    stats->t_final_sort += merge_wall;
+    stats->t_run_merge += merge_wall;
+    stats->t_merge_simulated += merge_simulated;
+    stats->t_merge_temp_read_sim +=
+        stats->t_temp_read_sim - merge_read_sim_before;
+    stats->t_merge_unhidden += merge_simulated;
+
+    int ret = 0;
+    while (active_blocks > 0) {
+        int next_active = 0;
+        double t0 = GetTime();
+        __real_athread_spawn((void *)slave_mpi_sort_compress_payload,
+                             paras_active, 1);
+        if (flush_pending() != 0) {
+            athread_join();
+            ret = -1;
+            break;
+        }
+        merge_read_actual_before = stats->t_temp_read_actual;
+        merge_read_sim_before = stats->t_temp_read_sim;
+        merge_t0 = GetTime();
+        if (MpiSortStrictPreparePayloadBatch(
+                &tree, &cursors, store, sim_scratch, sim_scratch_size,
+                payload_pending, out_pending, paras_pending,
+                compress_level, stats, &next_active) != 0) {
+            athread_join();
+            ret = -1;
+            break;
+        }
+        merge_wall = GetTime() - merge_t0;
+        merge_actual_io =
+            stats->t_temp_read_actual - merge_read_actual_before;
+        merge_simulated = merge_wall - merge_actual_io;
+        if (merge_simulated < 0.0) merge_simulated = 0.0;
+        stats->t_final_sort += merge_wall;
+        stats->t_run_merge += merge_wall;
+        stats->t_merge_simulated += merge_simulated;
+        stats->t_merge_temp_read_sim +=
+            stats->t_temp_read_sim - merge_read_sim_before;
+        athread_join();
+        double wall = GetTime() - t0;
+        stats->t_compress += wall;
+        double compress_simulated = MpiSortEstimateCompressSeconds(
+            paras_active, active_blocks, wall, stats);
+        stats->t_compress_simulated += compress_simulated;
+        MpiSortAccumulateCompressDetail(paras_active, active_blocks,
+                                        compress_simulated, stats);
+        for (int i = 0; i < active_blocks; ++i) {
+            if (paras_active[i].status != 0) {
+                ret = -1;
+                break;
+            }
+        }
+        if (ret != 0) break;
+        has_pending = active_blocks > 0;
+        std::swap(payload_active, payload_pending);
+        std::swap(out_active, out_pending);
+        std::swap(paras_active, paras_pending);
+        active_blocks = next_active;
+    }
+    if (ret == 0) ret = flush_pending();
+    MpiSortFreeBlockSet(&payload_a);
+    MpiSortFreeBlockSet(&payload_b);
+    MpiSortFreeBlockSet(&out_a);
+    MpiSortFreeBlockSet(&out_b);
+    MpiSortStrictFree(tracker, &cursor_memory);
+    tracker->release(compress_bytes);
+    return ret;
+}
+
 } // namespace
 
 
@@ -1171,4 +3266,238 @@ int FusedBamSortMPI(MemReader &reader,
     stats->t_fused_total += GetTime() - fused_t0;
     (void)global_sample_count;
     return 0;
+}
+
+int FusedBamExternalSortMPI(MemReader &reader,
+                            MemWriter &mem_writer,
+                            long long global_block_begin,
+                            int rank,
+                            int comm_size,
+                            int compress_level,
+                            size_t memory_limit,
+                            const char *temp_prefix,
+                            MpiSortStats *stats) {
+    double fused_t0 = GetTime();
+    stats->sort_mode = 1;
+    MpiSortMemoryTracker tracker(memory_limit);
+    MpiSortStrictTempStore temp_store;
+    MpiSortStrictBuffer sim_scratch;
+    MpiSortStrictBuffer run_arena_memory;
+    MpiSortStrictRunArena run_arena;
+    MpiSortStrictExchangeWorkspace exchange_ws;
+    std::vector<MpiSortStrictRun> runs;
+    std::vector<MpiSortStrictSegment> segments;
+    std::vector<MpiSortKey> local_samples;
+    std::vector<MpiSortKey> splitters;
+    int ret = -1;
+    bool exchange_allocated = false;
+    bool control_acquired = false;
+    bool run_arena_allocated = false;
+    auto all_ranks_ok = [](int local_ok) -> bool {
+        int global_ok = 0;
+        MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN,
+                      MPI_COMM_WORLD);
+        return global_ok != 0;
+    };
+
+    do {
+        int setup_ok = 1;
+        if (memory_limit == 0) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: strict external sort requires a non-zero -m limit.\n",
+                    rank);
+            setup_ok = 0;
+        }
+        const size_t extract_workspace = MpiSortStrictExtractWorkspaceBytes();
+        const size_t extract_minimum =
+            kSortStrictControlReserve + kSortStrictSimScratch +
+            extract_workspace + 2 * BGZF_MAX_BLOCK_SIZE +
+            128 * sizeof(MpiSortRecordMeta);
+        const size_t merge_minimum =
+            kSortStrictControlReserve + kSortStrictSimScratch +
+            MpiSortStrictCompressWorkspaceBytes() +
+            kSortStrictConsolidateMeta + kSortStrictConsolidateRaw +
+            2 * (kSortStrictMetaBuffer + kSortStrictRawBuffer);
+        const size_t minimum_memory = std::max(extract_minimum, merge_minimum);
+        if (setup_ok && memory_limit < minimum_memory) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: -m is too small for strict external sort. minimum_memory=%zu limit=%zu\n",
+                    rank, minimum_memory, memory_limit);
+            setup_ok = 0;
+        }
+        double setup_t0 = GetTime();
+        if (setup_ok) {
+            if (!tracker.acquire(kSortStrictControlReserve)) {
+                setup_ok = 0;
+            } else {
+                control_acquired = true;
+            }
+        }
+        if (setup_ok &&
+            MpiSortStrictAlloc(&tracker, kSortStrictSimScratch,
+                               &sim_scratch) != 0) {
+            setup_ok = 0;
+        }
+        if (setup_ok) {
+            double temp_open_t0 = GetTime();
+            if (MpiSortStrictOpenTemp(temp_prefix, rank, &temp_store) != 0) {
+                setup_ok = 0;
+            }
+            stats->t_temp_open_actual += GetTime() - temp_open_t0;
+        }
+
+        const size_t stage_budget = setup_ok
+            ? memory_limit - kSortStrictControlReserve - kSortStrictSimScratch
+            : 0;
+        size_t run_arena_bytes = stage_budget * 3 / 5;
+        const size_t exchange_min = 8ull * 1024ull * 1024ull;
+        if (setup_ok && run_arena_bytes + exchange_min > stage_budget) {
+            run_arena_bytes = stage_budget - exchange_min;
+        }
+        if (setup_ok && run_arena_bytes + extract_workspace > stage_budget) {
+            run_arena_bytes = stage_budget - extract_workspace;
+        }
+        run_arena_bytes -= run_arena_bytes % 64;
+        if (setup_ok && run_arena_bytes < 2 * BGZF_MAX_BLOCK_SIZE) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: -m leaves no usable run arena. arena=%zu limit=%zu\n",
+                    rank, run_arena_bytes, memory_limit);
+            setup_ok = 0;
+        }
+        if (setup_ok &&
+            MpiSortStrictAlloc(&tracker, run_arena_bytes,
+                               &run_arena_memory) != 0) {
+            setup_ok = 0;
+        }
+        if (setup_ok) {
+            run_arena_allocated = true;
+            run_arena.data = run_arena_memory.data;
+            run_arena.capacity = run_arena_memory.size;
+            run_arena.reset();
+            stats->run_arena_bytes = (long long)run_arena_bytes;
+        }
+        stats->t_setup +=
+            std::max(0.0,
+                     GetTime() - setup_t0 - stats->t_temp_open_actual);
+        if (!all_ranks_ok(setup_ok)) break;
+
+        int generate_ok = MpiSortStrictGenerateRuns(
+                reader, global_block_begin, rank, comm_size,
+                &run_arena, &temp_store, sim_scratch.data,
+                sim_scratch.size, &tracker, &runs, &local_samples,
+                stats) == 0 ? 1 : 0;
+        if (!all_ranks_ok(generate_ok)) break;
+        stats->external_runs = (long long)runs.size();
+
+        double sample_t0 = GetTime();
+        long long global_sample_count = 0;
+        if (MpiSortChooseSplitters(local_samples, rank, comm_size,
+                                   &splitters,
+                                   &global_sample_count) != 0) {
+            break;
+        }
+        stats->sample_records = (long long)local_samples.size();
+        stats->t_sample += GetTime() - sample_t0;
+
+        const size_t exchange_budget = stage_budget - run_arena_bytes;
+        int exchange_setup_ok =
+            MpiSortStrictAllocateExchange(&tracker, exchange_budget,
+                                          &exchange_ws) == 0 ? 1 : 0;
+        if (!exchange_setup_ok) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: -m cannot allocate bounded exchange buffers. exchange_budget=%zu limit=%zu\n",
+                    rank, exchange_budget, memory_limit);
+        }
+        exchange_allocated = exchange_setup_ok != 0;
+        if (!all_ranks_ok(exchange_setup_ok)) break;
+        if (MpiSortStrictExchangeRuns(
+                runs, splitters, &run_arena, &exchange_ws, &temp_store,
+                sim_scratch.data, sim_scratch.size, rank, comm_size,
+                &segments, stats) != 0) {
+            break;
+        }
+        stats->external_segments = (long long)segments.size();
+        MpiSortStrictFreeExchange(&tracker, &exchange_ws);
+        exchange_allocated = false;
+        MpiSortStrictFree(&tracker, &run_arena_memory);
+        run_arena_allocated = false;
+
+        const size_t cursor_stride =
+            kSortStrictMetaBuffer + kSortStrictRawBuffer;
+        const size_t merge_available =
+            memory_limit - tracker.current;
+        const size_t merge_fixed =
+            MpiSortStrictCompressWorkspaceBytes() +
+            kSortStrictConsolidateMeta + kSortStrictConsolidateRaw;
+        if (merge_available <= merge_fixed + 2 * cursor_stride) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: -m cannot support a two-way external merge. minimum_additional=%zu available=%zu\n",
+                    rank, merge_fixed + 2 * cursor_stride,
+                    merge_available);
+            break;
+        }
+        size_t fan_in = (merge_available - merge_fixed) / cursor_stride;
+        if (fan_in < 2) fan_in = 2;
+        stats->merge_fan_in = (long long)fan_in;
+        if (MpiSortStrictConsolidate(
+                &segments, fan_in, &tracker, &temp_store,
+                sim_scratch.data, sim_scratch.size, stats) != 0) {
+            break;
+        }
+        stats->external_segments = (long long)segments.size();
+        if (MpiSortStrictMergeCompress(
+                segments, &tracker, &temp_store, sim_scratch.data,
+                sim_scratch.size, mem_writer, compress_level,
+                stats) != 0) {
+            break;
+        }
+        (void)global_sample_count;
+        ret = 0;
+    } while (false);
+
+    double cleanup_t0 = GetTime();
+    if (exchange_allocated) {
+        MpiSortStrictFreeExchange(&tracker, &exchange_ws);
+    }
+    if (run_arena_allocated) {
+        MpiSortStrictFree(&tracker, &run_arena_memory);
+    }
+    MpiSortStrictCloseTemp(&temp_store);
+    MpiSortStrictFree(&tracker, &sim_scratch);
+    if (control_acquired) tracker.release(kSortStrictControlReserve);
+    stats->t_cleanup += GetTime() - cleanup_t0;
+    stats->tracked_peak_bytes = (long long)tracker.peak;
+    stats->t_fused_actual = GetTime() - fused_t0;
+    double non_merge_read_sim =
+        stats->t_temp_read_sim -
+        stats->t_merge_temp_read_sim -
+        stats->t_consolidation_temp_read_sim;
+    double non_consolidation_write_sim =
+        stats->t_temp_write_sim -
+        stats->t_consolidation_temp_write_sim;
+    if (non_merge_read_sim < 0.0) non_merge_read_sim = 0.0;
+    if (non_consolidation_write_sim < 0.0) {
+        non_consolidation_write_sim = 0.0;
+    }
+    const double final_pipeline_sim =
+        std::max(stats->t_merge_simulated,
+                 stats->t_compress_simulated);
+    stats->t_fused_total =
+        stats->t_setup +
+        stats->t_extract_read_unhidden +
+        stats->t_extract +
+        stats->t_extract_prepare +
+        stats->t_extract_merge +
+        stats->t_local_sort +
+        stats->t_sample +
+        stats->t_bucket_count +
+        stats->t_bucket_pack +
+        stats->t_mpi_simulated +
+        stats->t_offset_fix +
+        non_merge_read_sim +
+        non_consolidation_write_sim +
+        stats->t_consolidation_simulated +
+        final_pipeline_sim +
+        stats->t_status_check;
+    return ret;
 }

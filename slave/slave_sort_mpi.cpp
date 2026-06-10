@@ -424,3 +424,53 @@ extern "C" void slave_mpi_sort_bucket_pack(MpiSortBucketPackPara paras[64]) {
     para->total_cycles = (uint64_t)(sort_slave_cycle_now() - total_t0);
     para->status = 0;
 }
+
+extern "C" void slave_mpi_sort_range_pack(MpiSortRangePackPara paras[64]) {
+    int id = _PEN;
+    MpiSortRangePackPara *para = &paras[id];
+
+    para->pack_cycles = 0;
+    para->total_cycles = 0;
+    if (para->status != 0) return;
+    if (para->record_begin >= para->record_end) {
+        para->status = 0;
+        return;
+    }
+    if (para->local_records == nullptr || para->local_raw == nullptr ||
+        para->record_raw_offsets == nullptr || para->send_meta == nullptr ||
+        para->send_raw == nullptr) {
+        para->status = -2;
+        return;
+    }
+
+    unsigned long total_t0 = sort_slave_cycle_now();
+    unsigned long pack_t0 = sort_slave_cycle_now();
+    for (size_t i = para->record_begin; i < para->record_end; ++i) {
+        const MpiSortRecordMetaShared *src = &para->local_records[i];
+        size_t out_index = para->output_record_begin + (i - para->record_begin);
+        uint64_t raw_pos = para->record_raw_offsets[out_index];
+        uint64_t src_end = src->raw_offset + (uint64_t)src->raw_len;
+        uint64_t dst_end = raw_pos + (uint64_t)src->raw_len;
+        if (RB_SORT_UNLIKELY(src_end > (uint64_t)para->local_raw_size ||
+                             out_index >= para->send_meta_capacity ||
+                             dst_end > para->send_raw_capacity)) {
+            para->status = -3;
+            para->record_index = (int)i;
+            para->actual_value = (long long)(src_end > dst_end ? src_end : dst_end);
+            para->limit_value = (long long)(src_end > (uint64_t)para->local_raw_size
+                                            ? para->local_raw_size
+                                            : para->send_raw_capacity);
+            para->limit_id = BOUNDS_LIMIT_GENERIC_RUNTIME_ERROR;
+            para->pack_cycles = (uint64_t)(sort_slave_cycle_now() - pack_t0);
+            para->total_cycles = (uint64_t)(sort_slave_cycle_now() - total_t0);
+            return;
+        }
+        MpiSortRecordMetaShared dst = *src;
+        dst.raw_offset = raw_pos;
+        para->send_meta[out_index] = dst;
+        memcpy(para->send_raw + raw_pos, para->local_raw + src->raw_offset, src->raw_len);
+    }
+    para->pack_cycles = (uint64_t)(sort_slave_cycle_now() - pack_t0);
+    para->total_cycles = (uint64_t)(sort_slave_cycle_now() - total_t0);
+    para->status = 0;
+}

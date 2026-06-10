@@ -62,6 +62,8 @@ int main(int argc, char **argv) {
     sort->add_option("-i,--inFile", cmd_info.in_file_name_, "input bam name")->required()->check(CLI::ExistingFile);
     sort->add_option("-o,--outFile", cmd_info.out_file_name_, "output bam name")->required();
     sort->add_option("-m,--memory", cmd_info.sort_memory_, "Sort memory limit per MPI rank, e.g. 4G or 4096M");
+    sort->add_option("-T,--temp-prefix", cmd_info.sort_temp_prefix_,
+                     "External sort temporary prefix or directory");
     sort->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
     sort->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
 

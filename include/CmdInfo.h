@@ -25,6 +25,7 @@ public:
     int max_read_len_;
     int compress_level_;
     std::string sort_memory_;
+    std::string sort_temp_prefix_;
 
 };
 
