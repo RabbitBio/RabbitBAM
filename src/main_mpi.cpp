@@ -67,6 +67,23 @@ int main(int argc, char **argv) {
     sort->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
     sort->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
 
+    CLI::App *markdup = app.add_subcommand("markdup", "Run MPI BAM duplicate marking");
+    markdup->add_option("-i,--inFile", cmd_info.in_file_name_, "coordinate-sorted fixmate BAM name")->required()->check(CLI::ExistingFile);
+    markdup->add_option("-o,--outFile", cmd_info.out_file_name_, "output bam name")->required();
+    markdup->add_flag("-r,--remove-dups", cmd_info.markdup_remove_dups_, "Remove duplicate records")->default_val(false);
+    markdup->add_flag("-c,--clear", cmd_info.markdup_clear_, "Clear existing duplicate flags and dt/do tags first")->default_val(false);
+    markdup->add_flag("--include-fails", cmd_info.markdup_include_fails_, "Include QC-fail records in duplicate detection")->default_val(false);
+    markdup->add_option("-m,--memory", cmd_info.markdup_memory_, "Markdup candidate memory limit per MPI rank, e.g. 4G or 4096M");
+    markdup->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
+    markdup->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
+
+    CLI::App *fixmate = app.add_subcommand("fixmate", "Run MPI BAM fixmate");
+    fixmate->add_option("-i,--inFile", cmd_info.in_file_name_, "name-collated or queryname-sorted BAM name")->required()->check(CLI::ExistingFile);
+    fixmate->add_option("-o,--outFile", cmd_info.out_file_name_, "output bam name")->required();
+    fixmate->add_flag("-m", cmd_info.fixmate_mate_score_, "Add mate score ms tags")->required();
+    fixmate->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
+    fixmate->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
+
     CLI11_PARSE(app, argc, argv);
 
     int exit_code = 1;
@@ -75,6 +92,8 @@ int main(int argc, char **argv) {
     bool is_flagstat = false;
     bool is_stats = false;
     bool is_sort = false;
+    bool is_markdup = false;
+    bool is_fixmate = false;
     if (app.get_subcommands().empty()) {
         if (my_rank == 0) fprintf(stderr, "ERROR: You should input one command.\n");
         goto cleanup;
@@ -88,15 +107,17 @@ int main(int argc, char **argv) {
     is_flagstat = selected_command->get_name() == "flagstat";
     is_stats = selected_command->get_name() == "stats";
     is_sort = selected_command->get_name() == "sort";
-    if (!is_run_all && !is_flagstat && !is_stats && !is_sort) {
-        if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI only supports run_all, flagstat, stats, and sort.\n");
+    is_markdup = selected_command->get_name() == "markdup";
+    is_fixmate = selected_command->get_name() == "fixmate";
+    if (!is_run_all && !is_flagstat && !is_stats && !is_sort && !is_markdup && !is_fixmate) {
+        if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI only supports run_all, flagstat, stats, sort, markdup, and fixmate.\n");
         goto cleanup;
     }
     if (is_stats && !stats_basic) {
         if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI stats v1 requires --basic.\n");
         goto cleanup;
     }
-    if ((is_run_all || is_sort) &&
+    if ((is_run_all || is_sort || is_markdup || is_fixmate) &&
         cmd_info.compress_level_ != 0 &&
         cmd_info.compress_level_ != 1 &&
         cmd_info.compress_level_ != 6) {
@@ -108,12 +129,16 @@ int main(int argc, char **argv) {
 
     t1 = GetTime();
     exit_code = is_sort ? ProcessSortMPI(&cmd_info)
-                         : (is_stats ? ProcessStatsMPI(&cmd_info)
-                                     : (is_flagstat ? ProcessFlagstatMPI(&cmd_info) : ProcessSwBamMPI(&cmd_info)));
+                         : (is_markdup ? ProcessMarkdupMPI(&cmd_info)
+                                      : (is_fixmate ? ProcessFixmateMPI(&cmd_info)
+                                                    : (is_stats ? ProcessStatsMPI(&cmd_info)
+                                                                : (is_flagstat ? ProcessFlagstatMPI(&cmd_info) : ProcessSwBamMPI(&cmd_info)))));
     if (my_rank == 0) {
         printf("%s rank0 time is %lf--\n",
                is_sort ? "ProcessSortMPI" :
-               (is_stats ? "ProcessStatsMPI" : (is_flagstat ? "ProcessFlagstatMPI" : "ProcessSwBamMPI")),
+               (is_markdup ? "ProcessMarkdupMPI" :
+                (is_fixmate ? "ProcessFixmateMPI" :
+                 (is_stats ? "ProcessStatsMPI" : (is_flagstat ? "ProcessFlagstatMPI" : "ProcessSwBamMPI")))),
                GetTime() - t1);
     }
 

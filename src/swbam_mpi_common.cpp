@@ -491,6 +491,46 @@ void MpiPrintRankSamToBamStats(int rank, int comm_size,
 
 } // namespace
 
+int MpiCommonLoadFileToMemory(const std::string &path,
+                              char **data, size_t *size) {
+    return MpiLoadFileToMemory(path, data, size);
+}
+
+int MpiCommonScanBgzfBlocksInMemory(
+        const char *base, size_t size, long long body_start,
+        std::vector<long long> *offsets,
+        std::vector<long long> *lengths) {
+    return MpiScanBgzfBlocksInMemory(
+        base, size, body_start, offsets, lengths);
+}
+
+int MpiCommonSelectBlockRangeFromMemory(
+        char *base, size_t input_size,
+        const std::vector<long long> &offsets,
+        const std::vector<long long> &lengths,
+        long long begin, long long end,
+        char **data, size_t *size) {
+    return MpiSelectBlockRangeFromMemory(
+        base, input_size, offsets, lengths,
+        begin, end, data, size);
+}
+
+int MpiCommonDumpMemoryToFile(const std::string &path,
+                              const char *data, size_t size) {
+    return MpiDumpMemoryToFile(path, data, size);
+}
+
+int MpiCommonInitMemWriter(MemWriter &writer, size_t capacity) {
+    return MpiInitMemWriter(writer, capacity);
+}
+
+int MpiCommonBuildBamHeaderMemory(sam_hdr_t *header,
+                                  int compress_level,
+                                  char **data, size_t *size) {
+    return MpiBuildBamHeaderMemory(
+        header, compress_level, data, size);
+}
+
 int MpiWriteBlockToMem(MemWriter &w, bam_block *block) {
     if (MpiEnsureMemWriterCapacity(w, block->length) != 0) return -1;
     memcpy(w.data + w.size, block->data, block->length);

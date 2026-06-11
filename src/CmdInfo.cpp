@@ -16,4 +16,9 @@ CmdInfo::CmdInfo() {
     compress_level_ = 1;
     sort_memory_ = "";
     sort_temp_prefix_ = "";
+    markdup_remove_dups_ = false;
+    markdup_clear_ = false;
+    markdup_include_fails_ = false;
+    markdup_memory_ = "";
+    fixmate_mate_score_ = false;
 }

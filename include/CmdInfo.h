@@ -26,6 +26,11 @@ public:
     int compress_level_;
     std::string sort_memory_;
     std::string sort_temp_prefix_;
+    bool markdup_remove_dups_;
+    bool markdup_clear_;
+    bool markdup_include_fails_;
+    std::string markdup_memory_;
+    bool fixmate_mate_score_;
 
 };
 

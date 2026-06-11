@@ -168,11 +168,72 @@ struct MpiSortStats {
     double t_cpe_calibration_wall;
 };
 
+struct MpiMarkdupStats {
+    long long input_blocks;
+    long long group_count;
+    long long total_records;
+    long long examined_records;
+    long long excluded_records;
+    long long pair_candidates;
+    long long single_candidates;
+    long long owner_candidates;
+    long long pair_duplicates;
+    long long single_duplicates;
+    long long marked_records;
+    long long cleared_records;
+    long long removed_records;
+    long long qname_bytes;
+    long long mpi_candidate_bytes;
+    long long mpi_result_bytes;
+    long long bgzf_blocks;
+    long long tracked_peak_bytes;
+    double t_candidate_decomp;
+    double t_candidate_extract;
+    double t_candidate_exchange;
+    double t_group;
+    double t_result_exchange;
+    double t_rewrite_decomp;
+    double t_rewrite;
+    double t_pack;
+    double t_compress;
+    double t_read;
+    double t_write;
+    double t_fused_total;
+};
+
+struct MpiFixmateStats {
+    long long input_blocks;
+    long long group_count;
+    long long total_records;
+    long long paired_groups;
+    long long singleton_groups;
+    long long secondary_records;
+    long long supplementary_records;
+    long long boundary_groups;
+    long long boundary_bytes;
+    long long mq_updates;
+    long long mc_updates;
+    long long ms_updates;
+    long long bgzf_blocks;
+    double t_read;
+    double t_decompress;
+    double t_group_scan;
+    double t_plan;
+    double t_boundary_exchange;
+    double t_rewrite;
+    double t_pack;
+    double t_compress;
+    double t_write;
+    double t_fused_total;
+};
+
 int ProcessSwBamMPI(CmdInfo *cmd_info);
 int ProcessBamToBamMPI(CmdInfo *cmd_info);
 int ProcessFlagstatMPI(CmdInfo *cmd_info);
 int ProcessStatsMPI(CmdInfo *cmd_info);
 int ProcessSortMPI(CmdInfo *cmd_info);
+int ProcessMarkdupMPI(CmdInfo *cmd_info);
+int ProcessFixmateMPI(CmdInfo *cmd_info);
 
 int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      const BamFilterOptions &filter,
