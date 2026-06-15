@@ -106,6 +106,8 @@ struct MpiSortStats {
     long long bgzf_blocks;
     long long external_runs;
     long long external_segments;
+    long long resident_run_records;
+    long long resident_run_raw_bytes;
     long long bucket_self_records;
     long long bucket_remote_records;
     long long bucket_self_raw_bytes;
@@ -166,6 +168,39 @@ struct MpiSortStats {
     double t_fused_total;
     double t_fused_actual;
     double t_cpe_calibration_wall;
+};
+
+struct MpiCollateStats {
+    long long mode;
+    long long input_blocks;
+    long long total_records;
+    long long received_records;
+    long long qname_groups;
+    long long hash_collision_groups;
+    long long bgzf_blocks;
+    long long runs;
+    long long segments;
+    long long resident_run_records;
+    long long resident_run_raw_bytes;
+    long long temp_read_bytes;
+    long long temp_write_bytes;
+    long long tracked_peak_bytes;
+    long long run_arena_bytes;
+    long long merge_fan_in;
+    long long consolidation_passes;
+    double t_extract;
+    double t_local_sort;
+    double t_exchange;
+    double t_mpi;
+    double t_merge;
+    double t_compress;
+    double t_write;
+    double t_temp_read_actual;
+    double t_temp_write_actual;
+    double t_temp_read_sim;
+    double t_temp_write_sim;
+    double t_fused;
+    double t_actual;
 };
 
 struct MpiMarkdupStats {
@@ -234,6 +269,7 @@ int ProcessStatsMPI(CmdInfo *cmd_info);
 int ProcessSortMPI(CmdInfo *cmd_info);
 int ProcessMarkdupMPI(CmdInfo *cmd_info);
 int ProcessFixmateMPI(CmdInfo *cmd_info);
+int ProcessCollateMPI(CmdInfo *cmd_info);
 
 int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      const BamFilterOptions &filter,

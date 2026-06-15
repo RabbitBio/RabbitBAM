@@ -386,10 +386,6 @@ void MpiSortPrintRankStats(int rank, int comm_size,
         stats.bucket_self_raw_bytes + stats.bucket_remote_raw_bytes;
     const double bucket_self_raw_ratio =
         bucket_total_raw > 0 ? 100.0 * (double)stats.bucket_self_raw_bytes / (double)bucket_total_raw : 0.0;
-    const long long self_zero_saved_write =
-        stats.bucket_self_raw_bytes +
-        stats.bucket_self_records *
-            (long long)sizeof(MpiSortRecordMetaShared);
     const char *mode = stats.sort_mode == 1 ? "external" : "memory";
     char local_lines[12288] = {};
     snprintf(local_lines, sizeof(local_lines),
@@ -397,10 +393,9 @@ void MpiSortPrintRankStats(int rank, int comm_size,
              "[rank %d] extract=%.3f local_sort=%.3f sample=%.3f partition=%.3f exchange=%.3f final_sort=%.3f compress=%.3f write=%.3f\n"
              "[rank %d] pipeline_detail setup=%.3f read=%.3f read_unhidden=%.3f extract_prepare=%.3f extract_merge=%.3f bucket_count=%.3f bucket_pack=%.3f mpi_exchange=%.3f offset_fix=%.3f status=%.3f cleanup=%.3f unaccounted=%.3f\n"
              "[rank %d] bucket_dist self_records=%lld remote_records=%lld self_raw=%lld remote_raw=%lld self_raw_ratio=%.2f%%\n"
-             "[rank %d] self_zero_rewrite saved_write_bytes=%lld\n"
              "[rank %d] external_sim mpi=%.3f merge=%.3f compress=%.3f consolidation=%.3f temp_write=%.3f temp_read=%.3f\n"
              "[rank %d] external_actual runs=%lld segments=%lld temp_open=%.3f temp_write=%.3f temp_read=%.3f exchange_wall=%.3f merge_wall=%.3f compress_pipeline_wall=%.3f\n"
-             "[rank %d] external_memory temp_write_bytes=%lld temp_read_bytes=%lld tracked_peak=%lld limit_arena=%lld merge_fan_in=%lld consolidation_passes=%lld\n"
+             "[rank %d] external_memory temp_write_bytes=%lld temp_read_bytes=%lld resident_records=%lld resident_raw=%lld tracked_peak=%lld limit_arena=%lld merge_fan_in=%lld consolidation_passes=%lld\n"
              "[rank %d] extract_detail alloc=%.3f inflate=%.3f crc=%.3f parse=%.3f other=%.3f\n"
              "[rank %d] compress_detail pack=%.3f alloc=%.3f deflate=%.3f footer=%.3f other=%.3f\n"
              "[rank %d] fused_total=%.6f actual_wall_including_probe=%.6f core_stage=%.6f\n",
@@ -416,7 +411,6 @@ void MpiSortPrintRankStats(int rank, int comm_size,
              rank, stats.bucket_self_records, stats.bucket_remote_records,
              stats.bucket_self_raw_bytes, stats.bucket_remote_raw_bytes,
              bucket_self_raw_ratio,
-             rank, self_zero_saved_write,
              rank, stats.t_mpi_simulated, stats.t_merge_simulated,
              stats.t_compress_simulated,
              stats.t_consolidation_simulated,
@@ -426,6 +420,7 @@ void MpiSortPrintRankStats(int rank, int comm_size,
              stats.t_temp_write_actual, stats.t_temp_read_actual,
              stats.t_exchange, stats.t_final_sort, stats.t_compress,
              rank, stats.temp_write_bytes, stats.temp_read_bytes,
+             stats.resident_run_records, stats.resident_run_raw_bytes,
              stats.tracked_peak_bytes, stats.run_arena_bytes,
              stats.merge_fan_in, stats.consolidation_passes,
              rank, stats.t_extract_alloc, stats.t_extract_inflate, stats.t_extract_crc,
@@ -860,7 +855,7 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
 
         //4.7 全局同步，统计每个 rank 的处理时间和统计数据，rank 0 汇总并打印最终统计结果
         double stage47_t0 = GetTime();
-        long long local_long_stats[17] = {
+        long long local_long_stats[19] = {
             stats.input_blocks,
             stats.local_records,
             stats.received_records,
@@ -877,12 +872,14 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
             stats.tracked_peak_bytes,
             stats.run_arena_bytes,
             stats.merge_fan_in,
-            stats.consolidation_passes
+            stats.consolidation_passes,
+            stats.resident_run_records,
+            stats.resident_run_raw_bytes
         };
-        long long global_long_stats[17] = {};
-        long long max_long_stats[17] = {};
-        MPI_Reduce(local_long_stats, global_long_stats, 17, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-        MPI_Reduce(local_long_stats, max_long_stats, 17, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+        long long global_long_stats[19] = {};
+        long long max_long_stats[19] = {};
+        MPI_Reduce(local_long_stats, global_long_stats, 19, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(local_long_stats, max_long_stats, 19, MPI_LONG_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
         double local_double_stats[39] = {
             stats.t_setup,
             stats.t_extract_read,
@@ -952,10 +949,6 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
                    global_long_stats[5], global_long_stats[6],
                    global_long_stats[7], global_long_stats[8],
                    global_self_raw_ratio);
-            printf("  self_zero_rewrite_sum saved_write_bytes=%lld\n",
-                   global_long_stats[7] +
-                   global_long_stats[5] *
-                       (long long)sizeof(MpiSortRecordMetaShared));
             printf("  external_sim_sum mpi=%.3f merge=%.3f compress=%.3f consolidation=%.3f temp_write=%.3f temp_read=%.3f merge_temp_read=%.3f consolidation_temp_read=%.3f consolidation_temp_write=%.3f\n",
                    global_double_stats[30], global_double_stats[31],
                    global_double_stats[32], global_double_stats[33],
@@ -968,8 +961,9 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
                    global_double_stats[27], global_double_stats[28],
                    global_double_stats[11], global_double_stats[12],
                    global_double_stats[14], global_double_stats[15]);
-            printf("  external_memory_sum temp_read_bytes=%lld temp_write_bytes=%lld tracked_peak_max=%lld run_arena_max=%lld merge_fan_in_max=%lld consolidation_passes_max=%lld actual_wall_sum=%.3f\n",
+            printf("  external_memory_sum temp_read_bytes=%lld temp_write_bytes=%lld resident_records=%lld resident_raw=%lld tracked_peak_max=%lld run_arena_max=%lld merge_fan_in_max=%lld consolidation_passes_max=%lld actual_wall_sum=%.3f\n",
                    global_long_stats[11], global_long_stats[12],
+                   global_long_stats[17], global_long_stats[18],
                    max_long_stats[13], max_long_stats[14],
                    stats.sort_mode == 1 ? max_long_stats[15] : 0,
                    max_long_stats[16], global_double_stats[29]);

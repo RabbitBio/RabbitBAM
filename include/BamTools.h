@@ -260,6 +260,42 @@ struct MpiSortExtractPara {
     uint64_t decomp_total_cycles;
 };
 
+struct MpiCollateRecordMetaShared {
+    uint32_t hash;
+    uint32_t bin;
+    uint16_t qname_len;
+    uint8_t flag_order;
+    uint8_t pad;
+    uint32_t raw_len;
+    uint64_t raw_offset;
+    uint64_t global_order;
+};
+
+struct MpiCollateExtractPara {
+    int block_id;
+    bam_block *input_block;
+    bam_block *un_comp_block;
+    unsigned char *raw_arena;
+    size_t raw_capacity;
+    size_t raw_used;
+    uint64_t raw_base_offset;
+    MpiCollateRecordMetaShared *records;
+    int record_capacity;
+    int n_records;
+    int n_bins;
+    long long global_block_index;
+    int status;
+    int record_index;
+    long long actual_value;
+    long long limit_value;
+    int limit_id;
+    uint64_t decomp_alloc_cycles;
+    uint64_t decomp_inflate_cycles;
+    uint64_t decomp_crc_cycles;
+    uint64_t decomp_parse_cycles;
+    uint64_t decomp_total_cycles;
+};
+
 struct MpiSortRawCompressPara {
     int block_id;
     bam_block *un_comp_block;

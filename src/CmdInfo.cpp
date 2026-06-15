@@ -16,6 +16,9 @@ CmdInfo::CmdInfo() {
     compress_level_ = 1;
     sort_memory_ = "";
     sort_temp_prefix_ = "";
+    collate_bins_ = 64;
+    collate_memory_ = "";
+    collate_temp_prefix_ = "";
     markdup_remove_dups_ = false;
     markdup_clear_ = false;
     markdup_include_fails_ = false;

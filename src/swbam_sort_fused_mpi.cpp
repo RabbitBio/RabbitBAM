@@ -1605,6 +1605,10 @@ struct MpiSortStrictExtent {
 
 struct MpiSortStrictRun {
     MpiSortStrictExtent extent;
+    bool memory_backed;
+
+    MpiSortStrictRun()
+        : extent{-1, 0, 0, 0, 0}, memory_backed(false) {}
 };
 
 struct MpiSortStrictSegment {
@@ -1765,6 +1769,22 @@ int MpiSortStrictAppendExtent(int fd,
                               size_t sim_scratch_size,
                               MpiSortStats *stats,
                               MpiSortStrictExtent *extent) {
+    for (size_t i = 0; i < record_count; ++i) {
+        if (records[i].raw_len < 36 ||
+            records[i].raw_offset > raw_size ||
+            records[i].raw_len >
+                raw_size - (size_t)records[i].raw_offset ||
+            (uint64_t)MpiSortReadLe32(raw + records[i].raw_offset) + 4u !=
+                records[i].raw_len) {
+            fprintf(stderr,
+                    "ERROR: external sort attempted to spill an invalid "
+                    "record. record=%zu raw_offset=%llu raw_len=%u "
+                    "raw_size=%zu\n",
+                    i, (unsigned long long)records[i].raw_offset,
+                    records[i].raw_len, raw_size);
+            return -1;
+        }
+    }
     const size_t meta_bytes = record_count * sizeof(MpiSortRecordMeta);
     extent->fd = fd;
     extent->meta_offset = *file_end;
@@ -1858,118 +1878,25 @@ int MpiSortStrictAppendSortedRun(MpiSortStrictRunArena *arena,
                                  size_t sim_scratch_size,
                                  MpiSortStats *stats,
                                  MpiSortStrictExtent *extent) {
-    if (!sim_scratch || sim_scratch_size == 0) return -1;
-    MpiSortRecordMeta *records = arena->records();
-    const size_t meta_bytes =
-        arena->record_count * sizeof(MpiSortRecordMeta);
-    const size_t raw_capacity =
-        ((sim_scratch_size * 3 / 4) / 64) * 64;
-    const size_t remaining = sim_scratch_size - raw_capacity;
-    const size_t meta_region_bytes =
-        ((remaining * 3 / 4) / 64) * 64;
-    const size_t prefix_offset = raw_capacity + meta_region_bytes;
-    const size_t prefix_region_bytes = sim_scratch_size - prefix_offset;
-    const size_t meta_capacity =
-        meta_region_bytes / sizeof(MpiSortRecordMeta);
-    const size_t prefix_capacity =
-        prefix_region_bytes / sizeof(uint64_t);
-    const size_t record_capacity =
-        std::min(meta_capacity, prefix_capacity);
-    if (raw_capacity < BGZF_MAX_BLOCK_SIZE || record_capacity == 0) {
-        return -1;
-    }
-    unsigned char *packed_raw = sim_scratch;
-    MpiSortRecordMeta *packed_records =
-        (MpiSortRecordMeta *)(sim_scratch + raw_capacity);
-    uint64_t *prefix =
-        (uint64_t *)(sim_scratch + prefix_offset);
+    return MpiSortStrictAppendExtent(
+        store->runs_fd, &store->runs_end,
+        arena->records(), arena->record_count,
+        arena->data, arena->raw_used,
+        sim_scratch, sim_scratch_size, stats, extent);
+}
 
-    extent->fd = store->runs_fd;
-    extent->meta_offset = store->runs_end;
-    extent->raw_offset = store->runs_end + (off_t)meta_bytes;
-    extent->record_count = (uint64_t)arena->record_count;
-    extent->raw_size = (uint64_t)arena->raw_used;
-
-    uint64_t output_raw = 0;
-    size_t begin = 0;
-    while (begin < arena->record_count) {
-        size_t end = begin;
-        size_t chunk_raw_bytes = 0;
-        while (end < arena->record_count &&
-               end - begin < record_capacity) {
-            const size_t raw_len = records[end].raw_len;
-            if (raw_len > raw_capacity - chunk_raw_bytes) break;
-            prefix[end - begin] = (uint64_t)chunk_raw_bytes;
-            chunk_raw_bytes += raw_len;
-            end++;
-        }
-        if (end == begin) {
-            return -1;
-        }
-
-        const size_t count = end - begin;
-        MpiSortRangePackPara paras[kSortCpeBlocks];
-        for (int c = 0; c < kSortCpeBlocks; ++c) {
-            const size_t c_begin =
-                begin + count * (size_t)c / kSortCpeBlocks;
-            const size_t c_end =
-                begin + count * (size_t)(c + 1) / kSortCpeBlocks;
-            paras[c].core_id = c;
-            paras[c].local_records = records;
-            paras[c].local_raw = arena->data;
-            paras[c].local_raw_size = arena->raw_used;
-            paras[c].record_raw_offsets = prefix;
-            paras[c].send_meta = packed_records;
-            paras[c].send_raw = packed_raw;
-            paras[c].send_meta_capacity = meta_capacity;
-            paras[c].send_raw_capacity = raw_capacity;
-            paras[c].record_begin = c_begin;
-            paras[c].record_end = c_end;
-            paras[c].output_record_begin = c_begin - begin;
-            paras[c].status = 0;
-            paras[c].record_index = 0;
-            paras[c].actual_value = 0;
-            paras[c].limit_value = 0;
-            paras[c].limit_id = BOUNDS_LIMIT_NONE;
-            paras[c].pack_cycles = 0;
-            paras[c].total_cycles = 0;
-        }
-
-        double pack_t0 = GetTime();
-        __real_athread_spawn((void *)slave_mpi_sort_range_pack, paras, 1);
-        athread_join();
-        stats->t_temp_write_sim += GetTime() - pack_t0;
-        for (int c = 0; c < kSortCpeBlocks; ++c) {
-            if (paras[c].status != 0) return -1;
-        }
-
-        double fix_t0 = GetTime();
-        for (size_t i = 0; i < count; ++i) {
-            records[begin + i] = packed_records[i];
-            records[begin + i].raw_offset += output_raw;
-        }
-        stats->t_temp_write_sim += GetTime() - fix_t0;
-
-        if (MpiSortStrictPwriteAll(
-                store->runs_fd, packed_raw, chunk_raw_bytes,
-                extent->raw_offset + (off_t)output_raw, stats) != 0) {
-            return -1;
-        }
-        output_raw += chunk_raw_bytes;
-        begin = end;
-    }
-    if (output_raw != arena->raw_used) return -1;
-    if (MpiSortStrictPwriteAll(
-            store->runs_fd, records, meta_bytes,
-            extent->meta_offset, stats) != 0) {
-        return -1;
-    }
-    MpiSortStrictSimulateCopy(
-        records, meta_bytes, sim_scratch, sim_scratch_size,
-        &stats->t_temp_write_sim);
-    store->runs_end =
-        extent->raw_offset + (off_t)output_raw;
-    return 0;
+void MpiSortStrictSortRun(MpiSortStrictRunArena *arena,
+                          int comm_size,
+                          std::vector<MpiSortKey> *samples,
+                          MpiSortStats *stats) {
+    double t0 = GetTime();
+    std::sort(arena->records(), arena->records() + arena->record_count,
+              MpiSortMetaLess());
+    double wall = GetTime() - t0;
+    stats->t_local_sort += wall;
+    stats->t_run_sort += wall;
+    MpiSortStrictMakeSamples(arena->records(), arena->record_count,
+                             comm_size, samples);
 }
 
 int MpiSortStrictSpillRun(MpiSortStrictRunArena *arena,
@@ -1981,14 +1908,7 @@ int MpiSortStrictSpillRun(MpiSortStrictRunArena *arena,
                           std::vector<MpiSortKey> *samples,
                           MpiSortStats *stats) {
     if (arena->record_count == 0) return 0;
-    double t0 = GetTime();
-    std::sort(arena->records(), arena->records() + arena->record_count,
-              MpiSortMetaLess());
-    double wall = GetTime() - t0;
-    stats->t_local_sort += wall;
-    stats->t_run_sort += wall;
-    MpiSortStrictMakeSamples(arena->records(), arena->record_count,
-                             comm_size, samples);
+    MpiSortStrictSortRun(arena, comm_size, samples, stats);
     MpiSortStrictRun run;
     if (MpiSortStrictAppendSortedRun(
             arena, store, sim_scratch, sim_scratch_size,
@@ -1998,6 +1918,22 @@ int MpiSortStrictSpillRun(MpiSortStrictRunArena *arena,
     runs->push_back(run);
     arena->reset();
     return 0;
+}
+
+void MpiSortStrictRetainRun(MpiSortStrictRunArena *arena,
+                            int comm_size,
+                            std::vector<MpiSortStrictRun> *runs,
+                            std::vector<MpiSortKey> *samples,
+                            MpiSortStats *stats) {
+    if (arena->record_count == 0) return;
+    MpiSortStrictSortRun(arena, comm_size, samples, stats);
+    MpiSortStrictRun run;
+    run.memory_backed = true;
+    run.extent.record_count = (uint64_t)arena->record_count;
+    run.extent.raw_size = (uint64_t)arena->raw_used;
+    stats->resident_run_records = (long long)arena->record_count;
+    stats->resident_run_raw_bytes = (long long)arena->raw_used;
+    runs->insert(runs->begin(), run);
 }
 
 size_t MpiSortStrictExtractWorkspaceBytes() {
@@ -2152,10 +2088,8 @@ int MpiSortStrictGenerateRuns(MemReader &reader,
         if (ret != 0) break;
         local_block += (size_t)n_blocks;
     }
-    if (ret == 0 &&
-        MpiSortStrictSpillRun(arena, store, sim_scratch, sim_scratch_size,
-                              comm_size, runs, samples, stats) != 0) {
-        ret = -1;
+    if (ret == 0) {
+        MpiSortStrictRetainRun(arena, comm_size, runs, samples, stats);
     }
     MpiSortFreeExtractWorkspace(&ws);
     tracker->release(workspace_bytes);
@@ -2168,6 +2102,7 @@ int MpiSortStrictLoadRun(const MpiSortStrictRun &run,
                          unsigned char *sim_scratch,
                          size_t sim_scratch_size,
                          MpiSortStats *stats) {
+    if (run.memory_backed) return -1;
     arena->reset();
     size_t count = (size_t)run.extent.record_count;
     size_t raw_size = (size_t)run.extent.raw_size;
@@ -2308,8 +2243,41 @@ int MpiSortStrictPackRange(const MpiSortRecordMeta *records,
     __real_athread_spawn((void *)slave_mpi_sort_range_pack, paras, 1);
     athread_join();
     stats->t_bucket_pack += GetTime() - t0;
+    bool cpe_ok = true;
     for (int c = 0; c < kSortCpeBlocks; ++c) {
-        if (paras[c].status != 0) return -1;
+        if (paras[c].status != 0) cpe_ok = false;
+    }
+    MpiSortRecordMeta *packed =
+        (MpiSortRecordMeta *)ws->send_meta_buffer.data;
+    for (size_t i = 0; cpe_ok && i < count; ++i) {
+        const MpiSortRecordMeta &src = records[begin + i];
+        const MpiSortRecordMeta &dst = packed[i];
+        const uint64_t offset = prefix[i];
+        if (dst.tid != src.tid || dst.pos != src.pos ||
+            dst.flag != src.flag || dst.raw_len != src.raw_len ||
+            dst.global_order != src.global_order ||
+            dst.raw_offset != offset ||
+            offset > raw_pos || dst.raw_len > raw_pos - offset ||
+            (uint64_t)MpiSortReadLe32(
+                ws->send_raw_buffer.data + offset) + 4u != dst.raw_len) {
+            cpe_ok = false;
+        }
+    }
+    if (!cpe_ok) {
+        for (size_t i = 0; i < count; ++i) {
+            const MpiSortRecordMeta &src = records[begin + i];
+            const uint64_t offset = prefix[i];
+            if (src.raw_offset > raw_size ||
+                src.raw_len > raw_size - (size_t)src.raw_offset ||
+                offset > ws->raw_capacity ||
+                src.raw_len > ws->raw_capacity - (size_t)offset) {
+                return -1;
+            }
+            packed[i] = src;
+            packed[i].raw_offset = offset;
+            memcpy(ws->send_raw_buffer.data + offset,
+                   raw + src.raw_offset, src.raw_len);
+        }
     }
     (void)record_count;
     return 0;
@@ -2353,12 +2321,22 @@ int MpiSortStrictExchangeRuns(const std::vector<MpiSortStrictRun> &runs,
     MPI_Allreduce(&local_runs, &max_runs, 1, MPI_LONG_LONG, MPI_MAX,
                   MPI_COMM_WORLD);
     for (long long round = 0; round < max_runs; ++round) {
-        arena->reset();
         int load_ok = 1;
-        if (round < local_runs &&
-            MpiSortStrictLoadRun(runs[(size_t)round], arena, store,
-                                 sim_scratch, sim_scratch_size, stats) != 0) {
-            load_ok = 0;
+        if (round < local_runs) {
+            const MpiSortStrictRun &run = runs[(size_t)round];
+            if (run.memory_backed) {
+                if (round != 0 ||
+                    arena->record_count != (size_t)run.extent.record_count ||
+                    arena->raw_used != (size_t)run.extent.raw_size) {
+                    load_ok = 0;
+                }
+            } else if (MpiSortStrictLoadRun(
+                           run, arena, store, sim_scratch,
+                           sim_scratch_size, stats) != 0) {
+                load_ok = 0;
+            }
+        } else {
+            arena->reset();
         }
         int global_load_ok = 0;
         MPI_Allreduce(&load_ok, &global_load_ok, 1, MPI_INT, MPI_MIN,
@@ -2412,20 +2390,28 @@ int MpiSortStrictExchangeRuns(const std::vector<MpiSortStrictRun> &runs,
             MpiSortStrictSegment received_segment;
 
             if (step == 0) {
-                if (send_pos < send_end) {
-                    if (round >= local_runs) return -1;
-                    const MpiSortStrictExtent &run_extent =
-                        runs[(size_t)round].extent;
-                    MpiSortStrictExtent self_extent = run_extent;
-                    self_extent.meta_offset +=
-                        (off_t)(send_pos * sizeof(MpiSortRecordMeta));
-                    self_extent.record_count =
-                        (uint64_t)(send_end - send_pos);
-                    received_segment.extents.push_back(self_extent);
-                    received_segment.record_count +=
-                        self_extent.record_count;
-                    received_segment.raw_size +=
-                        bucket_raw_bytes[(size_t)rank];
+                while (send_pos < send_end) {
+                    size_t send_raw_bytes = 0;
+                    size_t send_chunk_end = MpiSortStrictChunkEnd(
+                        records, send_pos, send_end, ws->meta_capacity,
+                        ws->prefix_capacity, ws->raw_capacity,
+                        &send_raw_bytes);
+                    if (send_chunk_end == send_pos ||
+                        MpiSortStrictPackRange(
+                            records, record_count, arena->data,
+                            arena->raw_used, send_pos, send_chunk_end,
+                            ws, stats) != 0 ||
+                        MpiSortStrictAppendReceivedChunk(
+                            store,
+                            (MpiSortRecordMeta *)ws->send_meta_buffer.data,
+                            send_chunk_end - send_pos,
+                            ws->send_raw_buffer.data, send_raw_bytes,
+                            sim_scratch, sim_scratch_size,
+                            stats, &received_segment) != 0) {
+                        round_io_ok = 0;
+                        break;
+                    }
+                    send_pos = send_chunk_end;
                 }
             } else {
                 bool send_done = send_pos >= send_end;
@@ -2659,6 +2645,16 @@ int MpiSortStrictCursorRaw(MpiSortStrictCursor *cursor,
     }
     *raw_ptr = cursor->raw_buffer +
         (size_t)(meta.raw_offset - cursor->raw_buffer_begin);
+    if (meta.raw_len < 36 ||
+        (uint64_t)MpiSortReadLe32(*raw_ptr) + 4u != meta.raw_len) {
+        fprintf(stderr,
+                "ERROR: external sort temp record length mismatch. "
+                "extent=%zu record=%llu raw_offset=%llu raw_len=%u\n",
+                cursor->extent_index,
+                (unsigned long long)cursor->extent_record_pos,
+                (unsigned long long)meta.raw_offset, meta.raw_len);
+        return -1;
+    }
     (void)store;
     return 0;
 }

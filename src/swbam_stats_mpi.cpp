@@ -1003,8 +1003,11 @@ int FusedStatsMPI(MemReader &reader,
                             b, paras[b].limit_id, paras[b].limit_value,
                             paras[b].actual_value, paras[b].record_index);
                 } else {
-                    fprintf(stderr, "ERROR: MPI stats count failed on input block %d with status %d.\n",
-                            b, paras[b].status);
+                    fprintf(stderr,
+                            "ERROR: MPI stats count failed on input block %d "
+                            "with status %d. record=%d actual=%lld limit_id=%d.\n",
+                            b, paras[b].status, paras[b].record_index,
+                            paras[b].actual_value, paras[b].limit_id);
                 }
                 goto cleanup;
             }
