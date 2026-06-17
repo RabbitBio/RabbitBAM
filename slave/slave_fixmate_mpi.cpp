@@ -22,6 +22,14 @@ static inline uint32_t fm_le32(const uint8_t *p) {
            ((uint32_t)p[3] << 24);
 }
 
+static inline const uint8_t *fm_cigar_bytes(const bam1_t *record) {
+    return record->data + record->core.l_qname;
+}
+
+static inline uint32_t fm_cigar_word(const bam1_t *record, uint32_t index) {
+    return fm_le32(fm_cigar_bytes(record) + (size_t)index * 4);
+}
+
 static inline void fm_store_le32(uint8_t *p, uint32_t value) {
     p[0] = (uint8_t)value;
     p[1] = (uint8_t)(value >> 8);
@@ -112,10 +120,10 @@ static inline uint32_t fm_decimal_digits(uint32_t value) {
 
 static uint32_t fm_cigar_text_len(const bam1_t *record) {
     if (record->core.n_cigar == 0) return 1;
-    const uint32_t *cigar = bam_get_cigar(record);
     uint32_t total = 0;
     for (uint32_t i = 0; i < record->core.n_cigar; ++i) {
-        total += fm_decimal_digits(bam_cigar_oplen(cigar[i])) + 1;
+        const uint32_t cigar = fm_cigar_word(record, i);
+        total += fm_decimal_digits(bam_cigar_oplen(cigar)) + 1;
     }
     return total;
 }
@@ -136,12 +144,30 @@ static uint8_t *fm_write_cigar(uint8_t *dst, const bam1_t *record) {
         *dst++ = '*';
         return dst;
     }
-    const uint32_t *cigar = bam_get_cigar(record);
     for (uint32_t i = 0; i < record->core.n_cigar; ++i) {
-        dst = fm_write_decimal(dst, bam_cigar_oplen(cigar[i]));
-        *dst++ = (uint8_t)bam_cigar_opchr(cigar[i]);
+        const uint32_t cigar = fm_cigar_word(record, i);
+        dst = fm_write_decimal(dst, bam_cigar_oplen(cigar));
+        *dst++ = (uint8_t)bam_cigar_opchr(cigar);
     }
     return dst;
+}
+
+static int64_t fm_reference_length(const bam1_t *record) {
+    if (record->core.flag & BAM_FUNMAP) return 0;
+    int64_t length = 0;
+    for (uint32_t i = 0; i < record->core.n_cigar; ++i) {
+        const uint32_t cigar = fm_cigar_word(record, i);
+        if (bam_cigar_type(bam_cigar_op(cigar)) & 2) {
+            length += bam_cigar_oplen(cigar);
+        }
+    }
+    return length;
+}
+
+static int64_t fm_endpos(const bam1_t *record) {
+    int64_t length = fm_reference_length(record);
+    if (length == 0) length = 1;
+    return (int64_t)record->core.pos + length;
 }
 
 static inline void fm_sync_unmapped_pos(bam1_core_t *src,
@@ -177,9 +203,9 @@ static inline int fm_plausibly_properly_paired(
     if ((a->flag & BAM_FUNMAP) || (b->flag & BAM_FUNMAP)) return 0;
     if (a->tid != b->tid) return 0;
     int64_t a_pos = (a->flag & BAM_FREVERSE)
-        ? bam_endpos(a_record) : a->pos;
+        ? fm_endpos(a_record) : a->pos;
     int64_t b_pos = (b->flag & BAM_FREVERSE)
-        ? bam_endpos(b_record) : b->pos;
+        ? fm_endpos(b_record) : b->pos;
     const bam1_core_t *first = a;
     const bam1_core_t *second = b;
     if (a_pos > b_pos) {
@@ -232,8 +258,8 @@ static void fm_pair_records(
     if (pre_core->tid == cur_core->tid &&
         !(cur_core->flag & (BAM_FUNMAP | BAM_FMUNMAP)) &&
         !(pre_core->flag & (BAM_FUNMAP | BAM_FMUNMAP))) {
-        const int64_t pre_end = bam_endpos(records[pre]);
-        const int64_t cur_end = bam_endpos(records[cur]);
+        const int64_t pre_end = fm_endpos(records[pre]);
+        const int64_t cur_end = fm_endpos(records[cur]);
         const int64_t pre5 = (pre_core->flag & BAM_FREVERSE)
             ? pre_end : pre_core->pos;
         const int64_t cur5 = (cur_core->flag & BAM_FREVERSE)

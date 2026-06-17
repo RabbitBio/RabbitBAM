@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <mpi.h>
+#include <libdeflate.h>
 
 #ifdef PLATFORM_SUNWAY
 #include <athread.h>
@@ -34,6 +35,10 @@ const int kSortTagMeta = 7101;
 const int kSortTagRaw = 7102;
 const int kSortExchangeChunk = 64 * 1024 * 1024;
 const int kSortCpeBlocks = 64;
+
+#ifndef RABBITBAM_SORT_ENABLE_SANITY_CHECKS
+#define RABBITBAM_SORT_ENABLE_SANITY_CHECKS 0
+#endif
 
 //用于排序的结构体key
 struct MpiSortKey {
@@ -95,6 +100,126 @@ uint32_t MpiSortBgzfISize(const bam_block *block) {
     if (!block || block->length < BLOCK_FOOTER_LENGTH) return 0;
     return MpiSortReadLe32((const unsigned char *)block->data + block->length - 4);
 }
+
+#if RABBITBAM_SORT_ENABLE_SANITY_CHECKS
+int MpiSortValidatePayloadRecords(const bam_block *payload,
+                                  const char *stage) {
+    if (!payload || !payload->data) return -1;
+    const size_t payload_len = (size_t)payload->pos;
+    size_t pos = 0;
+    int record = 0;
+    while (pos < payload_len) {
+        int rank = -1;
+        if (payload_len - pos < 4) {
+            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+            fprintf(stderr,
+                    "[rank %d] ERROR: sort payload sanity failed "
+                    "stage=%s block=%d record=%d offset=%zu "
+                    "remaining=%zu reason=truncated_block_len\n",
+                    rank, stage, payload->block_id, record, pos,
+                    payload_len - pos);
+            return -1;
+        }
+        const uint32_t block_len =
+            MpiSortReadLe32((const unsigned char *)payload->data + pos);
+        const uint64_t record_end = (uint64_t)pos + 4u + block_len;
+        if (block_len < 32 || record_end > payload_len) {
+            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+            fprintf(stderr,
+                    "[rank %d] ERROR: sort payload sanity failed "
+                    "stage=%s block=%d record=%d offset=%zu "
+                    "payload_len=%zu block_len=%u record_end=%llu "
+                    "reason=bad_record_extent\n",
+                    rank, stage, payload->block_id, record, pos,
+                    payload_len, block_len,
+                    (unsigned long long)record_end);
+            return -1;
+        }
+        const unsigned char *body =
+            (const unsigned char *)payload->data + pos + 4;
+        const uint32_t x2 = MpiSortReadLe32(body + 8);
+        const uint32_t x3 = MpiSortReadLe32(body + 12);
+        const uint32_t raw_l_qname = x2 & 0xffu;
+        const uint32_t n_cigar = x3 & 0xffffu;
+        const uint32_t l_qseq = MpiSortReadLe32(body + 16);
+        const uint64_t data_len = (uint64_t)block_len - 32u;
+        const uint64_t minimum_data =
+            (uint64_t)raw_l_qname + ((uint64_t)n_cigar << 2) +
+            (((uint64_t)l_qseq + 1u) >> 1) + (uint64_t)l_qseq;
+        if (raw_l_qname == 0 || minimum_data > data_len) {
+            MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+            fprintf(stderr,
+                    "[rank %d] ERROR: sort payload sanity failed "
+                    "stage=%s block=%d record=%d offset=%zu "
+                    "payload_len=%zu block_len=%u raw_l_qname=%u "
+                    "n_cigar=%u l_qseq=%u min_data=%llu data_len=%llu "
+                    "reason=bad_record_fields\n",
+                    rank, stage, payload->block_id, record, pos,
+                    payload_len, block_len, raw_l_qname, n_cigar,
+                    l_qseq, (unsigned long long)minimum_data,
+                    (unsigned long long)data_len);
+            return -1;
+        }
+        pos = (size_t)record_end;
+        ++record;
+    }
+    return 0;
+}
+
+int MpiSortValidateMetaRawBuffer(
+        const std::vector<MpiSortRecordMeta> &records,
+        const unsigned char *raw_data,
+        size_t raw_size,
+        const std::vector<long long> *source_counts,
+        const char *stage,
+        bool verbose = true) {
+    int rank = -1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    size_t source = 0;
+    long long source_end = source_counts && !source_counts->empty()
+        ? (*source_counts)[0] : (long long)records.size();
+    for (size_t i = 0; i < records.size(); ++i) {
+        while (source_counts && source + 1 < source_counts->size() &&
+               (long long)i >= source_end) {
+            ++source;
+            source_end += (*source_counts)[source];
+        }
+        const MpiSortRecordMeta &rec = records[i];
+        const uint64_t end = rec.raw_offset + (uint64_t)rec.raw_len;
+        uint32_t block_len = 0;
+        if (rec.raw_len >= 4 && raw_data && end <= raw_size) {
+            block_len = MpiSortReadLe32(raw_data + rec.raw_offset);
+        }
+        if (rec.raw_len < 36 || end > raw_size ||
+            (uint64_t)block_len + 4u != rec.raw_len) {
+            if (verbose) {
+                fprintf(stderr,
+                        "[rank %d] ERROR: sort meta/raw sanity failed "
+                        "stage=%s source=%zu meta_index=%zu raw_offset=%llu "
+                        "raw_len=%u raw_size=%zu block_len=%u expected_raw_len=%llu "
+                        "tid=%d pos=%d flag=%u order=%llu\n",
+                        rank, stage, source, i,
+                        (unsigned long long)rec.raw_offset, rec.raw_len,
+                        raw_size, block_len,
+                        (unsigned long long)block_len + 4u,
+                        rec.tid, rec.pos, rec.flag,
+                        (unsigned long long)rec.global_order);
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int MpiSortValidateMetaRawRecords(
+        const std::vector<MpiSortRecordMeta> &records,
+        const std::vector<unsigned char> &raw,
+        const std::vector<long long> *source_counts,
+        const char *stage) {
+    return MpiSortValidateMetaRawBuffer(records, raw.empty() ? nullptr : raw.data(),
+                                        raw.size(), source_counts, stage);
+}
+#endif
 
 int MpiSortRawReserve(MpiSortRawBuffer *buf, size_t needed) {
     if (!buf) return -1;
@@ -471,7 +596,8 @@ int MpiSortExtractLocalRecordsCpe(MemReader &reader,
 
         for (int b = 0; b < kSortCpeBlocks; ++b) {
             if (b < n_blocks) {
-                ws.un_blocks.blocks[b].data = raw_data->data + block_raw_offsets[b];
+                ws.un_blocks.blocks[b].data =
+                    ws.un_blocks.data + (size_t)b * BGZF_MAX_BLOCK_SIZE;
                 ws.un_blocks.blocks[b].length = (int)block_raw_sizes[b];
                 ws.un_blocks.blocks[b].pos = 0;
                 ws.un_blocks.blocks[b].errcode = 0;
@@ -479,7 +605,7 @@ int MpiSortExtractLocalRecordsCpe(MemReader &reader,
             paras[b].block_id = b;
             paras[b].input_block = b < n_blocks ? &input_active->blocks[b] : nullptr;
             paras[b].un_comp_block = b < n_blocks ? &ws.un_blocks.blocks[b] : nullptr;
-            paras[b].raw_arena = b < n_blocks ? raw_data->data + block_raw_offsets[b] : nullptr;
+            paras[b].raw_arena = b < n_blocks ? ws.un_blocks.blocks[b].data : nullptr;
             paras[b].raw_capacity = b < n_blocks ? block_raw_sizes[b] : 0;
             paras[b].raw_used = 0;
             paras[b].raw_base_offset = b < n_blocks ? (uint64_t)block_raw_offsets[b] : 0;
@@ -566,6 +692,11 @@ int MpiSortExtractLocalRecordsCpe(MemReader &reader,
                 stats->t_cleanup += GetTime() - cleanup_t0;
                 return -1;
             }
+            if (block_raw_sizes[b] > 0) {
+                memcpy(raw_data->data + block_raw_offsets[b],
+                       ws.un_blocks.blocks[b].data,
+                       block_raw_sizes[b]);
+            }
             MpiSortRecordMeta *block_records = ws.records + (size_t)b * records_per_block;
             for (int r = 0; r < paras[b].n_records; ++r) {
                 records->push_back(block_records[r]);
@@ -585,6 +716,158 @@ int MpiSortExtractLocalRecordsCpe(MemReader &reader,
     stats->t_cleanup += GetTime() - cleanup_t0;
     return 0;
 }
+
+#if RABBITBAM_SORT_ENABLE_SANITY_CHECKS
+int MpiSortHostDecompressBlock(const bam_block *comp,
+                               unsigned char *dst,
+                               size_t capacity,
+                               struct libdeflate_decompressor *decompressor,
+                               size_t *out_len) {
+    if (!comp || !dst || !decompressor || !out_len ||
+        comp->length < BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH) {
+        return -1;
+    }
+    const unsigned char *src = (const unsigned char *)comp->data;
+    const uint32_t expected_crc =
+        MpiSortReadLe32(src + comp->length - 8);
+    size_t actual_len = capacity;
+    int ret = libdeflate_deflate_decompress(
+        decompressor,
+        src + BLOCK_HEADER_LENGTH,
+        (size_t)comp->length - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH,
+        dst, capacity, &actual_len);
+    if (ret != 0) return -1;
+    const uint32_t crc = libdeflate_crc32(0, dst, actual_len);
+    if (crc != expected_crc) return -1;
+    *out_len = actual_len;
+    return 0;
+}
+
+int MpiSortExtractLocalRecordsHost(MemReader &reader,
+                                   long long global_block_begin,
+                                   std::vector<MpiSortRecordMeta> *records,
+                                   MpiSortRawBuffer *raw_data,
+                                   MpiSortStats *stats) {
+    MpiSortBlockSet input = {};
+    if (MpiSortAllocateBlockSet(&input, 1) != 0) {
+        fprintf(stderr, "ERROR: failed to allocate MPI sort host extract block.\n");
+        return -1;
+    }
+    struct libdeflate_decompressor *decompressor =
+        libdeflate_alloc_decompressor();
+    if (!decompressor) {
+        MpiSortFreeBlockSet(&input);
+        fprintf(stderr, "ERROR: failed to allocate MPI sort host decompressor.\n");
+        return -1;
+    }
+
+    int ret = 0;
+    size_t local_block = 0;
+    while (true) {
+        bam_block *blk = &input.blocks[0];
+        int read_ret = MpiSortMemReadBlock(reader.base, reader.size,
+                                           reader.pos, blk);
+        if (read_ret < 0 || blk->length == 28) break;
+        const uint32_t isize = MpiSortBgzfISize(blk);
+        if (isize > BGZF_MAX_BLOCK_SIZE) {
+            fprintf(stderr,
+                    "ERROR: MPI sort host extract saw invalid BGZF ISIZE=%u on input block %lld.\n",
+                    isize, global_block_begin + (long long)local_block);
+            ret = -1;
+            break;
+        }
+        const size_t raw_begin = raw_data->size;
+        if (MpiSortRawReserve(raw_data, raw_begin + (size_t)isize) != 0) {
+            fprintf(stderr,
+                    "ERROR: MPI sort host extract failed to reserve raw buffer.\n");
+            ret = -1;
+            break;
+        }
+
+        double t0 = GetTime();
+        size_t out_len = (size_t)isize;
+        if (MpiSortHostDecompressBlock(
+                blk, raw_data->data + raw_begin, (size_t)isize,
+                decompressor, &out_len) != 0 ||
+            out_len != (size_t)isize) {
+            fprintf(stderr,
+                    "ERROR: MPI sort host extract failed to decompress input block %lld. expected=%u actual=%zu.\n",
+                    global_block_begin + (long long)local_block,
+                    isize, out_len);
+            ret = -1;
+            break;
+        }
+        if (stats) stats->t_extract += GetTime() - t0;
+
+        size_t pos = 0;
+        int count = 0;
+        while (pos < out_len) {
+            if (out_len - pos < 4) {
+                fprintf(stderr,
+                        "ERROR: MPI sort host extract saw truncated block_len at input block %lld offset=%zu.\n",
+                        global_block_begin + (long long)local_block, pos);
+                ret = -1;
+                break;
+            }
+            const unsigned char *record = raw_data->data + raw_begin + pos;
+            const uint32_t block_len = MpiSortReadLe32(record);
+            const size_t raw_len = (size_t)block_len + 4u;
+            if (block_len < 32 || raw_len > out_len - pos) {
+                fprintf(stderr,
+                        "ERROR: MPI sort host extract saw invalid record extent at input block %lld record=%d offset=%zu block_len=%u remaining=%zu.\n",
+                        global_block_begin + (long long)local_block,
+                        count, pos, block_len, out_len - pos);
+                ret = -1;
+                break;
+            }
+            const unsigned char *body = record + 4;
+            const uint32_t x2 = MpiSortReadLe32(body + 8);
+            const uint32_t x3 = MpiSortReadLe32(body + 12);
+            const uint32_t raw_l_qname = x2 & 0xffu;
+            const uint32_t n_cigar = x3 & 0xffffu;
+            const uint32_t l_qseq = MpiSortReadLe32(body + 16);
+            const uint64_t data_len = (uint64_t)block_len - 32u;
+            const uint64_t minimum_data =
+                (uint64_t)raw_l_qname + ((uint64_t)n_cigar << 2) +
+                (((uint64_t)l_qseq + 1u) >> 1) + (uint64_t)l_qseq;
+            if (raw_l_qname == 0 || minimum_data > data_len) {
+                fprintf(stderr,
+                        "ERROR: MPI sort host extract saw invalid record fields at input block %lld record=%d offset=%zu block_len=%u l_qname=%u n_cigar=%u l_qseq=%u.\n",
+                        global_block_begin + (long long)local_block,
+                        count, pos, block_len, raw_l_qname,
+                        n_cigar, l_qseq);
+                ret = -1;
+                break;
+            }
+
+            MpiSortRecordMeta meta;
+            meta.tid = (int32_t)MpiSortReadLe32(body);
+            meta.pos = (int32_t)MpiSortReadLe32(body + 4);
+            meta.flag = MpiSortReadLe16(body + 14);
+            meta.pad = 0;
+            meta.raw_len = (uint32_t)raw_len;
+            meta.pad2 = 0;
+            meta.raw_offset = (uint64_t)raw_begin + (uint64_t)pos;
+            meta.global_order =
+                ((uint64_t)(global_block_begin + (long long)local_block) << 32) |
+                (uint32_t)count;
+            records->push_back(meta);
+            pos += raw_len;
+            ++count;
+        }
+        if (ret != 0) break;
+        raw_data->size = raw_begin + out_len;
+        ++local_block;
+    }
+
+    if (ret == 0 && stats) {
+        stats->local_records += (long long)records->size();
+    }
+    libdeflate_free_decompressor(decompressor);
+    MpiSortFreeBlockSet(&input);
+    return ret;
+}
+#endif
 
 void MpiSortMakeLocalSamples(const std::vector<MpiSortRecordMeta> &records,
                              int comm_size,
@@ -724,8 +1007,8 @@ int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
         return -1;
     }
 
-    // 第二遍写入一次性分配的连续发送缓冲。CPE 做变长 raw bytes 拷贝；
-    // MPE 同时交换 counts 并分配接收缓冲，用 CPE pack 掩盖这部分主核工作。
+    // 第二遍写入一次性分配的连续发送缓冲。CPE 负责变长 raw bytes pack；
+    // 从核侧使用安全字节拷贝，允许 BAM record 起点和长度不对齐。
     double pack_t0 = GetTime();
     std::vector<MpiSortRecordMeta> send_meta((size_t)total_send_meta);
     std::vector<unsigned char> send_raw((size_t)total_send_raw);
@@ -763,7 +1046,6 @@ int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
     }
     __real_athread_spawn((void *)slave_mpi_sort_bucket_pack, pack_paras, 1);
 
-    // counts 交换和 recv buffer 分配不依赖 send_meta/send_raw 内容，可与 CPE pack 并行。
     MPI_Alltoall(send_meta_counts.data(), 1, MPI_LONG_LONG,
                  recv_meta_counts.data(), 1, MPI_LONG_LONG, MPI_COMM_WORLD);
     MPI_Alltoall(send_raw_counts.data(), 1, MPI_LONG_LONG,
@@ -794,7 +1076,6 @@ int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
     athread_join();
     *bucket_pack_time += GetTime() - pack_t0;
     if (!recv_layout_ok) return -1;
-
     for (int c = 0; c < kSortCpeBlocks; ++c) {
         if (pack_paras[c].status != 0) {
             fprintf(stderr,
@@ -867,6 +1148,13 @@ int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
     if (recv_source_counts) {
         *recv_source_counts = recv_meta_counts;
     }
+#if RABBITBAM_SORT_ENABLE_SANITY_CHECKS
+    if (MpiSortValidateMetaRawRecords(*recv_records, *recv_raw,
+                                      &recv_meta_counts,
+                                      "memory-post-exchange") != 0) {
+        return -1;
+    }
+#endif
 
     // 显式释放大容量发送缓冲，使析构/释放成本进入日志，而不是落在未计时区间。
     double cleanup_t0 = GetTime();
@@ -953,6 +1241,11 @@ int MpiSortPreparePayloadBatch(const std::vector<MpiSortRecordMeta> &records,
             (*record_pos)++;
         }
         if (payload->pos == 0) return -1;
+#if RABBITBAM_SORT_ENABLE_SANITY_CHECKS
+        if (MpiSortValidatePayloadRecords(payload, "memory-final") != 0) {
+            return -1;
+        }
+#endif
 
         paras[active].block_id = active;
         paras[active].un_comp_block = payload;
@@ -1364,6 +1657,11 @@ int MpiSortPreparePayloadBatchFromSegments(MpiSortLoserTree *tree,
             tree->advance();
         }
         if (payload->pos == 0) return -1;
+#if RABBITBAM_SORT_ENABLE_SANITY_CHECKS
+        if (MpiSortValidatePayloadRecords(payload, "external-memory") != 0) {
+            return -1;
+        }
+#endif
 
         paras[active].block_id = active;
         paras[active].un_comp_block = payload;
@@ -2941,6 +3239,11 @@ int MpiSortStrictPreparePayloadBatch(
             tree->replay(winner);
         }
         if (payload->pos == 0) return -1;
+#if RABBITBAM_SORT_ENABLE_SANITY_CHECKS
+        if (MpiSortValidatePayloadRecords(payload, "external-strict") != 0) {
+            return -1;
+        }
+#endif
         paras[active].block_id = active;
         paras[active].un_comp_block = payload;
         paras[active].un_comp_size = (int)payload->pos;
@@ -3174,9 +3477,35 @@ int FusedBamSortMPI(MemReader &reader,
     //2. 把本 rank 负责的 BGZF blocks 解析成：local_records 和 local_raw
     // local_records：record metadata，包括 tid/pos/flag/global_order/raw_offset/raw_len
     // local_raw：真实 BAM record bytes
+#if RABBITBAM_SORT_ENABLE_SANITY_CHECKS
+    const size_t extract_reader_pos = reader.pos;
+#endif
     if (MpiSortExtractLocalRecordsCpe(reader, global_block_begin, &local_records, &local_raw, stats) != 0) {
         return -1;
     }
+#if RABBITBAM_SORT_ENABLE_SANITY_CHECKS
+    if (MpiSortValidateMetaRawBuffer(local_records, local_raw.data,
+                                     local_raw.size, nullptr,
+                                     "memory-post-extract", false) != 0) {
+        fprintf(stderr,
+                "[rank %d] WARNING: MPI sort CPE extract produced inconsistent raw metadata; retrying extract on MPE host path.\n",
+                rank);
+        stats->local_records -= (long long)local_records.size();
+        local_records.clear();
+        MpiSortRawRelease(&local_raw);
+        reader.pos = extract_reader_pos;
+        if (MpiSortExtractLocalRecordsHost(reader, global_block_begin,
+                                           &local_records, &local_raw,
+                                           stats) != 0) {
+            return -1;
+        }
+        if (MpiSortValidateMetaRawBuffer(local_records, local_raw.data,
+                                         local_raw.size, nullptr,
+                                         "memory-post-extract-host") != 0) {
+            return -1;
+        }
+    }
+#endif
     //检查预估的大小是否超过输出的限制
     if (MpiSortCheckMemoryLimit(memory_limit,
                                 local_raw.size + local_records.size() * sizeof(MpiSortRecordMeta),

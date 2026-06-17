@@ -20,6 +20,7 @@ extern "C" {
     void slave_mpi_markdup_extract();
     void slave_mpi_markdup_rewrite();
     void slave_mpi_compressfunc();
+    void slave_mpi_sort_compress_payload();
 }
 
 int MpiCommonLoadFileToMemory(const std::string &path,
@@ -1231,6 +1232,196 @@ static int MdAppendRecords(MdPackWorkspace *workspace,
     return 0;
 }
 
+static int MdDeleteAuxTagHost(bam1_t *record, const char tag[2]) {
+    uint8_t *aux = bam_aux_get(record, tag);
+    if (!aux) return 0;
+    return bam_aux_del(record, aux);
+}
+
+static int MdRewriteBlockHost(MpiMarkdupRewritePara *para) {
+    if (!para || para->status != 0 || !para->records || !para->bam_lens) {
+        return 0;
+    }
+    int kept = 0;
+    uint32_t kept_len = 0;
+    para->marked_records = 0;
+    para->cleared_records = 0;
+    para->removed_records = 0;
+
+    for (int i = 0; i < para->n_records; ++i) {
+        bam1_t *record = para->records[i];
+        if (!record) {
+            para->status = -2;
+            para->record_index = i;
+            return -1;
+        }
+        const uint64_t ordinal = para->ordinal_base + (uint64_t)i;
+        const size_t byte = (size_t)(ordinal >> 3);
+        const uint8_t mask = (uint8_t)(1u << (ordinal & 7u));
+        const int duplicate =
+            byte < para->duplicate_bitmap_bytes &&
+            (para->duplicate_bitmap[byte] & mask);
+
+        if (para->clear_old) {
+            if (record->core.flag & BAM_FDUP) para->cleared_records++;
+            record->core.flag &= (uint16_t)~BAM_FDUP;
+            if (MdDeleteAuxTagHost(record, "dt") < 0 ||
+                MdDeleteAuxTagHost(record, "do") < 0) {
+                para->status = -2;
+                para->record_index = i;
+                return -1;
+            }
+        }
+        if (duplicate) {
+            record->core.flag |= BAM_FDUP;
+            para->marked_records++;
+        }
+        if (para->remove_dups && (record->core.flag & BAM_FDUP)) {
+            para->removed_records++;
+            continue;
+        }
+
+        const uint32_t bam_len =
+            (uint32_t)(record->l_data - record->core.l_extranul + 32);
+        para->records[kept] = record;
+        para->bam_lens[kept] = bam_len;
+        kept_len += bam_len + 4;
+        kept++;
+    }
+
+    para->n_kept_records = kept;
+    para->kept_total_len = kept_len;
+    para->status = 0;
+    return 0;
+}
+
+static void MdInitEmptyRawCompress(MpiSortRawCompressPara *para,
+                                   int block_id) {
+    memset(para, 0, sizeof(*para));
+    para->block_id = block_id;
+    para->status = -1;
+    para->compress_level = 1;
+}
+
+static void MdSetupRawCompress(MpiSortRawCompressPara *para,
+                               int block_id, bam_block *payload,
+                               bam_block *output,
+                               int compress_level) {
+    memset(para, 0, sizeof(*para));
+    para->block_id = block_id;
+    para->un_comp_block = payload;
+    para->un_comp_size = payload ? payload->pos : 0;
+    para->output_block = output;
+    para->output_size = 0;
+    para->status = para->un_comp_size > 0 ? 0 : -1;
+    para->compress_level = compress_level;
+}
+
+static void MdResetPayloadBlock(bam_block *block, int block_id) {
+    block->pos = 0;
+    block->length = 0;
+    block->errcode = 0;
+    block->block_id = block_id;
+    block->block_address = 0;
+}
+
+static int MdAppendRecordPayload(bam_block *payload, const bam1_t *record) {
+    if (!payload || !record || !record->data) return -1;
+    const bam1_core_t *core = &record->core;
+    const int raw_l_qname = core->l_qname - core->l_extranul;
+    if (raw_l_qname <= 0 || raw_l_qname > 255 ||
+        core->l_extranul > core->l_qname ||
+        record->l_data < core->l_qname ||
+        core->n_cigar > 0xffff ||
+        core->pos > INT_MAX ||
+        core->mpos > INT_MAX) {
+        return -1;
+    }
+
+    const uint32_t block_len =
+        (uint32_t)(record->l_data - core->l_extranul + 32);
+    const uint32_t packed_len = block_len + 4;
+    if (packed_len > BGZF_BLOCK_SIZE) return -1;
+    if (payload->pos > 0 &&
+        payload->pos + (int)packed_len > BGZF_BLOCK_SIZE) {
+        return 1;
+    }
+    if (payload->pos + (int)packed_len > BGZF_BLOCK_SIZE) return -1;
+
+    uint8_t *dst = payload->data + payload->pos;
+    uint32_t fields[8];
+    fields[0] = (uint32_t)core->tid;
+    fields[1] = (uint32_t)core->pos;
+    fields[2] = (uint32_t)core->bin << 16 |
+                (uint32_t)core->qual << 8 |
+                (uint32_t)raw_l_qname;
+    fields[3] = (uint32_t)core->flag << 16 |
+                (uint32_t)(core->n_cigar & 0xffff);
+    fields[4] = (uint32_t)core->l_qseq;
+    fields[5] = (uint32_t)core->mtid;
+    fields[6] = (uint32_t)core->mpos;
+    fields[7] = (uint32_t)core->isize;
+
+    memcpy(dst, &block_len, 4);
+    memcpy(dst + 4, fields, sizeof(fields));
+    memcpy(dst + 36, record->data, (size_t)raw_l_qname);
+    const uint32_t rest_len =
+        (uint32_t)(record->l_data - core->l_qname);
+    memcpy(dst + 36 + raw_l_qname,
+           record->data + core->l_qname,
+           (size_t)rest_len);
+    payload->pos += (int)packed_len;
+    payload->length = payload->pos;
+    return 0;
+}
+
+static int MdPreparePayloadFromRewrite(
+        MpiMarkdupRewritePara *rewrite, int n_blocks,
+        MdBlockSet *payload_blocks, MdBlockSet *output_blocks,
+        MpiSortRawCompressPara *paras, int compress_level,
+        int *active_blocks) {
+    int active = 0;
+    if (payload_blocks->n < kMarkdupNB ||
+        output_blocks->n < kMarkdupNB) {
+        return -1;
+    }
+    MdResetPayloadBlock(payload_blocks->blocks + active, active);
+
+    for (int b = 0; b < n_blocks; ++b) {
+        for (int r = 0; r < rewrite[b].n_kept_records; ++r) {
+            bam1_t *record = rewrite[b].records[r];
+            while (true) {
+                int ret = MdAppendRecordPayload(
+                    payload_blocks->blocks + active, record);
+                if (ret == 0) break;
+                if (ret < 0) return ret;
+
+                MdSetupRawCompress(paras + active, active,
+                                   payload_blocks->blocks + active,
+                                   output_blocks->blocks + active,
+                                   compress_level);
+                ++active;
+                if (active >= kMarkdupNB) return -3;
+                MdResetPayloadBlock(payload_blocks->blocks + active,
+                                    active);
+            }
+        }
+    }
+
+    if (payload_blocks->blocks[active].pos > 0) {
+        MdSetupRawCompress(paras + active, active,
+                           payload_blocks->blocks + active,
+                           output_blocks->blocks + active,
+                           compress_level);
+        ++active;
+    }
+    for (int i = active; i < kMarkdupNB; ++i) {
+        MdInitEmptyRawCompress(paras + i, i);
+    }
+    *active_blocks = active;
+    return 0;
+}
+
 static void MdInitEmptyComp(Comp_Para *para, int block_id) {
     memset(para, 0, sizeof(*para));
     para->block_id = block_id;
@@ -1256,6 +1447,7 @@ static int MdRewriteOutput(
     MpiMarkdupRewritePara rewrite[kMarkdupNB];
     Comp_Para comp_a[kMarkdupNB];
     Comp_Para comp_b[kMarkdupNB];
+    MpiSortRawCompressPara raw_comp[kMarkdupNB];
 
     if (MdAllocateBlockSet(&input, kMarkdupNB) != 0 ||
         MdAllocateBlockSet(&uncompressed, kMarkdupNB) != 0 ||
@@ -1283,6 +1475,7 @@ static int MdRewriteOutput(
     for (int i = 0; i < kMarkdupNB; ++i) {
         MdInitEmptyComp(comp_a + i, i);
         MdInitEmptyComp(comp_b + i, i);
+        MdInitEmptyRawCompress(raw_comp + i, i);
     }
 
     Comp_Para *comp_active = comp_a;
@@ -1416,15 +1609,18 @@ static int MdRewriteOutput(
                 (uint64_t)decomp[b].n_total_records;
         }
         double rewrite_t0 = GetTime();
-        __real_athread_spawn((void *)slave_mpi_markdup_rewrite,
-                             rewrite, 1);
-        athread_join();
+        if (remove_dups) {
+            for (int b = 0; b < n_blocks; ++b) {
+                if (MdRewriteBlockHost(rewrite + b) != 0) break;
+            }
+        } else {
+            __real_athread_spawn((void *)slave_mpi_markdup_rewrite,
+                                 rewrite, 1);
+            athread_join();
+        }
         stats->t_rewrite += GetTime() - rewrite_t0;
         ordinal = block_ordinal;
 
-        MdResetPackWorkspace(&pack);
-        double pack_t0 = GetTime();
-        int pack_status = 0;
         for (int b = 0; b < n_blocks; ++b) {
             if (rewrite[b].status != 0) {
                 fprintf(stderr,
@@ -1440,6 +1636,57 @@ static int MdRewriteOutput(
                 rewrite[b].cleared_records;
             stats->removed_records +=
                 rewrite[b].removed_records;
+        }
+        if (remove_dups) {
+            int active_payload_blocks = 0;
+            double payload_t0 = GetTime();
+            int payload_status = MdPreparePayloadFromRewrite(
+                rewrite, n_blocks, compress_un_active,
+                output_active, raw_comp, compress_level,
+                &active_payload_blocks);
+            stats->t_pack += GetTime() - payload_t0;
+            if (payload_status != 0) {
+                fprintf(stderr,
+                        "[rank %d] ERROR: markdup remove-dups payload "
+                        "pack failed status=%d.\n",
+                        rank, payload_status);
+                return -1;
+            }
+            if (active_payload_blocks == 0) {
+                if (read_group(&next_blocks) != 0) return -1;
+                continue;
+            }
+
+            double compress_t0 = GetTime();
+            __real_athread_spawn(
+                (void *)slave_mpi_sort_compress_payload,
+                raw_comp, 1);
+            athread_join();
+            stats->t_compress += GetTime() - compress_t0;
+            double write_t0 = GetTime();
+            for (int i = 0; i < active_payload_blocks; ++i) {
+                if (raw_comp[i].status != 0) {
+                    fprintf(stderr,
+                            "[rank %d] ERROR: markdup remove-dups "
+                            "payload compress failed block=%d status=%d.\n",
+                            rank, i, raw_comp[i].status);
+                    return -1;
+                }
+                if (MpiWriteBlockToMem(writer,
+                        output_active->blocks + i) != 0) {
+                    return -1;
+                }
+                stats->bgzf_blocks++;
+            }
+            stats->t_write += GetTime() - write_t0;
+            if (read_group(&next_blocks) != 0) return -1;
+            continue;
+        }
+
+        MdResetPackWorkspace(&pack);
+        double pack_t0 = GetTime();
+        int pack_status = 0;
+        for (int b = 0; b < n_blocks; ++b) {
             pack_status = MdAppendRecords(
                 &pack, rewrite[b].records,
                 rewrite[b].bam_lens,
@@ -1994,16 +2241,60 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
         if (!MdAllRanksOk(local_ok)) goto cleanup;
         duplicates_by_source.clear();
 
+        const int remove_dups = cmd_info->markdup_remove_dups_;
         reader.pos = 0;
         if (MdRewriteOutput(
                 reader, duplicate_bitmap, local_records,
                 cmd_info->markdup_clear_,
-                cmd_info->markdup_remove_dups_,
+                0,
                 cmd_info->compress_level_,
                 writer, rank, &stats) != 0) {
             local_ok = 0;
         }
         if (!MdAllRanksOk(local_ok)) goto cleanup;
+        if (remove_dups) {
+            MemReader filter_reader = {};
+            MemWriter filtered_writer = {};
+            MpiBamToBamStats filter_stats = {};
+            BamFilterOptions filter = {};
+            filter.min_mapq = -1;
+            filter.max_mapq = -1;
+            filter.require_flag = 0;
+            filter.exclude_flag = BAM_FDUP;
+            filter.ref_tid = -2;
+            filter.min_read_len = -1;
+            filter.max_read_len = -1;
+
+            filter_reader.base = writer.data;
+            filter_reader.size = writer.size;
+            filter_reader.pos = 0;
+            if (MpiCommonInitMemWriter(
+                    filtered_writer,
+                    writer.size ? writer.size : 64 * 1024 * 1024) != 0) {
+                local_ok = 0;
+            }
+            if (!MdAllRanksOk(local_ok)) {
+                if (filtered_writer.data) free(filtered_writer.data);
+                goto cleanup;
+            }
+            if (FusedBamToBamMPI(filter_reader, filtered_writer,
+                                 filter, cmd_info->compress_level_,
+                                 &filter_stats) != 0) {
+                local_ok = 0;
+            }
+            if (!MdAllRanksOk(local_ok)) {
+                if (filtered_writer.data) free(filtered_writer.data);
+                goto cleanup;
+            }
+            free(writer.data);
+            writer = filtered_writer;
+            stats.removed_records += filter_stats.dropped_records;
+            stats.bgzf_blocks = filter_stats.bgzf_blocks;
+            stats.t_rewrite_decomp += filter_stats.t_decomp_filter;
+            stats.t_pack += filter_stats.t_pack;
+            stats.t_compress += filter_stats.t_compress;
+            stats.t_write += filter_stats.t_write;
+        }
         stats.t_fused_total = GetTime() - fused_t0;
         double fused_cost = MdReduceMax(stats.t_fused_total);
         if (rank == 0) {

@@ -57,6 +57,28 @@ static inline int32_t sort_read_le32s(const unsigned char *p) {
     return (int32_t)sort_read_le32(p);
 }
 
+static inline void sort_copy_record_bytes(unsigned char *dst,
+                                          const unsigned char *src,
+                                          size_t n) {
+    while (n > 0 &&
+           (((uintptr_t)dst | (uintptr_t)src) & (sizeof(uint64_t) - 1u))) {
+        *dst++ = *src++;
+        --n;
+    }
+    uint64_t *dst64 = (uint64_t *)dst;
+    const uint64_t *src64 = (const uint64_t *)src;
+    while (n >= sizeof(uint64_t)) {
+        *dst64++ = *src64++;
+        n -= sizeof(uint64_t);
+    }
+    dst = (unsigned char *)dst64;
+    src = (const unsigned char *)src64;
+    while (n > 0) {
+        *dst++ = *src++;
+        --n;
+    }
+}
+
 static struct libdeflate_compressor *g_sort_mpi_compressors[64] = {0};
 static int g_sort_mpi_compressor_levels[64] = {0};
 static struct libdeflate_decompressor *g_sort_decompressors[64] = {0};
@@ -240,6 +262,7 @@ extern "C" void slave_mpi_sort_extract_raw(MpiSortExtractPara paras[64]) {
 
     unsigned long parse_t0 = sort_slave_cycle_now();
     size_t pos = 0;
+    size_t raw_used = 0;
     int count = 0;
     while (pos < un_comp->length) {
         if (RB_SORT_UNLIKELY(un_comp->length - pos < 4)) {
@@ -271,11 +294,11 @@ extern "C" void slave_mpi_sort_extract_raw(MpiSortExtractPara paras[64]) {
             para->decomp_total_cycles = (uint64_t)(sort_slave_cycle_now() - total_t0);
             return;
         }
-        if (RB_SORT_UNLIKELY(raw_len > para->raw_capacity - para->raw_used)) {
+        if (RB_SORT_UNLIKELY(raw_len > para->raw_capacity - raw_used)) {
             para->status = -3;
             para->record_index = count;
             para->actual_value = (long long)raw_len;
-            para->limit_value = (long long)(para->raw_capacity - para->raw_used);
+            para->limit_value = (long long)(para->raw_capacity - raw_used);
             para->limit_id = BOUNDS_LIMIT_INIT_DATA_SIZE;
             para->decomp_parse_cycles = (uint64_t)(sort_slave_cycle_now() - parse_t0);
             para->decomp_total_cycles = (uint64_t)(sort_slave_cycle_now() - total_t0);
@@ -300,16 +323,18 @@ extern "C" void slave_mpi_sort_extract_raw(MpiSortExtractPara paras[64]) {
         meta->pad = 0;
         meta->raw_len = (uint32_t)raw_len;
         meta->pad2 = 0;
-        meta->raw_offset = para->raw_base_offset + (uint64_t)para->raw_used;
+        meta->raw_offset = para->raw_base_offset + (uint64_t)pos;
         meta->global_order = ((uint64_t)para->global_block_index << 32) | (uint32_t)count;
-        if (para->raw_arena + para->raw_used != un_comp->data + pos) {
-            memcpy(para->raw_arena + para->raw_used, un_comp->data + pos, raw_len);
+        if (para->raw_arena + pos != un_comp->data + pos) {
+            sort_copy_record_bytes(para->raw_arena + pos,
+                                   un_comp->data + pos, raw_len);
         }
-        para->raw_used += raw_len;
+        raw_used += raw_len;
         pos += raw_len;
         count++;
     }
 
+    para->raw_used = raw_used;
     para->n_records = count;
     para->status = 0;
     para->decomp_parse_cycles = (uint64_t)(sort_slave_cycle_now() - parse_t0);
@@ -418,7 +443,9 @@ extern "C" void slave_mpi_sort_bucket_pack(MpiSortBucketPackPara paras[64]) {
         MpiSortRecordMetaShared dst = *src;
         dst.raw_offset = raw_in_bucket;
         para->send_meta[meta_pos] = dst;
-        memcpy(para->send_raw + raw_pos, para->local_raw + src->raw_offset, src->raw_len);
+        sort_copy_record_bytes(para->send_raw + raw_pos,
+                               para->local_raw + src->raw_offset,
+                               src->raw_len);
     }
     para->pack_cycles = (uint64_t)(sort_slave_cycle_now() - pack_t0);
     para->total_cycles = (uint64_t)(sort_slave_cycle_now() - total_t0);
@@ -468,7 +495,9 @@ extern "C" void slave_mpi_sort_range_pack(MpiSortRangePackPara paras[64]) {
         MpiSortRecordMetaShared dst = *src;
         dst.raw_offset = raw_pos;
         para->send_meta[out_index] = dst;
-        memcpy(para->send_raw + raw_pos, para->local_raw + src->raw_offset, src->raw_len);
+        sort_copy_record_bytes(para->send_raw + raw_pos,
+                               para->local_raw + src->raw_offset,
+                               src->raw_len);
     }
     para->pack_cycles = (uint64_t)(sort_slave_cycle_now() - pack_t0);
     para->total_cycles = (uint64_t)(sort_slave_cycle_now() - total_t0);

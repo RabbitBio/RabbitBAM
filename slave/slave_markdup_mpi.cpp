@@ -29,6 +29,14 @@ static inline uint32_t md_le32(const uint8_t *p) {
            ((uint32_t)p[3] << 24);
 }
 
+static inline const uint8_t *md_cigar_bytes(const bam1_t *record) {
+    return record->data + record->core.l_qname;
+}
+
+static inline uint32_t md_cigar_word(const bam1_t *record, uint32_t index) {
+    return md_le32(md_cigar_bytes(record) + (size_t)index * 4);
+}
+
 static inline uint64_t md_le64(const uint8_t *p) {
     return (uint64_t)md_le32(p) | ((uint64_t)md_le32(p + 4) << 32);
 }
@@ -145,12 +153,12 @@ static inline int64_t md_current_score(const bam1_t *record) {
 }
 
 static inline int64_t md_unclipped_start(const bam1_t *record) {
-    const uint32_t *cigar = bam_get_cigar(record);
     int64_t clipped = 0;
     for (uint32_t i = 0; i < record->core.n_cigar; ++i) {
-        const int op = bam_cigar_op(cigar[i]);
+        const uint32_t cigar = md_cigar_word(record, i);
+        const int op = bam_cigar_op(cigar);
         if (op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP) {
-            clipped += bam_cigar_oplen(cigar[i]);
+            clipped += bam_cigar_oplen(cigar);
         } else if (op != BAM_CHARD_CLIP) {
             break;
         }
@@ -159,18 +167,19 @@ static inline int64_t md_unclipped_start(const bam1_t *record) {
 }
 
 static inline int64_t md_unclipped_end(const bam1_t *record) {
-    const uint32_t *cigar = bam_get_cigar(record);
     int64_t ref_len = 0;
     for (uint32_t i = 0; i < record->core.n_cigar; ++i) {
-        const int op = bam_cigar_op(cigar[i]);
-        if (bam_cigar_type(op) & 2) ref_len += bam_cigar_oplen(cigar[i]);
+        const uint32_t cigar = md_cigar_word(record, i);
+        const int op = bam_cigar_op(cigar);
+        if (bam_cigar_type(op) & 2) ref_len += bam_cigar_oplen(cigar);
     }
     if (ref_len == 0) ref_len = 1;
     int64_t clipped = 0;
     for (int i = (int)record->core.n_cigar - 1; i >= 0; --i) {
-        const int op = bam_cigar_op(cigar[i]);
+        const uint32_t cigar = md_cigar_word(record, (uint32_t)i);
+        const int op = bam_cigar_op(cigar);
         if (op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP) {
-            clipped += bam_cigar_oplen(cigar[i]);
+            clipped += bam_cigar_oplen(cigar);
         } else if (op != BAM_CHARD_CLIP) {
             break;
         }
