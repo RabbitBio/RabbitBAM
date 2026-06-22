@@ -225,8 +225,18 @@ struct MpiMarkdupStats {
     double t_candidate_decomp;
     double t_candidate_extract;
     double t_candidate_exchange;
+    double t_candidate_pack;
+    double t_candidate_exchange_setup;
+    double t_candidate_exchange_mpi;
+    double t_candidate_cleanup;
+    double t_boundary_check;
+    double t_group_prepare;
+    double t_group_sort;
+    double t_group_scan;
     double t_group;
+    double t_owner_cleanup;
     double t_result_exchange;
+    double t_result_cleanup;
     double t_rewrite_decomp;
     double t_rewrite;
     double t_pack;

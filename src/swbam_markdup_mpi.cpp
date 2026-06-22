@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -92,6 +93,18 @@ struct MdCandidateWorkspace {
     unsigned char *qnames;
     int candidates_per_block;
     size_t qname_stride;
+};
+
+struct MdMarkdupCandidateBufferDeleter {
+    void operator()(MpiMarkdupCandidateShared *p) const {
+        if (p) aligned_free_custom((unsigned char *)p);
+    }
+};
+
+struct MdByteBufferDeleter {
+    void operator()(unsigned char *p) const {
+        if (p) aligned_free_custom(p);
+    }
 };
 
 struct MdDuplicateId {
@@ -347,6 +360,8 @@ static int MdExtractCandidates(
         int *range_first_tid, int *range_first_pos,
         int *range_last_tid, int *range_last_pos,
         MpiMarkdupStats *stats) {
+
+    // 工作区分配
     const int records_per_block = (int)MPI_RECORDS_PER_BLOCK;
     MdBlockSet input = {};
     MdBlockSet uncompressed = {};
@@ -371,6 +386,7 @@ static int MdExtractCandidates(
         return -1;
     }
 
+    // 固定内存估算
     const size_t fixed_workspace =
         (size_t)kMarkdupNB * BGZF_MAX_BLOCK_SIZE * 2 +
         (size_t)kMarkdupNB * MPI_BAM_BLOCK_ARENA_SIZE +
@@ -389,6 +405,7 @@ static int MdExtractCandidates(
         return -1;
     }
 
+    // ordinal 是本 rank 内 record 编号，作为索引
     uint64_t ordinal = 0;
     long long block_group_base = global_block_begin;
     int previous_tid = -1;
@@ -400,6 +417,8 @@ static int MdExtractCandidates(
     *range_last_tid = -1;
     *range_last_pos = -1;
     int n_blocks = 0;
+
+    // 先读一批 blocks
     MdReadGroup(reader, &input, &n_blocks, stats);
     while (n_blocks > 0) {
         stats->input_blocks += n_blocks;
@@ -429,6 +448,7 @@ static int MdExtractCandidates(
             }
         }
 
+        // 准备 candidate 提取参数
         uint64_t block_ordinal = ordinal;
         for (int b = 0; b < kMarkdupNB; ++b) {
             memset(extract + b, 0, sizeof(extract[b]));
@@ -457,6 +477,7 @@ static int MdExtractCandidates(
                 (uint64_t)decomp[b].n_total_records;
         }
 
+        // 从核提取 markdup candidate
         double extract_t0 = GetTime();
         __real_athread_spawn((void *)slave_mpi_markdup_extract,
                              extract, 1);
@@ -464,6 +485,7 @@ static int MdExtractCandidates(
         stats->t_candidate_extract += GetTime() - extract_t0;
 
         for (int b = 0; b < n_blocks; ++b) {
+            // 检查从核提取是否成功
             if (extract[b].status != 0) {
                 fprintf(stderr,
                         "[rank %d] ERROR: %s at global block %lld "
@@ -477,6 +499,10 @@ static int MdExtractCandidates(
                 MdFreeCandidateWorkspace(&candidate_workspace);
                 return -1;
             }
+
+            // 检查 coordinate sorted
+            // MdExtractCandidates 内部检查 rank 内 block 顺序
+            // MdValidateRankBoundaries 检查 rank 与 rank 之间的坐标顺序
             if (extract[b].has_records) {
                 if (!*range_has_records) {
                     *range_first_tid = extract[b].first_tid;
@@ -504,6 +530,7 @@ static int MdExtractCandidates(
                 have_previous = 1;
             }
 
+            // 合并 qname 和 candidates 到 local_candidates 中
             const uint64_t qname_base =
                 (uint64_t)local_qnames->size();
             if (extract[b].qname_used > 0) {
@@ -527,10 +554,12 @@ static int MdExtractCandidates(
             stats->single_candidates +=
                 extract[b].single_candidates;
         }
+        // 更新 ordinal 和 block_group_base
         ordinal = block_ordinal;
         block_group_base += n_blocks;
         stats->group_count++;
 
+        // 动态内存检查
         size_t dynamic = MdVectorBytes(
             *local_candidates, *local_qnames,
             std::vector<uint8_t>());
@@ -629,6 +658,12 @@ static int MdSendrecvBytes(const void *send_data,
     return 0;
 }
 
+/*
+把本 rank 提取出来的 local_candidates
+按照 duplicate key 的 hash 分配给 owner rank
+通过 MPI 交换
+让每个 owner rank 拿到自己负责判断 duplicate 的候选集合
+*/
 static int MdExchangeCandidates(
         const std::vector<MpiMarkdupCandidateShared> &local_candidates,
         const std::vector<unsigned char> &local_qnames,
@@ -636,16 +671,36 @@ static int MdExchangeCandidates(
         std::vector<MpiMarkdupCandidateShared> *owner_candidates,
         std::vector<unsigned char> *owner_qnames,
         MpiMarkdupStats *stats) {
-    std::vector<std::vector<MpiMarkdupCandidateShared> > send_candidates(
-        (size_t)comm_size);
-    std::vector<std::vector<unsigned char> > send_qnames(
-        (size_t)comm_size);
+    double exchange_total_t0 = GetTime();
+    std::vector<unsigned long long> send_candidate_counts(
+        (size_t)comm_size, 0);
+    std::vector<unsigned long long> recv_candidate_counts(
+        (size_t)comm_size, 0);
+    std::vector<unsigned long long> send_qname_counts(
+        (size_t)comm_size, 0);
+    std::vector<unsigned long long> recv_qname_counts(
+        (size_t)comm_size, 0);
+    std::vector<size_t> send_candidate_offsets((size_t)comm_size + 1, 0);
+    std::vector<size_t> send_qname_offsets((size_t)comm_size + 1, 0);
+    std::unique_ptr<MpiMarkdupCandidateShared,
+                    MdMarkdupCandidateBufferDeleter> send_candidates_flat;
+    std::unique_ptr<unsigned char,
+                    MdByteBufferDeleter> send_qnames_flat;
     int local_ok = 1;
 
+    // 第一阶段：两遍式按 owner 连续打包 send_candidates / send_qnames
+    double pack_t0 = GetTime();
     for (size_t i = 0; i < local_candidates.size(); ++i) {
-        MpiMarkdupCandidateShared candidate = local_candidates[i];
-        int owner = (int)(MdHashKey(candidate.key) %
+        const MpiMarkdupCandidateShared &candidate =
+            local_candidates[i];
+        const int owner = (int)(MdHashKey(candidate.key) %
                           (uint64_t)comm_size);
+        if (send_candidate_counts[(size_t)owner] ==
+            ULLONG_MAX) {
+            local_ok = 0;
+            break;
+        }
+        send_candidate_counts[(size_t)owner]++;
         if (!candidate.key.single) {
             if (candidate.qname_offset > local_qnames.size() ||
                 candidate.qname_len >
@@ -657,159 +712,193 @@ static int MdExchangeCandidates(
                 local_ok = 0;
                 break;
             }
-            candidate.qname_offset =
-                (uint64_t)send_qnames[(size_t)owner].size();
-            send_qnames[(size_t)owner].insert(
-                send_qnames[(size_t)owner].end(),
-                local_qnames.begin() +
-                    (size_t)local_candidates[i].qname_offset,
-                local_qnames.begin() +
-                    (size_t)local_candidates[i].qname_offset +
-                    local_candidates[i].qname_len);
+            const unsigned long long qname_len =
+                (unsigned long long)candidate.qname_len;
+            if (send_qname_counts[(size_t)owner] >
+                ULLONG_MAX - qname_len) {
+                local_ok = 0;
+                break;
+            }
+            send_qname_counts[(size_t)owner] += qname_len;
         }
-        send_candidates[(size_t)owner].push_back(candidate);
     }
     if (!MdAllRanksOk(local_ok)) return -1;
 
-    size_t exchange_memory = 0;
+    size_t total_send_candidates = 0;
+    size_t total_send_qnames = 0;
     for (int i = 0; i < comm_size; ++i) {
-        size_t bytes =
-            send_candidates[(size_t)i].capacity() *
-                sizeof(MpiMarkdupCandidateShared) +
-            send_qnames[(size_t)i].capacity();
-        if (bytes > SIZE_MAX - exchange_memory) {
+        send_candidate_offsets[(size_t)i] = total_send_candidates;
+        send_qname_offsets[(size_t)i] = total_send_qnames;
+        if (send_candidate_counts[(size_t)i] >
+                (unsigned long long)(SIZE_MAX - total_send_candidates) ||
+            send_qname_counts[(size_t)i] >
+                (unsigned long long)(SIZE_MAX - total_send_qnames)) {
+            local_ok = 0;
+            break;
+        }
+        total_send_candidates +=
+            (size_t)send_candidate_counts[(size_t)i];
+        total_send_qnames +=
+            (size_t)send_qname_counts[(size_t)i];
+    }
+    send_candidate_offsets[(size_t)comm_size] = total_send_candidates;
+    send_qname_offsets[(size_t)comm_size] = total_send_qnames;
+    if (!MdAllRanksOk(local_ok)) return -1;
+
+    if (total_send_candidates > 0) {
+        if (total_send_candidates >
+            SIZE_MAX / sizeof(MpiMarkdupCandidateShared)) {
             local_ok = 0;
         } else {
-            exchange_memory += bytes;
+            send_candidates_flat.reset(
+                (MpiMarkdupCandidateShared *)aligned_alloc_custom(
+                    64, total_send_candidates *
+                            sizeof(MpiMarkdupCandidateShared)));
+            if (!send_candidates_flat) local_ok = 0;
         }
+    }
+    if (total_send_qnames > 0) {
+        send_qnames_flat.reset(
+            aligned_alloc_custom(64, total_send_qnames));
+        if (!send_qnames_flat) local_ok = 0;
+    }
+    if (!MdAllRanksOk(local_ok)) return -1;
+    std::vector<size_t> candidate_write = send_candidate_offsets;
+    std::vector<size_t> qname_write = send_qname_offsets;
+
+    for (size_t i = 0; i < local_candidates.size(); ++i) {
+        MpiMarkdupCandidateShared candidate = local_candidates[i];
+        const int owner = (int)(MdHashKey(candidate.key) %
+                          (uint64_t)comm_size);
+        if (!candidate.key.single) {
+            const size_t qname_src = (size_t)candidate.qname_offset;
+            const size_t qname_len = (size_t)candidate.qname_len;
+            const size_t qname_dst = qname_write[(size_t)owner];
+            candidate.qname_offset =
+                (uint64_t)(qname_dst -
+                           send_qname_offsets[(size_t)owner]);
+            if (qname_len > 0) {
+                memcpy(send_qnames_flat.get() + qname_dst,
+                       local_qnames.data() + qname_src,
+                       qname_len);
+            }
+            qname_write[(size_t)owner] += qname_len;
+        }
+        send_candidates_flat.get()[candidate_write[(size_t)owner]++] =
+            candidate;
+    }
+    stats->t_candidate_pack += GetTime() - pack_t0;
+
+    // 第二阶段：统计将要收多少数据，并做内存检查
+    double setup_t0 = GetTime();
+    size_t send_candidate_bytes_total = 0;
+    size_t exchange_memory = 0;
+    if (total_send_candidates >
+        SIZE_MAX / sizeof(MpiMarkdupCandidateShared)) {
+        local_ok = 0;
+    } else {
+        send_candidate_bytes_total =
+            total_send_candidates * sizeof(MpiMarkdupCandidateShared);
+        exchange_memory = send_candidate_bytes_total;
+    }
+    if (total_send_qnames > SIZE_MAX - exchange_memory) {
+        local_ok = 0;
+    } else {
+        exchange_memory += total_send_qnames;
     }
     size_t local_memory =
         local_candidates.capacity() *
             sizeof(MpiMarkdupCandidateShared) +
         local_qnames.capacity();
-    unsigned long long send_candidate_counts[kMarkdupTagCount] = {};
-    unsigned long long recv_candidate_counts[kMarkdupTagCount] = {};
-    unsigned long long send_qname_counts[kMarkdupTagCount] = {};
-    unsigned long long recv_qname_counts[kMarkdupTagCount] = {};
-    if (comm_size > kMarkdupTagCount) {
-        std::vector<unsigned long long> send_candidates_dynamic(
-            (size_t)comm_size);
-        std::vector<unsigned long long> recv_candidates_dynamic(
-            (size_t)comm_size);
-        std::vector<unsigned long long> send_qnames_dynamic(
-            (size_t)comm_size);
-        std::vector<unsigned long long> recv_qnames_dynamic(
-            (size_t)comm_size);
-        for (int i = 0; i < comm_size; ++i) {
-            send_candidates_dynamic[(size_t)i] =
-                (unsigned long long)send_candidates[(size_t)i].size();
-            send_qnames_dynamic[(size_t)i] =
-                (unsigned long long)send_qnames[(size_t)i].size();
-        }
-        MPI_Alltoall(send_candidates_dynamic.data(), 1,
-                     MPI_UNSIGNED_LONG_LONG,
-                     recv_candidates_dynamic.data(), 1,
-                     MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
-        MPI_Alltoall(send_qnames_dynamic.data(), 1,
-                     MPI_UNSIGNED_LONG_LONG,
-                     recv_qnames_dynamic.data(), 1,
-                     MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
-        unsigned long long owner_candidate_count = 0;
-        unsigned long long owner_qname_count = 0;
-        for (int i = 0; i < comm_size; ++i) {
-            owner_candidate_count +=
-                recv_candidates_dynamic[(size_t)i];
-            owner_qname_count += recv_qnames_dynamic[(size_t)i];
-        }
+
+    MPI_Alltoall(send_candidate_counts.data(), 1,
+                 MPI_UNSIGNED_LONG_LONG,
+                 recv_candidate_counts.data(), 1,
+                 MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
+    MPI_Alltoall(send_qname_counts.data(), 1,
+                 MPI_UNSIGNED_LONG_LONG,
+                 recv_qname_counts.data(), 1,
+                 MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
+
+    unsigned long long owner_candidate_count = 0;
+    unsigned long long owner_qname_count = 0;
+    for (int i = 0; i < comm_size; ++i) {
         if (owner_candidate_count >
-                (unsigned long long)(SIZE_MAX /
-                    sizeof(MpiMarkdupCandidateShared)) ||
-            owner_qname_count > (unsigned long long)SIZE_MAX) {
+                ULLONG_MAX - recv_candidate_counts[(size_t)i] ||
+            owner_qname_count >
+                ULLONG_MAX - recv_qname_counts[(size_t)i]) {
             local_ok = 0;
-        } else {
-            size_t owner_bytes =
-                (size_t)owner_candidate_count *
-                    sizeof(MpiMarkdupCandidateShared) +
-                (size_t)owner_qname_count;
-            if (local_memory > SIZE_MAX - exchange_memory ||
-                local_memory + exchange_memory >
-                    SIZE_MAX - owner_bytes ||
-                MdCheckMemory(local_memory + exchange_memory +
-                                  owner_bytes,
-                              memory_limit, stats, rank,
-                              "candidate owner exchange") != 0) {
-                local_ok = 0;
-            } else {
-                owner_candidates->reserve(
-                    (size_t)owner_candidate_count);
-                owner_qnames->reserve((size_t)owner_qname_count);
-            }
+            break;
         }
+        owner_candidate_count +=
+            recv_candidate_counts[(size_t)i];
+        owner_qname_count += recv_qname_counts[(size_t)i];
+    }
+    if (owner_candidate_count >
+            (unsigned long long)(SIZE_MAX /
+                sizeof(MpiMarkdupCandidateShared)) ||
+        owner_qname_count > (unsigned long long)SIZE_MAX) {
+        local_ok = 0;
     } else {
-        for (int i = 0; i < comm_size; ++i) {
-            send_candidate_counts[i] =
-                (unsigned long long)send_candidates[(size_t)i].size();
-            send_qname_counts[i] =
-                (unsigned long long)send_qnames[(size_t)i].size();
-        }
-        MPI_Alltoall(send_candidate_counts, 1,
-                     MPI_UNSIGNED_LONG_LONG,
-                     recv_candidate_counts, 1,
-                     MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
-        MPI_Alltoall(send_qname_counts, 1,
-                     MPI_UNSIGNED_LONG_LONG,
-                     recv_qname_counts, 1,
-                     MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
-        unsigned long long owner_candidate_count = 0;
-        unsigned long long owner_qname_count = 0;
-        for (int i = 0; i < comm_size; ++i) {
-            owner_candidate_count += recv_candidate_counts[i];
-            owner_qname_count += recv_qname_counts[i];
-        }
-        if (owner_candidate_count >
-                (unsigned long long)(SIZE_MAX /
-                    sizeof(MpiMarkdupCandidateShared)) ||
-            owner_qname_count > (unsigned long long)SIZE_MAX) {
+        size_t owner_candidate_bytes =
+            (size_t)owner_candidate_count *
+                sizeof(MpiMarkdupCandidateShared);
+        size_t owner_bytes = 0;
+        if ((size_t)owner_qname_count >
+            SIZE_MAX - owner_candidate_bytes) {
             local_ok = 0;
         } else {
-            size_t owner_bytes =
-                (size_t)owner_candidate_count *
-                    sizeof(MpiMarkdupCandidateShared) +
-                (size_t)owner_qname_count;
-            if (local_memory > SIZE_MAX - exchange_memory ||
-                local_memory + exchange_memory >
-                    SIZE_MAX - owner_bytes ||
-                MdCheckMemory(local_memory + exchange_memory +
-                                  owner_bytes,
-                              memory_limit, stats, rank,
-                              "candidate owner exchange") != 0) {
-                local_ok = 0;
-            } else {
-                owner_candidates->reserve(
-                    (size_t)owner_candidate_count);
-                owner_qnames->reserve((size_t)owner_qname_count);
-            }
+            owner_bytes =
+                owner_candidate_bytes + (size_t)owner_qname_count;
+        }
+        if (local_ok &&
+            (local_memory > SIZE_MAX - exchange_memory ||
+             local_memory + exchange_memory >
+                 SIZE_MAX - owner_bytes ||
+             MdCheckMemory(local_memory + exchange_memory +
+                               owner_bytes,
+                           memory_limit, stats, rank,
+                           "candidate owner exchange") != 0)) {
+            local_ok = 0;
+        }
+        if (local_ok) {
+            owner_candidates->reserve((size_t)owner_candidate_count);
+            owner_qnames->reserve((size_t)owner_qname_count);
         }
     }
     if (!MdAllRanksOk(local_ok)) {
         return -1;
     }
+    stats->t_candidate_exchange_setup += GetTime() - setup_t0;
 
-    double exchange_t0 = GetTime();
+    // 第三阶段：真正 MPI 交换
+    double mpi_t0 = GetTime();
     for (int step = 0; step < comm_size; ++step) {
         int dest = (rank + step) % comm_size;
         int src = (rank - step + comm_size) % comm_size;
         if (step == 0) {
             const uint64_t qbase = (uint64_t)owner_qnames->size();
             size_t candidate_base = owner_candidates->size();
-            owner_qnames->insert(
-                owner_qnames->end(),
-                send_qnames[(size_t)rank].begin(),
-                send_qnames[(size_t)rank].end());
-            owner_candidates->insert(
-                owner_candidates->end(),
-                send_candidates[(size_t)rank].begin(),
-                send_candidates[(size_t)rank].end());
+            const size_t qname_begin = send_qname_offsets[(size_t)rank];
+            const size_t qname_count =
+                (size_t)send_qname_counts[(size_t)rank];
+            const size_t candidate_begin =
+                send_candidate_offsets[(size_t)rank];
+            const size_t candidate_count =
+                (size_t)send_candidate_counts[(size_t)rank];
+            if (qname_count > 0) {
+                owner_qnames->insert(
+                    owner_qnames->end(),
+                    send_qnames_flat.get() + qname_begin,
+                    send_qnames_flat.get() + qname_begin + qname_count);
+            }
+            if (candidate_count > 0) {
+                owner_candidates->insert(
+                    owner_candidates->end(),
+                    send_candidates_flat.get() + candidate_begin,
+                    send_candidates_flat.get() + candidate_begin +
+                        candidate_count);
+            }
             for (size_t i = candidate_base;
                  i < owner_candidates->size(); ++i) {
                 if (!(*owner_candidates)[i].key.single) {
@@ -819,51 +908,53 @@ static int MdExchangeCandidates(
             continue;
         }
 
-        unsigned long long send_counts[2] = {
-            (unsigned long long)send_candidates[(size_t)dest].size(),
-            (unsigned long long)send_qnames[(size_t)dest].size()
-        };
-        unsigned long long recv_counts[2] = {0, 0};
-        if (MPI_Sendrecv(send_counts, 2, MPI_UNSIGNED_LONG_LONG,
-                         dest, 4100,
-                         recv_counts, 2, MPI_UNSIGNED_LONG_LONG,
-                         src, 4100, MPI_COMM_WORLD,
-                         MPI_STATUS_IGNORE) != MPI_SUCCESS) {
-            return -1;
-        }
-        if (recv_counts[0] >
+        unsigned long long send_candidate_count =
+            send_candidate_counts[(size_t)dest];
+        unsigned long long send_qname_count =
+            send_qname_counts[(size_t)dest];
+        unsigned long long recv_candidate_count =
+            recv_candidate_counts[(size_t)src];
+        unsigned long long recv_qname_count =
+            recv_qname_counts[(size_t)src];
+        if (recv_candidate_count >
             (unsigned long long)(SIZE_MAX /
                 sizeof(MpiMarkdupCandidateShared)) ||
-            recv_counts[1] > (unsigned long long)SIZE_MAX) {
+            recv_qname_count > (unsigned long long)SIZE_MAX) {
             return -1;
         }
         size_t candidate_base = owner_candidates->size();
         size_t qname_base = owner_qnames->size();
         owner_candidates->resize(
-            candidate_base + (size_t)recv_counts[0]);
+            candidate_base + (size_t)recv_candidate_count);
         owner_qnames->resize(
-            qname_base + (size_t)recv_counts[1]);
+            qname_base + (size_t)recv_qname_count);
 
         unsigned long long send_candidate_bytes =
-            send_counts[0] *
+            send_candidate_count *
             sizeof(MpiMarkdupCandidateShared);
         unsigned long long recv_candidate_bytes =
-            recv_counts[0] *
+            recv_candidate_count *
             sizeof(MpiMarkdupCandidateShared);
         if (MdSendrecvBytes(
-                send_candidates[(size_t)dest].data(),
+                send_candidate_count
+                    ? send_candidates_flat.get() +
+                          send_candidate_offsets[(size_t)dest]
+                    : nullptr,
                 send_candidate_bytes, dest,
-                recv_counts[0]
+                recv_candidate_count
                     ? owner_candidates->data() + candidate_base
                     : nullptr,
                 recv_candidate_bytes, src, 4101) != 0 ||
             MdSendrecvBytes(
-                send_qnames[(size_t)dest].data(),
-                send_counts[1], dest,
-                recv_counts[1]
+                send_qname_count
+                    ? send_qnames_flat.get() +
+                          send_qname_offsets[(size_t)dest]
+                    : nullptr,
+                send_qname_count, dest,
+                recv_qname_count
                     ? owner_qnames->data() + qname_base
                     : nullptr,
-                recv_counts[1], src, 4102) != 0) {
+                recv_qname_count, src, 4102) != 0) {
             return -1;
         }
         for (size_t i = candidate_base;
@@ -875,10 +966,13 @@ static int MdExchangeCandidates(
         }
         stats->mpi_candidate_bytes +=
             (long long)send_candidate_bytes +
-            (long long)send_counts[1];
+            (long long)send_qname_count;
 
     }
-    stats->t_candidate_exchange += GetTime() - exchange_t0;
+
+    // 最后更新统计信息
+    stats->t_candidate_exchange_mpi += GetTime() - mpi_t0;
+    stats->t_candidate_exchange += GetTime() - exchange_total_t0;
     stats->owner_candidates =
         (long long)owner_candidates->size();
     stats->qname_bytes = (long long)owner_qnames->size();
@@ -918,44 +1012,147 @@ static bool MdPairBetter(
     return a.global_order < b.global_order;
 }
 
+static bool MdCandidateGroupLess(
+        const MpiMarkdupCandidateShared &a,
+        const MpiMarkdupCandidateShared &b) {
+    if (MdKeyLess(a.key, b.key)) return true;
+    if (MdKeyLess(b.key, a.key)) return false;
+    if (a.global_order != b.global_order) {
+        return a.global_order < b.global_order;
+    }
+    if (a.source_rank != b.source_rank) {
+        return a.source_rank < b.source_rank;
+    }
+    return a.ordinal < b.ordinal;
+}
+
+static bool MdKeyVectorContains(
+        const std::vector<MpiMarkdupKeyShared> &keys,
+        const MpiMarkdupKeyShared &key) {
+    std::vector<MpiMarkdupKeyShared>::const_iterator it =
+        std::lower_bound(
+            keys.begin(), keys.end(), key,
+            [](const MpiMarkdupKeyShared &a,
+               const MpiMarkdupKeyShared &b) {
+                return MdKeyLess(a, b);
+            });
+    return it != keys.end() && MdKeyEqual(*it, key);
+}
+
 static int MdFindDuplicates(
         std::vector<MpiMarkdupCandidateShared> *owner_candidates,
         const std::vector<unsigned char> &owner_qnames,
         int comm_size,
         std::vector<std::vector<uint64_t> > *duplicates_by_source,
         MpiMarkdupStats *stats) {
-    double group_t0 = GetTime();
-    std::sort(owner_candidates->begin(), owner_candidates->end(),
-              [](const MpiMarkdupCandidateShared &a,
-                 const MpiMarkdupCandidateShared &b) {
-        if (MdKeyLess(a.key, b.key)) return true;
-        if (MdKeyLess(b.key, a.key)) return false;
-        if (a.global_order != b.global_order) {
-            return a.global_order < b.global_order;
-        }
-        if (a.source_rank != b.source_rank) {
-            return a.source_rank < b.source_rank;
-        }
-        return a.ordinal < b.ordinal;
-    });
 
+    double group_t0 = GetTime();
+    std::vector<MpiMarkdupCandidateShared>::iterator pair_end =
+        std::partition(
+            owner_candidates->begin(), owner_candidates->end(),
+            [](const MpiMarkdupCandidateShared &candidate) {
+                return !candidate.key.single;
+            });
+    const size_t pair_count =
+        (size_t)(pair_end - owner_candidates->begin());
+
+    std::vector<MpiMarkdupKeyShared> paired_marker_keys;
+    paired_marker_keys.reserve(owner_candidates->size() - pair_count);
+    size_t real_single_write = pair_count;
+    for (size_t i = pair_count; i < owner_candidates->size(); ++i) {
+        const MpiMarkdupCandidateShared candidate =
+            (*owner_candidates)[i];
+        if (candidate.paired_marker) {
+            paired_marker_keys.push_back(candidate.key);
+        } else {
+            (*owner_candidates)[real_single_write++] = candidate;
+        }
+    }
+    owner_candidates->resize(real_single_write);
+    const size_t real_single_count = real_single_write - pair_count;
+
+    double group_sort_t0 = GetTime();
+    std::sort(owner_candidates->begin(),
+              owner_candidates->begin() + (ptrdiff_t)pair_count,
+              MdCandidateGroupLess);
+    std::sort(paired_marker_keys.begin(), paired_marker_keys.end(),
+              [](const MpiMarkdupKeyShared &a,
+                 const MpiMarkdupKeyShared &b) {
+                  return MdKeyLess(a, b);
+              });
+    paired_marker_keys.erase(
+        std::unique(
+            paired_marker_keys.begin(), paired_marker_keys.end(),
+            [](const MpiMarkdupKeyShared &a,
+               const MpiMarkdupKeyShared &b) {
+                return MdKeyEqual(a, b);
+            }),
+        paired_marker_keys.end());
+    std::sort(owner_candidates->begin() + (ptrdiff_t)pair_count,
+              owner_candidates->end(), MdCandidateGroupLess);
+    stats->t_group_sort += GetTime() - group_sort_t0;
+
+    double group_scan_t0 = GetTime();
     duplicates_by_source->assign(
         (size_t)comm_size, std::vector<uint64_t>());
+
     size_t begin = 0;
-    while (begin < owner_candidates->size()) {
+    while (begin < pair_count) {
         size_t end = begin + 1;
-        while (end < owner_candidates->size() &&
+        while (end < pair_count &&
                MdKeyEqual((*owner_candidates)[begin].key,
                           (*owner_candidates)[end].key)) {
             ++end;
         }
 
-        if (!(*owner_candidates)[begin].key.single) {
+        size_t winner = begin;
+        for (size_t i = begin + 1; i < end; ++i) {
+            if (MdPairBetter((*owner_candidates)[i],
+                             (*owner_candidates)[winner],
+                             owner_qnames)) {
+                winner = i;
+            }
+        }
+        for (size_t i = begin; i < end; ++i) {
+            if (i == winner) continue;
+            int source = (*owner_candidates)[i].source_rank;
+            if (source < 0 || source >= comm_size) return -1;
+            (*duplicates_by_source)[(size_t)source].push_back(
+                (*owner_candidates)[i].ordinal);
+            stats->pair_duplicates++;
+        }
+        begin = end;
+    }
+
+    begin = pair_count;
+    const size_t real_single_end = pair_count + real_single_count;
+    while (begin < real_single_end) {
+        size_t end = begin + 1;
+        while (end < real_single_end &&
+               MdKeyEqual((*owner_candidates)[begin].key,
+                          (*owner_candidates)[end].key)) {
+            ++end;
+        }
+
+        if (MdKeyVectorContains(
+                paired_marker_keys, (*owner_candidates)[begin].key)) {
+            for (size_t i = begin; i < end; ++i) {
+                int source = (*owner_candidates)[i].source_rank;
+                if (source < 0 || source >= comm_size) return -1;
+                (*duplicates_by_source)[(size_t)source]
+                    .push_back((*owner_candidates)[i].ordinal);
+                stats->single_duplicates++;
+            }
+        } else if (end - begin > 1) {
             size_t winner = begin;
             for (size_t i = begin + 1; i < end; ++i) {
-                if (MdPairBetter((*owner_candidates)[i],
-                                 (*owner_candidates)[winner],
-                                 owner_qnames)) {
+                const MpiMarkdupCandidateShared &candidate =
+                    (*owner_candidates)[i];
+                const MpiMarkdupCandidateShared &best =
+                    (*owner_candidates)[winner];
+                if (candidate.score > best.score ||
+                    (candidate.score == best.score &&
+                     candidate.global_order < best.global_order)) {
                     winner = i;
                 }
             }
@@ -963,55 +1160,14 @@ static int MdFindDuplicates(
                 if (i == winner) continue;
                 int source = (*owner_candidates)[i].source_rank;
                 if (source < 0 || source >= comm_size) return -1;
-                (*duplicates_by_source)[(size_t)source].push_back(
-                    (*owner_candidates)[i].ordinal);
-                stats->pair_duplicates++;
-            }
-        } else {
-            bool has_pair = false;
-            for (size_t i = begin; i < end; ++i) {
-                if ((*owner_candidates)[i].paired_marker) {
-                    has_pair = true;
-                    break;
-                }
-            }
-            if (has_pair) {
-                for (size_t i = begin; i < end; ++i) {
-                    if ((*owner_candidates)[i].paired_marker) continue;
-                    int source =
-                        (*owner_candidates)[i].source_rank;
-                    if (source < 0 || source >= comm_size) return -1;
-                    (*duplicates_by_source)[(size_t)source]
-                        .push_back((*owner_candidates)[i].ordinal);
-                    stats->single_duplicates++;
-                }
-            } else if (end - begin > 1) {
-                size_t winner = begin;
-                for (size_t i = begin + 1; i < end; ++i) {
-                    const MpiMarkdupCandidateShared &candidate =
-                        (*owner_candidates)[i];
-                    const MpiMarkdupCandidateShared &best =
-                        (*owner_candidates)[winner];
-                    if (candidate.score > best.score ||
-                        (candidate.score == best.score &&
-                         candidate.global_order <
-                             best.global_order)) {
-                        winner = i;
-                    }
-                }
-                for (size_t i = begin; i < end; ++i) {
-                    if (i == winner) continue;
-                    int source =
-                        (*owner_candidates)[i].source_rank;
-                    if (source < 0 || source >= comm_size) return -1;
-                    (*duplicates_by_source)[(size_t)source]
-                        .push_back((*owner_candidates)[i].ordinal);
-                    stats->single_duplicates++;
-                }
+                (*duplicates_by_source)[(size_t)source]
+                    .push_back((*owner_candidates)[i].ordinal);
+                stats->single_duplicates++;
             }
         }
         begin = end;
     }
+    stats->t_group_scan += GetTime() - group_scan_t0;
     stats->t_group += GetTime() - group_t0;
     return 0;
 }
@@ -1021,6 +1177,7 @@ static int MdExchangeDuplicateResults(
         int rank, int comm_size, uint64_t local_records,
         size_t memory_limit, std::vector<uint8_t> *bitmap,
         MpiMarkdupStats *stats) {
+    // 先对 duplicate ordinal 去重
     for (int i = 0; i < comm_size; ++i) {
         std::vector<uint64_t> &values =
             (*duplicates_by_source)[(size_t)i];
@@ -1028,11 +1185,13 @@ static int MdExchangeDuplicateResults(
         values.erase(std::unique(values.begin(), values.end()),
                      values.end());
     }
+    // 创建本 rank 的 duplicate bitmap
     int local_ok =
         local_records <= (uint64_t)SIZE_MAX * 8ull ? 1 : 0;
     if (!MdAllRanksOk(local_ok)) return -1;
     bitmap->assign((size_t)((local_records + 7) / 8), 0);
 
+    // 先用 MPI_Alltoall 交换每个 rank 会收多少结果
     std::vector<unsigned long long> send_counts((size_t)comm_size, 0);
     std::vector<unsigned long long> recv_counts((size_t)comm_size, 0);
     for (int i = 0; i < comm_size; ++i) {
@@ -1043,6 +1202,8 @@ static int MdExchangeDuplicateResults(
     MPI_Alltoall(send_counts.data(), 1, MPI_UNSIGNED_LONG_LONG,
                  recv_counts.data(), 1, MPI_UNSIGNED_LONG_LONG,
                  MPI_COMM_WORLD);
+
+    // 内存检查
     unsigned long long max_receive = 0;
     size_t result_memory = bitmap->capacity();
     for (int i = 0; i < comm_size; ++i) {
@@ -1072,6 +1233,7 @@ static int MdExchangeDuplicateResults(
     }
     if (!MdAllRanksOk(local_ok)) return -1;
 
+    // 使用 ring MPI_Sendrecv 回传 duplicate 结果
     double exchange_t0 = GetTime();
     for (int step = 0; step < comm_size; ++step) {
         int dest = (rank + step) % comm_size;
@@ -1232,69 +1394,6 @@ static int MdAppendRecords(MdPackWorkspace *workspace,
     return 0;
 }
 
-static int MdDeleteAuxTagHost(bam1_t *record, const char tag[2]) {
-    uint8_t *aux = bam_aux_get(record, tag);
-    if (!aux) return 0;
-    return bam_aux_del(record, aux);
-}
-
-static int MdRewriteBlockHost(MpiMarkdupRewritePara *para) {
-    if (!para || para->status != 0 || !para->records || !para->bam_lens) {
-        return 0;
-    }
-    int kept = 0;
-    uint32_t kept_len = 0;
-    para->marked_records = 0;
-    para->cleared_records = 0;
-    para->removed_records = 0;
-
-    for (int i = 0; i < para->n_records; ++i) {
-        bam1_t *record = para->records[i];
-        if (!record) {
-            para->status = -2;
-            para->record_index = i;
-            return -1;
-        }
-        const uint64_t ordinal = para->ordinal_base + (uint64_t)i;
-        const size_t byte = (size_t)(ordinal >> 3);
-        const uint8_t mask = (uint8_t)(1u << (ordinal & 7u));
-        const int duplicate =
-            byte < para->duplicate_bitmap_bytes &&
-            (para->duplicate_bitmap[byte] & mask);
-
-        if (para->clear_old) {
-            if (record->core.flag & BAM_FDUP) para->cleared_records++;
-            record->core.flag &= (uint16_t)~BAM_FDUP;
-            if (MdDeleteAuxTagHost(record, "dt") < 0 ||
-                MdDeleteAuxTagHost(record, "do") < 0) {
-                para->status = -2;
-                para->record_index = i;
-                return -1;
-            }
-        }
-        if (duplicate) {
-            record->core.flag |= BAM_FDUP;
-            para->marked_records++;
-        }
-        if (para->remove_dups && (record->core.flag & BAM_FDUP)) {
-            para->removed_records++;
-            continue;
-        }
-
-        const uint32_t bam_len =
-            (uint32_t)(record->l_data - record->core.l_extranul + 32);
-        para->records[kept] = record;
-        para->bam_lens[kept] = bam_len;
-        kept_len += bam_len + 4;
-        kept++;
-    }
-
-    para->n_kept_records = kept;
-    para->kept_total_len = kept_len;
-    para->status = 0;
-    return 0;
-}
-
 static void MdInitEmptyRawCompress(MpiSortRawCompressPara *para,
                                    int block_id) {
     memset(para, 0, sizeof(*para));
@@ -1325,74 +1424,81 @@ static void MdResetPayloadBlock(bam_block *block, int block_id) {
     block->block_address = 0;
 }
 
-static int MdAppendRecordPayload(bam_block *payload, const bam1_t *record) {
-    if (!payload || !record || !record->data) return -1;
-    const bam1_core_t *core = &record->core;
-    const int raw_l_qname = core->l_qname - core->l_extranul;
-    if (raw_l_qname <= 0 || raw_l_qname > 255 ||
-        core->l_extranul > core->l_qname ||
-        record->l_data < core->l_qname ||
-        core->n_cigar > 0xffff ||
-        core->pos > INT_MAX ||
-        core->mpos > INT_MAX) {
+static uint32_t MdLoadLe32(const unsigned char *p) {
+    uint32_t v = 0;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+static int MdAppendRawPayload(bam_block *payload,
+                              const unsigned char *record,
+                              uint32_t raw_len) {
+    if (!payload || !record || raw_len == 0 ||
+        raw_len > BGZF_BLOCK_SIZE) {
         return -1;
     }
-
-    const uint32_t block_len =
-        (uint32_t)(record->l_data - core->l_extranul + 32);
-    const uint32_t packed_len = block_len + 4;
-    if (packed_len > BGZF_BLOCK_SIZE) return -1;
     if (payload->pos > 0 &&
-        payload->pos + (int)packed_len > BGZF_BLOCK_SIZE) {
+        payload->pos + (int)raw_len > BGZF_BLOCK_SIZE) {
         return 1;
     }
-    if (payload->pos + (int)packed_len > BGZF_BLOCK_SIZE) return -1;
-
-    uint8_t *dst = payload->data + payload->pos;
-    uint32_t fields[8];
-    fields[0] = (uint32_t)core->tid;
-    fields[1] = (uint32_t)core->pos;
-    fields[2] = (uint32_t)core->bin << 16 |
-                (uint32_t)core->qual << 8 |
-                (uint32_t)raw_l_qname;
-    fields[3] = (uint32_t)core->flag << 16 |
-                (uint32_t)(core->n_cigar & 0xffff);
-    fields[4] = (uint32_t)core->l_qseq;
-    fields[5] = (uint32_t)core->mtid;
-    fields[6] = (uint32_t)core->mpos;
-    fields[7] = (uint32_t)core->isize;
-
-    memcpy(dst, &block_len, 4);
-    memcpy(dst + 4, fields, sizeof(fields));
-    memcpy(dst + 36, record->data, (size_t)raw_l_qname);
-    const uint32_t rest_len =
-        (uint32_t)(record->l_data - core->l_qname);
-    memcpy(dst + 36 + raw_l_qname,
-           record->data + core->l_qname,
-           (size_t)rest_len);
-    payload->pos += (int)packed_len;
+    if (payload->pos + (int)raw_len > BGZF_BLOCK_SIZE) {
+        return -1;
+    }
+    memcpy(payload->data + payload->pos, record, raw_len);
+    payload->pos += (int)raw_len;
     payload->length = payload->pos;
     return 0;
 }
 
-static int MdPreparePayloadFromRewrite(
-        MpiMarkdupRewritePara *rewrite, int n_blocks,
-        MdBlockSet *payload_blocks, MdBlockSet *output_blocks,
-        MpiSortRawCompressPara *paras, int compress_level,
-        int *active_blocks) {
+static int MdPrepareRemoveDupsPayloadFromRaw(
+        Bam2BamPara *decomp, MdBlockSet *uncompressed,
+        int n_blocks, const std::vector<uint8_t> &bitmap,
+        uint64_t ordinal_base, MdBlockSet *payload_blocks,
+        MdBlockSet *output_blocks, MpiSortRawCompressPara *paras,
+        int compress_level, int *active_blocks,
+        uint64_t *ordinal_end, MpiMarkdupStats *stats) {
     int active = 0;
-    if (payload_blocks->n < kMarkdupNB ||
+    uint64_t ordinal = ordinal_base;
+    if (!decomp || !uncompressed || !payload_blocks ||
+        !output_blocks || !paras || !active_blocks ||
+        !ordinal_end || payload_blocks->n < kMarkdupNB ||
         output_blocks->n < kMarkdupNB) {
         return -1;
     }
-    MdResetPayloadBlock(payload_blocks->blocks + active, active);
 
+    MdResetPayloadBlock(payload_blocks->blocks + active, active);
     for (int b = 0; b < n_blocks; ++b) {
-        for (int r = 0; r < rewrite[b].n_kept_records; ++r) {
-            bam1_t *record = rewrite[b].records[r];
+        bam_block *src = uncompressed->blocks + b;
+        size_t pos = 0;
+        for (int r = 0; r < decomp[b].n_total_records; ++r) {
+            if (pos + 36u > src->length) return -11;
+            const unsigned char *raw = src->data + pos;
+            const uint32_t block_len = MdLoadLe32(raw);
+            const uint64_t raw_len64 = (uint64_t)block_len + 4u;
+            if (block_len < 32 ||
+                raw_len64 > BGZF_BLOCK_SIZE ||
+                raw_len64 > (uint64_t)src->length - pos) {
+                return -12;
+            }
+            const uint32_t flag_nc = MdLoadLe32(raw + 16);
+            const uint16_t flag = (uint16_t)(flag_nc >> 16);
+            const size_t byte = (size_t)(ordinal >> 3);
+            const uint8_t mask = (uint8_t)(1u << (ordinal & 7u));
+            const int duplicate =
+                byte < bitmap.size() && (bitmap[byte] & mask);
+
+            if (duplicate && stats) stats->marked_records++;
+            if (duplicate || (flag & BAM_FDUP)) {
+                if (stats) stats->removed_records++;
+                ++ordinal;
+                pos += (size_t)raw_len64;
+                continue;
+            }
+
             while (true) {
-                int ret = MdAppendRecordPayload(
-                    payload_blocks->blocks + active, record);
+                int ret = MdAppendRawPayload(
+                    payload_blocks->blocks + active,
+                    raw, (uint32_t)raw_len64);
                 if (ret == 0) break;
                 if (ret < 0) return ret;
 
@@ -1401,11 +1507,14 @@ static int MdPreparePayloadFromRewrite(
                                    output_blocks->blocks + active,
                                    compress_level);
                 ++active;
-                if (active >= kMarkdupNB) return -3;
+                if (active >= kMarkdupNB) return -13;
                 MdResetPayloadBlock(payload_blocks->blocks + active,
                                     active);
             }
+            ++ordinal;
+            pos += (size_t)raw_len64;
         }
+        if (pos != src->length) return -14;
     }
 
     if (payload_blocks->blocks[active].pos > 0) {
@@ -1419,6 +1528,7 @@ static int MdPreparePayloadFromRewrite(
         MdInitEmptyRawCompress(paras + i, i);
     }
     *active_blocks = active;
+    *ordinal_end = ordinal;
     return 0;
 }
 
@@ -1586,6 +1696,58 @@ static int MdRewriteOutput(
             }
         }
 
+        // 快速路径：-r 且没有 -c
+        if (remove_dups && !clear_old) {
+            int active_payload_blocks = 0;
+            uint64_t next_ordinal = ordinal;
+            double payload_t0 = GetTime();
+            int payload_status = MdPrepareRemoveDupsPayloadFromRaw(
+                decomp, &uncompressed, n_blocks, bitmap,
+                ordinal, compress_un_active, output_active,
+                raw_comp, compress_level, &active_payload_blocks,
+                &next_ordinal, stats);
+            stats->t_pack += GetTime() - payload_t0;
+            if (payload_status != 0) {
+                fprintf(stderr,
+                        "[rank %d] ERROR: markdup remove-dups raw "
+                        "payload pack failed status=%d ordinal=%llu.\n",
+                        rank, payload_status,
+                        (unsigned long long)next_ordinal);
+                return -1;
+            }
+            ordinal = next_ordinal;
+            if (active_payload_blocks == 0) {
+                if (read_group(&next_blocks) != 0) return -1;
+                continue;
+            }
+
+            double compress_t0 = GetTime();
+            __real_athread_spawn(
+                (void *)slave_mpi_sort_compress_payload,
+                raw_comp, 1);
+            athread_join();
+            stats->t_compress += GetTime() - compress_t0;
+            double write_t0 = GetTime();
+            for (int i = 0; i < active_payload_blocks; ++i) {
+                if (raw_comp[i].status != 0) {
+                    fprintf(stderr,
+                            "[rank %d] ERROR: markdup remove-dups "
+                            "raw payload compress failed block=%d status=%d.\n",
+                            rank, i, raw_comp[i].status);
+                    return -1;
+                }
+                if (MpiWriteBlockToMem(writer,
+                        output_active->blocks + i) != 0) {
+                    return -1;
+                }
+                stats->bgzf_blocks++;
+            }
+            stats->t_write += GetTime() - write_t0;
+            if (read_group(&next_blocks) != 0) return -1;
+            continue;
+        }
+
+        // 普通路径：修改 FLAG / 清旧标记 / 重新打包
         uint64_t block_ordinal = ordinal;
         for (int b = 0; b < kMarkdupNB; ++b) {
             memset(rewrite + b, 0, sizeof(rewrite[b]));
@@ -1609,15 +1771,9 @@ static int MdRewriteOutput(
                 (uint64_t)decomp[b].n_total_records;
         }
         double rewrite_t0 = GetTime();
-        if (remove_dups) {
-            for (int b = 0; b < n_blocks; ++b) {
-                if (MdRewriteBlockHost(rewrite + b) != 0) break;
-            }
-        } else {
-            __real_athread_spawn((void *)slave_mpi_markdup_rewrite,
-                                 rewrite, 1);
-            athread_join();
-        }
+        __real_athread_spawn((void *)slave_mpi_markdup_rewrite,
+                             rewrite, 1);
+        athread_join();
         stats->t_rewrite += GetTime() - rewrite_t0;
         ordinal = block_ordinal;
 
@@ -1637,52 +1793,8 @@ static int MdRewriteOutput(
             stats->removed_records +=
                 rewrite[b].removed_records;
         }
-        if (remove_dups) {
-            int active_payload_blocks = 0;
-            double payload_t0 = GetTime();
-            int payload_status = MdPreparePayloadFromRewrite(
-                rewrite, n_blocks, compress_un_active,
-                output_active, raw_comp, compress_level,
-                &active_payload_blocks);
-            stats->t_pack += GetTime() - payload_t0;
-            if (payload_status != 0) {
-                fprintf(stderr,
-                        "[rank %d] ERROR: markdup remove-dups payload "
-                        "pack failed status=%d.\n",
-                        rank, payload_status);
-                return -1;
-            }
-            if (active_payload_blocks == 0) {
-                if (read_group(&next_blocks) != 0) return -1;
-                continue;
-            }
 
-            double compress_t0 = GetTime();
-            __real_athread_spawn(
-                (void *)slave_mpi_sort_compress_payload,
-                raw_comp, 1);
-            athread_join();
-            stats->t_compress += GetTime() - compress_t0;
-            double write_t0 = GetTime();
-            for (int i = 0; i < active_payload_blocks; ++i) {
-                if (raw_comp[i].status != 0) {
-                    fprintf(stderr,
-                            "[rank %d] ERROR: markdup remove-dups "
-                            "payload compress failed block=%d status=%d.\n",
-                            rank, i, raw_comp[i].status);
-                    return -1;
-                }
-                if (MpiWriteBlockToMem(writer,
-                        output_active->blocks + i) != 0) {
-                    return -1;
-                }
-                stats->bgzf_blocks++;
-            }
-            stats->t_write += GetTime() - write_t0;
-            if (read_group(&next_blocks) != 0) return -1;
-            continue;
-        }
-
+        // MdAppendRecords：把保留 records 重新打包进行压缩
         MdResetPackWorkspace(&pack);
         double pack_t0 = GetTime();
         int pack_status = 0;
@@ -1773,10 +1885,39 @@ static int MdValidateRankBoundaries(
     return 0;
 }
 
-static int MdGatherOutput(
+struct MdOutputMemory {
+    char *data;
+    size_t size;
+    char *header_data;
+    size_t header_size;
+    long long total_body_size;
+    std::vector<long long> body_sizes;
+    std::vector<long long> body_offsets;
+};
+
+struct MdOutputStageCosts {
+    double stage44;
+    double stage45_header;
+    double stage45_malloc;
+    double stage46;
+};
+
+static int MdPrepareOutputMemory(
         const MemWriter &local_writer, sam_hdr_t *header,
-        int compress_level, const std::string &output_path,
-        int rank, int comm_size, MpiMarkdupStats *stats) {
+        int compress_level, int rank, int comm_size,
+        MpiMarkdupStats *stats, MdOutputMemory *output,
+        MdOutputStageCosts *costs) {
+    memset(costs, 0, sizeof(*costs));
+    output->data = nullptr;
+    output->size = 0;
+    output->header_data = nullptr;
+    output->header_size = 0;
+    output->total_body_size = 0;
+    output->body_sizes.clear();
+    output->body_offsets.clear();
+
+    // 4.4 统计各 rank 输出大小 / gather layout
+    double stage44_t0 = GetTime();
     long long local_size = (long long)local_writer.size;
     std::vector<long long> sizes((size_t)comm_size, 0);
     MPI_Allgather(&local_size, 1, MPI_LONG_LONG,
@@ -1792,12 +1933,28 @@ static int MdGatherOutput(
         }
         total_body += sizes[(size_t)i];
     }
+    output->body_sizes = sizes;
+    output->body_offsets = offsets;
+    output->total_body_size = total_body;
+    costs->stage44 = MdReduceMax(GetTime() - stage44_t0);
+    if (rank == 0) {
+        printf("Complete the 4.4 gather body sizes cost %lf\n",
+               costs->stage44);
+    }
 
     char *header_memory = nullptr;
     size_t header_size = 0;
-    char *output_memory = nullptr;
-    size_t output_size = 0;
     int local_ok = 1;
+    double stage45_header_t0 = 0.0;
+    double stage45_malloc_t0 = 0.0;
+    double sim_write_t0 = 0.0;
+    char *simulated_write_mem = nullptr;
+    size_t simulated_write_size = 0;
+    size_t simulated_pos = 0;
+    volatile unsigned long long simulated_write_guard = 0;
+
+    // 4.5a header/layout
+    stage45_header_t0 = GetTime();
     if (rank == 0) {
         if (sam_hdr_add_pg(header, "RabbitBAM-MPI",
                            "PN", "RabbitBAM-MPI",
@@ -1826,75 +1983,121 @@ static int MdGatherOutput(
             local_ok = 0;
         }
         if (local_ok) {
-            output_size = (size_t)final_size;
-            output_memory =
-                output_size ? (char *)malloc(output_size) : nullptr;
-            if (output_size && !output_memory) local_ok = 0;
+            output->size = (size_t)final_size;
+            output->header_data = header_memory;
+            output->header_size = header_size;
+            header_memory = nullptr;
         }
     }
-    if (!MdAllRanksOk(local_ok)) {
-        if (header_memory) free(header_memory);
-        if (output_memory) free(output_memory);
-        return -1;
-    }
-
-    double gather_t0 = GetTime();
-    if (rank == 0) {
-        memcpy(output_memory, header_memory, header_size);
-        if (local_writer.size > 0) {
-            memcpy(output_memory + header_size,
-                   local_writer.data, local_writer.size);
-        }
-        for (int src = 1; src < comm_size; ++src) {
-            unsigned long long received = 0;
-            unsigned long long bytes =
-                (unsigned long long)sizes[(size_t)src];
-            while (received < bytes) {
-                int chunk = (int)std::min(
-                    (unsigned long long)kMarkdupExchangeChunk,
-                    bytes - received);
-                MPI_Recv(output_memory + header_size +
-                             offsets[(size_t)src] + received,
-                         chunk, MPI_BYTE, src, 4300,
-                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                received += (unsigned long long)chunk;
-            }
-        }
-        memcpy(output_memory + header_size + total_body,
-               kMarkdupBgzfEofBlock,
-               sizeof(kMarkdupBgzfEofBlock));
-    } else {
-        unsigned long long sent = 0;
-        unsigned long long bytes =
-            (unsigned long long)local_writer.size;
-        while (sent < bytes) {
-            int chunk = (int)std::min(
-                (unsigned long long)kMarkdupExchangeChunk,
-                bytes - sent);
-            MPI_Send(local_writer.data + sent, chunk, MPI_BYTE,
-                     0, 4300, MPI_COMM_WORLD);
-            sent += (unsigned long long)chunk;
-        }
-    }
-    stats->t_write += GetTime() - gather_t0;
-
-    double dump_t0 = GetTime();
-    if (rank == 0 &&
-        MpiCommonDumpMemoryToFile(
-            output_path, output_memory, output_size) != 0) {
-        fprintf(stderr,
-                "ERROR: failed to write markdup output %s.\n",
-                output_path.c_str());
-        local_ok = 0;
-    }
-    double dump_cost = MdReduceMax(GetTime() - dump_t0);
+    local_ok = MdAllRanksOk(local_ok);
+    costs->stage45_header =
+        MdReduceMax(GetTime() - stage45_header_t0);
     if (rank == 0 && local_ok) {
-        printf("555Dump memory to output file cost %lf--\n",
-               dump_cost);
+        printf("Complete the 4.5a header/layout cost %lf\n",
+               costs->stage45_header);
     }
+    if (!local_ok) goto fail;
+
+    // 4.5b 分配各 rank 的本地模拟写内存，这部分不计入核心处理时间
+    stage45_malloc_t0 = GetTime();
+    simulated_write_size = local_writer.size;
+    if (rank == 0) {
+        if (output->header_size > SIZE_MAX - simulated_write_size) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: simulated markdup output memory "
+                    "estimate overflow.\n", rank);
+            local_ok = 0;
+        } else {
+            simulated_write_size += output->header_size;
+        }
+    }
+    if (local_ok && simulated_write_size > 0) {
+        simulated_write_mem = (char *)malloc(simulated_write_size);
+        if (!simulated_write_mem) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: failed to allocate markdup "
+                    "simulated output memory. size=%zu\n",
+                    rank, simulated_write_size);
+            local_ok = 0;
+        }
+    }
+    local_ok = MdAllRanksOk(local_ok);
+    costs->stage45_malloc =
+        MdReduceMax(GetTime() - stage45_malloc_t0);
+    if (rank == 0 && local_ok) {
+        printf("Complete the 4.5b malloc simulated write memory cost %lf\n",
+               costs->stage45_malloc);
+    }
+    if (!local_ok) goto fail;
+
+    // 4.6 各 rank 根据逻辑偏移模拟写入高速磁盘内存，只统计 memcpy 时间
+    sim_write_t0 = GetTime();
+    simulated_pos = 0;
+    if (rank == 0 && output->header_size > 0) {
+        memcpy(simulated_write_mem + simulated_pos,
+               output->header_data, output->header_size);
+        simulated_pos += output->header_size;
+    }
+    if (local_writer.size > 0) {
+        memcpy(simulated_write_mem + simulated_pos,
+               local_writer.data, local_writer.size);
+        simulated_pos += local_writer.size;
+    }
+    if (simulated_pos > 0) {
+        unsigned char *guard_ptr =
+            (unsigned char *)simulated_write_mem;
+        simulated_write_guard += guard_ptr[0];
+        simulated_write_guard += guard_ptr[simulated_pos - 1];
+    }
+    {
+        double sim_write_cost = GetTime() - sim_write_t0;
+        costs->stage46 = MdReduceMax(sim_write_cost);
+    }
+    if (rank == 0 && local_ok) {
+        printf("Complete the 4.6 simulated header/body distributed write cost %lf\n",
+               costs->stage46);
+    }
+    if (simulated_write_guard == (unsigned long long)-1 && rank < 0) {
+        fprintf(stderr, "unused markdup simulated write guard %llu\n",
+                simulated_write_guard);
+    }
+    if (simulated_write_mem) free(simulated_write_mem);
     if (header_memory) free(header_memory);
-    if (output_memory) free(output_memory);
     return MdAllRanksOk(local_ok) ? 0 : -1;
+
+fail:
+    if (simulated_write_mem) free(simulated_write_mem);
+    if (header_memory) free(header_memory);
+    if (output->data) {
+        free(output->data);
+        output->data = nullptr;
+        output->size = 0;
+    }
+    if (output->header_data) {
+        free(output->header_data);
+        output->header_data = nullptr;
+        output->header_size = 0;
+    }
+    return -1;
+}
+
+static double MdAccountedFusedTime(const MpiMarkdupStats &stats) {
+    return stats.t_candidate_decomp +
+           stats.t_candidate_extract +
+           stats.t_candidate_exchange +
+           stats.t_boundary_check +
+           stats.t_candidate_cleanup +
+           stats.t_group_prepare +
+           stats.t_group +
+           stats.t_owner_cleanup +
+           stats.t_result_exchange +
+           stats.t_result_cleanup +
+           stats.t_rewrite_decomp +
+           stats.t_rewrite +
+           stats.t_pack +
+           stats.t_compress +
+           stats.t_read +
+           stats.t_write;
 }
 
 static void MdPrintStats(const MpiMarkdupStats &stats,
@@ -1918,6 +2121,66 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
         stats.mpi_candidate_bytes,
         stats.mpi_result_bytes
     };
+    const double accounted = MdAccountedFusedTime(stats);
+    const double unaccounted = stats.t_fused_total - accounted;
+
+    const int kLineBytes = 8192;
+    char local_lines[kLineBytes];
+    memset(local_lines, 0, sizeof(local_lines));
+    int used = snprintf(
+        local_lines, sizeof(local_lines),
+        "[rank %d] markdup_stats blocks=%lld groups=%lld "
+        "records=%lld examined=%lld excluded=%lld "
+        "pair_candidates=%lld single_candidates=%lld "
+        "owner_candidates=%lld qname_bytes=%lld "
+        "pair_duplicates=%lld single_duplicates=%lld "
+        "marked=%lld cleared=%lld removed=%lld "
+        "mpi_candidate_bytes=%lld result_bytes=%lld "
+        "bgzf=%lld tracked_peak=%lld\n",
+        rank, stats.input_blocks, stats.group_count,
+        stats.total_records, stats.examined_records,
+        stats.excluded_records, stats.pair_candidates,
+        stats.single_candidates, stats.owner_candidates,
+        stats.qname_bytes, stats.pair_duplicates,
+        stats.single_duplicates, stats.marked_records,
+        stats.cleared_records, stats.removed_records,
+        stats.mpi_candidate_bytes, stats.mpi_result_bytes,
+        stats.bgzf_blocks, stats.tracked_peak_bytes);
+    if (used < 0) used = 0;
+    if (used >= kLineBytes) used = kLineBytes - 1;
+    snprintf(
+        local_lines + used, (size_t)(kLineBytes - used),
+        "[rank %d] markdup_timing candidate_decomp=%.6f "
+        "candidate_extract=%.6f candidate_pack=%.6f "
+        "candidate_setup=%.6f candidate_mpi=%.6f "
+        "candidate_exchange=%.6f boundary=%.6f "
+        "candidate_cleanup=%.6f group_prepare=%.6f "
+        "group_sort=%.6f group_scan=%.6f group=%.6f "
+        "owner_cleanup=%.6f result=%.6f "
+        "result_cleanup=%.6f rewrite_decomp=%.6f "
+        "rewrite=%.6f pack=%.6f compress=%.6f "
+        "read=%.6f write=%.6f accounted=%.6f "
+        "unaccounted=%.6f fused=%.6f\n",
+        rank, stats.t_candidate_decomp,
+        stats.t_candidate_extract, stats.t_candidate_pack,
+        stats.t_candidate_exchange_setup,
+        stats.t_candidate_exchange_mpi,
+        stats.t_candidate_exchange,
+        stats.t_boundary_check, stats.t_candidate_cleanup,
+        stats.t_group_prepare, stats.t_group_sort,
+        stats.t_group_scan, stats.t_group, stats.t_owner_cleanup,
+        stats.t_result_exchange, stats.t_result_cleanup,
+        stats.t_rewrite_decomp, stats.t_rewrite, stats.t_pack,
+        stats.t_compress, stats.t_read, stats.t_write,
+        accounted, unaccounted, stats.t_fused_total);
+    std::vector<char> gathered_lines;
+    if (rank == 0) {
+        gathered_lines.resize((size_t)comm_size * kLineBytes);
+    }
+    MPI_Gather(local_lines, kLineBytes, MPI_CHAR,
+               rank == 0 ? gathered_lines.data() : nullptr,
+               kLineBytes, MPI_CHAR, 0, MPI_COMM_WORLD);
+
     long long sums[count] = {};
     MPI_Reduce(local_counts, sums, count, MPI_LONG_LONG,
                MPI_SUM, 0, MPI_COMM_WORLD);
@@ -1926,22 +2189,44 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
     MPI_Reduce(&peak, &peak_max, 1, MPI_LONG_LONG,
                MPI_MAX, 0, MPI_COMM_WORLD);
 
-    double local_times[10] = {
+    const int time_count = 24;
+    double local_times[time_count] = {
         stats.t_candidate_decomp,
         stats.t_candidate_extract,
+        stats.t_candidate_pack,
+        stats.t_candidate_exchange_setup,
+        stats.t_candidate_exchange_mpi,
         stats.t_candidate_exchange,
+        stats.t_boundary_check,
+        stats.t_candidate_cleanup,
+        stats.t_group_prepare,
+        stats.t_group_sort,
+        stats.t_group_scan,
         stats.t_group,
+        stats.t_owner_cleanup,
         stats.t_result_exchange,
+        stats.t_result_cleanup,
         stats.t_rewrite_decomp,
         stats.t_rewrite,
         stats.t_pack,
         stats.t_compress,
+        stats.t_read,
+        stats.t_write,
+        accounted,
+        unaccounted,
         stats.t_fused_total
     };
-    double time_sums[10] = {};
-    MPI_Reduce(local_times, time_sums, 10, MPI_DOUBLE,
+    double time_sums[time_count] = {};
+    double time_max[time_count] = {};
+    MPI_Reduce(local_times, time_sums, time_count, MPI_DOUBLE,
                MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(local_times, time_max, time_count, MPI_DOUBLE,
+               MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank == 0) {
+        for (int r = 0; r < comm_size; ++r) {
+            fputs(gathered_lines.data() + (size_t)r * kLineBytes,
+                  stdout);
+        }
         printf("FusedMarkdupMPI finished. ranks=%d blocks=%lld "
                "records=%lld examined=%lld excluded=%lld\n",
                comm_size, sums[0], sums[2], sums[3], sums[4]);
@@ -1955,19 +2240,52 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
                "tracked_peak_max=%lld\n",
                sums[14], sums[15], peak_max);
         printf("  timing_sum candidate_decomp=%.3f "
-               "candidate_extract=%.3f exchange=%.3f group=%.3f "
-               "result=%.3f rewrite_decomp=%.3f rewrite=%.3f "
-               "pack=%.3f compress=%.3f fused=%.3f\n",
+               "candidate_extract=%.3f candidate_pack=%.3f "
+               "candidate_setup=%.3f candidate_mpi=%.3f "
+               "candidate_exchange=%.3f boundary=%.3f "
+               "candidate_cleanup=%.3f group_prepare=%.3f "
+               "group_sort=%.3f group_scan=%.3f group=%.3f "
+               "owner_cleanup=%.3f result=%.3f "
+               "result_cleanup=%.3f rewrite_decomp=%.3f "
+               "rewrite=%.3f pack=%.3f compress=%.3f "
+               "read=%.3f write=%.3f accounted=%.3f "
+               "unaccounted=%.3f fused=%.3f\n",
                time_sums[0], time_sums[1], time_sums[2],
                time_sums[3], time_sums[4], time_sums[5],
                time_sums[6], time_sums[7], time_sums[8],
-               time_sums[9]);
+               time_sums[9], time_sums[10], time_sums[11],
+               time_sums[12], time_sums[13], time_sums[14],
+               time_sums[15], time_sums[16], time_sums[17],
+               time_sums[18], time_sums[19], time_sums[20],
+               time_sums[21], time_sums[22], time_sums[23]);
+        printf("  timing_max candidate_decomp=%.3f "
+               "candidate_extract=%.3f candidate_pack=%.3f "
+               "candidate_setup=%.3f candidate_mpi=%.3f "
+               "candidate_exchange=%.3f boundary=%.3f "
+               "candidate_cleanup=%.3f group_prepare=%.3f "
+               "group_sort=%.3f group_scan=%.3f group=%.3f "
+               "owner_cleanup=%.3f result=%.3f "
+               "result_cleanup=%.3f rewrite_decomp=%.3f "
+               "rewrite=%.3f pack=%.3f compress=%.3f "
+               "read=%.3f write=%.3f accounted=%.3f "
+               "unaccounted=%.3f fused=%.3f\n",
+               time_max[0], time_max[1], time_max[2],
+               time_max[3], time_max[4], time_max[5],
+               time_max[6], time_max[7], time_max[8],
+               time_max[9], time_max[10], time_max[11],
+               time_max[12], time_max[13], time_max[14],
+               time_max[15], time_max[16], time_max[17],
+               time_max[18], time_max[19], time_max[20],
+               time_max[21], time_max[22], time_max[23]);
+        fflush(stdout);
     }
 }
 
 } // namespace
 
 int ProcessMarkdupMPI(CmdInfo *cmd_info) {
+
+    // 1. 初始化阶段：拿 rank、解析内存参数
     double total_t0 = GetTime();
     int rank = 0;
     int comm_size = 1;
@@ -1993,6 +2311,12 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
     MemWriter writer = {};
     size_t memory_limit = 0;
     MpiMarkdupStats stats = {};
+    MdOutputMemory output_memory = {};
+    MdOutputStageCosts output_stage_costs = {};
+    double stage41_cost = 0.0;
+    double stage42_cost = 0.0;
+    double stage43_cost = 0.0;
+    double body_total_t0 = 0.0;
 
     std::vector<MpiMarkdupCandidateShared> local_candidates;
     std::vector<unsigned char> local_qnames;
@@ -2024,6 +2348,8 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
         MdReduceMax(GetTime() - total_t0);
     }
 
+
+    // 2. 222Complete the memory cost：每个 rank 预读整个 BAM
     {
         double t0 = GetTime();
         if (MpiCommonLoadFileToMemory(
@@ -2041,6 +2367,8 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
     }
     if (!MdAllRanksOk(local_ok)) goto cleanup;
 
+
+    // 3. 333Complete the head cost：从内存打开 BAM，读 header，检查格式
     {
         double t0 = GetTime();
         input_hfile = hopen("mem:", "rb:",
@@ -2098,7 +2426,9 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
     }
     if (!MdAllRanksOk(local_ok)) goto cleanup;
 
+    body_total_t0 = GetTime();
     {
+        // 4.1：扫描 BGZF block，并按 block 分给各 rank
         double t0 = GetTime();
         if (rank == 0) {
             printf("Enable MPI BAM MARKDUP mode (%d MPE + %d CPEs)!!!\n",
@@ -2139,30 +2469,41 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                 &rank_input, &rank_input_size) != 0) {
             local_ok = 0;
         }
-        double cost = MdReduceMax(GetTime() - t0);
+        stage41_cost = MdReduceMax(GetTime() - t0);
         if (rank == 0 && local_ok) {
             printf("MPI BAM scan complete. data_blocks=%lld "
                    "body_start=%lld\n",
                    n_blocks, body_start);
             printf("Complete the 4.1 scan/split/broadcast/select cost %lf\n",
-                   cost);
+                   stage41_cost);
         }
     }
     if (!MdAllRanksOk(local_ok)) goto cleanup;
 
-    reader.base = rank_input;
-    reader.size = rank_input_size;
-    reader.pos = 0;
-    if (MpiCommonInitMemWriter(
-            writer, rank_input_size ?
-                        rank_input_size :
-                        64 * 1024 * 1024) != 0) {
-        local_ok = 0;
+    // 4.2：初始化本 rank 的内存 reader / writer
+    {
+        double t0 = GetTime();
+        reader.base = rank_input;
+        reader.size = rank_input_size;
+        reader.pos = 0;
+        if (MpiCommonInitMemWriter(
+                writer, rank_input_size ?
+                            rank_input_size :
+                            64 * 1024 * 1024) != 0) {
+            local_ok = 0;
+        }
+        stage42_cost = MdReduceMax(GetTime() - t0);
+        if (rank == 0 && local_ok) {
+            printf("Complete the 4.2 init reader/writer cost %lf\n",
+                   stage42_cost);
+        }
     }
     if (!MdAllRanksOk(local_ok)) goto cleanup;
 
+    // 4.3 核心：提取候选、交换、找 duplicate、重写 BAM
     {
         double fused_t0 = GetTime();
+        // 1. MdExtractCandidates：提取本 rank 的候选记录
         if (MdExtractCandidates(
                 reader, local_block_begin, rank,
                 cmd_info->markdup_include_fails_,
@@ -2176,14 +2517,20 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
         }
         if (!MdAllRanksOk(local_ok)) goto cleanup;
 
-        if (MdValidateRankBoundaries(
+        // 2. MdValidateRankBoundaries：检查 rank 边界
+        {
+            double boundary_t0 = GetTime();
+            if (MdValidateRankBoundaries(
                 range_has_records, range_first_tid, range_first_pos,
                 range_last_tid, range_last_pos, rank,
                 comm_size) != 0) {
-            local_ok = 0;
+                local_ok = 0;
+            }
+            stats.t_boundary_check += GetTime() - boundary_t0;
         }
         if (!MdAllRanksOk(local_ok)) goto cleanup;
 
+        // 3. MdExchangeCandidates：把候选记录发给“负责判断 duplicate 的 owner rank”
         if (MdExchangeCandidates(
                 local_candidates, local_qnames,
                 rank, comm_size, memory_limit,
@@ -2193,32 +2540,49 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
         }
         if (!MdAllRanksOk(local_ok)) goto cleanup;
 
-        local_candidates.clear();
-        local_candidates.shrink_to_fit();
-        local_qnames.clear();
-        local_qnames.shrink_to_fit();
+        {
+            double cleanup_t0 = GetTime();
+            local_candidates.clear();
+            local_candidates.shrink_to_fit();
+            local_qnames.clear();
+            local_qnames.shrink_to_fit();
+            stats.t_candidate_cleanup += GetTime() - cleanup_t0;
+        }
 
         {
+            double group_prepare_t0 = GetTime();
             size_t grouping_bytes =
                 owner_candidates.capacity() *
                     sizeof(MpiMarkdupCandidateShared) +
                 owner_qnames.capacity();
+            size_t marker_key_bytes =
+                owner_candidates.size() >
+                        SIZE_MAX / sizeof(MpiMarkdupKeyShared)
+                    ? SIZE_MAX
+                    : owner_candidates.size() *
+                        sizeof(MpiMarkdupKeyShared);
             size_t worst_results =
                 owner_candidates.size() >
                         SIZE_MAX / sizeof(uint64_t)
                     ? SIZE_MAX
                     : owner_candidates.size() *
                         sizeof(uint64_t);
-            if (worst_results == SIZE_MAX ||
-                grouping_bytes > SIZE_MAX - worst_results ||
-                MdCheckMemory(grouping_bytes + worst_results,
+            if (marker_key_bytes == SIZE_MAX ||
+                worst_results == SIZE_MAX ||
+                grouping_bytes > SIZE_MAX - marker_key_bytes ||
+                grouping_bytes + marker_key_bytes >
+                    SIZE_MAX - worst_results ||
+                MdCheckMemory(grouping_bytes + marker_key_bytes +
+                                  worst_results,
                               memory_limit, &stats, rank,
                               "duplicate grouping") != 0) {
                 local_ok = 0;
             }
+            stats.t_group_prepare += GetTime() - group_prepare_t0;
         }
         if (!MdAllRanksOk(local_ok)) goto cleanup;
 
+        // 4. MdFindDuplicates：在 owner rank 上判断重复
         if (MdFindDuplicates(
                 &owner_candidates, owner_qnames,
                 comm_size, &duplicates_by_source,
@@ -2226,11 +2590,16 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
             local_ok = 0;
         }
         if (!MdAllRanksOk(local_ok)) goto cleanup;
-        owner_candidates.clear();
-        owner_candidates.shrink_to_fit();
-        owner_qnames.clear();
-        owner_qnames.shrink_to_fit();
+        {
+            double cleanup_t0 = GetTime();
+            owner_candidates.clear();
+            owner_candidates.shrink_to_fit();
+            owner_qnames.clear();
+            owner_qnames.shrink_to_fit();
+            stats.t_owner_cleanup += GetTime() - cleanup_t0;
+        }
 
+        // 5. MdExchangeDuplicateResults：把 duplicate 结果发回原 rank
         if (MdExchangeDuplicateResults(
                 &duplicates_by_source, rank,
                 comm_size, local_records,
@@ -2239,20 +2608,35 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
             local_ok = 0;
         }
         if (!MdAllRanksOk(local_ok)) goto cleanup;
-        duplicates_by_source.clear();
+        {
+            double cleanup_t0 = GetTime();
+            duplicates_by_source.clear();
+            stats.t_result_cleanup += GetTime() - cleanup_t0;
+        }
 
+        // 6. MdRewriteOutput：重写本 rank 的 BAM body
         const int remove_dups = cmd_info->markdup_remove_dups_;
+        const int fused_remove_dups =
+            remove_dups && !cmd_info->markdup_clear_;
         reader.pos = 0;
         if (MdRewriteOutput(
                 reader, duplicate_bitmap, local_records,
                 cmd_info->markdup_clear_,
-                0,
+                fused_remove_dups,
                 cmd_info->compress_level_,
                 writer, rank, &stats) != 0) {
             local_ok = 0;
         }
         if (!MdAllRanksOk(local_ok)) goto cleanup;
-        if (remove_dups) {
+
+        // -c -r 的情况：
+        /*第一步 MdRewriteOutput：
+            清除旧 DUP 标记
+            根据 duplicate_bitmap 重新打 DUP 标记
+            暂时不删除
+        第二步 FusedBamToBamMPI：
+            从刚才的 writer 结果中，过滤掉 BAM_FDUP records*/
+        if (remove_dups && !fused_remove_dups) {
             MemReader filter_reader = {};
             MemWriter filtered_writer = {};
             MpiBamToBamStats filter_stats = {};
@@ -2296,25 +2680,157 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
             stats.t_write += filter_stats.t_write;
         }
         stats.t_fused_total = GetTime() - fused_t0;
-        double fused_cost = MdReduceMax(stats.t_fused_total);
+        stage43_cost = MdReduceMax(stats.t_fused_total);
         if (rank == 0) {
             printf("Complete the 4.3 FusedMarkdupMPI cost %lf\n",
-                   fused_cost);
+                   stage43_cost);
         }
     }
 
-    MdPrintStats(stats, rank, comm_size);
-
-    if (MdGatherOutput(writer, header,
-                       cmd_info->compress_level_,
-                       cmd_info->out_file_name_,
-                       rank, comm_size, &stats) != 0) {
+    // 4.4~4.6 MdPrepareOutputMemory：准备最终输出文件内存
+    if (MdPrepareOutputMemory(writer, header,
+                              cmd_info->compress_level_,
+                              rank, comm_size, &stats,
+                              &output_memory,
+                              &output_stage_costs) != 0) {
         local_ok = 0;
+    }
+    if (!MdAllRanksOk(local_ok)) goto cleanup;
+
+    if (rank == 0) {
+        double core_total = stage41_cost + stage42_cost +
+                            stage43_cost + output_stage_costs.stage44 +
+                            output_stage_costs.stage45_header +
+                            output_stage_costs.stage46;
+        printf("Complete the total (4.1~4.6) cost %lf-----\n",
+               core_total);
+    }
+
+    // 4.7 MdPrintStats打印统计信息
+    {
+        double stage47_t0 = GetTime();
+        MdPrintStats(stats, rank, comm_size);
+        double stage47_cost =
+            MdReduceMax(GetTime() - stage47_t0);
+        if (rank == 0 && local_ok) {
+            printf("Complete the 4.7 rank stats reduce/print cost %lf\n",
+                   stage47_cost);
+        }
+    }
+
+    {
+        double body_total_cost =
+            MdReduceMax(GetTime() - body_total_t0);
+        if (rank == 0 && local_ok) {
+            printf("444Complete the total body cost %lf\n",
+                   body_total_cost);
+        }
+    }
+
+    // 5. rank 0 为验证结果汇总输出内存并写入文件，不计入核心处理时间
+    {
+        double verify_alloc_t0 = GetTime();
+        if (rank == 0) {
+            output_memory.data =
+                output_memory.size ? (char *)malloc(output_memory.size)
+                                   : nullptr;
+            if (output_memory.size && !output_memory.data) {
+                fprintf(stderr,
+                        "ERROR: failed to allocate markdup final output memory.\n");
+                local_ok = 0;
+            }
+            if (local_ok && output_memory.header_size > 0) {
+                memcpy(output_memory.data,
+                       output_memory.header_data,
+                       output_memory.header_size);
+            }
+        }
+        double verify_alloc_cost =
+            MdReduceMax(GetTime() - verify_alloc_t0);
+        if (rank == 0 && local_ok) {
+            printf("555Prepare verification output memory cost %lf--\n",
+                   verify_alloc_cost);
+        }
+        if (!MdAllRanksOk(local_ok)) goto cleanup;
+
+        double verify_gather_t0 = GetTime();
+        if (rank == 0) {
+            if (writer.size > 0) {
+                memcpy(output_memory.data + output_memory.header_size +
+                           output_memory.body_offsets[(size_t)rank],
+                       writer.data, writer.size);
+            }
+            for (int src = 1; src < comm_size; ++src) {
+                unsigned long long received = 0;
+                unsigned long long bytes =
+                    (unsigned long long)
+                        output_memory.body_sizes[(size_t)src];
+                while (received < bytes) {
+                    int chunk = (int)std::min(
+                        (unsigned long long)kMarkdupExchangeChunk,
+                        bytes - received);
+                    MPI_Recv(
+                        output_memory.data + output_memory.header_size +
+                            output_memory.body_offsets[(size_t)src] +
+                            received,
+                        chunk, MPI_BYTE, src, 4300,
+                        MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                    received += (unsigned long long)chunk;
+                }
+            }
+            if (local_ok) {
+                memcpy(output_memory.data + output_memory.header_size +
+                           output_memory.total_body_size,
+                       kMarkdupBgzfEofBlock,
+                       sizeof(kMarkdupBgzfEofBlock));
+            }
+        } else {
+            unsigned long long sent = 0;
+            unsigned long long bytes =
+                (unsigned long long)writer.size;
+            while (sent < bytes) {
+                int chunk = (int)std::min(
+                    (unsigned long long)kMarkdupExchangeChunk,
+                    bytes - sent);
+                MPI_Send(writer.data + sent, chunk, MPI_BYTE,
+                         0, 4300, MPI_COMM_WORLD);
+                sent += (unsigned long long)chunk;
+            }
+        }
+        double verify_gather_cost =
+            MdReduceMax(GetTime() - verify_gather_t0);
+        if (rank == 0 && local_ok) {
+            printf("555Gather verification output memory cost %lf--\n",
+                   verify_gather_cost);
+        }
+        if (!MdAllRanksOk(local_ok)) goto cleanup;
+
+        double dump_t0 = 0.0;
+        double dump_cost = 0.0;
+        if (rank == 0) {
+            dump_t0 = GetTime();
+            if (MpiCommonDumpMemoryToFile(
+                    cmd_info->out_file_name_,
+                    output_memory.data, output_memory.size) != 0) {
+                fprintf(stderr,
+                        "ERROR: failed to write markdup output %s.\n",
+                        cmd_info->out_file_name_.c_str());
+                local_ok = 0;
+            }
+            dump_cost = GetTime() - dump_t0;
+        }
+        dump_cost = MdReduceMax(dump_cost);
+        if (rank == 0 && local_ok) {
+            printf("555Dump memory to output file cost %lf--\n",
+                   dump_cost);
+        }
     }
     if (!MdAllRanksOk(local_ok)) goto cleanup;
     exit_code = 0;
 
 cleanup:
+    if (output_memory.data) free(output_memory.data);
+    if (output_memory.header_data) free(output_memory.header_data);
     if (writer.data) free(writer.data);
     if (header) sam_hdr_destroy(header);
     if (input) {
