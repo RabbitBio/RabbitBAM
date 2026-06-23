@@ -42,6 +42,12 @@ int MpiCommonInitMemWriter(MemWriter &w, size_t cap);
 int MpiCommonBuildBamHeaderMemory(
     sam_hdr_t *hdr, int compress_level,
     char **data, size_t *size);
+int MpiMarkdupFindDuplicatesStreamingHash(
+    std::vector<MpiMarkdupCandidateShared> *owner_candidates,
+    const std::vector<unsigned char> &owner_qnames,
+    int comm_size,
+    std::vector<std::vector<uint64_t> > *duplicates_by_source,
+    MpiMarkdupStats *stats);
 
 namespace {
 
@@ -101,6 +107,12 @@ struct MdMarkdupCandidateBufferDeleter {
     }
 };
 
+struct MdMarkdupKeyBufferDeleter {
+    void operator()(MpiMarkdupKeyShared *p) const {
+        if (p) aligned_free_custom((unsigned char *)p);
+    }
+};
+
 struct MdByteBufferDeleter {
     void operator()(unsigned char *p) const {
         if (p) aligned_free_custom(p);
@@ -113,10 +125,31 @@ struct MdDuplicateId {
     uint64_t ordinal;
 };
 
+struct MdCoordBoundary {
+    int has_records;
+    int32_t first_ref;
+    int64_t first_coord;
+    int32_t last_ref;
+    int64_t last_coord;
+};
+
+struct MdBucketRange {
+    uint64_t code;
+    size_t begin;
+    size_t end;
+};
+
 static int MdAllRanksOk(int local_ok) {
     int global_ok = 0;
     MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN,
                   MPI_COMM_WORLD);
+    return global_ok;
+}
+
+static int MdAllRanksOkTimed(int local_ok, MpiMarkdupStats *stats) {
+    double t0 = GetTime();
+    const int global_ok = MdAllRanksOk(local_ok);
+    stats->t_rank_sync += GetTime() - t0;
     return global_ok;
 }
 
@@ -161,6 +194,42 @@ static size_t MdVectorBytes(
     total += qnames.capacity();
     if (bitmap.capacity() > SIZE_MAX - total) return SIZE_MAX;
     return total + bitmap.capacity();
+}
+
+static size_t MdFlatHashCapacityForEstimate(size_t expected) {
+    if (expected == 0) return 0;
+    if (expected > (SIZE_MAX / 2) - 16) return 0;
+    size_t wanted = expected * 2 + 16;
+    size_t cap = 16;
+    while (cap < wanted) {
+        if (cap > SIZE_MAX / 2) return 0;
+        cap <<= 1;
+    }
+    return cap;
+}
+
+static size_t MdFlatHashBytesForEstimate(size_t owner_count) {
+    const size_t cap = MdFlatHashCapacityForEstimate(owner_count);
+    if (owner_count != 0 && cap == 0) return SIZE_MAX;
+    const size_t best_slot =
+        sizeof(MpiMarkdupKeyShared) + sizeof(uint64_t) +
+        sizeof(size_t) + sizeof(unsigned char);
+    const size_t set_slot =
+        sizeof(MpiMarkdupKeyShared) + sizeof(uint64_t) +
+        sizeof(unsigned char);
+    if (cap > SIZE_MAX / best_slot) return SIZE_MAX;
+    size_t total = cap * best_slot;
+    if (cap > SIZE_MAX / best_slot ||
+        total > SIZE_MAX - cap * best_slot) {
+        return SIZE_MAX;
+    }
+    total += cap * best_slot;
+    if (cap > SIZE_MAX / set_slot ||
+        total > SIZE_MAX - cap * set_slot) {
+        return SIZE_MAX;
+    }
+    total += cap * set_slot;
+    return total;
 }
 
 static int MdCheckMemory(size_t bytes, size_t limit,
@@ -363,45 +432,71 @@ static int MdExtractCandidates(
 
     // 工作区分配
     const int records_per_block = (int)MPI_RECORDS_PER_BLOCK;
-    MdBlockSet input = {};
-    MdBlockSet uncompressed = {};
-    MdRecordSet records = {};
-    MdCandidateWorkspace candidate_workspace = {};
-    Bam2BamPara decomp[kMarkdupNB];
-    MpiMarkdupExtractPara extract[kMarkdupNB];
+    struct MdExtractSlot {
+        MdBlockSet input;
+        MdBlockSet uncompressed;
+        MdRecordSet records;
+        MdCandidateWorkspace candidate_workspace;
+        Bam2BamPara decomp[kMarkdupNB];
+        MpiMarkdupExtractPara extract[kMarkdupNB];
+        int n_blocks;
+        long long block_group_base;
+        uint64_t ordinal_base;
+        uint64_t ordinal_end;
+    };
 
-    if (MdAllocateBlockSet(&input, kMarkdupNB) != 0 ||
-        MdAllocateBlockSet(&uncompressed, kMarkdupNB) != 0 ||
-        MdAllocateRecordSet(&records, kMarkdupNB, records_per_block,
-                            MPI_BAM_BLOCK_ARENA_SIZE) != 0 ||
-        MdAllocateCandidateWorkspace(&candidate_workspace,
-                                     records_per_block) != 0) {
-        fprintf(stderr,
-                "[rank %d] ERROR: failed to allocate markdup candidate workspace.\n",
-                rank);
-        MdFreeBlockSet(&input);
-        MdFreeBlockSet(&uncompressed);
-        MdFreeRecordSet(&records);
-        MdFreeCandidateWorkspace(&candidate_workspace);
-        return -1;
+    MdExtractSlot slots[2];
+    memset(slots, 0, sizeof(slots));
+
+    auto free_slot = [](MdExtractSlot *slot) {
+        MdFreeBlockSet(&slot->input);
+        MdFreeBlockSet(&slot->uncompressed);
+        MdFreeRecordSet(&slot->records);
+        MdFreeCandidateWorkspace(&slot->candidate_workspace);
+        slot->n_blocks = 0;
+    };
+    auto free_slots = [&]() {
+        free_slot(slots + 0);
+        free_slot(slots + 1);
+    };
+
+    for (int s = 0; s < 2; ++s) {
+        if (MdAllocateBlockSet(&slots[s].input, kMarkdupNB) != 0 ||
+            MdAllocateBlockSet(&slots[s].uncompressed, kMarkdupNB) != 0 ||
+            MdAllocateRecordSet(&slots[s].records, kMarkdupNB,
+                                records_per_block,
+                                MPI_BAM_BLOCK_ARENA_SIZE) != 0 ||
+            MdAllocateCandidateWorkspace(
+                &slots[s].candidate_workspace,
+                records_per_block) != 0) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: failed to allocate markdup "
+                    "candidate pipeline workspace.\n",
+                    rank);
+            free_slots();
+            return -1;
+        }
     }
 
-    // 固定内存估算
-    const size_t fixed_workspace =
+    // 固定内存估算：candidate extract 使用双槽流水线。
+    const MdCandidateWorkspace &cw0 = slots[0].candidate_workspace;
+    const size_t fixed_workspace_per_slot =
         (size_t)kMarkdupNB * BGZF_MAX_BLOCK_SIZE * 2 +
         (size_t)kMarkdupNB * MPI_BAM_BLOCK_ARENA_SIZE +
         (size_t)kMarkdupNB * records_per_block *
             (sizeof(bam1_t) + sizeof(bam1_t *) + sizeof(uint32_t)) +
-        (size_t)kMarkdupNB *
-            candidate_workspace.candidates_per_block *
+        (size_t)kMarkdupNB * cw0.candidates_per_block *
             sizeof(MpiMarkdupCandidateShared) +
-        (size_t)kMarkdupNB * candidate_workspace.qname_stride;
+        (size_t)kMarkdupNB * cw0.qname_stride;
+    size_t fixed_workspace = fixed_workspace_per_slot;
+    if (fixed_workspace > SIZE_MAX - fixed_workspace_per_slot) {
+        free_slots();
+        return -1;
+    }
+    fixed_workspace += fixed_workspace_per_slot;
     if (MdCheckMemory(fixed_workspace, memory_limit, stats, rank,
-                      "candidate workspace") != 0) {
-        MdFreeBlockSet(&input);
-        MdFreeBlockSet(&uncompressed);
-        MdFreeRecordSet(&records);
-        MdFreeCandidateWorkspace(&candidate_workspace);
+                      "candidate pipeline workspace") != 0) {
+        free_slots();
         return -1;
     }
 
@@ -416,150 +511,194 @@ static int MdExtractCandidates(
     *range_first_pos = -1;
     *range_last_tid = -1;
     *range_last_pos = -1;
-    int n_blocks = 0;
 
-    // 先读一批 blocks
-    MdReadGroup(reader, &input, &n_blocks, stats);
-    while (n_blocks > 0) {
-        stats->input_blocks += n_blocks;
-        for (int b = 0; b < kMarkdupNB; ++b) {
-            MdInitDecompPara(decomp + b, b, &input, &uncompressed,
-                             &records, b < n_blocks);
+    auto read_slot = [&](MdExtractSlot *slot, long long block_base,
+                         uint64_t ordinal_base) -> int {
+        slot->block_group_base = block_base;
+        slot->ordinal_base = ordinal_base;
+        slot->ordinal_end = ordinal_base;
+        if (MdReadGroup(reader, &slot->input, &slot->n_blocks,
+                        stats) != 0) {
+            return -1;
         }
+        if (slot->n_blocks > 0) {
+            stats->input_blocks += slot->n_blocks;
+        }
+        return 0;
+    };
 
-        double decomp_t0 = GetTime();
+    auto prepare_decomp = [&](MdExtractSlot *slot) {
+        for (int b = 0; b < kMarkdupNB; ++b) {
+            MdInitDecompPara(slot->decomp + b, b, &slot->input,
+                             &slot->uncompressed, &slot->records,
+                             b < slot->n_blocks);
+        }
+    };
+
+    auto launch_decomp = [&](MdExtractSlot *slot) {
+        prepare_decomp(slot);
         __real_athread_spawn(
             (void *)slave_mpi_decompress_bam2bam_passthrough,
-            decomp, 1);
+            slot->decomp, 1);
+    };
+
+    auto join_decomp = [&](MdExtractSlot *slot) -> int {
+        double cpe_sync_t0 = GetTime();
         athread_join();
-        stats->t_candidate_decomp += GetTime() - decomp_t0;
-        for (int b = 0; b < n_blocks; ++b) {
-            if (decomp[b].status != 0) {
+        const double sync_dt = GetTime() - cpe_sync_t0;
+        stats->t_cpe_sync += sync_dt;
+        stats->t_candidate_decomp += sync_dt;
+        for (int b = 0; b < slot->n_blocks; ++b) {
+            if (slot->decomp[b].status != 0) {
                 fprintf(stderr,
                         "[rank %d] ERROR: markdup candidate BAM decode failed "
                         "at global block %lld status=%d record=%d.\n",
-                        rank, block_group_base + b, decomp[b].status,
-                        decomp[b].record_index);
-                MdFreeBlockSet(&input);
-                MdFreeBlockSet(&uncompressed);
-                MdFreeRecordSet(&records);
-                MdFreeCandidateWorkspace(&candidate_workspace);
+                        rank, slot->block_group_base + b,
+                        slot->decomp[b].status,
+                        slot->decomp[b].record_index);
                 return -1;
             }
         }
+        return 0;
+    };
 
-        // 准备 candidate 提取参数
-        uint64_t block_ordinal = ordinal;
+    auto prepare_extract = [&](MdExtractSlot *slot) {
+        uint64_t block_ordinal = slot->ordinal_base;
         for (int b = 0; b < kMarkdupNB; ++b) {
-            memset(extract + b, 0, sizeof(extract[b]));
-            extract[b].block_id = b;
-            extract[b].status = b < n_blocks ? 0 : -1;
-            if (b >= n_blocks) continue;
-            extract[b].records = decomp[b].output_records;
-            extract[b].n_records = decomp[b].n_total_records;
-            extract[b].ordinal_base = block_ordinal;
-            extract[b].global_block_index =
-                (uint64_t)(block_group_base + b);
-            extract[b].source_rank = rank;
-            extract[b].include_fails = include_fails;
-            extract[b].candidates =
-                candidate_workspace.candidates +
+            memset(slot->extract + b, 0, sizeof(slot->extract[b]));
+            slot->extract[b].block_id = b;
+            slot->extract[b].status = b < slot->n_blocks ? 0 : -1;
+            if (b >= slot->n_blocks) continue;
+            slot->extract[b].records = slot->decomp[b].output_records;
+            slot->extract[b].n_records = slot->decomp[b].n_total_records;
+            slot->extract[b].ordinal_base = block_ordinal;
+            slot->extract[b].global_block_index =
+                (uint64_t)(slot->block_group_base + b);
+            slot->extract[b].source_rank = rank;
+            slot->extract[b].include_fails = include_fails;
+            slot->extract[b].candidates =
+                slot->candidate_workspace.candidates +
                 (size_t)b *
-                    candidate_workspace.candidates_per_block;
-            extract[b].candidate_capacity =
-                candidate_workspace.candidates_per_block;
-            extract[b].qname_arena =
-                candidate_workspace.qnames +
-                (size_t)b * candidate_workspace.qname_stride;
-            extract[b].qname_capacity =
-                candidate_workspace.qname_stride;
+                    slot->candidate_workspace.candidates_per_block;
+            slot->extract[b].candidate_capacity =
+                slot->candidate_workspace.candidates_per_block;
+            slot->extract[b].qname_arena =
+                slot->candidate_workspace.qnames +
+                (size_t)b * slot->candidate_workspace.qname_stride;
+            slot->extract[b].qname_capacity =
+                slot->candidate_workspace.qname_stride;
             block_ordinal +=
-                (uint64_t)decomp[b].n_total_records;
+                (uint64_t)slot->decomp[b].n_total_records;
         }
+        slot->ordinal_end = block_ordinal;
+    };
 
-        // 从核提取 markdup candidate
-        double extract_t0 = GetTime();
+    auto launch_extract = [&](MdExtractSlot *slot) {
         __real_athread_spawn((void *)slave_mpi_markdup_extract,
-                             extract, 1);
-        athread_join();
-        stats->t_candidate_extract += GetTime() - extract_t0;
+                             slot->extract, 1);
+    };
 
-        for (int b = 0; b < n_blocks; ++b) {
+    auto join_extract = [&](MdExtractSlot *slot) {
+        (void)slot;
+        double cpe_sync_t0 = GetTime();
+        athread_join();
+        const double sync_dt = GetTime() - cpe_sync_t0;
+        stats->t_cpe_sync += sync_dt;
+        stats->t_candidate_extract += sync_dt;
+    };
+
+    auto run_slot_cpe = [&](MdExtractSlot *slot) -> int {
+        launch_decomp(slot);
+        if (join_decomp(slot) != 0) return -1;
+        prepare_extract(slot);
+        launch_extract(slot);
+        join_extract(slot);
+        return 0;
+    };
+
+    auto process_slot = [&](MdExtractSlot *slot) -> int {
+        double status_total = 0.0;
+        double merge_total = 0.0;
+        for (int b = 0; b < slot->n_blocks; ++b) {
+            double status_t0 = GetTime();
             // 检查从核提取是否成功
-            if (extract[b].status != 0) {
+            if (slot->extract[b].status != 0) {
+                stats->t_extract_status +=
+                    status_total + (GetTime() - status_t0);
                 fprintf(stderr,
                         "[rank %d] ERROR: %s at global block %lld "
                         "record=%d status=%d.\n",
-                        rank, MdExtractErrorText(extract[b].status),
-                        block_group_base + b, extract[b].record_index,
-                        extract[b].status);
-                MdFreeBlockSet(&input);
-                MdFreeBlockSet(&uncompressed);
-                MdFreeRecordSet(&records);
-                MdFreeCandidateWorkspace(&candidate_workspace);
+                        rank,
+                        MdExtractErrorText(slot->extract[b].status),
+                        slot->block_group_base + b,
+                        slot->extract[b].record_index,
+                        slot->extract[b].status);
                 return -1;
             }
 
             // 检查 coordinate sorted
             // MdExtractCandidates 内部检查 rank 内 block 顺序
             // MdValidateRankBoundaries 检查 rank 与 rank 之间的坐标顺序
-            if (extract[b].has_records) {
+            if (slot->extract[b].has_records) {
                 if (!*range_has_records) {
-                    *range_first_tid = extract[b].first_tid;
-                    *range_first_pos = extract[b].first_pos;
+                    *range_first_tid = slot->extract[b].first_tid;
+                    *range_first_pos = slot->extract[b].first_pos;
                     *range_has_records = 1;
                 }
-                if (extract[b].first_tid >= 0 && have_previous &&
-                    (extract[b].first_tid < previous_tid ||
-                     (extract[b].first_tid == previous_tid &&
-                      extract[b].first_pos < previous_pos))) {
+                if (slot->extract[b].first_tid >= 0 && have_previous &&
+                    (slot->extract[b].first_tid < previous_tid ||
+                     (slot->extract[b].first_tid == previous_tid &&
+                      slot->extract[b].first_pos < previous_pos))) {
                     fprintf(stderr,
                             "[rank %d] ERROR: input is not coordinate sorted "
                             "near global block %lld.\n",
-                            rank, block_group_base + b);
-                    MdFreeBlockSet(&input);
-                    MdFreeBlockSet(&uncompressed);
-                    MdFreeRecordSet(&records);
-                    MdFreeCandidateWorkspace(&candidate_workspace);
+                            rank, slot->block_group_base + b);
+                    stats->t_extract_status +=
+                        status_total + (GetTime() - status_t0);
                     return -1;
                 }
-                previous_tid = extract[b].last_tid;
-                previous_pos = extract[b].last_pos;
-                *range_last_tid = extract[b].last_tid;
-                *range_last_pos = extract[b].last_pos;
+                previous_tid = slot->extract[b].last_tid;
+                previous_pos = slot->extract[b].last_pos;
+                *range_last_tid = slot->extract[b].last_tid;
+                *range_last_pos = slot->extract[b].last_pos;
                 have_previous = 1;
             }
+            status_total += GetTime() - status_t0;
 
             // 合并 qname 和 candidates 到 local_candidates 中
+            double merge_t0 = GetTime();
             const uint64_t qname_base =
                 (uint64_t)local_qnames->size();
-            if (extract[b].qname_used > 0) {
+            if (slot->extract[b].qname_used > 0) {
                 local_qnames->insert(
-                    local_qnames->end(), extract[b].qname_arena,
-                    extract[b].qname_arena + extract[b].qname_used);
+                    local_qnames->end(), slot->extract[b].qname_arena,
+                    slot->extract[b].qname_arena +
+                        slot->extract[b].qname_used);
             }
-            for (int i = 0; i < extract[b].n_candidates; ++i) {
+            for (int i = 0; i < slot->extract[b].n_candidates; ++i) {
                 MpiMarkdupCandidateShared candidate =
-                    extract[b].candidates[i];
+                    slot->extract[b].candidates[i];
                 if (!candidate.key.single) {
                     candidate.qname_offset += qname_base;
                 }
                 local_candidates->push_back(candidate);
             }
-            stats->total_records += decomp[b].n_total_records;
-            stats->examined_records += extract[b].examined;
-            stats->excluded_records += extract[b].excluded;
+            stats->total_records += slot->decomp[b].n_total_records;
+            stats->examined_records += slot->extract[b].examined;
+            stats->excluded_records += slot->extract[b].excluded;
             stats->pair_candidates +=
-                extract[b].pair_candidates;
+                slot->extract[b].pair_candidates;
             stats->single_candidates +=
-                extract[b].single_candidates;
+                slot->extract[b].single_candidates;
+            merge_total += GetTime() - merge_t0;
         }
-        // 更新 ordinal 和 block_group_base
-        ordinal = block_ordinal;
-        block_group_base += n_blocks;
+        stats->t_extract_status += status_total;
+        stats->t_extract_merge += merge_total;
+        ordinal = slot->ordinal_end;
         stats->group_count++;
 
         // 动态内存检查
+        double memcheck_t0 = GetTime();
         size_t dynamic = MdVectorBytes(
             *local_candidates, *local_qnames,
             std::vector<uint8_t>());
@@ -568,20 +707,62 @@ static int MdExtractCandidates(
             MdCheckMemory(fixed_workspace + dynamic, memory_limit,
                           stats, rank,
                           "local candidate accumulation") != 0) {
-            MdFreeBlockSet(&input);
-            MdFreeBlockSet(&uncompressed);
-            MdFreeRecordSet(&records);
-            MdFreeCandidateWorkspace(&candidate_workspace);
+            stats->t_extract_memcheck += GetTime() - memcheck_t0;
             return -1;
         }
-        MdReadGroup(reader, &input, &n_blocks, stats);
+        stats->t_extract_memcheck += GetTime() - memcheck_t0;
+        return 0;
+    };
+
+    int current = 0;
+    int next = 1;
+    if (read_slot(slots + current, global_block_begin, ordinal) != 0) {
+        free_slots();
+        return -1;
+    }
+    if (slots[current].n_blocks == 0) {
+        *local_records = 0;
+        free_slots();
+        return 0;
+    }
+    if (run_slot_cpe(slots + current) != 0) {
+        free_slots();
+        return -1;
+    }
+
+    for (;;) {
+        const long long next_block_base =
+            slots[current].block_group_base + slots[current].n_blocks;
+        const uint64_t next_ordinal_base = slots[current].ordinal_end;
+        if (read_slot(slots + next, next_block_base,
+                      next_ordinal_base) != 0) {
+            free_slots();
+            return -1;
+        }
+        const int have_next = slots[next].n_blocks > 0;
+        if (have_next) {
+            launch_decomp(slots + next);
+        }
+
+        int process_status = process_slot(slots + current);
+        int decomp_status = 0;
+        if (have_next) {
+            decomp_status = join_decomp(slots + next);
+        }
+        if (process_status != 0 || decomp_status != 0) {
+            free_slots();
+            return -1;
+        }
+        if (!have_next) break;
+
+        prepare_extract(slots + next);
+        launch_extract(slots + next);
+        join_extract(slots + next);
+        std::swap(current, next);
     }
 
     *local_records = ordinal;
-    MdFreeBlockSet(&input);
-    MdFreeBlockSet(&uncompressed);
-    MdFreeRecordSet(&records);
-    MdFreeCandidateWorkspace(&candidate_workspace);
+    free_slots();
     return 0;
 }
 
@@ -979,6 +1160,449 @@ static int MdExchangeCandidates(
     return 0;
 }
 
+static int MdCompareCoord(int32_t a_ref, int64_t a_coord,
+                          int32_t b_ref, int64_t b_coord) {
+    if (a_ref != b_ref) return a_ref < b_ref ? -1 : 1;
+    if (a_coord != b_coord) return a_coord < b_coord ? -1 : 1;
+    return 0;
+}
+
+static int MdBuildCoordBoundaries(
+        int range_has_records, int range_first_tid, int range_first_pos,
+        int range_last_tid, int range_last_pos, int comm_size,
+        std::vector<MdCoordBoundary> *boundaries) {
+    long long local[5] = {
+        (long long)range_has_records,
+        range_has_records ? (long long)range_first_tid + 1 : 0,
+        range_has_records ? (long long)range_first_pos + 1 : 0,
+        range_has_records ? (long long)range_last_tid + 1 : 0,
+        range_has_records ? (long long)range_last_pos + 1 : 0
+    };
+    std::vector<long long> gathered((size_t)comm_size * 5, 0);
+    MPI_Allgather(local, 5, MPI_LONG_LONG, gathered.data(), 5,
+                  MPI_LONG_LONG, MPI_COMM_WORLD);
+    boundaries->assign((size_t)comm_size, MdCoordBoundary());
+    for (int r = 0; r < comm_size; ++r) {
+        const long long *src = gathered.data() + (size_t)r * 5;
+        MdCoordBoundary &b = (*boundaries)[(size_t)r];
+        b.has_records = src[0] != 0;
+        b.first_ref = (int32_t)src[1];
+        b.first_coord = (int64_t)src[2];
+        b.last_ref = (int32_t)src[3];
+        b.last_coord = (int64_t)src[4];
+    }
+    return 0;
+}
+
+static int MdCoordinateOwner(const MpiMarkdupKeyShared &key,
+                             const std::vector<MdCoordBoundary> &boundaries,
+                             int fallback_rank) {
+    int last_nonempty = fallback_rank;
+    const int32_t ref = key.this_ref;
+    const int64_t coord = key.this_coord;
+    for (size_t r = 0; r < boundaries.size(); ++r) {
+        const MdCoordBoundary &b = boundaries[r];
+        if (!b.has_records) continue;
+        last_nonempty = (int)r;
+        if (MdCompareCoord(ref, coord, b.last_ref, b.last_coord) <= 0) {
+            return (int)r;
+        }
+    }
+    return last_nonempty;
+}
+
+static int MdCoordinateOwnerFast(const MpiMarkdupKeyShared &key,
+                                 const std::vector<MdCoordBoundary> &boundaries,
+                                 int rank) {
+    if (rank < 0 || rank >= (int)boundaries.size()) {
+        return MdCoordinateOwner(key, boundaries, rank);
+    }
+
+    const MdCoordBoundary &local = boundaries[(size_t)rank];
+    const int32_t ref = key.this_ref;
+    const int64_t coord = key.this_coord;
+    if (local.has_records) {
+        const int cmp_first =
+            MdCompareCoord(ref, coord, local.first_ref,
+                           local.first_coord);
+        const int cmp_last =
+            MdCompareCoord(ref, coord, local.last_ref,
+                           local.last_coord);
+        if (cmp_first >= 0 && cmp_last <= 0) {
+            return rank;
+        }
+
+        if (cmp_last > 0) {
+            int last_nonempty = rank;
+            for (size_t r = (size_t)rank + 1;
+                 r < boundaries.size(); ++r) {
+                const MdCoordBoundary &b = boundaries[r];
+                if (!b.has_records) continue;
+                last_nonempty = (int)r;
+                if (MdCompareCoord(ref, coord, b.last_ref,
+                                   b.last_coord) <= 0) {
+                    return (int)r;
+                }
+            }
+            return last_nonempty;
+        }
+    }
+
+    return MdCoordinateOwner(key, boundaries, rank);
+}
+
+static int MdAppendOwnerCandidate(
+        const MpiMarkdupCandidateShared &input,
+        const std::vector<unsigned char> &local_qnames,
+        std::vector<MpiMarkdupCandidateShared> *owner_candidates,
+        std::vector<unsigned char> *owner_qnames,
+        int rank) {
+    MpiMarkdupCandidateShared candidate = input;
+    if (!candidate.key.single) {
+        const size_t qname_src = (size_t)candidate.qname_offset;
+        const size_t qname_len = (size_t)candidate.qname_len;
+        if (qname_src > local_qnames.size() ||
+            qname_len > local_qnames.size() - qname_src) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: invalid local markdup QNAME range.\n",
+                    rank);
+            return -1;
+        }
+        candidate.qname_offset = (uint64_t)owner_qnames->size();
+        if (qname_len > 0) {
+            owner_qnames->insert(owner_qnames->end(),
+                                 local_qnames.data() + qname_src,
+                                 local_qnames.data() + qname_src + qname_len);
+        }
+    }
+    owner_candidates->push_back(candidate);
+    return 0;
+}
+
+static int MdExchangeCandidatesByCoordinate(
+        std::vector<MpiMarkdupCandidateShared> *local_candidates_in,
+        std::vector<unsigned char> *local_qnames_in,
+        int range_has_records, int range_first_tid, int range_first_pos,
+        int range_last_tid, int range_last_pos,
+        int rank, int comm_size, size_t memory_limit,
+        std::vector<MpiMarkdupCandidateShared> *owner_candidates,
+        std::vector<unsigned char> *owner_qnames,
+        MpiMarkdupStats *stats) {
+    double exchange_total_t0 = GetTime();
+    std::vector<MpiMarkdupCandidateShared> &local_candidates =
+        *local_candidates_in;
+    std::vector<unsigned char> &local_qnames = *local_qnames_in;
+    std::vector<MdCoordBoundary> boundaries;
+    MdBuildCoordBoundaries(range_has_records, range_first_tid,
+                           range_first_pos, range_last_tid,
+                           range_last_pos, comm_size, &boundaries);
+
+    std::vector<unsigned long long> send_candidate_counts(
+        (size_t)comm_size, 0);
+    std::vector<unsigned long long> recv_candidate_counts(
+        (size_t)comm_size, 0);
+    std::vector<unsigned long long> send_qname_counts(
+        (size_t)comm_size, 0);
+    std::vector<unsigned long long> recv_qname_counts(
+        (size_t)comm_size, 0);
+    std::vector<size_t> send_candidate_offsets((size_t)comm_size + 1, 0);
+    std::vector<size_t> send_qname_offsets((size_t)comm_size + 1, 0);
+    std::unique_ptr<MpiMarkdupCandidateShared,
+                    MdMarkdupCandidateBufferDeleter> send_candidates_flat;
+    std::unique_ptr<unsigned char, MdByteBufferDeleter> send_qnames_flat;
+    size_t self_candidate_count = 0;
+    size_t self_qname_count = 0;
+    int local_ok = 1;
+
+    double pack_t0 = GetTime();
+    for (size_t i = 0; i < local_candidates.size(); ++i) {
+        const MpiMarkdupCandidateShared &candidate = local_candidates[i];
+        const int owner =
+            MdCoordinateOwnerFast(candidate.key, boundaries, rank);
+        if (owner < 0 || owner >= comm_size) {
+            local_ok = 0;
+            break;
+        }
+        if (owner == rank) {
+            self_candidate_count++;
+            if (!candidate.key.single) {
+                if (candidate.qname_offset > local_qnames.size() ||
+                    candidate.qname_len >
+                        local_qnames.size() -
+                            (size_t)candidate.qname_offset) {
+                    fprintf(stderr,
+                            "[rank %d] ERROR: invalid local markdup QNAME range.\n",
+                            rank);
+                    local_ok = 0;
+                    break;
+                }
+                self_qname_count += (size_t)candidate.qname_len;
+            }
+            continue;
+        }
+        if (send_candidate_counts[(size_t)owner] == ULLONG_MAX) {
+            local_ok = 0;
+            break;
+        }
+        send_candidate_counts[(size_t)owner]++;
+        if (!candidate.key.single) {
+            if (candidate.qname_offset > local_qnames.size() ||
+                candidate.qname_len >
+                    local_qnames.size() -
+                        (size_t)candidate.qname_offset) {
+                fprintf(stderr,
+                        "[rank %d] ERROR: invalid local markdup QNAME range.\n",
+                        rank);
+                local_ok = 0;
+                break;
+            }
+            const unsigned long long qname_len =
+                (unsigned long long)candidate.qname_len;
+            if (send_qname_counts[(size_t)owner] >
+                ULLONG_MAX - qname_len) {
+                local_ok = 0;
+                break;
+            }
+            send_qname_counts[(size_t)owner] += qname_len;
+        }
+    }
+    if (!MdAllRanksOk(local_ok)) return -1;
+
+    size_t total_send_candidates = 0;
+    size_t total_send_qnames = 0;
+    for (int i = 0; i < comm_size; ++i) {
+        send_candidate_offsets[(size_t)i] = total_send_candidates;
+        send_qname_offsets[(size_t)i] = total_send_qnames;
+        if (send_candidate_counts[(size_t)i] >
+                (unsigned long long)(SIZE_MAX - total_send_candidates) ||
+            send_qname_counts[(size_t)i] >
+                (unsigned long long)(SIZE_MAX - total_send_qnames)) {
+            local_ok = 0;
+            break;
+        }
+        total_send_candidates +=
+            (size_t)send_candidate_counts[(size_t)i];
+        total_send_qnames += (size_t)send_qname_counts[(size_t)i];
+    }
+    send_candidate_offsets[(size_t)comm_size] = total_send_candidates;
+    send_qname_offsets[(size_t)comm_size] = total_send_qnames;
+    if (!MdAllRanksOk(local_ok)) return -1;
+
+    if (total_send_candidates > 0) {
+        if (total_send_candidates >
+            SIZE_MAX / sizeof(MpiMarkdupCandidateShared)) {
+            local_ok = 0;
+        } else {
+            send_candidates_flat.reset(
+                (MpiMarkdupCandidateShared *)aligned_alloc_custom(
+                    64, total_send_candidates *
+                            sizeof(MpiMarkdupCandidateShared)));
+            if (!send_candidates_flat) local_ok = 0;
+        }
+    }
+    if (total_send_qnames > 0) {
+        send_qnames_flat.reset(
+            aligned_alloc_custom(64, total_send_qnames));
+        if (!send_qnames_flat) local_ok = 0;
+    }
+    if (!MdAllRanksOk(local_ok)) return -1;
+
+    double setup_t0 = GetTime();
+    MPI_Alltoall(send_candidate_counts.data(), 1,
+                 MPI_UNSIGNED_LONG_LONG,
+                 recv_candidate_counts.data(), 1,
+                 MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
+    MPI_Alltoall(send_qname_counts.data(), 1,
+                 MPI_UNSIGNED_LONG_LONG,
+                 recv_qname_counts.data(), 1,
+                 MPI_UNSIGNED_LONG_LONG, MPI_COMM_WORLD);
+
+    unsigned long long recv_candidate_total = 0;
+    unsigned long long recv_qname_total = 0;
+    for (int i = 0; i < comm_size; ++i) {
+        if (recv_candidate_total >
+                ULLONG_MAX - recv_candidate_counts[(size_t)i] ||
+            recv_qname_total >
+                ULLONG_MAX - recv_qname_counts[(size_t)i]) {
+            local_ok = 0;
+            break;
+        }
+        recv_candidate_total += recv_candidate_counts[(size_t)i];
+        recv_qname_total += recv_qname_counts[(size_t)i];
+    }
+    if (!MdAllRanksOk(local_ok)) return -1;
+
+    if (recv_candidate_total >
+            (unsigned long long)(SIZE_MAX /
+                sizeof(MpiMarkdupCandidateShared)) ||
+        recv_qname_total > (unsigned long long)SIZE_MAX ||
+        self_candidate_count >
+            SIZE_MAX - (size_t)recv_candidate_total ||
+        self_qname_count > SIZE_MAX - (size_t)recv_qname_total) {
+        local_ok = 0;
+    }
+
+    size_t send_candidate_bytes_total = 0;
+    size_t exchange_memory = 0;
+    if (local_ok) {
+        send_candidate_bytes_total =
+            total_send_candidates * sizeof(MpiMarkdupCandidateShared);
+        exchange_memory = send_candidate_bytes_total;
+        if (total_send_qnames > SIZE_MAX - exchange_memory) {
+            local_ok = 0;
+        } else {
+            exchange_memory += total_send_qnames;
+        }
+    }
+    size_t local_memory =
+        local_candidates.capacity() *
+            sizeof(MpiMarkdupCandidateShared) +
+        local_qnames.capacity();
+    if (local_ok) {
+        size_t recv_owner_bytes = 0;
+        if ((size_t)recv_candidate_total >
+            SIZE_MAX / sizeof(MpiMarkdupCandidateShared)) {
+            local_ok = 0;
+        } else {
+            recv_owner_bytes =
+                (size_t)recv_candidate_total *
+                sizeof(MpiMarkdupCandidateShared);
+        }
+        if (local_ok &&
+            (size_t)recv_qname_total > SIZE_MAX - recv_owner_bytes) {
+            local_ok = 0;
+        } else if (local_ok) {
+            recv_owner_bytes += (size_t)recv_qname_total;
+        }
+        if (local_ok &&
+            (local_memory > SIZE_MAX - exchange_memory ||
+             local_memory + exchange_memory >
+                 SIZE_MAX - recv_owner_bytes ||
+             MdCheckMemory(local_memory + exchange_memory +
+                               recv_owner_bytes,
+                           memory_limit, stats, rank,
+                           "coordinate candidate owner exchange") != 0)) {
+            local_ok = 0;
+        }
+    }
+    if (!MdAllRanksOk(local_ok)) return -1;
+    stats->t_candidate_exchange_setup += GetTime() - setup_t0;
+
+    std::vector<size_t> candidate_write = send_candidate_offsets;
+    std::vector<size_t> qname_write = send_qname_offsets;
+    size_t self_write = 0;
+    for (size_t i = 0; i < local_candidates.size(); ++i) {
+        MpiMarkdupCandidateShared candidate = local_candidates[i];
+        const int owner =
+            MdCoordinateOwnerFast(candidate.key, boundaries, rank);
+        if (owner == rank) {
+            if (self_write != i) {
+                local_candidates[self_write] = candidate;
+            }
+            ++self_write;
+            continue;
+        }
+        if (!candidate.key.single) {
+            const size_t qname_src = (size_t)candidate.qname_offset;
+            const size_t qname_len = (size_t)candidate.qname_len;
+            const size_t qname_dst = qname_write[(size_t)owner];
+            candidate.qname_offset =
+                (uint64_t)(qname_dst -
+                           send_qname_offsets[(size_t)owner]);
+            if (qname_len > 0) {
+                memcpy(send_qnames_flat.get() + qname_dst,
+                       local_qnames.data() + qname_src, qname_len);
+            }
+            qname_write[(size_t)owner] += qname_len;
+        }
+        send_candidates_flat.get()[candidate_write[(size_t)owner]++] =
+            candidate;
+    }
+    local_candidates.resize(self_write);
+    owner_candidates->swap(local_candidates);
+    owner_qnames->swap(local_qnames);
+    const size_t needed_candidates =
+        owner_candidates->size() + (size_t)recv_candidate_total;
+    const size_t needed_qnames =
+        owner_qnames->size() + (size_t)recv_qname_total;
+    if (owner_candidates->capacity() < needed_candidates) {
+        owner_candidates->reserve(needed_candidates);
+    }
+    if (owner_qnames->capacity() < needed_qnames) {
+        owner_qnames->reserve(needed_qnames);
+    }
+    stats->t_candidate_pack += GetTime() - pack_t0;
+    if (!MdAllRanksOk(local_ok)) return -1;
+
+    double mpi_t0 = GetTime();
+    for (int step = 1; step < comm_size; ++step) {
+        int dest = (rank + step) % comm_size;
+        int src = (rank - step + comm_size) % comm_size;
+        unsigned long long send_candidate_count =
+            send_candidate_counts[(size_t)dest];
+        unsigned long long send_qname_count =
+            send_qname_counts[(size_t)dest];
+        unsigned long long recv_candidate_count =
+            recv_candidate_counts[(size_t)src];
+        unsigned long long recv_qname_count =
+            recv_qname_counts[(size_t)src];
+        if (recv_candidate_count >
+            (unsigned long long)(SIZE_MAX /
+                sizeof(MpiMarkdupCandidateShared)) ||
+            recv_qname_count > (unsigned long long)SIZE_MAX) {
+            return -1;
+        }
+        size_t candidate_base = owner_candidates->size();
+        size_t qname_base = owner_qnames->size();
+        owner_candidates->resize(
+            candidate_base + (size_t)recv_candidate_count);
+        owner_qnames->resize(qname_base + (size_t)recv_qname_count);
+
+        unsigned long long send_candidate_bytes =
+            send_candidate_count * sizeof(MpiMarkdupCandidateShared);
+        unsigned long long recv_candidate_bytes =
+            recv_candidate_count * sizeof(MpiMarkdupCandidateShared);
+        if (MdSendrecvBytes(
+                send_candidate_count
+                    ? send_candidates_flat.get() +
+                          send_candidate_offsets[(size_t)dest]
+                    : nullptr,
+                send_candidate_bytes, dest,
+                recv_candidate_count
+                    ? owner_candidates->data() + candidate_base
+                    : nullptr,
+                recv_candidate_bytes, src, 4111) != 0 ||
+            MdSendrecvBytes(
+                send_qname_count
+                    ? send_qnames_flat.get() +
+                          send_qname_offsets[(size_t)dest]
+                    : nullptr,
+                send_qname_count, dest,
+                recv_qname_count
+                    ? owner_qnames->data() + qname_base
+                    : nullptr,
+                recv_qname_count, src, 4112) != 0) {
+            return -1;
+        }
+        for (size_t i = candidate_base;
+             i < owner_candidates->size(); ++i) {
+            if (!(*owner_candidates)[i].key.single) {
+                (*owner_candidates)[i].qname_offset +=
+                    (uint64_t)qname_base;
+            }
+        }
+        stats->mpi_candidate_bytes +=
+            (long long)send_candidate_bytes +
+            (long long)send_qname_count;
+    }
+
+    stats->t_candidate_exchange_mpi += GetTime() - mpi_t0;
+    stats->t_candidate_exchange += GetTime() - exchange_total_t0;
+    stats->owner_candidates = (long long)owner_candidates->size();
+    stats->qname_bytes = (long long)owner_qnames->size();
+    return 0;
+}
+
 static int MdCompareQname(
         const MpiMarkdupCandidateShared &a,
         const MpiMarkdupCandidateShared &b,
@@ -1037,6 +1661,392 @@ static bool MdKeyVectorContains(
                 return MdKeyLess(a, b);
             });
     return it != keys.end() && MdKeyEqual(*it, key);
+}
+
+static bool MdKeyRangeContains(
+        const std::vector<MpiMarkdupKeyShared> &keys,
+        size_t begin, size_t end,
+        const MpiMarkdupKeyShared &key) {
+    std::vector<MpiMarkdupKeyShared>::const_iterator first =
+        keys.begin() + (ptrdiff_t)begin;
+    std::vector<MpiMarkdupKeyShared>::const_iterator last =
+        keys.begin() + (ptrdiff_t)end;
+    std::vector<MpiMarkdupKeyShared>::const_iterator it =
+        std::lower_bound(
+            first, last, key,
+            [](const MpiMarkdupKeyShared &a,
+               const MpiMarkdupKeyShared &b) {
+                return MdKeyLess(a, b);
+            });
+    return it != last && MdKeyEqual(*it, key);
+}
+
+static uint64_t MdCoordBucketCode(const MpiMarkdupKeyShared &key) {
+    uint64_t hash = 1469598103934665603ull;
+    auto mix = [&](uint64_t value) {
+        for (int i = 0; i < 8; ++i) {
+            hash ^= (unsigned char)(value & 0xffu);
+            hash *= 1099511628211ull;
+            value >>= 8;
+        }
+    };
+    mix((uint64_t)(uint32_t)key.this_ref);
+    mix((uint64_t)key.this_coord);
+    return hash;
+}
+
+static size_t MdFindBucketIndex(
+        const std::vector<uint64_t> &unique_codes, uint64_t code) {
+    std::vector<uint64_t>::const_iterator it =
+        std::lower_bound(unique_codes.begin(), unique_codes.end(), code);
+    if (it == unique_codes.end() || *it != code) return SIZE_MAX;
+    return (size_t)(it - unique_codes.begin());
+}
+
+static int MdBucketCandidateRangeByCoord(
+        std::vector<MpiMarkdupCandidateShared> *candidates,
+        size_t begin, size_t end,
+        std::vector<MdBucketRange> *ranges) {
+    ranges->clear();
+    if (end <= begin) return 0;
+    const size_t n = end - begin;
+    const MpiMarkdupCandidateShared *src = candidates->data() + begin;
+
+    if (n == 1) {
+        MdBucketRange range;
+        range.code = MdCoordBucketCode(src[0].key);
+        range.begin = begin;
+        range.end = end;
+        ranges->push_back(range);
+        return 0;
+    }
+
+    std::vector<uint64_t> unique_codes;
+    unique_codes.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        unique_codes.push_back(MdCoordBucketCode(src[i].key));
+    }
+    std::sort(unique_codes.begin(), unique_codes.end());
+    unique_codes.erase(std::unique(unique_codes.begin(),
+                                   unique_codes.end()),
+                       unique_codes.end());
+    if (unique_codes.size() > (size_t)UINT_MAX) return -1;
+
+    const size_t nb = unique_codes.size();
+    std::vector<unsigned int> bucket_ids(n);
+    std::vector<size_t> offsets(nb + 1, 0);
+    for (size_t i = 0; i < n; ++i) {
+        const uint64_t code = MdCoordBucketCode(src[i].key);
+        const size_t bucket = MdFindBucketIndex(unique_codes, code);
+        if (bucket == SIZE_MAX) return -1;
+        bucket_ids[i] = (unsigned int)bucket;
+        offsets[bucket + 1]++;
+    }
+    for (size_t i = 1; i <= nb; ++i) {
+        offsets[i] += offsets[i - 1];
+    }
+
+    std::unique_ptr<MpiMarkdupCandidateShared,
+                    MdMarkdupCandidateBufferDeleter> scratch(
+        (MpiMarkdupCandidateShared *)aligned_alloc_custom(
+            64, n * sizeof(MpiMarkdupCandidateShared)));
+    if (!scratch) return -1;
+
+    std::vector<size_t> write = offsets;
+    for (size_t i = 0; i < n; ++i) {
+        const size_t bucket = (size_t)bucket_ids[i];
+        scratch.get()[write[bucket]++] = src[i];
+    }
+    memcpy(candidates->data() + begin, scratch.get(),
+           n * sizeof(MpiMarkdupCandidateShared));
+
+    ranges->reserve(nb);
+    for (size_t i = 0; i < nb; ++i) {
+        if (offsets[i] == offsets[i + 1]) continue;
+        MdBucketRange range;
+        range.code = unique_codes[i];
+        range.begin = begin + offsets[i];
+        range.end = begin + offsets[i + 1];
+        ranges->push_back(range);
+    }
+    return 0;
+}
+
+static int MdBucketKeyRangeByCoord(
+        std::vector<MpiMarkdupKeyShared> *keys,
+        std::vector<MdBucketRange> *ranges) {
+    ranges->clear();
+    const size_t n = keys->size();
+    if (n == 0) return 0;
+    if (n == 1) {
+        MdBucketRange range;
+        range.code = MdCoordBucketCode((*keys)[0]);
+        range.begin = 0;
+        range.end = 1;
+        ranges->push_back(range);
+        return 0;
+    }
+
+    std::vector<uint64_t> unique_codes;
+    unique_codes.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        unique_codes.push_back(MdCoordBucketCode((*keys)[i]));
+    }
+    std::sort(unique_codes.begin(), unique_codes.end());
+    unique_codes.erase(std::unique(unique_codes.begin(),
+                                   unique_codes.end()),
+                       unique_codes.end());
+    if (unique_codes.size() > (size_t)UINT_MAX) return -1;
+
+    const size_t nb = unique_codes.size();
+    std::vector<unsigned int> bucket_ids(n);
+    std::vector<size_t> offsets(nb + 1, 0);
+    for (size_t i = 0; i < n; ++i) {
+        const uint64_t code = MdCoordBucketCode((*keys)[i]);
+        const size_t bucket = MdFindBucketIndex(unique_codes, code);
+        if (bucket == SIZE_MAX) return -1;
+        bucket_ids[i] = (unsigned int)bucket;
+        offsets[bucket + 1]++;
+    }
+    for (size_t i = 1; i <= nb; ++i) {
+        offsets[i] += offsets[i - 1];
+    }
+
+    std::unique_ptr<MpiMarkdupKeyShared, MdMarkdupKeyBufferDeleter> scratch(
+        (MpiMarkdupKeyShared *)aligned_alloc_custom(
+            64, n * sizeof(MpiMarkdupKeyShared)));
+    if (!scratch) return -1;
+
+    std::vector<size_t> write = offsets;
+    for (size_t i = 0; i < n; ++i) {
+        const size_t bucket = (size_t)bucket_ids[i];
+        scratch.get()[write[bucket]++] = (*keys)[i];
+    }
+    memcpy(keys->data(), scratch.get(),
+           n * sizeof(MpiMarkdupKeyShared));
+
+    ranges->reserve(nb);
+    for (size_t i = 0; i < nb; ++i) {
+        if (offsets[i] == offsets[i + 1]) continue;
+        MdBucketRange range;
+        range.code = unique_codes[i];
+        range.begin = offsets[i];
+        range.end = offsets[i + 1];
+        ranges->push_back(range);
+    }
+    return 0;
+}
+
+static int MdPushDuplicate(
+        const MpiMarkdupCandidateShared &candidate, int comm_size,
+        std::vector<std::vector<uint64_t> > *duplicates_by_source) {
+    const int source = candidate.source_rank;
+    if (source < 0 || source >= comm_size) return -1;
+    (*duplicates_by_source)[(size_t)source].push_back(candidate.ordinal);
+    return 0;
+}
+
+static int MdScanPairDuplicateRange(
+        const std::vector<MpiMarkdupCandidateShared> &candidates,
+        const std::vector<unsigned char> &qnames,
+        size_t begin, size_t end, int comm_size,
+        std::vector<std::vector<uint64_t> > *duplicates_by_source,
+        MpiMarkdupStats *stats) {
+    while (begin < end) {
+        size_t group_end = begin + 1;
+        while (group_end < end &&
+               MdKeyEqual(candidates[begin].key,
+                          candidates[group_end].key)) {
+            ++group_end;
+        }
+
+        size_t winner = begin;
+        for (size_t i = begin + 1; i < group_end; ++i) {
+            if (MdPairBetter(candidates[i], candidates[winner], qnames)) {
+                winner = i;
+            }
+        }
+        for (size_t i = begin; i < group_end; ++i) {
+            if (i == winner) continue;
+            if (MdPushDuplicate(candidates[i], comm_size,
+                                duplicates_by_source) != 0) {
+                return -1;
+            }
+            stats->pair_duplicates++;
+        }
+        begin = group_end;
+    }
+    return 0;
+}
+
+static int MdScanSingleDuplicateRange(
+        const std::vector<MpiMarkdupCandidateShared> &candidates,
+        const std::vector<MpiMarkdupKeyShared> &paired_marker_keys,
+        size_t begin, size_t end,
+        size_t marker_begin, size_t marker_end,
+        int comm_size,
+        std::vector<std::vector<uint64_t> > *duplicates_by_source,
+        MpiMarkdupStats *stats) {
+    while (begin < end) {
+        size_t group_end = begin + 1;
+        while (group_end < end &&
+               MdKeyEqual(candidates[begin].key,
+                          candidates[group_end].key)) {
+            ++group_end;
+        }
+
+        if (MdKeyRangeContains(paired_marker_keys, marker_begin,
+                               marker_end, candidates[begin].key)) {
+            for (size_t i = begin; i < group_end; ++i) {
+                if (MdPushDuplicate(candidates[i], comm_size,
+                                    duplicates_by_source) != 0) {
+                    return -1;
+                }
+                stats->single_duplicates++;
+            }
+        } else if (group_end - begin > 1) {
+            size_t winner = begin;
+            for (size_t i = begin + 1; i < group_end; ++i) {
+                const MpiMarkdupCandidateShared &candidate = candidates[i];
+                const MpiMarkdupCandidateShared &best = candidates[winner];
+                if (candidate.score > best.score ||
+                    (candidate.score == best.score &&
+                     candidate.global_order < best.global_order)) {
+                    winner = i;
+                }
+            }
+            for (size_t i = begin; i < group_end; ++i) {
+                if (i == winner) continue;
+                if (MdPushDuplicate(candidates[i], comm_size,
+                                    duplicates_by_source) != 0) {
+                    return -1;
+                }
+                stats->single_duplicates++;
+            }
+        }
+        begin = group_end;
+    }
+    return 0;
+}
+
+static int MdFindDuplicatesCoordinateBuckets(
+        std::vector<MpiMarkdupCandidateShared> *owner_candidates,
+        const std::vector<unsigned char> &owner_qnames,
+        int comm_size,
+        std::vector<std::vector<uint64_t> > *duplicates_by_source,
+        MpiMarkdupStats *stats) {
+    double group_t0 = GetTime();
+    std::vector<MpiMarkdupCandidateShared>::iterator pair_end =
+        std::partition(
+            owner_candidates->begin(), owner_candidates->end(),
+            [](const MpiMarkdupCandidateShared &candidate) {
+                return !candidate.key.single;
+            });
+    const size_t pair_count =
+        (size_t)(pair_end - owner_candidates->begin());
+
+    std::vector<MpiMarkdupKeyShared> paired_marker_keys;
+    paired_marker_keys.reserve(owner_candidates->size() - pair_count);
+    size_t real_single_write = pair_count;
+    for (size_t i = pair_count; i < owner_candidates->size(); ++i) {
+        const MpiMarkdupCandidateShared candidate =
+            (*owner_candidates)[i];
+        if (candidate.paired_marker) {
+            paired_marker_keys.push_back(candidate.key);
+        } else {
+            (*owner_candidates)[real_single_write++] = candidate;
+        }
+    }
+    owner_candidates->resize(real_single_write);
+    const size_t real_single_end = real_single_write;
+
+    double group_sort_t0 = GetTime();
+    std::vector<MdBucketRange> pair_ranges;
+    std::vector<MdBucketRange> marker_ranges;
+    std::vector<MdBucketRange> single_ranges;
+    if (MdBucketCandidateRangeByCoord(owner_candidates, 0, pair_count,
+                                      &pair_ranges) != 0 ||
+        MdBucketKeyRangeByCoord(&paired_marker_keys,
+                                &marker_ranges) != 0 ||
+        MdBucketCandidateRangeByCoord(owner_candidates, pair_count,
+                                      real_single_end,
+                                      &single_ranges) != 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < pair_ranges.size(); ++i) {
+        const MdBucketRange &range = pair_ranges[i];
+        if (range.end - range.begin > 1) {
+            std::sort(owner_candidates->begin() +
+                          (ptrdiff_t)range.begin,
+                      owner_candidates->begin() +
+                          (ptrdiff_t)range.end,
+                      MdCandidateGroupLess);
+        }
+    }
+    for (size_t i = 0; i < marker_ranges.size(); ++i) {
+        const MdBucketRange &range = marker_ranges[i];
+        if (range.end - range.begin > 1) {
+            std::sort(paired_marker_keys.begin() +
+                          (ptrdiff_t)range.begin,
+                      paired_marker_keys.begin() +
+                          (ptrdiff_t)range.end,
+                      [](const MpiMarkdupKeyShared &a,
+                         const MpiMarkdupKeyShared &b) {
+                          return MdKeyLess(a, b);
+                      });
+        }
+    }
+    for (size_t i = 0; i < single_ranges.size(); ++i) {
+        const MdBucketRange &range = single_ranges[i];
+        if (range.end - range.begin > 1) {
+            std::sort(owner_candidates->begin() +
+                          (ptrdiff_t)range.begin,
+                      owner_candidates->begin() +
+                          (ptrdiff_t)range.end,
+                      MdCandidateGroupLess);
+        }
+    }
+    stats->t_group_sort += GetTime() - group_sort_t0;
+
+    double group_scan_t0 = GetTime();
+    duplicates_by_source->assign(
+        (size_t)comm_size, std::vector<uint64_t>());
+
+    for (size_t i = 0; i < pair_ranges.size(); ++i) {
+        const MdBucketRange &range = pair_ranges[i];
+        if (MdScanPairDuplicateRange(
+                *owner_candidates, owner_qnames, range.begin,
+                range.end, comm_size, duplicates_by_source,
+                stats) != 0) {
+            return -1;
+        }
+    }
+
+    size_t marker_idx = 0;
+    for (size_t i = 0; i < single_ranges.size(); ++i) {
+        const MdBucketRange &range = single_ranges[i];
+        while (marker_idx < marker_ranges.size() &&
+               marker_ranges[marker_idx].code < range.code) {
+            ++marker_idx;
+        }
+        size_t marker_begin = 0;
+        size_t marker_end = 0;
+        if (marker_idx < marker_ranges.size() &&
+            marker_ranges[marker_idx].code == range.code) {
+            marker_begin = marker_ranges[marker_idx].begin;
+            marker_end = marker_ranges[marker_idx].end;
+        }
+        if (MdScanSingleDuplicateRange(
+                *owner_candidates, paired_marker_keys,
+                range.begin, range.end,
+                marker_begin, marker_end, comm_size,
+                duplicates_by_source, stats) != 0) {
+            return -1;
+        }
+    }
+    stats->t_group_scan += GetTime() - group_scan_t0;
+    stats->t_group += GetTime() - group_t0;
+    return 0;
 }
 
 static int MdFindDuplicates(
@@ -1177,6 +2187,7 @@ static int MdExchangeDuplicateResults(
         int rank, int comm_size, uint64_t local_records,
         size_t memory_limit, std::vector<uint8_t> *bitmap,
         MpiMarkdupStats *stats) {
+    double exchange_t0 = GetTime();
     // 先对 duplicate ordinal 去重
     for (int i = 0; i < comm_size; ++i) {
         std::vector<uint64_t> &values =
@@ -1234,7 +2245,6 @@ static int MdExchangeDuplicateResults(
     if (!MdAllRanksOk(local_ok)) return -1;
 
     // 使用 ring MPI_Sendrecv 回传 duplicate 结果
-    double exchange_t0 = GetTime();
     for (int step = 0; step < comm_size; ++step) {
         int dest = (rank + step) % comm_size;
         int src = (rank - step + comm_size) % comm_size;
@@ -1648,7 +2658,9 @@ static int MdRewriteOutput(
             read_group(next_blocks) != 0) {
             return -1;
         }
+        double cpe_sync_t0 = GetTime();
         athread_join();
+        stats->t_cpe_sync += GetTime() - cpe_sync_t0;
         stats->t_compress += GetTime() - t0;
         for (int i = 0; i < active_blocks; ++i) {
             if (comp_active[i].status != 0) {
@@ -1683,7 +2695,9 @@ static int MdRewriteOutput(
         __real_athread_spawn(
             (void *)slave_mpi_decompress_bam2bam_passthrough,
             decomp, 1);
+        double cpe_sync_t0 = GetTime();
         athread_join();
+        stats->t_cpe_sync += GetTime() - cpe_sync_t0;
         stats->t_rewrite_decomp += GetTime() - decomp_t0;
         for (int b = 0; b < n_blocks; ++b) {
             if (decomp[b].status != 0) {
@@ -1725,7 +2739,9 @@ static int MdRewriteOutput(
             __real_athread_spawn(
                 (void *)slave_mpi_sort_compress_payload,
                 raw_comp, 1);
+            cpe_sync_t0 = GetTime();
             athread_join();
+            stats->t_cpe_sync += GetTime() - cpe_sync_t0;
             stats->t_compress += GetTime() - compress_t0;
             double write_t0 = GetTime();
             for (int i = 0; i < active_payload_blocks; ++i) {
@@ -1773,7 +2789,9 @@ static int MdRewriteOutput(
         double rewrite_t0 = GetTime();
         __real_athread_spawn((void *)slave_mpi_markdup_rewrite,
                              rewrite, 1);
+        cpe_sync_t0 = GetTime();
         athread_join();
+        stats->t_cpe_sync += GetTime() - cpe_sync_t0;
         stats->t_rewrite += GetTime() - rewrite_t0;
         ordinal = block_ordinal;
 
@@ -2084,6 +3102,9 @@ fail:
 static double MdAccountedFusedTime(const MpiMarkdupStats &stats) {
     return stats.t_candidate_decomp +
            stats.t_candidate_extract +
+           stats.t_extract_status +
+           stats.t_extract_merge +
+           stats.t_extract_memcheck +
            stats.t_candidate_exchange +
            stats.t_boundary_check +
            stats.t_candidate_cleanup +
@@ -2097,7 +3118,8 @@ static double MdAccountedFusedTime(const MpiMarkdupStats &stats) {
            stats.t_pack +
            stats.t_compress +
            stats.t_read +
-           stats.t_write;
+           stats.t_write +
+           stats.t_rank_sync;
 }
 
 static void MdPrintStats(const MpiMarkdupStats &stats,
@@ -2151,28 +3173,31 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
     snprintf(
         local_lines + used, (size_t)(kLineBytes - used),
         "[rank %d] markdup_timing candidate_decomp=%.6f "
-        "candidate_extract=%.6f candidate_pack=%.6f "
-        "candidate_setup=%.6f candidate_mpi=%.6f "
+        "candidate_extract=%.6f extract_status=%.6f "
+        "extract_merge=%.6f extract_memcheck=%.6f "
+        "candidate_pack=%.6f candidate_mpi=%.6f "
         "candidate_exchange=%.6f boundary=%.6f "
-        "candidate_cleanup=%.6f group_prepare=%.6f "
         "group_sort=%.6f group_scan=%.6f group=%.6f "
-        "owner_cleanup=%.6f result=%.6f "
-        "result_cleanup=%.6f rewrite_decomp=%.6f "
+        "flat_init=%.6f flat_probe=%.6f result=%.6f "
+        "rewrite_decomp=%.6f "
         "rewrite=%.6f pack=%.6f compress=%.6f "
-        "read=%.6f write=%.6f accounted=%.6f "
+        "read=%.6f write=%.6f rank_sync=%.6f "
+        "cpe_sync=%.6f accounted=%.6f "
         "unaccounted=%.6f fused=%.6f\n",
         rank, stats.t_candidate_decomp,
-        stats.t_candidate_extract, stats.t_candidate_pack,
-        stats.t_candidate_exchange_setup,
+        stats.t_candidate_extract, stats.t_extract_status,
+        stats.t_extract_merge, stats.t_extract_memcheck,
+        stats.t_candidate_pack,
         stats.t_candidate_exchange_mpi,
         stats.t_candidate_exchange,
-        stats.t_boundary_check, stats.t_candidate_cleanup,
-        stats.t_group_prepare, stats.t_group_sort,
-        stats.t_group_scan, stats.t_group, stats.t_owner_cleanup,
-        stats.t_result_exchange, stats.t_result_cleanup,
+        stats.t_boundary_check, stats.t_group_sort,
+        stats.t_group_scan, stats.t_group,
+        stats.t_flat_init, stats.t_flat_probe,
+        stats.t_result_exchange,
         stats.t_rewrite_decomp, stats.t_rewrite, stats.t_pack,
         stats.t_compress, stats.t_read, stats.t_write,
-        accounted, unaccounted, stats.t_fused_total);
+        stats.t_rank_sync, stats.t_cpe_sync, accounted,
+        unaccounted, stats.t_fused_total);
     std::vector<char> gathered_lines;
     if (rank == 0) {
         gathered_lines.resize((size_t)comm_size * kLineBytes);
@@ -2189,29 +3214,31 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
     MPI_Reduce(&peak, &peak_max, 1, MPI_LONG_LONG,
                MPI_MAX, 0, MPI_COMM_WORLD);
 
-    const int time_count = 24;
+    const int time_count = 26;
     double local_times[time_count] = {
         stats.t_candidate_decomp,
         stats.t_candidate_extract,
+        stats.t_extract_status,
+        stats.t_extract_merge,
+        stats.t_extract_memcheck,
         stats.t_candidate_pack,
-        stats.t_candidate_exchange_setup,
         stats.t_candidate_exchange_mpi,
         stats.t_candidate_exchange,
         stats.t_boundary_check,
-        stats.t_candidate_cleanup,
-        stats.t_group_prepare,
         stats.t_group_sort,
         stats.t_group_scan,
         stats.t_group,
-        stats.t_owner_cleanup,
+        stats.t_flat_init,
+        stats.t_flat_probe,
         stats.t_result_exchange,
-        stats.t_result_cleanup,
         stats.t_rewrite_decomp,
         stats.t_rewrite,
         stats.t_pack,
         stats.t_compress,
         stats.t_read,
         stats.t_write,
+        stats.t_rank_sync,
+        stats.t_cpe_sync,
         accounted,
         unaccounted,
         stats.t_fused_total
@@ -2240,15 +3267,16 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
                "tracked_peak_max=%lld\n",
                sums[14], sums[15], peak_max);
         printf("  timing_sum candidate_decomp=%.3f "
-               "candidate_extract=%.3f candidate_pack=%.3f "
-               "candidate_setup=%.3f candidate_mpi=%.3f "
+               "candidate_extract=%.3f extract_status=%.3f "
+               "extract_merge=%.3f extract_memcheck=%.3f "
+               "candidate_pack=%.3f candidate_mpi=%.3f "
                "candidate_exchange=%.3f boundary=%.3f "
-               "candidate_cleanup=%.3f group_prepare=%.3f "
                "group_sort=%.3f group_scan=%.3f group=%.3f "
-               "owner_cleanup=%.3f result=%.3f "
-               "result_cleanup=%.3f rewrite_decomp=%.3f "
+               "flat_init=%.3f flat_probe=%.3f result=%.3f "
+               "rewrite_decomp=%.3f "
                "rewrite=%.3f pack=%.3f compress=%.3f "
-               "read=%.3f write=%.3f accounted=%.3f "
+               "read=%.3f write=%.3f rank_sync=%.3f "
+               "cpe_sync=%.3f accounted=%.3f "
                "unaccounted=%.3f fused=%.3f\n",
                time_sums[0], time_sums[1], time_sums[2],
                time_sums[3], time_sums[4], time_sums[5],
@@ -2257,17 +3285,19 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
                time_sums[12], time_sums[13], time_sums[14],
                time_sums[15], time_sums[16], time_sums[17],
                time_sums[18], time_sums[19], time_sums[20],
-               time_sums[21], time_sums[22], time_sums[23]);
+               time_sums[21], time_sums[22], time_sums[23],
+               time_sums[24], time_sums[25]);
         printf("  timing_max candidate_decomp=%.3f "
-               "candidate_extract=%.3f candidate_pack=%.3f "
-               "candidate_setup=%.3f candidate_mpi=%.3f "
+               "candidate_extract=%.3f extract_status=%.3f "
+               "extract_merge=%.3f extract_memcheck=%.3f "
+               "candidate_pack=%.3f candidate_mpi=%.3f "
                "candidate_exchange=%.3f boundary=%.3f "
-               "candidate_cleanup=%.3f group_prepare=%.3f "
                "group_sort=%.3f group_scan=%.3f group=%.3f "
-               "owner_cleanup=%.3f result=%.3f "
-               "result_cleanup=%.3f rewrite_decomp=%.3f "
+               "flat_init=%.3f flat_probe=%.3f result=%.3f "
+               "rewrite_decomp=%.3f "
                "rewrite=%.3f pack=%.3f compress=%.3f "
-               "read=%.3f write=%.3f accounted=%.3f "
+               "read=%.3f write=%.3f rank_sync=%.3f "
+               "cpe_sync=%.3f accounted=%.3f "
                "unaccounted=%.3f fused=%.3f\n",
                time_max[0], time_max[1], time_max[2],
                time_max[3], time_max[4], time_max[5],
@@ -2276,7 +3306,8 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
                time_max[12], time_max[13], time_max[14],
                time_max[15], time_max[16], time_max[17],
                time_max[18], time_max[19], time_max[20],
-               time_max[21], time_max[22], time_max[23]);
+               time_max[21], time_max[22], time_max[23],
+               time_max[24], time_max[25]);
         fflush(stdout);
     }
 }
@@ -2515,7 +3546,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                 &stats) != 0) {
             local_ok = 0;
         }
-        if (!MdAllRanksOk(local_ok)) goto cleanup;
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
 
         // 2. MdValidateRankBoundaries：检查 rank 边界
         {
@@ -2528,17 +3559,33 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
             }
             stats.t_boundary_check += GetTime() - boundary_t0;
         }
-        if (!MdAllRanksOk(local_ok)) goto cleanup;
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
 
-        // 3. MdExchangeCandidates：把候选记录发给“负责判断 duplicate 的 owner rank”
-        if (MdExchangeCandidates(
-                local_candidates, local_qnames,
-                rank, comm_size, memory_limit,
-                &owner_candidates, &owner_qnames,
-                &stats) != 0) {
-            local_ok = 0;
+        // 3. MdExchangeCandidatesByCoordinate：
+        // coordinate-sorted markdup fast path.  Most candidates are owned by
+        // the local rank; only boundary/unclipped candidates are sent.
+        // RABBITBAM_MARKDUP_HASH_OWNER=1 keeps the old hash-owner path for
+        // quick correctness bisecting.
+        const char *force_hash_owner =
+            getenv("RABBITBAM_MARKDUP_HASH_OWNER");
+        if (force_hash_owner && force_hash_owner[0] == '1') {
+            if (MdExchangeCandidates(
+                    local_candidates, local_qnames,
+                    rank, comm_size, memory_limit,
+                    &owner_candidates, &owner_qnames,
+                    &stats) != 0) {
+                local_ok = 0;
+            }
+        } else if (MdExchangeCandidatesByCoordinate(
+                    &local_candidates, &local_qnames,
+                    range_has_records, range_first_tid, range_first_pos,
+                    range_last_tid, range_last_pos,
+                    rank, comm_size, memory_limit,
+                    &owner_candidates, &owner_qnames,
+                    &stats) != 0) {
+                local_ok = 0;
         }
-        if (!MdAllRanksOk(local_ok)) goto cleanup;
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
 
         {
             double cleanup_t0 = GetTime();
@@ -2548,6 +3595,20 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
             local_qnames.shrink_to_fit();
             stats.t_candidate_cleanup += GetTime() - cleanup_t0;
         }
+
+        const char *use_coord_bucket =
+            getenv("RABBITBAM_MARKDUP_COORD_BUCKET");
+        const char *use_full_sort =
+            getenv("RABBITBAM_MARKDUP_FULL_SORT");
+        const char *use_global_sort =
+            getenv("RABBITBAM_MARKDUP_GLOBAL_SORT");
+        const int enable_coord_bucket =
+            use_coord_bucket && use_coord_bucket[0] == '1';
+        const int enable_full_sort =
+            (use_full_sort && use_full_sort[0] == '1') ||
+            (use_global_sort && use_global_sort[0] == '1');
+        const int enable_flat_hash =
+            !enable_full_sort && !enable_coord_bucket;
 
         {
             double group_prepare_t0 = GetTime();
@@ -2567,29 +3628,84 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                     ? SIZE_MAX
                     : owner_candidates.size() *
                         sizeof(uint64_t);
+            size_t flat_hash_bytes = enable_flat_hash
+                ? MdFlatHashBytesForEstimate(owner_candidates.size())
+                : 0;
+            size_t bucket_scratch_bytes = 0;
+            if (enable_coord_bucket && owner_candidates.size() >
+                    SIZE_MAX / (sizeof(MpiMarkdupCandidateShared) +
+                                sizeof(uint64_t) +
+                                sizeof(unsigned int) +
+                                sizeof(size_t))) {
+                bucket_scratch_bytes = SIZE_MAX;
+            } else if (enable_coord_bucket) {
+                bucket_scratch_bytes =
+                    owner_candidates.size() *
+                    (sizeof(MpiMarkdupCandidateShared) +
+                     sizeof(uint64_t) + sizeof(unsigned int) +
+                     sizeof(size_t));
+            }
+            size_t group_total = grouping_bytes;
             if (marker_key_bytes == SIZE_MAX ||
                 worst_results == SIZE_MAX ||
-                grouping_bytes > SIZE_MAX - marker_key_bytes ||
-                grouping_bytes + marker_key_bytes >
-                    SIZE_MAX - worst_results ||
-                MdCheckMemory(grouping_bytes + marker_key_bytes +
-                                  worst_results,
-                              memory_limit, &stats, rank,
+                flat_hash_bytes == SIZE_MAX ||
+                bucket_scratch_bytes == SIZE_MAX ||
+                marker_key_bytes > SIZE_MAX - group_total) {
+                local_ok = 0;
+            } else {
+                group_total += marker_key_bytes;
+            }
+            if (local_ok && worst_results > SIZE_MAX - group_total) {
+                local_ok = 0;
+            } else if (local_ok) {
+                group_total += worst_results;
+            }
+            if (local_ok && flat_hash_bytes > SIZE_MAX - group_total) {
+                local_ok = 0;
+            } else if (local_ok) {
+                group_total += flat_hash_bytes;
+            }
+            if (local_ok && bucket_scratch_bytes > SIZE_MAX - group_total) {
+                local_ok = 0;
+            } else if (local_ok) {
+                group_total += bucket_scratch_bytes;
+            }
+            if (local_ok &&
+                MdCheckMemory(group_total, memory_limit, &stats, rank,
                               "duplicate grouping") != 0) {
                 local_ok = 0;
             }
             stats.t_group_prepare += GetTime() - group_prepare_t0;
         }
-        if (!MdAllRanksOk(local_ok)) goto cleanup;
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
 
-        // 4. MdFindDuplicates：在 owner rank 上判断重复
-        if (MdFindDuplicates(
-                &owner_candidates, owner_qnames,
-                comm_size, &duplicates_by_source,
-                &stats) != 0) {
-            local_ok = 0;
+        // 4. 在 owner rank 上判断重复。默认使用已验证最快的
+        // contiguous flat-hash grouping。RABBITBAM_MARKDUP_FULL_SORT=1
+        // 可回退 full sort/group，RABBITBAM_MARKDUP_COORD_BUCKET=1
+        // 可启用 coordinate bucket 实验路径。
+        if (enable_full_sort) {
+            if (MdFindDuplicates(
+                    &owner_candidates, owner_qnames,
+                    comm_size, &duplicates_by_source,
+                    &stats) != 0) {
+                local_ok = 0;
+            }
+        } else if (enable_coord_bucket) {
+            if (MdFindDuplicatesCoordinateBuckets(
+                    &owner_candidates, owner_qnames,
+                    comm_size, &duplicates_by_source,
+                    &stats) != 0) {
+                local_ok = 0;
+            }
+        } else {
+            if (MpiMarkdupFindDuplicatesStreamingHash(
+                    &owner_candidates, owner_qnames,
+                    comm_size, &duplicates_by_source,
+                    &stats) != 0) {
+                local_ok = 0;
+            }
         }
-        if (!MdAllRanksOk(local_ok)) goto cleanup;
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
         {
             double cleanup_t0 = GetTime();
             owner_candidates.clear();
@@ -2607,7 +3723,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                 &stats) != 0) {
             local_ok = 0;
         }
-        if (!MdAllRanksOk(local_ok)) goto cleanup;
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
         {
             double cleanup_t0 = GetTime();
             duplicates_by_source.clear();
@@ -2627,7 +3743,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                 writer, rank, &stats) != 0) {
             local_ok = 0;
         }
-        if (!MdAllRanksOk(local_ok)) goto cleanup;
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
 
         // -c -r 的情况：
         /*第一步 MdRewriteOutput：
@@ -2657,7 +3773,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                     writer.size ? writer.size : 64 * 1024 * 1024) != 0) {
                 local_ok = 0;
             }
-            if (!MdAllRanksOk(local_ok)) {
+            if (!MdAllRanksOkTimed(local_ok, &stats)) {
                 if (filtered_writer.data) free(filtered_writer.data);
                 goto cleanup;
             }
@@ -2666,7 +3782,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                                  &filter_stats) != 0) {
                 local_ok = 0;
             }
-            if (!MdAllRanksOk(local_ok)) {
+            if (!MdAllRanksOkTimed(local_ok, &stats)) {
                 if (filtered_writer.data) free(filtered_writer.data);
                 goto cleanup;
             }

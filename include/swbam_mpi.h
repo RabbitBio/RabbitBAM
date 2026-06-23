@@ -224,6 +224,9 @@ struct MpiMarkdupStats {
     long long tracked_peak_bytes;
     double t_candidate_decomp;
     double t_candidate_extract;
+    double t_extract_status;
+    double t_extract_merge;
+    double t_extract_memcheck;
     double t_candidate_exchange;
     double t_candidate_pack;
     double t_candidate_exchange_setup;
@@ -234,8 +237,14 @@ struct MpiMarkdupStats {
     double t_group_sort;
     double t_group_scan;
     double t_group;
+    double t_flat_alloc;
+    double t_flat_init;
+    double t_flat_probe;
+    double t_flat_finalize;
+    double t_flat_free;
     double t_owner_cleanup;
     double t_result_exchange;
+    double t_bitmap_merge;
     double t_result_cleanup;
     double t_rewrite_decomp;
     double t_rewrite;
@@ -243,6 +252,9 @@ struct MpiMarkdupStats {
     double t_compress;
     double t_read;
     double t_write;
+    double t_rank_sync;
+    double t_cpe_launch;
+    double t_cpe_sync;
     double t_fused_total;
 };
 

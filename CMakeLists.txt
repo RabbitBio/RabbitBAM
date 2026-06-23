@@ -99,6 +99,7 @@ list(APPEND MPI_SRC_FILES
     "${CMAKE_SOURCE_DIR}/src/swbam_sort_mpi.cpp"
     "${CMAKE_SOURCE_DIR}/src/swbam_sort_fused_mpi.cpp"
     "${CMAKE_SOURCE_DIR}/src/swbam_markdup_mpi.cpp"
+    "${CMAKE_SOURCE_DIR}/src/swbam_markdup_stream_mpi.cpp"
     "${CMAKE_SOURCE_DIR}/src/swbam_fixmate_mpi.cpp"
 )
 list(REMOVE_DUPLICATES MPI_SRC_FILES)
