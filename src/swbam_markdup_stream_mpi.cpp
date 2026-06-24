@@ -14,15 +14,21 @@ static uint64_t MdMix64(uint64_t value) {
     return value ^ (value >> 31);
 }
 
+static uint64_t MdRotl64(uint64_t value, int shift) {
+    return (value << shift) | (value >> (64 - shift));
+}
+
 static uint64_t MdHashKeyFlat(const MpiMarkdupKeyShared &key) {
-    uint64_t hash = 0x6a09e667f3bcc909ull;
-    hash ^= MdMix64((uint64_t)key.this_coord);
-    hash ^= MdMix64((uint64_t)key.other_coord + 0x100000001b3ull);
-    hash ^= MdMix64((uint64_t)(uint32_t)key.this_ref << 1);
-    hash ^= MdMix64((uint64_t)(uint32_t)key.other_ref << 2);
-    hash ^= MdMix64((uint64_t)(uint8_t)key.single << 8 |
-                    (uint64_t)(uint8_t)key.leftmost << 16 |
-                    (uint64_t)(uint8_t)key.orientation << 24);
+    uint64_t hash =
+        (uint64_t)key.this_coord * 0x9e3779b97f4a7c15ull;
+    hash ^= MdRotl64(
+        (uint64_t)key.other_coord * 0xbf58476d1ce4e5b9ull, 23);
+    hash ^= ((uint64_t)(uint32_t)key.this_ref << 32) |
+            (uint64_t)(uint32_t)key.other_ref;
+    hash ^= (uint64_t)(uint8_t)key.single << 8 |
+            (uint64_t)(uint8_t)key.leftmost << 16 |
+            (uint64_t)(uint8_t)key.orientation << 24;
+    hash = MdMix64(hash);
     return hash ? hash : 1;
 }
 
@@ -136,90 +142,15 @@ struct MdFlatBestTable {
             pos = (pos + 1) & mask;
         }
     }
-};
 
-struct MdFlatKeySet {
-    MpiMarkdupKeyShared *keys;
-    uint64_t *hashes;
-    unsigned char *used;
-    size_t capacity;
-    size_t mask;
-    size_t filled;
-
-    MdFlatKeySet()
-        : keys(nullptr), hashes(nullptr), used(nullptr),
-          capacity(0), mask(0), filled(0) {}
-
-    ~MdFlatKeySet() {
-        Free();
-    }
-
-    int Init(size_t expected, double *alloc_time, double *init_time) {
-        Free();
-        double init_t0 = GetTime();
-        capacity = MdNextTableCapacity(expected);
-        if (expected == 0) {
-            if (init_time) *init_time += GetTime() - init_t0;
-            return 0;
-        }
-        if (capacity == 0) {
-            if (init_time) *init_time += GetTime() - init_t0;
-            return -1;
-        }
-        mask = capacity - 1;
-        if (init_time) *init_time += GetTime() - init_t0;
-        double alloc_t0 = GetTime();
-        keys = (MpiMarkdupKeyShared *)aligned_alloc_custom(
-            64, capacity * sizeof(MpiMarkdupKeyShared));
-        hashes = (uint64_t *)aligned_alloc_custom(
-            64, capacity * sizeof(uint64_t));
-        used = aligned_alloc_custom(64, capacity);
-        if (alloc_time) *alloc_time += GetTime() - alloc_t0;
-        if (!keys || !hashes || !used) return -1;
-        init_t0 = GetTime();
-        memset(used, 0, capacity);
-        filled = 0;
-        if (init_time) *init_time += GetTime() - init_t0;
-        return 0;
-    }
-
-    void Free() {
-        if (keys) aligned_free_custom((unsigned char *)keys);
-        if (hashes) aligned_free_custom((unsigned char *)hashes);
-        if (used) aligned_free_custom(used);
-        keys = nullptr;
-        hashes = nullptr;
-        used = nullptr;
-        capacity = 0;
-        mask = 0;
-        filled = 0;
-    }
-
-    int Insert(const MpiMarkdupKeyShared &key, uint64_t hash) {
-        if (capacity == 0) return -1;
-        size_t pos = (size_t)hash & mask;
-        for (;;) {
-            if (!used[pos]) {
-                if (filled + 1 >= capacity) return -1;
-                used[pos] = 1;
-                hashes[pos] = hash;
-                keys[pos] = key;
-                filled++;
-                return 0;
-            }
-            if (hashes[pos] == hash && MdKeyEqualFlat(keys[pos], key)) {
-                return 0;
-            }
-            pos = (pos + 1) & mask;
-        }
-    }
-
-    bool Contains(const MpiMarkdupKeyShared &key, uint64_t hash) const {
+    bool FindExisting(const MpiMarkdupKeyShared &key, uint64_t hash,
+                      size_t *slot) const {
         if (capacity == 0) return false;
         size_t pos = (size_t)hash & mask;
         for (;;) {
             if (!used[pos]) return false;
             if (hashes[pos] == hash && MdKeyEqualFlat(keys[pos], key)) {
+                *slot = pos;
                 return true;
             }
             pos = (pos + 1) & mask;
@@ -287,16 +218,13 @@ int MpiMarkdupFindDuplicatesStreamingHash(
     double init_t0 = GetTime();
     const size_t total = owner_candidates->size();
     size_t pair_expected = 0;
-    size_t marker_expected = 0;
     size_t single_expected = 0;
     for (size_t i = 0; i < total; ++i) {
         const MpiMarkdupCandidateShared &candidate =
             (*owner_candidates)[i];
         if (!candidate.key.single) {
             pair_expected++;
-        } else if (candidate.paired_marker) {
-            marker_expected++;
-        } else {
+        } else if (!candidate.paired_marker) {
             single_expected++;
         }
     }
@@ -304,16 +232,13 @@ int MpiMarkdupFindDuplicatesStreamingHash(
 
     MdFlatBestTable pair_best;
     MdFlatBestTable single_best;
-    MdFlatKeySet paired_marker_keys;
     int status = 0;
     double probe_t0 = 0.0;
     double finalize_t0 = 0.0;
     if (pair_best.Init(pair_expected, &stats->t_flat_alloc,
                        &stats->t_flat_init) != 0 ||
         single_best.Init(single_expected, &stats->t_flat_alloc,
-                         &stats->t_flat_init) != 0 ||
-        paired_marker_keys.Init(marker_expected, &stats->t_flat_alloc,
-                                &stats->t_flat_init) != 0) {
+                         &stats->t_flat_init) != 0) {
         status = -1;
         goto cleanup;
     }
@@ -322,8 +247,8 @@ int MpiMarkdupFindDuplicatesStreamingHash(
     for (size_t i = 0; i < total; ++i) {
         const MpiMarkdupCandidateShared &candidate =
             (*owner_candidates)[i];
-        const uint64_t hash = MdHashKeyFlat(candidate.key);
         if (!candidate.key.single) {
+            const uint64_t hash = MdHashKeyFlat(candidate.key);
             size_t slot = 0;
             int inserted = 0;
             if (pair_best.FindOrInsert(candidate.key, hash, i, &slot,
@@ -355,13 +280,10 @@ int MpiMarkdupFindDuplicatesStreamingHash(
         }
 
         if (candidate.paired_marker) {
-            if (paired_marker_keys.Insert(candidate.key, hash) != 0) {
-                status = -1;
-                goto cleanup_after_probe;
-            }
             continue;
         }
 
+        const uint64_t hash = MdHashKeyFlat(candidate.key);
         size_t slot = 0;
         int inserted = 0;
         if (single_best.FindOrInsert(candidate.key, hash, i, &slot,
@@ -401,12 +323,14 @@ cleanup_after_probe:
     if (status != 0) goto cleanup;
 
     finalize_t0 = GetTime();
-    for (size_t slot = 0; slot < single_best.capacity; ++slot) {
-        if (!single_best.used[slot]) continue;
-        if (!paired_marker_keys.Contains(single_best.keys[slot],
-                                         single_best.hashes[slot])) {
-            continue;
-        }
+    for (size_t i = 0; i < total; ++i) {
+        const MpiMarkdupCandidateShared &marker =
+            (*owner_candidates)[i];
+        if (!marker.key.single || !marker.paired_marker) continue;
+        const uint64_t hash = MdHashKeyFlat(marker.key);
+        size_t slot = 0;
+        if (!single_best.FindExisting(marker.key, hash, &slot)) continue;
+        if (single_best.best[slot] == SIZE_MAX) continue;
         const MpiMarkdupCandidateShared &candidate =
             (*owner_candidates)[single_best.best[slot]];
         if (MdPushDuplicateStream(candidate, comm_size,
@@ -414,6 +338,7 @@ cleanup_after_probe:
             status = -1;
             break;
         }
+        single_best.best[slot] = SIZE_MAX;
         stats->single_duplicates++;
     }
     {
@@ -427,7 +352,6 @@ cleanup:
         double free_t0 = GetTime();
         pair_best.Free();
         single_best.Free();
-        paired_marker_keys.Free();
         stats->t_flat_free += GetTime() - free_t0;
     }
     stats->t_group += GetTime() - group_t0;

@@ -62,6 +62,11 @@ const unsigned char kMarkdupBgzfEofBlock[28] = {
     0x00, 0x00, 0x00, 0x00
 };
 
+static int MdEnvFlagEnabled(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] && value[0] != '0';
+}
+
 struct MdBlockSet {
     bam_block *blocks;
     unsigned char *data;
@@ -131,6 +136,11 @@ struct MdCoordBoundary {
     int64_t first_coord;
     int32_t last_ref;
     int64_t last_coord;
+};
+
+struct MdRemoteCandidateRef {
+    size_t index;
+    int owner;
 };
 
 struct MdBucketRange {
@@ -214,9 +224,6 @@ static size_t MdFlatHashBytesForEstimate(size_t owner_count) {
     const size_t best_slot =
         sizeof(MpiMarkdupKeyShared) + sizeof(uint64_t) +
         sizeof(size_t) + sizeof(unsigned char);
-    const size_t set_slot =
-        sizeof(MpiMarkdupKeyShared) + sizeof(uint64_t) +
-        sizeof(unsigned char);
     if (cap > SIZE_MAX / best_slot) return SIZE_MAX;
     size_t total = cap * best_slot;
     if (cap > SIZE_MAX / best_slot ||
@@ -224,11 +231,6 @@ static size_t MdFlatHashBytesForEstimate(size_t owner_count) {
         return SIZE_MAX;
     }
     total += cap * best_slot;
-    if (cap > SIZE_MAX / set_slot ||
-        total > SIZE_MAX - cap * set_slot) {
-        return SIZE_MAX;
-    }
-    total += cap * set_slot;
     return total;
 }
 
@@ -1310,6 +1312,7 @@ static int MdExchangeCandidatesByCoordinate(
     std::unique_ptr<MpiMarkdupCandidateShared,
                     MdMarkdupCandidateBufferDeleter> send_candidates_flat;
     std::unique_ptr<unsigned char, MdByteBufferDeleter> send_qnames_flat;
+    std::vector<MdRemoteCandidateRef> remote_candidates;
     size_t self_candidate_count = 0;
     size_t self_qname_count = 0;
     int local_ok = 1;
@@ -1340,6 +1343,10 @@ static int MdExchangeCandidatesByCoordinate(
             }
             continue;
         }
+        MdRemoteCandidateRef ref;
+        ref.index = i;
+        ref.owner = owner;
+        remote_candidates.push_back(ref);
         if (send_candidate_counts[(size_t)owner] == ULLONG_MAX) {
             local_ok = 0;
             break;
@@ -1458,6 +1465,19 @@ static int MdExchangeCandidatesByCoordinate(
         local_candidates.capacity() *
             sizeof(MpiMarkdupCandidateShared) +
         local_qnames.capacity();
+    if (remote_candidates.capacity() >
+        SIZE_MAX / sizeof(remote_candidates[0])) {
+        local_ok = 0;
+    } else if (local_ok) {
+        const size_t remote_ref_memory =
+            remote_candidates.capacity() *
+            sizeof(remote_candidates[0]);
+        if (local_memory > SIZE_MAX - remote_ref_memory) {
+            local_ok = 0;
+        } else {
+            local_memory += remote_ref_memory;
+        }
+    }
     if (local_ok) {
         size_t recv_owner_bytes = 0;
         if ((size_t)recv_candidate_total >
@@ -1490,18 +1510,11 @@ static int MdExchangeCandidatesByCoordinate(
 
     std::vector<size_t> candidate_write = send_candidate_offsets;
     std::vector<size_t> qname_write = send_qname_offsets;
-    size_t self_write = 0;
-    for (size_t i = 0; i < local_candidates.size(); ++i) {
-        MpiMarkdupCandidateShared candidate = local_candidates[i];
-        const int owner =
-            MdCoordinateOwnerFast(candidate.key, boundaries, rank);
-        if (owner == rank) {
-            if (self_write != i) {
-                local_candidates[self_write] = candidate;
-            }
-            ++self_write;
-            continue;
-        }
+    for (size_t i = 0; i < remote_candidates.size(); ++i) {
+        const MdRemoteCandidateRef &ref = remote_candidates[i];
+        MpiMarkdupCandidateShared candidate =
+            local_candidates[ref.index];
+        const int owner = ref.owner;
         if (!candidate.key.single) {
             const size_t qname_src = (size_t)candidate.qname_offset;
             const size_t qname_len = (size_t)candidate.qname_len;
@@ -1518,7 +1531,16 @@ static int MdExchangeCandidatesByCoordinate(
         send_candidates_flat.get()[candidate_write[(size_t)owner]++] =
             candidate;
     }
-    local_candidates.resize(self_write);
+    for (size_t i = remote_candidates.size(); i > 0; --i) {
+        const size_t remove_index = remote_candidates[i - 1].index;
+        const size_t last_index = local_candidates.size() - 1;
+        if (remove_index != last_index) {
+            local_candidates[remove_index] =
+                local_candidates[last_index];
+        }
+        local_candidates.pop_back();
+    }
+    remote_candidates.clear();
     owner_candidates->swap(local_candidates);
     owner_qnames->swap(local_qnames);
     const size_t needed_candidates =
@@ -2460,6 +2482,56 @@ static int MdAppendRawPayload(bam_block *payload,
     return 0;
 }
 
+static int MdAppendBamRecordPayload(bam_block *payload,
+                                    const bam1_t *record) {
+    if (!payload || !record || !record->data) return -1;
+    const bam1_core_t *core = &record->core;
+    const int raw_l_qname =
+        (int)core->l_qname - (int)core->l_extranul;
+    if (raw_l_qname <= 0 || raw_l_qname > 255 ||
+        core->n_cigar > 0xffff ||
+        record->l_data < (int)core->l_qname) {
+        return -1;
+    }
+    const uint32_t rest_len =
+        (uint32_t)(record->l_data - core->l_qname);
+    const uint32_t block_len =
+        (uint32_t)(record->l_data - core->l_extranul + 32);
+    const uint32_t raw_len = block_len + 4u;
+    if (raw_len > BGZF_BLOCK_SIZE) return -1;
+    if (payload->pos > 0 &&
+        payload->pos + (int)raw_len > BGZF_BLOCK_SIZE) {
+        return 1;
+    }
+    if (payload->pos + (int)raw_len > BGZF_BLOCK_SIZE) {
+        return -1;
+    }
+
+    uint32_t fields[8];
+    fields[0] = (uint32_t)core->tid;
+    fields[1] = (uint32_t)core->pos;
+    fields[2] = ((uint32_t)core->bin << 16) |
+                ((uint32_t)core->qual << 8) |
+                (uint32_t)raw_l_qname;
+    fields[3] = ((uint32_t)core->flag << 16) |
+                ((uint32_t)core->n_cigar & 0xffffu);
+    fields[4] = (uint32_t)core->l_qseq;
+    fields[5] = (uint32_t)core->mtid;
+    fields[6] = (uint32_t)core->mpos;
+    fields[7] = (uint32_t)core->isize;
+
+    unsigned char *dst =
+        (unsigned char *)payload->data + payload->pos;
+    memcpy(dst, &block_len, 4);
+    memcpy(dst + 4, fields, sizeof(fields));
+    memcpy(dst + 36, record->data, (size_t)raw_l_qname);
+    memcpy(dst + 36 + raw_l_qname,
+           record->data + core->l_qname, rest_len);
+    payload->pos += (int)raw_len;
+    payload->length = payload->pos;
+    return 0;
+}
+
 static int MdPrepareRemoveDupsPayloadFromRaw(
         Bam2BamPara *decomp, MdBlockSet *uncompressed,
         int n_blocks, const std::vector<uint8_t> &bitmap,
@@ -2542,6 +2614,58 @@ static int MdPrepareRemoveDupsPayloadFromRaw(
     return 0;
 }
 
+static int MdPrepareRewrittenPayloadFromRecords(
+        MpiMarkdupRewritePara *rewrite, int n_blocks,
+        MdBlockSet *payload_blocks, MdBlockSet *output_blocks,
+        MpiSortRawCompressPara *paras, int compress_level,
+        int *active_blocks, MpiMarkdupStats *stats) {
+    if (!rewrite || !payload_blocks || !output_blocks || !paras ||
+        !active_blocks || payload_blocks->n < kMarkdupNB ||
+        output_blocks->n < kMarkdupNB) {
+        return -1;
+    }
+    int active = 0;
+    MdResetPayloadBlock(payload_blocks->blocks + active, active);
+    for (int b = 0; b < n_blocks; ++b) {
+        for (int i = 0; i < rewrite[b].n_kept_records; ++i) {
+            bam1_t *record = rewrite[b].records[i];
+            if (!record) return -1;
+            if (record->core.flag & BAM_FDUP) {
+                if (stats) stats->removed_records++;
+                continue;
+            }
+
+            while (true) {
+                int ret = MdAppendBamRecordPayload(
+                    payload_blocks->blocks + active, record);
+                if (ret == 0) break;
+                if (ret < 0) return ret;
+
+                MdSetupRawCompress(paras + active, active,
+                                   payload_blocks->blocks + active,
+                                   output_blocks->blocks + active,
+                                   compress_level);
+                ++active;
+                if (active >= kMarkdupNB) return -13;
+                MdResetPayloadBlock(payload_blocks->blocks + active,
+                                    active);
+            }
+        }
+    }
+    if (payload_blocks->blocks[active].pos > 0) {
+        MdSetupRawCompress(paras + active, active,
+                           payload_blocks->blocks + active,
+                           output_blocks->blocks + active,
+                           compress_level);
+        ++active;
+    }
+    for (int i = active; i < kMarkdupNB; ++i) {
+        MdInitEmptyRawCompress(paras + i, i);
+    }
+    *active_blocks = active;
+    return 0;
+}
+
 static void MdInitEmptyComp(Comp_Para *para, int block_id) {
     memset(para, 0, sizeof(*para));
     para->block_id = block_id;
@@ -2605,6 +2729,8 @@ static int MdRewriteOutput(
     MdBlockSet *output_active = &output_a;
     MdBlockSet *output_pending = &output_b;
     bool has_pending = false;
+    const int fused_remove_path =
+        clear_old || MdEnvFlagEnabled("RABBITBAM_MARKDUP_FUSED_REMOVE");
 
     auto flush_pending = [&]() -> int {
         if (!has_pending) return 0;
@@ -2710,8 +2836,9 @@ static int MdRewriteOutput(
             }
         }
 
-        // 快速路径：-r 且没有 -c
-        if (remove_dups && !clear_old) {
+        // 普通 -r 默认走已验证的 raw payload 删除路径；需要测试
+        // host-filter 融合路径时设置 RABBITBAM_MARKDUP_FUSED_REMOVE=1。
+        if (remove_dups && !clear_old && !fused_remove_path) {
             int active_payload_blocks = 0;
             uint64_t next_ordinal = ordinal;
             double payload_t0 = GetTime();
@@ -2782,7 +2909,8 @@ static int MdRewriteOutput(
             rewrite[b].duplicate_bitmap_bytes =
                 bitmap.size();
             rewrite[b].clear_old = clear_old;
-            rewrite[b].remove_dups = remove_dups;
+            // 删除由 MPE 在 pack 前过滤，CPE 只负责清旧/标记。
+            rewrite[b].remove_dups = 0;
             block_ordinal +=
                 (uint64_t)decomp[b].n_total_records;
         }
@@ -2810,6 +2938,54 @@ static int MdRewriteOutput(
                 rewrite[b].cleared_records;
             stats->removed_records +=
                 rewrite[b].removed_records;
+        }
+
+        if (remove_dups && fused_remove_path) {
+            int active_payload_blocks = 0;
+            double payload_t0 = GetTime();
+            int payload_status = MdPrepareRewrittenPayloadFromRecords(
+                rewrite, n_blocks, compress_un_active, output_active,
+                raw_comp, compress_level, &active_payload_blocks,
+                stats);
+            stats->t_pack += GetTime() - payload_t0;
+            if (payload_status != 0) {
+                fprintf(stderr,
+                        "[rank %d] ERROR: markdup rewritten payload "
+                        "pack failed status=%d.\n",
+                        rank, payload_status);
+                return -1;
+            }
+            if (active_payload_blocks == 0) {
+                if (read_group(&next_blocks) != 0) return -1;
+                continue;
+            }
+
+            double compress_t0 = GetTime();
+            __real_athread_spawn(
+                (void *)slave_mpi_sort_compress_payload,
+                raw_comp, 1);
+            cpe_sync_t0 = GetTime();
+            athread_join();
+            stats->t_cpe_sync += GetTime() - cpe_sync_t0;
+            stats->t_compress += GetTime() - compress_t0;
+            double write_t0 = GetTime();
+            for (int i = 0; i < active_payload_blocks; ++i) {
+                if (raw_comp[i].status != 0) {
+                    fprintf(stderr,
+                            "[rank %d] ERROR: markdup rewritten "
+                            "payload compress failed block=%d status=%d.\n",
+                            rank, i, raw_comp[i].status);
+                    return -1;
+                }
+                if (MpiWriteBlockToMem(writer,
+                        output_active->blocks + i) != 0) {
+                    return -1;
+                }
+                stats->bgzf_blocks++;
+            }
+            stats->t_write += GetTime() - write_t0;
+            if (read_group(&next_blocks) != 0) return -1;
+            continue;
         }
 
         // MdAppendRecords：把保留 records 重新打包进行压缩
@@ -3117,8 +3293,6 @@ static double MdAccountedFusedTime(const MpiMarkdupStats &stats) {
            stats.t_rewrite +
            stats.t_pack +
            stats.t_compress +
-           stats.t_read +
-           stats.t_write +
            stats.t_rank_sync;
 }
 
@@ -3732,8 +3906,11 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
 
         // 6. MdRewriteOutput：重写本 rank 的 BAM body
         const int remove_dups = cmd_info->markdup_remove_dups_;
+        const int legacy_remove_path =
+            MdEnvFlagEnabled("RABBITBAM_MARKDUP_LEGACY_REMOVE");
         const int fused_remove_dups =
-            remove_dups && !cmd_info->markdup_clear_;
+            remove_dups &&
+            (!cmd_info->markdup_clear_ || !legacy_remove_path);
         reader.pos = 0;
         if (MdRewriteOutput(
                 reader, duplicate_bitmap, local_records,
@@ -3745,13 +3922,8 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
         }
         if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
 
-        // -c -r 的情况：
-        /*第一步 MdRewriteOutput：
-            清除旧 DUP 标记
-            根据 duplicate_bitmap 重新打 DUP 标记
-            暂时不删除
-        第二步 FusedBamToBamMPI：
-            从刚才的 writer 结果中，过滤掉 BAM_FDUP records*/
+        // 兼容回退路径：设置 RABBITBAM_MARKDUP_LEGACY_REMOVE=1 时，
+        // -c -r 仍使用两段式稳定实现，便于和融合路径对照。
         if (remove_dups && !fused_remove_dups) {
             MemReader filter_reader = {};
             MemWriter filtered_writer = {};

@@ -353,7 +353,7 @@ static int md_delete_aux_tag(bam1_t *record, char a, char b) {
     while ((size_t)(end - p) >= 3) {
         uint8_t *type = p + 2;
         const uint8_t *next = md_aux_payload_end(type, end);
-        if (!next) return -1;
+        if (!next) return 0;
         if (p[0] == (uint8_t)a && p[1] == (uint8_t)b) {
             size_t remove_len = (size_t)(next - p);
             memmove(p, next, (size_t)(end - next));
@@ -536,13 +536,13 @@ extern "C" void slave_mpi_markdup_rewrite(MpiMarkdupRewritePara paras[64]) {
             record->core.flag &= (uint16_t)~BAM_FDUP;
             int ret = md_delete_aux_tag(record, 'd', 't');
             if (ret < 0) {
-                para->status = -2;
+                para->status = -21;
                 para->record_index = i;
                 return;
             }
             ret = md_delete_aux_tag(record, 'd', 'o');
             if (ret < 0) {
-                para->status = -2;
+                para->status = -22;
                 para->record_index = i;
                 return;
             }
