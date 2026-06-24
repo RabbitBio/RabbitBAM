@@ -2482,6 +2482,229 @@ static int MdAppendRawPayload(bam_block *payload,
     return 0;
 }
 
+static int MdAppendRawPayloadPatchedFlag(bam_block *payload,
+                                         const unsigned char *record,
+                                         uint32_t raw_len,
+                                         uint16_t final_flag) {
+    if (!payload || !record || raw_len == 0 ||
+        raw_len > BGZF_BLOCK_SIZE) {
+        return -1;
+    }
+    if (payload->pos > 0 &&
+        payload->pos + (int)raw_len > BGZF_BLOCK_SIZE) {
+        return 1;
+    }
+    if (payload->pos + (int)raw_len > BGZF_BLOCK_SIZE) {
+        return -1;
+    }
+
+    unsigned char *dst =
+        (unsigned char *)payload->data + payload->pos;
+    memcpy(dst, record, raw_len);
+    uint32_t flag_nc = MdLoadLe32(dst + 16);
+    flag_nc = (flag_nc & 0xffffu) |
+              ((uint32_t)final_flag << 16);
+    memcpy(dst + 16, &flag_nc, sizeof(flag_nc));
+    payload->pos += (int)raw_len;
+    payload->length = payload->pos;
+    return 0;
+}
+
+static const unsigned char *MdRawAuxPayloadEnd(
+        const unsigned char *tag, const unsigned char *end) {
+    if (!tag || tag + 3 > end) return nullptr;
+    const unsigned char type = tag[2];
+    const unsigned char *p = tag + 3;
+    switch (type) {
+    case 'A':
+    case 'c':
+    case 'C':
+        return p + 1 <= end ? p + 1 : nullptr;
+    case 's':
+    case 'S':
+        return p + 2 <= end ? p + 2 : nullptr;
+    case 'i':
+    case 'I':
+    case 'f':
+        return p + 4 <= end ? p + 4 : nullptr;
+    case 'd':
+        return p + 8 <= end ? p + 8 : nullptr;
+    case 'Z':
+    case 'H': {
+        while (p < end) {
+            if (*p == '\0') return p + 1;
+            ++p;
+        }
+        return nullptr;
+    }
+    case 'B': {
+        if (p + 5 > end) return nullptr;
+        size_t elem_size = 0;
+        switch (p[0]) {
+        case 'c':
+        case 'C':
+        case 'A':
+            elem_size = 1;
+            break;
+        case 's':
+        case 'S':
+            elem_size = 2;
+            break;
+        case 'i':
+        case 'I':
+        case 'f':
+            elem_size = 4;
+            break;
+        default:
+            return nullptr;
+        }
+        const uint32_t count = MdLoadLe32(p + 1);
+        if (count > (uint32_t)((size_t)(end - (p + 5)) /
+                               elem_size)) {
+            return nullptr;
+        }
+        return p + 5 + (size_t)count * elem_size;
+    }
+    default:
+        return nullptr;
+    }
+}
+
+static int MdAppendRawPayloadClearOld(bam_block *payload,
+                                      const unsigned char *record,
+                                      uint32_t block_len,
+                                      uint16_t final_flag) {
+    if (!payload || !record || block_len < 32) return -1;
+    const uint32_t raw_len = block_len + 4u;
+    if (raw_len > BGZF_BLOCK_SIZE) return -1;
+
+    const uint32_t bin_mq_nl = MdLoadLe32(record + 12);
+    const uint32_t flag_nc = MdLoadLe32(record + 16);
+    const uint32_t raw_l_qname = bin_mq_nl & 0xffu;
+    const uint32_t n_cigar = flag_nc & 0xffffu;
+    const uint32_t l_qseq = MdLoadLe32(record + 20);
+    const uint64_t aux_start64 =
+        36ull + (uint64_t)raw_l_qname +
+        4ull * (uint64_t)n_cigar +
+        (((uint64_t)l_qseq + 1ull) >> 1) +
+        (uint64_t)l_qseq;
+    if (raw_l_qname == 0 || aux_start64 > raw_len) return -1;
+
+    const unsigned char *aux_start =
+        record + (size_t)aux_start64;
+    const unsigned char *record_end = record + raw_len;
+    const size_t aux_len = (size_t)(record_end - aux_start);
+    if (aux_len == 0 || memchr(aux_start, 'd', aux_len) == nullptr) {
+        return MdAppendRawPayloadPatchedFlag(
+            payload, record, raw_len, final_flag);
+    }
+
+    const unsigned char *scan = aux_start;
+    uint32_t removed = 0;
+    while (scan + 3 <= record_end) {
+        const unsigned char *next =
+            MdRawAuxPayloadEnd(scan, record_end);
+        if (!next) break;
+        if (scan[0] == 'd' &&
+            (scan[1] == 't' || scan[1] == 'o')) {
+            removed += (uint32_t)(next - scan);
+        }
+        scan = next;
+    }
+
+    if (removed == 0) {
+        return MdAppendRawPayloadPatchedFlag(
+            payload, record, raw_len, final_flag);
+    }
+
+    const uint32_t output_block_len = block_len - removed;
+    const uint32_t output_raw_len = output_block_len + 4u;
+    if (payload->pos > 0 &&
+        payload->pos + (int)output_raw_len > BGZF_BLOCK_SIZE) {
+        return 1;
+    }
+    if (payload->pos + (int)output_raw_len > BGZF_BLOCK_SIZE) {
+        return -1;
+    }
+
+    unsigned char *dst =
+        (unsigned char *)payload->data + payload->pos;
+    memcpy(dst, &output_block_len, 4);
+    memcpy(dst + 4, record + 4, (size_t)aux_start64 - 4u);
+    uint32_t patched_flag_nc = MdLoadLe32(dst + 16);
+    patched_flag_nc = (patched_flag_nc & 0xffffu) |
+                      ((uint32_t)final_flag << 16);
+    memcpy(dst + 16, &patched_flag_nc, sizeof(patched_flag_nc));
+
+    unsigned char *out = dst + (size_t)aux_start64;
+    scan = aux_start;
+    while (scan < record_end) {
+        const unsigned char *next =
+            MdRawAuxPayloadEnd(scan, record_end);
+        if (!next) {
+            memcpy(out, scan, (size_t)(record_end - scan));
+            out += record_end - scan;
+            break;
+        }
+        if (!(scan[0] == 'd' &&
+              (scan[1] == 't' || scan[1] == 'o'))) {
+            memcpy(out, scan, (size_t)(next - scan));
+            out += next - scan;
+        }
+        scan = next;
+    }
+    if ((uint32_t)(out - dst) != output_raw_len) return -2;
+    payload->pos += (int)output_raw_len;
+    payload->length = payload->pos;
+    return 0;
+}
+
+static int MdRawRecordCanPatchFlagOnly(const unsigned char *raw,
+                                       uint32_t block_len,
+                                       const bam1_t *record,
+                                       uint32_t final_bam_len) {
+    if (!raw || !record || !record->data) return 0;
+    const bam1_core_t *core = &record->core;
+    if (final_bam_len != block_len) return 0;
+    if (core->n_cigar > 0xffff) return 0;
+    const int raw_l_qname =
+        (int)core->l_qname - (int)core->l_extranul;
+    if (raw_l_qname <= 0 || raw_l_qname > 255) return 0;
+
+    const uint32_t raw_tid = MdLoadLe32(raw + 4);
+    const uint32_t raw_pos = MdLoadLe32(raw + 8);
+    const uint32_t raw_bin_mq_nl = MdLoadLe32(raw + 12);
+    const uint32_t raw_flag_nc = MdLoadLe32(raw + 16);
+    const uint32_t raw_l_qseq = MdLoadLe32(raw + 20);
+    const uint32_t raw_mtid = MdLoadLe32(raw + 24);
+    const uint32_t raw_mpos = MdLoadLe32(raw + 28);
+    const uint32_t raw_isize = MdLoadLe32(raw + 32);
+
+    if ((int32_t)raw_tid != core->tid ||
+        (int32_t)raw_pos != core->pos ||
+        (int32_t)raw_mtid != core->mtid ||
+        (int32_t)raw_mpos != core->mpos ||
+        (int32_t)raw_isize != core->isize) {
+        return 0;
+    }
+    if ((int32_t)raw_l_qseq != core->l_qseq) return 0;
+    if ((raw_bin_mq_nl & 0xffu) != (uint32_t)raw_l_qname) {
+        return 0;
+    }
+    if (((raw_bin_mq_nl >> 8) & 0xffu) !=
+        (uint32_t)core->qual) {
+        return 0;
+    }
+    if ((raw_bin_mq_nl >> 16) != (uint32_t)core->bin) {
+        return 0;
+    }
+    if ((raw_flag_nc & 0xffffu) !=
+        ((uint32_t)core->n_cigar & 0xffffu)) {
+        return 0;
+    }
+    return 1;
+}
+
 static int MdAppendBamRecordPayload(bam_block *payload,
                                     const bam1_t *record) {
     if (!payload || !record || !record->data) return -1;
@@ -2614,30 +2837,62 @@ static int MdPrepareRemoveDupsPayloadFromRaw(
     return 0;
 }
 
-static int MdPrepareRewrittenPayloadFromRecords(
-        MpiMarkdupRewritePara *rewrite, int n_blocks,
-        MdBlockSet *payload_blocks, MdBlockSet *output_blocks,
-        MpiSortRawCompressPara *paras, int compress_level,
-        int *active_blocks, MpiMarkdupStats *stats) {
-    if (!rewrite || !payload_blocks || !output_blocks || !paras ||
-        !active_blocks || payload_blocks->n < kMarkdupNB ||
+static int MdPrepareClearRemoveDupsPayloadFromRaw(
+        Bam2BamPara *decomp, MdBlockSet *uncompressed,
+        int n_blocks, const std::vector<uint8_t> &bitmap,
+        uint64_t ordinal_base, MdBlockSet *payload_blocks,
+        MdBlockSet *output_blocks, MpiSortRawCompressPara *paras,
+        int compress_level, int *active_blocks,
+        uint64_t *ordinal_end, MpiMarkdupStats *stats) {
+    int active = 0;
+    uint64_t ordinal = ordinal_base;
+    if (!decomp || !uncompressed || !payload_blocks ||
+        !output_blocks || !paras || !active_blocks ||
+        !ordinal_end || payload_blocks->n < kMarkdupNB ||
         output_blocks->n < kMarkdupNB) {
         return -1;
     }
-    int active = 0;
+
     MdResetPayloadBlock(payload_blocks->blocks + active, active);
     for (int b = 0; b < n_blocks; ++b) {
-        for (int i = 0; i < rewrite[b].n_kept_records; ++i) {
-            bam1_t *record = rewrite[b].records[i];
-            if (!record) return -1;
-            if (record->core.flag & BAM_FDUP) {
-                if (stats) stats->removed_records++;
+        bam_block *src = uncompressed->blocks + b;
+        size_t pos = 0;
+        for (int r = 0; r < decomp[b].n_total_records; ++r) {
+            if (pos + 36u > src->length) return -11;
+            const unsigned char *raw = src->data + pos;
+            const uint32_t block_len = MdLoadLe32(raw);
+            const uint64_t raw_len64 = (uint64_t)block_len + 4u;
+            if (block_len < 32 ||
+                raw_len64 > BGZF_BLOCK_SIZE ||
+                raw_len64 > (uint64_t)src->length - pos) {
+                return -12;
+            }
+            const uint32_t flag_nc = MdLoadLe32(raw + 16);
+            const uint16_t old_flag = (uint16_t)(flag_nc >> 16);
+            uint16_t final_flag =
+                (uint16_t)(old_flag & (uint16_t)~BAM_FDUP);
+            const size_t byte = (size_t)(ordinal >> 3);
+            const uint8_t mask = (uint8_t)(1u << (ordinal & 7u));
+            const int duplicate =
+                byte < bitmap.size() && (bitmap[byte] & mask);
+
+            if (old_flag & BAM_FDUP) {
+                if (stats) stats->cleared_records++;
+            }
+            if (duplicate) {
+                if (stats) {
+                    stats->marked_records++;
+                    stats->removed_records++;
+                }
+                ++ordinal;
+                pos += (size_t)raw_len64;
                 continue;
             }
 
             while (true) {
-                int ret = MdAppendBamRecordPayload(
-                    payload_blocks->blocks + active, record);
+                int ret = MdAppendRawPayloadClearOld(
+                    payload_blocks->blocks + active,
+                    raw, block_len, final_flag);
                 if (ret == 0) break;
                 if (ret < 0) return ret;
 
@@ -2650,7 +2905,95 @@ static int MdPrepareRewrittenPayloadFromRecords(
                 MdResetPayloadBlock(payload_blocks->blocks + active,
                                     active);
             }
+            ++ordinal;
+            pos += (size_t)raw_len64;
         }
+        if (pos != src->length) return -14;
+    }
+
+    if (payload_blocks->blocks[active].pos > 0) {
+        MdSetupRawCompress(paras + active, active,
+                           payload_blocks->blocks + active,
+                           output_blocks->blocks + active,
+                           compress_level);
+        ++active;
+    }
+    for (int i = active; i < kMarkdupNB; ++i) {
+        MdInitEmptyRawCompress(paras + i, i);
+    }
+    *active_blocks = active;
+    *ordinal_end = ordinal;
+    return 0;
+}
+
+static int MdPrepareRewrittenPayloadFromRecords(
+        Bam2BamPara *decomp, MdBlockSet *uncompressed,
+        MpiMarkdupRewritePara *rewrite, int n_blocks,
+        MdBlockSet *payload_blocks, MdBlockSet *output_blocks,
+        MpiSortRawCompressPara *paras, int compress_level,
+        int *active_blocks, MpiMarkdupStats *stats) {
+    if (!decomp || !uncompressed || !rewrite ||
+        !payload_blocks || !output_blocks || !paras ||
+        !active_blocks || uncompressed->n < n_blocks ||
+        payload_blocks->n < kMarkdupNB ||
+        output_blocks->n < kMarkdupNB) {
+        return -1;
+    }
+    int active = 0;
+    MdResetPayloadBlock(payload_blocks->blocks + active, active);
+    for (int b = 0; b < n_blocks; ++b) {
+        bam_block *src = uncompressed->blocks + b;
+        size_t pos = 0;
+        if (rewrite[b].n_kept_records != decomp[b].n_total_records ||
+            rewrite[b].n_records != decomp[b].n_total_records) {
+            return -2;
+        }
+        for (int i = 0; i < decomp[b].n_total_records; ++i) {
+            if (pos + 36u > src->length) return -11;
+            const unsigned char *raw = src->data + pos;
+            const uint32_t block_len = MdLoadLe32(raw);
+            const uint64_t raw_len64 = (uint64_t)block_len + 4u;
+            if (block_len < 32 ||
+                raw_len64 > BGZF_BLOCK_SIZE ||
+                raw_len64 > (uint64_t)src->length - pos) {
+                return -12;
+            }
+            bam1_t *record = rewrite[b].records[i];
+            if (!record) return -1;
+            if (record->core.flag & BAM_FDUP) {
+                if (stats) stats->removed_records++;
+                pos += (size_t)raw_len64;
+                continue;
+            }
+
+            while (true) {
+                int ret = 0;
+                if (MdRawRecordCanPatchFlagOnly(
+                        raw, block_len, record,
+                        rewrite[b].bam_lens[i])) {
+                    ret = MdAppendRawPayloadPatchedFlag(
+                        payload_blocks->blocks + active,
+                        raw, (uint32_t)raw_len64,
+                        record->core.flag);
+                } else {
+                    ret = MdAppendBamRecordPayload(
+                        payload_blocks->blocks + active, record);
+                }
+                if (ret == 0) break;
+                if (ret < 0) return ret;
+
+                MdSetupRawCompress(paras + active, active,
+                                   payload_blocks->blocks + active,
+                                   output_blocks->blocks + active,
+                                   compress_level);
+                ++active;
+                if (active >= kMarkdupNB) return -13;
+                MdResetPayloadBlock(payload_blocks->blocks + active,
+                                    active);
+            }
+            pos += (size_t)raw_len64;
+        }
+        if (pos != src->length) return -14;
     }
     if (payload_blocks->blocks[active].pos > 0) {
         MdSetupRawCompress(paras + active, active,
@@ -2890,6 +3233,58 @@ static int MdRewriteOutput(
             continue;
         }
 
+        if (remove_dups && clear_old && fused_remove_path) {
+            int active_payload_blocks = 0;
+            uint64_t next_ordinal = ordinal;
+            double payload_t0 = GetTime();
+            int payload_status = MdPrepareClearRemoveDupsPayloadFromRaw(
+                decomp, &uncompressed, n_blocks, bitmap,
+                ordinal, compress_un_active, output_active,
+                raw_comp, compress_level, &active_payload_blocks,
+                &next_ordinal, stats);
+            stats->t_pack += GetTime() - payload_t0;
+            if (payload_status != 0) {
+                fprintf(stderr,
+                        "[rank %d] ERROR: markdup clear/remove raw "
+                        "payload pack failed status=%d ordinal=%llu.\n",
+                        rank, payload_status,
+                        (unsigned long long)next_ordinal);
+                return -1;
+            }
+            ordinal = next_ordinal;
+            if (active_payload_blocks == 0) {
+                if (read_group(&next_blocks) != 0) return -1;
+                continue;
+            }
+
+            double compress_t0 = GetTime();
+            __real_athread_spawn(
+                (void *)slave_mpi_sort_compress_payload,
+                raw_comp, 1);
+            cpe_sync_t0 = GetTime();
+            athread_join();
+            stats->t_cpe_sync += GetTime() - cpe_sync_t0;
+            stats->t_compress += GetTime() - compress_t0;
+            double write_t0 = GetTime();
+            for (int i = 0; i < active_payload_blocks; ++i) {
+                if (raw_comp[i].status != 0) {
+                    fprintf(stderr,
+                            "[rank %d] ERROR: markdup clear/remove "
+                            "raw payload compress failed block=%d status=%d.\n",
+                            rank, i, raw_comp[i].status);
+                    return -1;
+                }
+                if (MpiWriteBlockToMem(writer,
+                        output_active->blocks + i) != 0) {
+                    return -1;
+                }
+                stats->bgzf_blocks++;
+            }
+            stats->t_write += GetTime() - write_t0;
+            if (read_group(&next_blocks) != 0) return -1;
+            continue;
+        }
+
         // 普通路径：修改 FLAG / 清旧标记 / 重新打包
         uint64_t block_ordinal = ordinal;
         for (int b = 0; b < kMarkdupNB; ++b) {
@@ -2944,9 +3339,9 @@ static int MdRewriteOutput(
             int active_payload_blocks = 0;
             double payload_t0 = GetTime();
             int payload_status = MdPrepareRewrittenPayloadFromRecords(
-                rewrite, n_blocks, compress_un_active, output_active,
-                raw_comp, compress_level, &active_payload_blocks,
-                stats);
+                decomp, &uncompressed, rewrite, n_blocks,
+                compress_un_active, output_active, raw_comp,
+                compress_level, &active_payload_blocks, stats);
             stats->t_pack += GetTime() - payload_t0;
             if (payload_status != 0) {
                 fprintf(stderr,
