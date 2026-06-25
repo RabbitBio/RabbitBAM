@@ -27,6 +27,7 @@ public:
     std::string sort_memory_;
     std::string sort_temp_prefix_;
     int collate_bins_;
+    bool collate_bins_explicit_;
     std::string collate_memory_;
     std::string collate_temp_prefix_;
     bool markdup_remove_dups_;

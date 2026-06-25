@@ -70,7 +70,8 @@ int main(int argc, char **argv) {
     CLI::App *collate = app.add_subcommand("collate", "Run MPI BAM name collation");
     collate->add_option("-i,--inFile", cmd_info.in_file_name_, "input BAM name")->required()->check(CLI::ExistingFile);
     collate->add_option("-o,--outFile", cmd_info.out_file_name_, "output BAM name")->required();
-    collate->add_option("-n,--bins", cmd_info.collate_bins_, "Number of logical QNAME hash bins")->default_val(64);
+    CLI::Option *collate_bins_option =
+        collate->add_option("-n,--bins", cmd_info.collate_bins_, "Number of logical QNAME hash bins")->default_val(64);
     collate->add_option("-m,--memory", cmd_info.collate_memory_, "Collate memory limit per MPI rank, e.g. 4G or 4096M");
     collate->add_option("-T,--temp-prefix", cmd_info.collate_temp_prefix_, "External collate temporary prefix or directory");
     collate->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
@@ -120,6 +121,9 @@ int main(int argc, char **argv) {
     is_collate = selected_command->get_name() == "collate";
     is_markdup = selected_command->get_name() == "markdup";
     is_fixmate = selected_command->get_name() == "fixmate";
+    cmd_info.collate_bins_explicit_ =
+        is_collate && collate_bins_option &&
+        collate_bins_option->count() > 0;
     if (!is_run_all && !is_flagstat && !is_stats && !is_sort && !is_collate && !is_markdup && !is_fixmate) {
         if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI only supports run_all, flagstat, stats, sort, collate, markdup, and fixmate.\n");
         goto cleanup;

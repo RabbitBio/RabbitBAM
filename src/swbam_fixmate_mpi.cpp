@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef PLATFORM_SUNWAY
@@ -118,12 +119,26 @@ static int FmAllRanksOk(int local_ok) {
     return global_ok;
 }
 
+static int FmAllRanksOkTimed(int local_ok, MpiFixmateStats *stats) {
+    double t0 = GetTime();
+    const int global_ok = FmAllRanksOk(local_ok);
+    stats->t_rank_sync += GetTime() - t0;
+    return global_ok;
+}
+
 static double FmReduceMax(double local) {
     double result = 0.0;
     MPI_Reduce(&local, &result, 1, MPI_DOUBLE, MPI_MAX, 0,
                MPI_COMM_WORLD);
     return result;
 }
+
+struct FmOutputStageCosts {
+    double stage44;
+    double stage45_header;
+    double stage45_malloc;
+    double stage46;
+};
 
 static int FmAllocateBlockSet(FmBlockSet *set, int n) {
     memset(set, 0, sizeof(*set));
@@ -376,6 +391,7 @@ static int FmCompressPlans(
         const std::vector<uint32_t> &bam_lens,
         int compress_level, MemWriter *writer,
         int rank, MpiFixmateStats *stats) {
+    double workspace_t0 = GetTime();
     FmBlockSet un_a = {};
     FmBlockSet un_b = {};
     FmBlockSet out_a = {};
@@ -388,8 +404,10 @@ static int FmCompressPlans(
         FmFreeBlockSet(&un_b);
         FmFreeBlockSet(&out_a);
         FmFreeBlockSet(&out_b);
+        stats->t_compress_setup += GetTime() - workspace_t0;
         return -1;
     }
+    stats->t_compress_setup += GetTime() - workspace_t0;
 
     double pack_t0 = GetTime();
     std::vector<FmPackPlan> plans;
@@ -424,12 +442,14 @@ static int FmCompressPlans(
     }
     stats->t_pack += GetTime() - pack_t0;
 
+    double setup_t0 = GetTime();
     Comp_Para comp_a[kFixmateNB];
     Comp_Para comp_b[kFixmateNB];
     for (int i = 0; i < kFixmateNB; ++i) {
         FmInitEmptyComp(comp_a + i, i);
         FmInitEmptyComp(comp_b + i, i);
     }
+    stats->t_compress_setup += GetTime() - setup_t0;
     Comp_Para *active = comp_a;
     Comp_Para *pending = comp_b;
     FmBlockSet *active_un = &un_a;
@@ -476,10 +496,12 @@ static int FmCompressPlans(
                              active, 1);
         if (flush_pending() != 0) {
             athread_join();
+            double free_t0 = GetTime();
             FmFreeBlockSet(&un_a);
             FmFreeBlockSet(&un_b);
             FmFreeBlockSet(&out_a);
             FmFreeBlockSet(&out_b);
+            stats->t_workspace_free += GetTime() - free_t0;
             return -1;
         }
         athread_join();
@@ -490,10 +512,12 @@ static int FmCompressPlans(
                         "[rank %d] ERROR: fixmate compression failed "
                         "at block %d status=%d.\n",
                         rank, i, active[i].status);
+                double free_t0 = GetTime();
                 FmFreeBlockSet(&un_a);
                 FmFreeBlockSet(&un_b);
                 FmFreeBlockSet(&out_a);
                 FmFreeBlockSet(&out_b);
+                stats->t_workspace_free += GetTime() - free_t0;
                 return -1;
             }
         }
@@ -504,10 +528,12 @@ static int FmCompressPlans(
         plan_pos += active_count;
     }
     const int result = flush_pending();
+    double free_t0 = GetTime();
     FmFreeBlockSet(&un_a);
     FmFreeBlockSet(&un_b);
     FmFreeBlockSet(&out_a);
     FmFreeBlockSet(&out_b);
+    stats->t_workspace_free += GetTime() - free_t0;
     return result;
 }
 
@@ -517,7 +543,11 @@ static int FmProcessGroups(
         int compress_level, MemWriter *writer,
         int rank, MpiFixmateStats *stats) {
     if (records.empty()) return 0;
+    double alloc_t0 = GetTime();
     std::vector<MpiFixmateRecordPlanShared> plans(records.size());
+    stats->t_process_alloc += GetTime() - alloc_t0;
+
+    double setup_t0 = GetTime();
     MpiFixmatePlanPara plan_paras[kFixmateNB];
     for (int c = 0; c < kFixmateNB; ++c) {
         memset(plan_paras + c, 0, sizeof(plan_paras[c]));
@@ -530,6 +560,8 @@ static int FmProcessGroups(
             (int)((long long)groups.size() * (c + 1) / kFixmateNB);
         plan_paras[c].status = 0;
     }
+    stats->t_process_setup += GetTime() - setup_t0;
+
     double t0 = GetTime();
     __real_athread_spawn((void *)slave_mpi_fixmate_plan,
                          plan_paras, 1);
@@ -557,6 +589,7 @@ static int FmProcessGroups(
     }
     stats->group_count += (long long)groups.size();
 
+    double output_index_t0 = GetTime();
     std::vector<uint64_t> offsets(records.size() + 1, 0);
     for (size_t i = 0; i < records.size(); ++i) {
         if (plans[i].output_data_len >
@@ -566,12 +599,16 @@ static int FmProcessGroups(
         offsets[i + 1] =
             offsets[i] + plans[i].output_data_len;
     }
+    stats->t_output_index += GetTime() - output_index_t0;
+
     if (offsets.back() > SIZE_MAX) return -1;
+    alloc_t0 = GetTime();
     unsigned char *output_data = aligned_alloc_custom(
         64, offsets.back() ? (size_t)offsets.back() : 1);
     bam1_t *output_records =
         (bam1_t *)aligned_alloc_custom(
             64, records.size() * sizeof(bam1_t));
+    stats->t_process_alloc += GetTime() - alloc_t0;
     if (!output_data || !output_records) {
         if (output_data) aligned_free_custom(output_data);
         if (output_records) {
@@ -581,6 +618,7 @@ static int FmProcessGroups(
         return -1;
     }
 
+    setup_t0 = GetTime();
     MpiFixmateRewritePara rewrite[kFixmateNB];
     for (int c = 0; c < kFixmateNB; ++c) {
         memset(rewrite + c, 0, sizeof(rewrite[c]));
@@ -596,6 +634,8 @@ static int FmProcessGroups(
             (int)((long long)records.size() * (c + 1) / kFixmateNB);
         rewrite[c].status = 0;
     }
+    stats->t_process_setup += GetTime() - setup_t0;
+
     t0 = GetTime();
     __real_athread_spawn((void *)slave_mpi_fixmate_rewrite,
                          rewrite, 1);
@@ -608,13 +648,16 @@ static int FmProcessGroups(
                     "status=%d record=%d.\n",
                     rank, rewrite[c].status,
                     rewrite[c].record_index);
+            double free_t0 = GetTime();
             aligned_free_custom(output_data);
             aligned_free_custom(
                 (unsigned char *)output_records);
+            stats->t_workspace_free += GetTime() - free_t0;
             return -1;
         }
     }
 
+    output_index_t0 = GetTime();
     std::vector<bam1_t *> output_ptrs(records.size());
     std::vector<uint32_t> bam_lens(records.size());
     for (size_t i = 0; i < records.size(); ++i) {
@@ -623,18 +666,24 @@ static int FmProcessGroups(
             (uint64_t)output_records[i].l_data -
             output_records[i].core.l_extranul + 32;
         if (length > UINT32_MAX) {
+            double free_t0 = GetTime();
             aligned_free_custom(output_data);
             aligned_free_custom(
                 (unsigned char *)output_records);
+            stats->t_workspace_free += GetTime() - free_t0;
             return -1;
         }
         bam_lens[i] = (uint32_t)length;
     }
+    stats->t_output_index += GetTime() - output_index_t0;
+
     const int ret = FmCompressPlans(
         output_ptrs, bam_lens, compress_level,
         writer, rank, stats);
+    double free_t0 = GetTime();
     aligned_free_custom(output_data);
     aligned_free_custom((unsigned char *)output_records);
+    stats->t_workspace_free += GetTime() - free_t0;
     return ret;
 }
 
@@ -642,15 +691,20 @@ static int FmProcessStoredGroup(
         FmStoredGroup *group, int compress_level,
         MemWriter *writer, int rank,
         MpiFixmateStats *stats) {
+    double setup_t0 = GetTime();
     std::vector<bam1_t> records;
     std::vector<bam1_t *> ptrs;
-    if (FmBuildStoredViews(group, &records, &ptrs) != 0) return -1;
+    if (FmBuildStoredViews(group, &records, &ptrs) != 0) {
+        stats->t_process_setup += GetTime() - setup_t0;
+        return -1;
+    }
     MpiFixmateGroupShared descriptor;
     descriptor.begin = 0;
     descriptor.count = (int)ptrs.size();
     std::vector<MpiFixmateGroupShared> groups(1, descriptor);
+    stats->t_process_setup += GetTime() - setup_t0;
     return FmProcessGroups(
-        ptrs, groups, compress_level, writer, rank, stats);
+        std::move(ptrs), groups, compress_level, writer, rank, stats);
 }
 
 static int FmProcessDirectRange(
@@ -660,6 +714,7 @@ static int FmProcessDirectRange(
         int compress_level, MemWriter *writer,
         int rank, MpiFixmateStats *stats) {
     if (range_begin >= range_end) return 0;
+    double setup_t0 = GetTime();
     const size_t record_begin = ranges[range_begin].first;
     const size_t record_end = ranges[range_end - 1].second;
     std::vector<bam1_t *> records(
@@ -675,8 +730,9 @@ static int FmProcessDirectRange(
             (int)(ranges[i].second - ranges[i].first);
         groups.push_back(group);
     }
+    stats->t_process_setup += GetTime() - setup_t0;
     return FmProcessGroups(
-        records, groups, compress_level, writer, rank, stats);
+        std::move(records), groups, compress_level, writer, rank, stats);
 }
 
 static void FmBuildRanges(
@@ -736,6 +792,7 @@ static int FmStreamLocalGroups(
         athread_join();
         stats->t_decompress += GetTime() - t0;
 
+        double collect_t0 = GetTime();
         std::vector<bam1_t *> records;
         for (int b = 0; b < n_blocks; ++b) {
             if (decomp[b].status != 0) {
@@ -756,6 +813,7 @@ static int FmStreamLocalGroups(
                 decomp[b].output_records +
                     decomp[b].n_total_records);
         }
+        stats->t_record_collect += GetTime() - collect_t0;
 
         t0 = GetTime();
         size_t cursor = 0;
@@ -998,10 +1056,19 @@ static int FmPrependAppend(
     return 0;
 }
 
+static void FmPrintStats(
+        const MpiFixmateStats &stats, int rank, int comm_size);
+
 static int FmGatherOutput(
         const MemWriter &local_writer, sam_hdr_t *header,
         int compress_level, const std::string &output_path,
-        int rank, int comm_size, MpiFixmateStats *stats) {
+        int rank, int comm_size, MpiFixmateStats *stats,
+        FmOutputStageCosts *costs,
+        double stage41_cost, double stage42_cost,
+        double stage43_cost, double body_total_t0) {
+    memset(costs, 0, sizeof(*costs));
+
+    double stage44_t0 = GetTime();
     long long local_size = (long long)local_writer.size;
     std::vector<long long> sizes((size_t)comm_size, 0);
     MPI_Allgather(&local_size, 1, MPI_LONG_LONG,
@@ -1017,12 +1084,19 @@ static int FmGatherOutput(
         }
         total_body += sizes[(size_t)i];
     }
+    costs->stage44 = FmReduceMax(GetTime() - stage44_t0);
+    if (rank == 0) {
+        printf("Complete the 4.4 gather body sizes cost %lf\n",
+               costs->stage44);
+    }
 
     char *header_memory = nullptr;
     size_t header_size = 0;
     char *output_memory = nullptr;
     size_t output_size = 0;
     int local_ok = 1;
+
+    double stage45_header_t0 = GetTime();
     if (rank == 0) {
         if (sam_hdr_add_pg(header, "RabbitBAM-MPI",
                            "PN", "RabbitBAM-MPI",
@@ -1045,10 +1119,114 @@ static int FmGatherOutput(
         if (local_ok && final_size > SIZE_MAX) local_ok = 0;
         if (local_ok) {
             output_size = (size_t)final_size;
-            output_memory =
-                output_size ? (char *)malloc(output_size) : nullptr;
-            if (output_size && !output_memory) local_ok = 0;
         }
+    }
+    costs->stage45_header =
+        FmReduceMax(GetTime() - stage45_header_t0);
+    if (rank == 0 && local_ok) {
+        printf("Complete the 4.5a header/layout cost %lf\n",
+               costs->stage45_header);
+    }
+    if (!FmAllRanksOk(local_ok)) {
+        free(header_memory);
+        return -1;
+    }
+
+    double stage45_malloc_t0 = GetTime();
+    const size_t simulated_write_size =
+        local_writer.size +
+        (rank == 0 ? header_size + sizeof(kFixmateBgzfEofBlock) : 0);
+    char *simulated_write_mem =
+        simulated_write_size ? (char *)malloc(simulated_write_size)
+                             : nullptr;
+    if (simulated_write_size && !simulated_write_mem) {
+        local_ok = 0;
+    }
+    costs->stage45_malloc =
+        FmReduceMax(GetTime() - stage45_malloc_t0);
+    if (rank == 0 && local_ok) {
+        printf("Complete the 4.5b malloc simulated write memory cost %lf\n",
+               costs->stage45_malloc);
+    }
+    if (!FmAllRanksOk(local_ok)) {
+        free(header_memory);
+        free(simulated_write_mem);
+        return -1;
+    }
+
+    double stage46_t0 = GetTime();
+    volatile unsigned long long simulated_guard = 0;
+    size_t simulated_pos = 0;
+    if (rank == 0 && header_size > 0) {
+        memcpy(simulated_write_mem + simulated_pos,
+               header_memory, header_size);
+        simulated_pos += header_size;
+    }
+    if (local_writer.size > 0) {
+        memcpy(simulated_write_mem + simulated_pos,
+               local_writer.data, local_writer.size);
+        simulated_pos += local_writer.size;
+    }
+    if (rank == 0) {
+        memcpy(simulated_write_mem + simulated_pos,
+               kFixmateBgzfEofBlock,
+               sizeof(kFixmateBgzfEofBlock));
+        simulated_pos += sizeof(kFixmateBgzfEofBlock);
+    }
+    if (simulated_write_size > 0) {
+        simulated_guard +=
+            (unsigned char)simulated_write_mem[0];
+        simulated_guard +=
+            (unsigned char)simulated_write_mem[simulated_write_size - 1];
+    }
+    (void)simulated_guard;
+    costs->stage46 = FmReduceMax(GetTime() - stage46_t0);
+    if (rank == 0) {
+        printf("Complete the 4.6 simulated header/body distributed write cost %lf\n",
+               costs->stage46);
+    }
+    free(simulated_write_mem);
+
+    if (rank == 0) {
+        const double core_total =
+            stage41_cost + stage42_cost + stage43_cost +
+            costs->stage44 + costs->stage45_header +
+            costs->stage46;
+        printf("Complete the total (4.1~4.6) cost %lf-----\n",
+               core_total);
+    }
+
+    {
+        double stage47_t0 = GetTime();
+        FmPrintStats(*stats, rank, comm_size);
+        const double stage47_cost =
+            FmReduceMax(GetTime() - stage47_t0);
+        if (rank == 0 && local_ok) {
+            printf("Complete the 4.7 rank stats reduce/print cost %lf\n",
+                   stage47_cost);
+        }
+    }
+
+    {
+        const double body_total_cost =
+            FmReduceMax(GetTime() - body_total_t0);
+        if (rank == 0 && local_ok) {
+            printf("444Complete the total body cost %lf\n",
+                   body_total_cost);
+        }
+    }
+
+    double verify_alloc_t0 = GetTime();
+    if (rank == 0) {
+        output_memory =
+            output_size ? (char *)malloc(output_size) : nullptr;
+        if (output_size && !output_memory) local_ok = 0;
+    }
+    double verify_alloc_cost =
+        FmReduceMax(GetTime() - verify_alloc_t0);
+    if (rank == 0 && local_ok) {
+        printf("555Prepare verification output memory cost %lf--\n",
+               verify_alloc_cost);
     }
     if (!FmAllRanksOk(local_ok)) {
         free(header_memory);
@@ -1056,7 +1234,7 @@ static int FmGatherOutput(
         return -1;
     }
 
-    double t0 = GetTime();
+    double gather_t0 = GetTime();
     if (rank == 0) {
         memcpy(output_memory, header_memory, header_size);
         if (local_writer.size) {
@@ -1093,7 +1271,11 @@ static int FmGatherOutput(
             sent += (unsigned long long)chunk;
         }
     }
-    stats->t_write += GetTime() - t0;
+    const double gather_cost = FmReduceMax(GetTime() - gather_t0);
+    if (rank == 0 && local_ok) {
+        printf("555Gather verification output memory cost %lf--\n",
+               gather_cost);
+    }
 
     double dump_t0 = GetTime();
     if (rank == 0 &&
@@ -1114,6 +1296,24 @@ static int FmGatherOutput(
     return FmAllRanksOk(local_ok) ? 0 : -1;
 }
 
+static double FmAccountedFusedTime(const MpiFixmateStats &stats) {
+    return stats.t_read +
+           stats.t_decompress +
+           stats.t_record_collect +
+           stats.t_group_scan +
+           stats.t_process_setup +
+           stats.t_process_alloc +
+           stats.t_plan +
+           stats.t_output_index +
+           stats.t_boundary_exchange +
+           stats.t_rewrite +
+           stats.t_pack +
+           stats.t_compress_setup +
+           stats.t_compress +
+           stats.t_rank_sync +
+           stats.t_workspace_free;
+}
+
 static void FmPrintStats(
         const MpiFixmateStats &stats, int rank, int comm_size) {
     const int count = 13;
@@ -1132,25 +1332,90 @@ static void FmPrintStats(
         stats.ms_updates,
         stats.bgzf_blocks
     };
+    const double accounted = FmAccountedFusedTime(stats);
+    const double unaccounted = stats.t_fused_total - accounted;
+
+    const int kLineBytes = 8192;
+    char local_lines[kLineBytes];
+    memset(local_lines, 0, sizeof(local_lines));
+    int used = snprintf(
+        local_lines, sizeof(local_lines),
+        "[rank %d] fixmate_stats blocks=%lld groups=%lld "
+        "records=%lld paired=%lld singleton=%lld "
+        "secondary=%lld supplementary=%lld boundary_groups=%lld "
+        "boundary_bytes=%lld MQ=%lld MC=%lld ms=%lld bgzf=%lld\n",
+        rank, stats.input_blocks, stats.group_count,
+        stats.total_records, stats.paired_groups,
+        stats.singleton_groups, stats.secondary_records,
+        stats.supplementary_records, stats.boundary_groups,
+        stats.boundary_bytes, stats.mq_updates,
+        stats.mc_updates, stats.ms_updates,
+        stats.bgzf_blocks);
+    if (used < 0) used = 0;
+    if (used >= kLineBytes) used = kLineBytes - 1;
+    snprintf(
+        local_lines + used, (size_t)(kLineBytes - used),
+        "[rank %d] fixmate_timing read=%.6f decompress=%.6f "
+        "record_collect=%.6f group_scan=%.6f "
+        "process_setup=%.6f process_alloc=%.6f plan=%.6f "
+        "output_index=%.6f boundary=%.6f rewrite=%.6f "
+        "pack=%.6f compress_setup=%.6f compress=%.6f "
+        "write=%.6f rank_sync=%.6f workspace_free=%.6f "
+        "accounted=%.6f unaccounted=%.6f fused=%.6f\n",
+        rank, stats.t_read, stats.t_decompress,
+        stats.t_record_collect, stats.t_group_scan,
+        stats.t_process_setup, stats.t_process_alloc,
+        stats.t_plan, stats.t_output_index,
+        stats.t_boundary_exchange, stats.t_rewrite,
+        stats.t_pack, stats.t_compress_setup,
+        stats.t_compress, stats.t_write,
+        stats.t_rank_sync, stats.t_workspace_free,
+        accounted, unaccounted, stats.t_fused_total);
+
+    std::vector<char> gathered_lines;
+    if (rank == 0) {
+        gathered_lines.resize((size_t)comm_size * kLineBytes);
+    }
+    MPI_Gather(local_lines, kLineBytes, MPI_CHAR,
+               rank == 0 ? gathered_lines.data() : nullptr,
+               kLineBytes, MPI_CHAR, 0, MPI_COMM_WORLD);
+
     long long sums[count] = {};
     MPI_Reduce(local, sums, count, MPI_LONG_LONG,
                MPI_SUM, 0, MPI_COMM_WORLD);
-    double times[10] = {
+    const int time_count = 19;
+    double times[time_count] = {
         stats.t_read,
         stats.t_decompress,
+        stats.t_record_collect,
         stats.t_group_scan,
+        stats.t_process_setup,
+        stats.t_process_alloc,
         stats.t_plan,
+        stats.t_output_index,
         stats.t_boundary_exchange,
         stats.t_rewrite,
         stats.t_pack,
+        stats.t_compress_setup,
         stats.t_compress,
         stats.t_write,
+        stats.t_rank_sync,
+        stats.t_workspace_free,
+        accounted,
+        unaccounted,
         stats.t_fused_total
     };
-    double time_sums[10] = {};
-    MPI_Reduce(times, time_sums, 10, MPI_DOUBLE,
+    double time_sums[time_count] = {};
+    double time_max[time_count] = {};
+    MPI_Reduce(times, time_sums, time_count, MPI_DOUBLE,
                MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(times, time_max, time_count, MPI_DOUBLE,
+               MPI_MAX, 0, MPI_COMM_WORLD);
     if (rank == 0) {
+        for (int r = 0; r < comm_size; ++r) {
+            fputs(gathered_lines.data() + (size_t)r * kLineBytes,
+                  stdout);
+        }
         printf("FusedFixmateMPI finished. ranks=%d blocks=%lld "
                "records=%lld groups=%lld paired=%lld singleton=%lld\n",
                comm_size, sums[0], sums[2], sums[1],
@@ -1162,13 +1427,36 @@ static void FmPrintStats(
                "bgzf_blocks=%lld\n",
                sums[9], sums[10], sums[11], sums[12]);
         printf("  timing_sum read=%.3f decompress=%.3f "
-               "group_scan=%.3f plan=%.3f boundary=%.3f "
-               "rewrite=%.3f pack=%.3f compress=%.3f "
-               "write=%.3f fused=%.3f\n",
+               "record_collect=%.3f group_scan=%.3f "
+               "process_setup=%.3f process_alloc=%.3f "
+               "plan=%.3f output_index=%.3f boundary=%.3f "
+               "rewrite=%.3f pack=%.3f compress_setup=%.3f "
+               "compress=%.3f write=%.3f rank_sync=%.3f "
+               "workspace_free=%.3f accounted=%.3f "
+               "unaccounted=%.3f fused=%.3f\n",
                time_sums[0], time_sums[1], time_sums[2],
                time_sums[3], time_sums[4], time_sums[5],
                time_sums[6], time_sums[7], time_sums[8],
-               time_sums[9]);
+               time_sums[9], time_sums[10], time_sums[11],
+               time_sums[12], time_sums[13], time_sums[14],
+               time_sums[15], time_sums[16], time_sums[17],
+               time_sums[18]);
+        printf("  timing_max read=%.3f decompress=%.3f "
+               "record_collect=%.3f group_scan=%.3f "
+               "process_setup=%.3f process_alloc=%.3f "
+               "plan=%.3f output_index=%.3f boundary=%.3f "
+               "rewrite=%.3f pack=%.3f compress_setup=%.3f "
+               "compress=%.3f write=%.3f rank_sync=%.3f "
+               "workspace_free=%.3f accounted=%.3f "
+               "unaccounted=%.3f fused=%.3f\n",
+               time_max[0], time_max[1], time_max[2],
+               time_max[3], time_max[4], time_max[5],
+               time_max[6], time_max[7], time_max[8],
+               time_max[9], time_max[10], time_max[11],
+               time_max[12], time_max[13], time_max[14],
+               time_max[15], time_max[16], time_max[17],
+               time_max[18]);
+        fflush(stdout);
     }
 }
 
@@ -1205,6 +1493,11 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
     int single_group = 0;
     int continues_previous = 0;
     MpiFixmateStats stats = {};
+    FmOutputStageCosts output_stage_costs = {};
+    double stage41_cost = 0.0;
+    double stage42_cost = 0.0;
+    double stage43_cost = 0.0;
+    double body_total_t0 = 0.0;
 
     if (!cmd_info->fixmate_mate_score_) {
         if (rank == 0) {
@@ -1286,6 +1579,7 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
     }
     if (!FmAllRanksOk(local_ok)) goto cleanup;
 
+    body_total_t0 = GetTime();
     {
         double t0 = GetTime();
         if (rank == 0) {
@@ -1325,49 +1619,67 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
                 &rank_input, &rank_input_size) != 0) {
             local_ok = 0;
         }
-        const double cost = FmReduceMax(GetTime() - t0);
+        stage41_cost = FmReduceMax(GetTime() - t0);
         if (rank == 0 && local_ok) {
             printf("MPI BAM scan complete. data_blocks=%lld "
                    "body_start=%lld\n", n_blocks, body_start);
             printf("Complete the 4.1 scan/split/broadcast/select cost %lf\n",
-                   cost);
+                   stage41_cost);
         }
     }
     if (!FmAllRanksOk(local_ok)) goto cleanup;
 
-    reader.base = rank_input;
-    reader.size = rank_input_size;
-    reader.pos = 0;
-    if (MpiCommonInitMemWriter(
-            middle, rank_input_size ?
-                rank_input_size : 1024 * 1024) != 0 ||
-        MpiCommonInitMemWriter(prefix, 1024 * 1024) != 0 ||
-        MpiCommonInitMemWriter(suffix, 1024 * 1024) != 0) {
-        local_ok = 0;
+    {
+        double t0 = GetTime();
+        reader.base = rank_input;
+        reader.size = rank_input_size;
+        reader.pos = 0;
+        if (MpiCommonInitMemWriter(
+                middle, rank_input_size ?
+                    rank_input_size : 1024 * 1024) != 0 ||
+            MpiCommonInitMemWriter(prefix, 1024 * 1024) != 0 ||
+            MpiCommonInitMemWriter(suffix, 1024 * 1024) != 0) {
+            local_ok = 0;
+        }
+        stage42_cost = FmReduceMax(GetTime() - t0);
+        if (rank == 0 && local_ok) {
+            printf("Complete the 4.2 init reader/writer cost %lf\n",
+                   stage42_cost);
+        }
     }
     if (!FmAllRanksOk(local_ok)) goto cleanup;
 
+    //4.3 核心计算部分
+    /* 先流式处理 rank 内部完整 QNAME group，
+    再交换 rank 边界上的 leading/trailing group，
+    判断当前 leading 是否属于前一个 rank，
+    最后只由 group 的负责 rank 处理边界 group，
+    并把 prefix/middle/suffix 按顺序拼成当前 rank 输出。*/
     {
         double fused_t0 = GetTime();
+        // 1. FmStreamLocalGroups：先处理本 rank 内部完整 group
         if (FmStreamLocalGroups(
                 reader, cmd_info->compress_level_,
                 &middle, &leading, &trailing,
                 &single_group, rank, &stats) != 0) {
             local_ok = 0;
         }
-        if (!FmAllRanksOk(local_ok)) goto cleanup;
+        if (!FmAllRanksOkTimed(local_ok, &stats)) goto cleanup;
 
+        // 2. FmExchangeBoundaryGroups：跨 rank 交换 leading / trailing
         if (FmExchangeBoundaryGroups(
                 &leading, &trailing, single_group,
                 rank, comm_size, &continues_previous,
                 &stats) != 0) {
             local_ok = 0;
         }
-        if (!FmAllRanksOk(local_ok)) goto cleanup;
+        if (!FmAllRanksOkTimed(local_ok, &stats)) goto cleanup;
 
+        // 3. 处理 leading / trailing 边界 group
         if (!leading.empty()) {
             if (single_group) {
                 if (!continues_previous &&
+                    // FmProcessStoredGroup：真正对一个 QNAME group 做 fixmate
                     FmProcessStoredGroup(
                         &leading, cmd_info->compress_level_,
                         &prefix, rank, &stats) != 0) {
@@ -1389,24 +1701,26 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
             }
         }
         if (local_ok &&
+            // 4. FmPrependAppend：把 prefix / suffix 拼回 middle
             FmPrependAppend(&middle, prefix, suffix) != 0) {
             local_ok = 0;
         }
+        if (!FmAllRanksOkTimed(local_ok, &stats)) goto cleanup;
         stats.t_fused_total = GetTime() - fused_t0;
-        const double fused_cost =
-            FmReduceMax(stats.t_fused_total);
+        stage43_cost = FmReduceMax(stats.t_fused_total);
         if (rank == 0 && local_ok) {
             printf("Complete the 4.3 FusedFixmateMPI cost %lf\n",
-                   fused_cost);
+                   stage43_cost);
         }
     }
     if (!FmAllRanksOk(local_ok)) goto cleanup;
 
-    FmPrintStats(stats, rank, comm_size);
     if (FmGatherOutput(
             middle, header, cmd_info->compress_level_,
             cmd_info->out_file_name_, rank, comm_size,
-            &stats) != 0) {
+            &stats, &output_stage_costs,
+            stage41_cost, stage42_cost, stage43_cost,
+            body_total_t0) != 0) {
         local_ok = 0;
     }
     if (!FmAllRanksOk(local_ok)) goto cleanup;
