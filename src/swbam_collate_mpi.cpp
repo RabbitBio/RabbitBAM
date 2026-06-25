@@ -102,7 +102,72 @@ struct CollateExtractWorkspace {
 
 struct CollateMemorySegment {
     std::vector<CollateMeta> records;
-    std::vector<unsigned char> raw;
+    unsigned char *raw_data;
+    size_t raw_size;
+    size_t raw_capacity;
+
+    CollateMemorySegment()
+        : raw_data(nullptr), raw_size(0), raw_capacity(0) {}
+
+    ~CollateMemorySegment() {
+        if (raw_data) aligned_free_custom(raw_data);
+    }
+
+    CollateMemorySegment(CollateMemorySegment &&other) noexcept
+        : records(std::move(other.records)),
+          raw_data(other.raw_data),
+          raw_size(other.raw_size),
+          raw_capacity(other.raw_capacity) {
+        other.raw_data = nullptr;
+        other.raw_size = 0;
+        other.raw_capacity = 0;
+    }
+
+    CollateMemorySegment &operator=(
+            CollateMemorySegment &&other) noexcept {
+        if (this != &other) {
+            if (raw_data) aligned_free_custom(raw_data);
+            records = std::move(other.records);
+            raw_data = other.raw_data;
+            raw_size = other.raw_size;
+            raw_capacity = other.raw_capacity;
+            other.raw_data = nullptr;
+            other.raw_size = 0;
+            other.raw_capacity = 0;
+        }
+        return *this;
+    }
+
+    int ReserveRaw(size_t capacity) {
+        if (capacity <= raw_capacity) return 0;
+        unsigned char *next =
+            (unsigned char *)aligned_alloc_custom(
+                64, capacity);
+        if (!next) return -1;
+        if (raw_data) {
+            if (raw_size) {
+                memcpy(next, raw_data, raw_size);
+            }
+            aligned_free_custom(raw_data);
+        }
+        raw_data = next;
+        raw_capacity = capacity;
+        return 0;
+    }
+
+    int ResizeRaw(size_t size) {
+        if (size > raw_capacity &&
+            ReserveRaw(size) != 0) {
+            return -1;
+        }
+        raw_size = size;
+        return 0;
+    }
+
+private:
+    CollateMemorySegment(const CollateMemorySegment &);
+    CollateMemorySegment &operator=(
+        const CollateMemorySegment &);
 };
 
 struct CollateRawArena {
@@ -207,6 +272,97 @@ struct CollateLocalLess {
                    b, raw, raw_size) < 0;
     }
 };
+
+static bool CollateTryBucketSortRecords(
+        std::vector<CollateMeta> *records,
+        const unsigned char *raw, size_t raw_size,
+        int bins) {
+    const size_t n = records->size();
+    if (n < 262144 || bins <= 0 || bins > 4096) {
+        return false;
+    }
+
+    const size_t hash_buckets = 256;
+    const size_t bin_count = (size_t)bins;
+    if (bin_count >
+            std::numeric_limits<size_t>::max() /
+                hash_buckets) {
+        return false;
+    }
+    const size_t bucket_count =
+        bin_count * hash_buckets;
+    if (bucket_count > n / 4) {
+        return false;
+    }
+
+    std::vector<size_t> offsets;
+    try {
+        offsets.assign(bucket_count + 1, 0);
+    } catch (...) {
+        return false;
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        const CollateMeta &meta = (*records)[i];
+        if (meta.bin >= (uint32_t)bins) {
+            return false;
+        }
+        const size_t bucket =
+            (size_t)meta.bin * hash_buckets +
+            (size_t)(meta.hash >> 24);
+        ++offsets[bucket + 1];
+    }
+    for (size_t i = 1; i <= bucket_count; ++i) {
+        offsets[i] += offsets[i - 1];
+    }
+
+    std::vector<size_t> pos;
+    try {
+        pos = offsets;
+    } catch (...) {
+        return false;
+    }
+    CollateMeta *tmp =
+        (CollateMeta *)aligned_alloc_custom(
+            64, n * sizeof(CollateMeta));
+    if (!tmp) return false;
+
+    for (size_t i = 0; i < n; ++i) {
+        const CollateMeta &meta = (*records)[i];
+        const size_t bucket =
+            (size_t)meta.bin * hash_buckets +
+            (size_t)(meta.hash >> 24);
+        tmp[pos[bucket]++] = meta;
+    }
+
+    CollateLocalLess less{raw, raw_size};
+    for (size_t bucket = 0; bucket < bucket_count;
+         ++bucket) {
+        const size_t begin = offsets[bucket];
+        const size_t end = offsets[bucket + 1];
+        if (end > begin + 1) {
+            std::sort(tmp + begin, tmp + end, less);
+        }
+    }
+
+    memcpy(records->data(), tmp, n * sizeof(CollateMeta));
+    aligned_free_custom((unsigned char *)tmp);
+    return true;
+}
+
+static void CollateSortRecords(
+        std::vector<CollateMeta> *records,
+        const unsigned char *raw, size_t raw_size,
+        int bins, MpiCollateStats *stats) {
+    double t0 = GetTime();
+    if (!CollateTryBucketSortRecords(
+            records, raw, raw_size, bins)) {
+        std::sort(
+            records->begin(), records->end(),
+            CollateLocalLess{raw, raw_size});
+    }
+    stats->t_local_sort += GetTime() - t0;
+}
 
 static int CollateAllocateBlockSet(
         CollateBlockSet *set, int count) {
@@ -601,12 +757,38 @@ static int CollateAppendMemoryChunk(
         const unsigned char *raw, size_t raw_size,
         CollateMemorySegment *segment) {
     const uint64_t raw_base =
-        (uint64_t)segment->raw.size();
+        (uint64_t)segment->raw_size;
     try {
         size_t old = segment->records.size();
         segment->records.resize(old + count);
-        segment->raw.insert(
-            segment->raw.end(), raw, raw + raw_size);
+        size_t raw_old = segment->raw_size;
+        if (raw_size >
+            SIZE_MAX - raw_old ||
+            segment->ResizeRaw(raw_old + raw_size) != 0) {
+            return -1;
+        }
+        if (raw_size) {
+            memcpy(segment->raw_data + raw_old,
+                   raw, raw_size);
+        }
+        for (size_t i = 0; i < count; ++i) {
+            segment->records[old + i] = records[i];
+            segment->records[old + i].raw_offset +=
+                raw_base;
+        }
+    } catch (...) {
+        return -1;
+    }
+    return 0;
+}
+
+static int CollateAppendMemoryMetaChunk(
+        const CollateMeta *records, size_t count,
+        uint64_t raw_base,
+        CollateMemorySegment *segment) {
+    try {
+        size_t old = segment->records.size();
+        segment->records.resize(old + count);
         for (size_t i = 0; i < count; ++i) {
             segment->records[old + i] = records[i];
             segment->records[old + i].raw_offset +=
@@ -630,9 +812,14 @@ static int CollateAppendSelfCompactRange(
     try {
         const size_t old = segment->records.size();
         const size_t count = end - begin;
-        const size_t raw_base = segment->raw.size();
+        const size_t raw_base = segment->raw_size;
         segment->records.resize(old + count);
-        segment->raw.resize(raw_base + compact_raw_size);
+        if (compact_raw_size >
+            SIZE_MAX - raw_base ||
+            segment->ResizeRaw(
+                raw_base + compact_raw_size) != 0) {
+            return -1;
+        }
         size_t raw_pos = raw_base;
         for (size_t i = 0; i < count; ++i) {
             const CollateMeta &src = records[begin + i];
@@ -645,7 +832,7 @@ static int CollateAppendSelfCompactRange(
             }
             CollateMeta dst = src;
             dst.raw_offset = raw_pos;
-            memcpy(segment->raw.data() + raw_pos,
+            memcpy(segment->raw_data + raw_pos,
                    raw + src.raw_offset,
                    src.raw_len);
             segment->records[old + i] = dst;
@@ -702,8 +889,6 @@ static int CollateExchangeMemory(
     std::vector<CollateMeta> recv_meta(meta_capacity);
     std::vector<unsigned char> send_raw(
         kCollateExchangeRaw);
-    std::vector<unsigned char> recv_raw(
-        kCollateExchangeRaw);
     segments->clear();
     segments->reserve((size_t)comm_size);
 
@@ -739,20 +924,22 @@ static int CollateExchangeMemory(
                 recv_counts[(size_t)source];
             const unsigned long long raw_bytes =
                 recv_raw_bytes_total[(size_t)source];
-            if (count >
-                    (unsigned long long)
-                        segment->records.max_size() ||
-                (reserve_raw && raw_bytes >
-                    (unsigned long long)
-                        segment->raw.max_size())) {
-                return -1;
-            }
             try {
+                if (count >
+                        (unsigned long long)
+                            segment->records.max_size() ||
+                    raw_bytes >
+                        (unsigned long long)
+                            std::numeric_limits<size_t>::max()) {
+                    return -1;
+                }
                 segment->records.reserve(
                     (size_t)count);
                 if (reserve_raw) {
-                    segment->raw.reserve(
-                        (size_t)raw_bytes);
+                    if (segment->ReserveRaw(
+                            (size_t)raw_bytes) != 0) {
+                        return -1;
+                    }
                 }
             } catch (...) {
                 return -1;
@@ -798,7 +985,9 @@ static int CollateExchangeMemory(
                         records, send_pos, send_end,
                         meta_capacity, send_raw.size(),
                         &send_raw_bytes);
-                    if (chunk_end == send_pos) return -1;
+                    if (chunk_end == send_pos) {
+                        return -1;
+                    }
                     double pack_t0 = GetTime();
                     int pack_ret = CollatePackRange(
                         records, raw, raw_size, send_pos,
@@ -838,8 +1027,15 @@ static int CollateExchangeMemory(
                     (size_t)recv_header[0];
                 size_t recv_raw_bytes =
                     (size_t)recv_header[1];
+                size_t recv_raw_base =
+                    segment.raw_size;
                 if (recv_count > meta_capacity ||
-                    recv_raw_bytes > recv_raw.size() ||
+                    recv_raw_bytes > kCollateExchangeRaw ||
+                    recv_raw_bytes >
+                        segment.raw_capacity -
+                            recv_raw_base ||
+                    (recv_count == 0 &&
+                     recv_raw_bytes != 0) ||
                     CollateSendRecvBytes(
                         send_to,
                         (const char *)send_meta.data(),
@@ -854,7 +1050,10 @@ static int CollateExchangeMemory(
                         send_to,
                         (const char *)send_raw.data(),
                         send_raw_bytes, recv_from,
-                        (char *)recv_raw.data(),
+                        (char *)(recv_raw_bytes
+                            ? segment.raw_data +
+                                  recv_raw_base
+                            : nullptr),
                         recv_raw_bytes,
                         kCollateTagRaw) != 0) {
                     return -1;
@@ -862,9 +1061,11 @@ static int CollateExchangeMemory(
                 stats->t_mpi += GetTime() - mpi_t0;
                 if (recv_count > 0) {
                     double append_t0 = GetTime();
-                    int append_ret = CollateAppendMemoryChunk(
+                    segment.raw_size =
+                        recv_raw_base + recv_raw_bytes;
+                    int append_ret = CollateAppendMemoryMetaChunk(
                         recv_meta.data(), recv_count,
-                        recv_raw.data(), recv_raw_bytes,
+                        (uint64_t)recv_raw_base,
                         &segment);
                     stats->t_exchange_recv_append +=
                         GetTime() - append_t0;
@@ -888,6 +1089,25 @@ static int CollateExchangeMemory(
 struct CollateMemoryCursor {
     const CollateMemorySegment *segment;
     size_t pos;
+    const CollateMeta *meta;
+    const unsigned char *raw;
+    size_t raw_size;
+
+    CollateMemoryCursor()
+        : segment(nullptr), pos(0), meta(nullptr),
+          raw(nullptr), raw_size(0) {}
+
+    void Refresh() {
+        if (!segment || pos >= segment->records.size()) {
+            meta = nullptr;
+            raw = nullptr;
+            raw_size = 0;
+            return;
+        }
+        meta = &segment->records[pos];
+        raw = segment->raw_data + meta->raw_offset;
+        raw_size = segment->raw_size;
+    }
 };
 
 class CollateMemoryLoserTree {
@@ -900,6 +1120,7 @@ public:
                 CollateMemoryCursor cursor;
                 cursor.segment = &(*segments)[i];
                 cursor.pos = 0;
+                cursor.Refresh();
                 cursors_.push_back(cursor);
             }
         }
@@ -923,18 +1144,28 @@ public:
     const CollateMeta &meta(int index) const {
         const CollateMemoryCursor &cursor =
             cursors_[(size_t)index];
-        return cursor.segment->records[cursor.pos];
+        return *cursor.meta;
     }
 
     const unsigned char *raw(int index) const {
         const CollateMemoryCursor &cursor =
             cursors_[(size_t)index];
-        return cursor.segment->raw.data() +
-               meta(index).raw_offset;
+        return cursor.raw;
+    }
+
+    void current(int index, const CollateMeta **meta,
+                 const unsigned char **raw) const {
+        const CollateMemoryCursor &cursor =
+            cursors_[(size_t)index];
+        *meta = cursor.meta;
+        *raw = cursor.raw;
     }
 
     void advance(int index) {
-        ++cursors_[(size_t)index].pos;
+        CollateMemoryCursor &cursor =
+            cursors_[(size_t)index];
+        ++cursor.pos;
+        cursor.Refresh();
         size_t node = base_ + (size_t)index;
         tree_[node] = Active(index) ? index : -1;
         while ((node >>= 1) > 0) {
@@ -947,9 +1178,7 @@ public:
 private:
     bool Active(int index) const {
         return index >= 0 &&
-               cursors_[(size_t)index].pos <
-                   cursors_[(size_t)index]
-                       .segment->records.size();
+               cursors_[(size_t)index].meta != nullptr;
     }
 
     bool Less(int lhs, int rhs) const {
@@ -960,12 +1189,8 @@ private:
         const CollateMemoryCursor &b =
             cursors_[(size_t)rhs];
         return CollateCompare(
-                   a.segment->records[a.pos],
-                   a.segment->raw.data(),
-                   a.segment->raw.size(),
-                   b.segment->records[b.pos],
-                   b.segment->raw.data(),
-                   b.segment->raw.size()) < 0;
+                   *a.meta, a.raw, a.raw_size,
+                   *b.meta, b.raw, b.raw_size) < 0;
     }
 
     int Winner(int lhs, int rhs) const {
@@ -989,6 +1214,13 @@ static void CollateInitCompressPara(
     para->status = -1;
     para->compress_level = 1;
 }
+
+static void CollateCountGroup(
+        const CollateMeta &meta,
+        const unsigned char *raw,
+        std::string *previous,
+        uint32_t *previous_hash,
+        MpiCollateStats *stats);
 
 static int CollateCompressStream(
         const std::function<int(
@@ -1242,6 +1474,189 @@ static int CollateCompressStream(
     return result;
 }
 
+static int CollateFillMemoryPayload(
+        CollateMemoryLoserTree *tree,
+        std::string *previous,
+        uint32_t *previous_hash,
+        CollateBlockSet *payload,
+        CollateBlockSet *output,
+        MpiSortRawCompressPara *paras,
+        int compress_level,
+        MpiCollateStats *stats,
+        int *active_count) {
+    int count = 0;
+    while (count < kCollateCpes) {
+        bam_block *block = &payload->blocks[count];
+        block->pos = 0;
+        block->length = 0;
+        while (true) {
+            int winner = tree->winner();
+            if (winner < 0) break;
+
+            const CollateMeta *meta = nullptr;
+            const unsigned char *record = nullptr;
+            tree->current(winner, &meta, &record);
+            if (!meta || !record ||
+                meta->raw_len > BGZF_BLOCK_SIZE) {
+                return -1;
+            }
+            if (block->pos > 0 &&
+                block->pos + meta->raw_len >
+                    BGZF_BLOCK_SIZE) {
+                break;
+            }
+
+            CollateCountGroup(
+                *meta, record, previous,
+                previous_hash, stats);
+            memcpy(block->data + block->pos,
+                   record, meta->raw_len);
+            block->pos += meta->raw_len;
+            block->length = block->pos;
+            tree->advance(winner);
+        }
+        if (block->pos == 0) break;
+        memset(&paras[count], 0,
+               sizeof(paras[count]));
+        paras[count].block_id = count;
+        paras[count].un_comp_block = block;
+        paras[count].un_comp_size = (int)block->pos;
+        paras[count].output_block =
+            &output->blocks[count];
+        paras[count].compress_level = compress_level;
+        paras[count].status = 0;
+        ++count;
+    }
+    for (int i = count; i < kCollateCpes; ++i) {
+        CollateInitCompressPara(&paras[i], i);
+    }
+    *active_count = count;
+    return 0;
+}
+
+static int CollateCompressMemoryStream(
+        CollateMemoryLoserTree *tree,
+        std::string *previous,
+        uint32_t *previous_hash,
+        int compress_level, MemWriter *writer,
+        MpiCollateStats *stats) {
+    CollateBlockSet payload_a, payload_b;
+    CollateBlockSet output_a, output_b;
+    if (CollateAllocateBlockSet(
+            &payload_a, kCollateCpes) != 0 ||
+        CollateAllocateBlockSet(
+            &payload_b, kCollateCpes) != 0 ||
+        CollateAllocateBlockSet(
+            &output_a, kCollateCpes) != 0 ||
+        CollateAllocateBlockSet(
+            &output_b, kCollateCpes) != 0) {
+        CollateFreeBlockSet(&payload_a);
+        CollateFreeBlockSet(&payload_b);
+        CollateFreeBlockSet(&output_a);
+        CollateFreeBlockSet(&output_b);
+        return -1;
+    }
+
+    MpiSortRawCompressPara paras_a[kCollateCpes];
+    MpiSortRawCompressPara paras_b[kCollateCpes];
+    for (int i = 0; i < kCollateCpes; ++i) {
+        CollateInitCompressPara(&paras_a[i], i);
+        CollateInitCompressPara(&paras_b[i], i);
+    }
+
+    CollateBlockSet *payload_active = &payload_a;
+    CollateBlockSet *payload_pending = &payload_b;
+    CollateBlockSet *output_active = &output_a;
+    CollateBlockSet *output_pending = &output_b;
+    MpiSortRawCompressPara *active = paras_a;
+    MpiSortRawCompressPara *pending = paras_b;
+    int pending_count = 0;
+
+    auto flush_pending = [&]() -> int {
+        double t0 = GetTime();
+        for (int i = 0; i < pending_count; ++i) {
+            if (pending[i].status != 0 ||
+                !pending[i].output_block ||
+                MpiWriteBlockToMem(
+                    *writer,
+                    pending[i].output_block) != 0) {
+                return -1;
+            }
+            ++stats->bgzf_blocks;
+        }
+        stats->t_write += GetTime() - t0;
+        pending_count = 0;
+        return 0;
+    };
+
+    int active_count = 0;
+    {
+        double fill_t0 = GetTime();
+        int fill_ret = CollateFillMemoryPayload(
+            tree, previous, previous_hash,
+            payload_active, output_active,
+            active, compress_level, stats,
+            &active_count);
+        stats->t_compress_fill +=
+            GetTime() - fill_t0;
+        if (fill_ret != 0) {
+            CollateFreeBlockSet(&payload_a);
+            CollateFreeBlockSet(&payload_b);
+            CollateFreeBlockSet(&output_a);
+            CollateFreeBlockSet(&output_b);
+            return -1;
+        }
+    }
+
+    while (active_count > 0) {
+        double t0 = GetTime();
+        __real_athread_spawn(
+            (void *)slave_mpi_sort_compress_payload,
+            active, 1);
+        if (flush_pending() != 0) {
+            athread_join();
+            active_count = -1;
+            break;
+        }
+        int next_count = 0;
+        double fill_t0 = GetTime();
+        int fill_ret = CollateFillMemoryPayload(
+            tree, previous, previous_hash,
+            payload_pending, output_pending,
+            pending, compress_level, stats,
+            &next_count);
+        stats->t_compress_fill +=
+            GetTime() - fill_t0;
+        if (fill_ret != 0) {
+            athread_join();
+            active_count = -1;
+            break;
+        }
+        athread_join();
+        stats->t_compress += GetTime() - t0;
+        for (int i = 0; i < active_count; ++i) {
+            if (active[i].status != 0) {
+                active_count = -1;
+                break;
+            }
+        }
+        if (active_count < 0) break;
+        pending_count = active_count;
+        std::swap(payload_active, payload_pending);
+        std::swap(output_active, output_pending);
+        std::swap(active, pending);
+        active_count = next_count;
+    }
+
+    int result = active_count < 0
+        ? -1 : flush_pending();
+    CollateFreeBlockSet(&payload_a);
+    CollateFreeBlockSet(&payload_b);
+    CollateFreeBlockSet(&output_a);
+    CollateFreeBlockSet(&output_b);
+    return result;
+}
+
 static void CollateCountGroup(
         const CollateMeta &meta,
         const unsigned char *raw,
@@ -1273,24 +1688,10 @@ static int CollateMergeMemory(
     CollateMemoryLoserTree tree(&segments);
     std::string previous;
     uint32_t previous_hash = 0;
-    auto next = [&](const unsigned char **raw,
-                    uint32_t *length) -> int {
-        int winner = tree.winner();
-        if (winner < 0) return 0;
-        const CollateMeta meta = tree.meta(winner);
-        const unsigned char *record =
-            tree.raw(winner);
-        CollateCountGroup(
-            meta, record, &previous,
-            &previous_hash, stats);
-        *raw = record;
-        *length = meta.raw_len;
-        tree.advance(winner);
-        return 1;
-    };
     double t0 = GetTime();
-    int ret = CollateCompressStream(
-        next, compress_level, writer, stats);
+    int ret = CollateCompressMemoryStream(
+        &tree, &previous, &previous_hash,
+        compress_level, writer, stats);
     stats->t_merge += GetTime() - t0;
     return ret;
 }
@@ -2985,11 +3386,8 @@ static int FusedBamMemoryCollateMPI(
     }
 
     // 2. 本地排序
-    double t0 = GetTime();
-    std::sort(
-        records.begin(), records.end(),
-        CollateLocalLess{raw.data, raw.size});
-    stats->t_local_sort += GetTime() - t0;
+    CollateSortRecords(
+        &records, raw.data, raw.size, bins, stats);
 
     // 3. 跨 rank 交换：让相同 QNAME 去同一个 owner rank
     if (CollateExchangeMemory(
@@ -3012,13 +3410,13 @@ static int FusedBamMemoryCollateMPI(
         segment_bytes +=
             segments[i].records.capacity() *
             sizeof(CollateMeta);
-        if (segments[i].raw.capacity() >
+        if (segments[i].raw_capacity >
             SIZE_MAX - segment_bytes) {
             stats->t_memory_track +=
                 GetTime() - memory_track_t0;
             return -1;
         }
-        segment_bytes += segments[i].raw.capacity();
+        segment_bytes += segments[i].raw_capacity;
     }
     size_t tracked =
         records.capacity() * sizeof(CollateMeta);
