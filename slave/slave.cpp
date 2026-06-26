@@ -1319,6 +1319,26 @@ static inline struct libdeflate_decompressor *slave_get_reused_decompressor(
     return z;
 }
 
+extern "C" void slave_mpi_common_release_caches(void *unused) {
+    (void)unused;
+    const int id = _PEN;
+    if (id < 0 || id >= 64) return;
+    if (g_slave_compressors[id]) {
+        libdeflate_free_compressor(g_slave_compressors[id]);
+        g_slave_compressors[id] = nullptr;
+        g_slave_compressor_levels[id] = 0;
+    }
+    if (g_slave_mpi_compressors[id]) {
+        libdeflate_free_compressor(g_slave_mpi_compressors[id]);
+        g_slave_mpi_compressors[id] = nullptr;
+        g_slave_mpi_compressor_levels[id] = 0;
+    }
+    if (g_slave_decompressors[id]) {
+        libdeflate_free_decompressor(g_slave_decompressors[id]);
+        g_slave_decompressors[id] = nullptr;
+    }
+}
+
 int bgzf_uncompress_reuse(uint8_t *dst, size_t *dlen,
                           const uint8_t *src, size_t slen,
                           uint32_t expected_crc,
@@ -1591,7 +1611,7 @@ extern "C" void slave_mpi_decompress_filterfunc(Bam2BamPara paras[64]) {
     struct libdeflate_decompressor *z =
         slave_get_reused_decompressor(id, &para->decomp_alloc_cycles);
     if (!z) {
-        para->status = -2;
+        para->status = -19;
         para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
         return;
     }
@@ -1599,7 +1619,7 @@ extern "C" void slave_mpi_decompress_filterfunc(Bam2BamPara paras[64]) {
     if (block_decode_func_reuse(comp, un_comp, z,
                                 &para->decomp_inflate_cycles,
                                 &para->decomp_crc_cycles) != 0) {
-        para->status = -2;
+        para->status = -20;
         para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
         return;
     }
@@ -1672,7 +1692,7 @@ extern "C" void slave_mpi_decompress_filterfunc(Bam2BamPara paras[64]) {
     }
 
     if (ret < -1) {
-        para->status = -2;
+        para->status = -21;
         para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
         return;
     }
@@ -1757,7 +1777,7 @@ extern "C" void slave_mpi_decompress_bam2bam_passthrough(Bam2BamPara paras[64]) 
     struct libdeflate_decompressor *z =
         slave_get_reused_decompressor(id, &para->decomp_alloc_cycles);
     if (!z) {
-        para->status = -2;
+        para->status = -19;
         para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
         return;
     }
@@ -1765,7 +1785,7 @@ extern "C" void slave_mpi_decompress_bam2bam_passthrough(Bam2BamPara paras[64]) 
     if (block_decode_func_reuse(comp, un_comp, z,
                                 &para->decomp_inflate_cycles,
                                 &para->decomp_crc_cycles) != 0) {
-        para->status = -2;
+        para->status = -20;
         para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
         return;
     }
@@ -1831,7 +1851,7 @@ extern "C" void slave_mpi_decompress_bam2bam_passthrough(Bam2BamPara paras[64]) 
     }
 
     if (ret < -1) {
-        para->status = -2;
+        para->status = -21;
         para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
         return;
     }

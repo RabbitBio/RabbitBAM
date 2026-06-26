@@ -42,6 +42,9 @@ int MpiCommonInitMemWriter(MemWriter &w, size_t cap);
 int MpiCommonBuildBamHeaderMemory(
     sam_hdr_t *hdr, int compress_level,
     char **data, size_t *size);
+int MpiCommonReadBamHeaderFromMemory(
+    const char *data, size_t size,
+    sam_hdr_t **header, long long *body_start);
 int MpiMarkdupFindDuplicatesStreamingHash(
     std::vector<MpiMarkdupCandidateShared> *owner_candidates,
     const std::vector<unsigned char> &owner_qnames,
@@ -3882,6 +3885,529 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
 }
 
 } // namespace
+
+int MpiMarkdupMemoryToMemory(CmdInfo *cmd_info,
+                             const char *input_memory_const,
+                             size_t input_size,
+                             MpiMemoryBam *output_bam,
+                             double *core_cost) {
+    double total_t0 = GetTime();
+    int rank = 0;
+    int comm_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
+
+    int exit_code = 1;
+    int local_ok = 1;
+    char *input_memory = const_cast<char *>(input_memory_const);
+    sam_hdr_t *header = nullptr;
+    long long body_start = 0;
+    std::vector<long long> block_offsets;
+    std::vector<long long> block_lengths;
+    long long n_blocks = 0;
+    long long local_block_begin = 0;
+    long long local_block_end = 0;
+    char *rank_input = nullptr;
+    size_t rank_input_size = 0;
+    MemReader reader = {};
+    MemWriter writer = {};
+    size_t memory_limit = 0;
+    MpiMarkdupStats stats = {};
+    MdOutputMemory output_memory = {};
+    MdOutputStageCosts output_stage_costs = {};
+    double stage41_cost = 0.0;
+    double stage42_cost = 0.0;
+    double stage43_cost = 0.0;
+    double body_total_t0 = 0.0;
+
+    std::vector<MpiMarkdupCandidateShared> local_candidates;
+    std::vector<unsigned char> local_qnames;
+    std::vector<MpiMarkdupCandidateShared> owner_candidates;
+    std::vector<unsigned char> owner_qnames;
+    std::vector<std::vector<uint64_t> > duplicates_by_source;
+    std::vector<uint8_t> duplicate_bitmap;
+    uint64_t local_records = 0;
+    int range_has_records = 0;
+    int range_first_tid = -1;
+    int range_first_pos = -1;
+    int range_last_tid = -1;
+    int range_last_pos = -1;
+
+    if (output_bam) {
+        output_bam->data = nullptr;
+        output_bam->size = 0;
+    }
+    if (core_cost) *core_cost = 0.0;
+
+    if (!input_memory || input_size == 0 || !output_bam ||
+        cmd_info->markdup_remove_dups_ ||
+        cmd_info->markdup_clear_ ||
+        MdParseMemory(cmd_info->markdup_memory_,
+                      &memory_limit) != 0) {
+        if (rank == 0) {
+            fprintf(stderr,
+                    "ERROR: dedup-pipeline markdup v1 requires default mark mode, non-empty BAM input, and a valid memory limit.\n");
+        }
+        local_ok = 0;
+    }
+    if (!MdAllRanksOk(local_ok)) goto cleanup;
+    if (rank == 0) {
+        printf("111Complete the initialization cost %lf-----\n",
+               MdReduceMax(GetTime() - total_t0));
+    } else {
+        MdReduceMax(GetTime() - total_t0);
+    }
+
+    {
+        double t0 = GetTime();
+        if (rank == 0 &&
+            MpiCommonReadBamHeaderFromMemory(
+                input_memory, input_size,
+                &header, &body_start) != 0) {
+            fprintf(stderr,
+                    "ERROR: failed to parse markdup pipeline BAM header.\n");
+            local_ok = 0;
+        }
+        if (rank == 0 && local_ok) {
+            kstring_t sort_order = {0, 0, nullptr};
+            if (sam_hdr_find_tag_hd(header, "SO",
+                                    &sort_order) == 0 &&
+                sort_order.s &&
+                strcmp(sort_order.s, "queryname") == 0) {
+                if (rank == 0) {
+                    fprintf(stderr,
+                            "ERROR: markdup input is queryname sorted; "
+                            "coordinate sort it first.\n");
+                }
+                local_ok = 0;
+            }
+            free(sort_order.s);
+        }
+        MPI_Bcast(&local_ok, 1, MPI_INT, 0,
+                  MPI_COMM_WORLD);
+        MPI_Bcast(&body_start, 1, MPI_LONG_LONG, 0,
+                  MPI_COMM_WORLD);
+        double cost = MdReduceMax(GetTime() - t0);
+        if (rank == 0 && local_ok) {
+            printf("333Complete the head cost %lf---\n", cost);
+        }
+    }
+    if (!MdAllRanksOk(local_ok)) goto cleanup;
+
+    body_total_t0 = GetTime();
+    {
+        double t0 = GetTime();
+        if (rank == 0) {
+            printf("Enable MPI BAM MARKDUP mode (%d MPE + %d CPEs)!!!\n",
+                   comm_size, comm_size * 64);
+            printf("MPI BAM output compression level=%d\n",
+                   cmd_info->compress_level_);
+            if (MpiCommonScanBgzfBlocksInMemory(
+                    input_memory, input_size, body_start,
+                    &block_offsets, &block_lengths) != 0) {
+                local_ok = 0;
+            }
+            n_blocks = (long long)block_offsets.size();
+            if (n_blocks > INT_MAX) local_ok = 0;
+        }
+        MPI_Bcast(&local_ok, 1, MPI_INT, 0,
+                  MPI_COMM_WORLD);
+        if (!local_ok) goto cleanup;
+        MPI_Bcast(&n_blocks, 1, MPI_LONG_LONG, 0,
+                  MPI_COMM_WORLD);
+        if (rank != 0) {
+            block_offsets.resize((size_t)n_blocks);
+            block_lengths.resize((size_t)n_blocks);
+        }
+        if (n_blocks > 0) {
+            MPI_Bcast(block_offsets.data(), (int)n_blocks,
+                      MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+            MPI_Bcast(block_lengths.data(), (int)n_blocks,
+                      MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+        }
+        local_block_begin = n_blocks * rank / comm_size;
+        local_block_end =
+            n_blocks * (rank + 1) / comm_size;
+        if (MpiCommonSelectBlockRangeFromMemory(
+                input_memory, input_size,
+                block_offsets, block_lengths,
+                local_block_begin, local_block_end,
+                &rank_input, &rank_input_size) != 0) {
+            local_ok = 0;
+        }
+        stage41_cost = MdReduceMax(GetTime() - t0);
+        if (rank == 0 && local_ok) {
+            printf("MPI BAM scan complete. data_blocks=%lld "
+                   "body_start=%lld\n",
+                   n_blocks, body_start);
+            printf("Complete the 4.1 scan/split/broadcast/select cost %lf\n",
+                   stage41_cost);
+        }
+    }
+    if (!MdAllRanksOk(local_ok)) goto cleanup;
+
+    {
+        double t0 = GetTime();
+        reader.base = rank_input;
+        reader.size = rank_input_size;
+        reader.pos = 0;
+        if (MpiCommonInitMemWriter(
+                writer, rank_input_size ?
+                            rank_input_size :
+                            64 * 1024 * 1024) != 0) {
+            local_ok = 0;
+        }
+        stage42_cost = MdReduceMax(GetTime() - t0);
+        if (rank == 0 && local_ok) {
+            printf("Complete the 4.2 init reader/writer cost %lf\n",
+                   stage42_cost);
+        }
+    }
+    if (!MdAllRanksOk(local_ok)) goto cleanup;
+
+    {
+        double fused_t0 = GetTime();
+        if (MdExtractCandidates(
+                reader, local_block_begin, rank,
+                cmd_info->markdup_include_fails_,
+                memory_limit, &local_candidates,
+                &local_qnames, &local_records,
+                &range_has_records,
+                &range_first_tid, &range_first_pos,
+                &range_last_tid, &range_last_pos,
+                &stats) != 0) {
+            local_ok = 0;
+        }
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
+
+        {
+            double boundary_t0 = GetTime();
+            if (MdValidateRankBoundaries(
+                    range_has_records, range_first_tid, range_first_pos,
+                    range_last_tid, range_last_pos, rank,
+                    comm_size) != 0) {
+                local_ok = 0;
+            }
+            stats.t_boundary_check += GetTime() - boundary_t0;
+        }
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
+
+        const char *force_hash_owner =
+            getenv("RABBITBAM_MARKDUP_HASH_OWNER");
+        if (force_hash_owner && force_hash_owner[0] == '1') {
+            if (MdExchangeCandidates(
+                    local_candidates, local_qnames,
+                    rank, comm_size, memory_limit,
+                    &owner_candidates, &owner_qnames,
+                    &stats) != 0) {
+                local_ok = 0;
+            }
+        } else if (MdExchangeCandidatesByCoordinate(
+                       &local_candidates, &local_qnames,
+                       range_has_records,
+                       range_first_tid, range_first_pos,
+                       range_last_tid, range_last_pos,
+                       rank, comm_size, memory_limit,
+                       &owner_candidates, &owner_qnames,
+                       &stats) != 0) {
+            local_ok = 0;
+        }
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
+
+        {
+            double cleanup_t0 = GetTime();
+            local_candidates.clear();
+            local_candidates.shrink_to_fit();
+            local_qnames.clear();
+            local_qnames.shrink_to_fit();
+            stats.t_candidate_cleanup += GetTime() - cleanup_t0;
+        }
+
+        const char *use_coord_bucket =
+            getenv("RABBITBAM_MARKDUP_COORD_BUCKET");
+        const char *use_full_sort =
+            getenv("RABBITBAM_MARKDUP_FULL_SORT");
+        const char *use_global_sort =
+            getenv("RABBITBAM_MARKDUP_GLOBAL_SORT");
+        const int enable_coord_bucket =
+            use_coord_bucket && use_coord_bucket[0] == '1';
+        const int enable_full_sort =
+            (use_full_sort && use_full_sort[0] == '1') ||
+            (use_global_sort && use_global_sort[0] == '1');
+        const int enable_flat_hash =
+            !enable_full_sort && !enable_coord_bucket;
+
+        {
+            double group_prepare_t0 = GetTime();
+            size_t grouping_bytes =
+                owner_candidates.capacity() *
+                    sizeof(MpiMarkdupCandidateShared) +
+                owner_qnames.capacity();
+            size_t marker_key_bytes =
+                owner_candidates.size() >
+                        SIZE_MAX / sizeof(MpiMarkdupKeyShared)
+                    ? SIZE_MAX
+                    : owner_candidates.size() *
+                        sizeof(MpiMarkdupKeyShared);
+            size_t worst_results =
+                owner_candidates.size() >
+                        SIZE_MAX / sizeof(uint64_t)
+                    ? SIZE_MAX
+                    : owner_candidates.size() *
+                        sizeof(uint64_t);
+            size_t flat_hash_bytes = enable_flat_hash
+                ? MdFlatHashBytesForEstimate(owner_candidates.size())
+                : 0;
+            size_t bucket_scratch_bytes = 0;
+            if (enable_coord_bucket && owner_candidates.size() >
+                    SIZE_MAX / (sizeof(MpiMarkdupCandidateShared) +
+                                sizeof(uint64_t) +
+                                sizeof(unsigned int) +
+                                sizeof(size_t))) {
+                bucket_scratch_bytes = SIZE_MAX;
+            } else if (enable_coord_bucket) {
+                bucket_scratch_bytes =
+                    owner_candidates.size() *
+                    (sizeof(MpiMarkdupCandidateShared) +
+                     sizeof(uint64_t) + sizeof(unsigned int) +
+                     sizeof(size_t));
+            }
+            size_t group_total = grouping_bytes;
+            if (marker_key_bytes == SIZE_MAX ||
+                worst_results == SIZE_MAX ||
+                flat_hash_bytes == SIZE_MAX ||
+                bucket_scratch_bytes == SIZE_MAX ||
+                marker_key_bytes > SIZE_MAX - group_total) {
+                local_ok = 0;
+            } else {
+                group_total += marker_key_bytes;
+            }
+            if (local_ok && worst_results > SIZE_MAX - group_total) {
+                local_ok = 0;
+            } else if (local_ok) {
+                group_total += worst_results;
+            }
+            if (local_ok && flat_hash_bytes > SIZE_MAX - group_total) {
+                local_ok = 0;
+            } else if (local_ok) {
+                group_total += flat_hash_bytes;
+            }
+            if (local_ok && bucket_scratch_bytes > SIZE_MAX - group_total) {
+                local_ok = 0;
+            } else if (local_ok) {
+                group_total += bucket_scratch_bytes;
+            }
+            if (local_ok &&
+                MdCheckMemory(group_total, memory_limit, &stats, rank,
+                              "duplicate grouping") != 0) {
+                local_ok = 0;
+            }
+            stats.t_group_prepare += GetTime() - group_prepare_t0;
+        }
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
+
+        if (enable_full_sort) {
+            if (MdFindDuplicates(
+                    &owner_candidates, owner_qnames,
+                    comm_size, &duplicates_by_source,
+                    &stats) != 0) {
+                local_ok = 0;
+            }
+        } else if (enable_coord_bucket) {
+            if (MdFindDuplicatesCoordinateBuckets(
+                    &owner_candidates, owner_qnames,
+                    comm_size, &duplicates_by_source,
+                    &stats) != 0) {
+                local_ok = 0;
+            }
+        } else {
+            if (MpiMarkdupFindDuplicatesStreamingHash(
+                    &owner_candidates, owner_qnames,
+                    comm_size, &duplicates_by_source,
+                    &stats) != 0) {
+                local_ok = 0;
+            }
+        }
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
+        {
+            double cleanup_t0 = GetTime();
+            owner_candidates.clear();
+            owner_candidates.shrink_to_fit();
+            owner_qnames.clear();
+            owner_qnames.shrink_to_fit();
+            stats.t_owner_cleanup += GetTime() - cleanup_t0;
+        }
+
+        if (MdExchangeDuplicateResults(
+                &duplicates_by_source, rank,
+                comm_size, local_records,
+                memory_limit, &duplicate_bitmap,
+                &stats) != 0) {
+            local_ok = 0;
+        }
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
+        {
+            double cleanup_t0 = GetTime();
+            duplicates_by_source.clear();
+            stats.t_result_cleanup += GetTime() - cleanup_t0;
+        }
+
+        reader.pos = 0;
+        if (MdRewriteOutput(
+                reader, duplicate_bitmap, local_records,
+                0, 0,
+                cmd_info->compress_level_,
+                writer, rank, &stats) != 0) {
+            local_ok = 0;
+        }
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
+
+        stats.t_fused_total = GetTime() - fused_t0;
+        stage43_cost = MdReduceMax(stats.t_fused_total);
+        if (rank == 0) {
+            printf("Complete the 4.3 FusedMarkdupMPI cost %lf\n",
+                   stage43_cost);
+        }
+    }
+
+    if (MdPrepareOutputMemory(writer, header,
+                              cmd_info->compress_level_,
+                              rank, comm_size, &stats,
+                              &output_memory,
+                              &output_stage_costs) != 0) {
+        local_ok = 0;
+    }
+    if (!MdAllRanksOk(local_ok)) goto cleanup;
+
+    if (rank == 0) {
+        double total = stage41_cost + stage42_cost +
+                       stage43_cost + output_stage_costs.stage44 +
+                       output_stage_costs.stage45_header +
+                       output_stage_costs.stage46;
+        printf("Complete the total (4.1~4.6) cost %lf-----\n",
+               total);
+    }
+
+    {
+        double stage47_t0 = GetTime();
+        MdPrintStats(stats, rank, comm_size);
+        double stage47_cost =
+            MdReduceMax(GetTime() - stage47_t0);
+        if (rank == 0 && local_ok) {
+            printf("Complete the 4.7 rank stats reduce/print cost %lf\n",
+                   stage47_cost);
+        }
+    }
+
+    {
+        double body_total_cost =
+            MdReduceMax(GetTime() - body_total_t0);
+        if (rank == 0 && local_ok) {
+            printf("444Complete the total body cost %lf\n",
+                   body_total_cost);
+        }
+    }
+
+    {
+        double verify_alloc_t0 = GetTime();
+        if (rank == 0) {
+            output_memory.data =
+                output_memory.size ? (char *)malloc(output_memory.size)
+                                   : nullptr;
+            if (output_memory.size && !output_memory.data) {
+                local_ok = 0;
+            }
+            if (local_ok && output_memory.header_size > 0) {
+                memcpy(output_memory.data,
+                       output_memory.header_data,
+                       output_memory.header_size);
+            }
+        }
+        double verify_alloc_cost =
+            MdReduceMax(GetTime() - verify_alloc_t0);
+        if (rank == 0 && local_ok) {
+            printf("555Prepare verification output memory cost %lf--\n",
+                   verify_alloc_cost);
+        }
+        if (!MdAllRanksOk(local_ok)) goto cleanup;
+
+        double verify_gather_t0 = GetTime();
+        if (rank == 0) {
+            if (writer.size > 0) {
+                memcpy(output_memory.data + output_memory.header_size +
+                           output_memory.body_offsets[(size_t)rank],
+                       writer.data, writer.size);
+            }
+            for (int src = 1; src < comm_size; ++src) {
+                unsigned long long received = 0;
+                unsigned long long bytes =
+                    (unsigned long long)
+                        output_memory.body_sizes[(size_t)src];
+                while (received < bytes) {
+                    int chunk = (int)std::min(
+                        (unsigned long long)kMarkdupExchangeChunk,
+                        bytes - received);
+                    MPI_Recv(
+                        output_memory.data + output_memory.header_size +
+                            output_memory.body_offsets[(size_t)src] +
+                            received,
+                        chunk, MPI_BYTE, src, 4300,
+                        MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                    received += (unsigned long long)chunk;
+                }
+            }
+            if (local_ok) {
+                memcpy(output_memory.data + output_memory.header_size +
+                           output_memory.total_body_size,
+                       kMarkdupBgzfEofBlock,
+                       sizeof(kMarkdupBgzfEofBlock));
+            }
+            output_bam->data = output_memory.data;
+            output_bam->size = output_memory.size;
+            output_memory.data = nullptr;
+            output_memory.size = 0;
+        } else {
+            unsigned long long sent = 0;
+            unsigned long long bytes =
+                (unsigned long long)writer.size;
+            while (sent < bytes) {
+                int chunk = (int)std::min(
+                    (unsigned long long)kMarkdupExchangeChunk,
+                    bytes - sent);
+                MPI_Send(writer.data + sent, chunk, MPI_BYTE,
+                         0, 4300, MPI_COMM_WORLD);
+                sent += (unsigned long long)chunk;
+            }
+        }
+        double verify_gather_cost =
+            MdReduceMax(GetTime() - verify_gather_t0);
+        if (rank == 0 && local_ok) {
+            printf("555Gather verification output memory cost %lf--\n",
+                   verify_gather_cost);
+            printf("555Keep output memory cost 0.000000--\n");
+        }
+        if (!MdAllRanksOk(local_ok)) goto cleanup;
+    }
+
+    if (core_cost) {
+        *core_cost = stage41_cost + stage42_cost + stage43_cost +
+                     output_stage_costs.stage44 +
+                     output_stage_costs.stage45_header +
+                     output_stage_costs.stage46;
+    }
+    exit_code = 0;
+
+cleanup:
+    if (output_memory.data) free(output_memory.data);
+    if (output_memory.header_data) free(output_memory.header_data);
+    if (writer.data) free(writer.data);
+    if (header) sam_hdr_destroy(header);
+    if (rank == 0) {
+        printf("666markdup total process cost %lf-----\n",
+               GetTime() - total_t0);
+    }
+    return exit_code;
+}
 
 int ProcessMarkdupMPI(CmdInfo *cmd_info) {
 

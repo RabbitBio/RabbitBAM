@@ -4,8 +4,17 @@
 #include "swbam.h"
 
 #include <cstddef>
+#include <string>
+#include <vector>
 
 #define ENABLE_MASKING
+
+struct MpiMemoryBam {
+    char *data;
+    size_t size;
+
+    MpiMemoryBam() : data(nullptr), size(0) {}
+};
 
 struct MpiBamToBamStats {
     long long input_blocks;
@@ -318,6 +327,52 @@ int ProcessSortMPI(CmdInfo *cmd_info);
 int ProcessMarkdupMPI(CmdInfo *cmd_info);
 int ProcessFixmateMPI(CmdInfo *cmd_info);
 int ProcessCollateMPI(CmdInfo *cmd_info);
+int ProcessDedupPipelineMPI(CmdInfo *cmd_info);
+
+void MpiMemoryBamFree(MpiMemoryBam *bam);
+int MpiBroadcastMemoryBam(MpiMemoryBam *bam, int root);
+int MpiCollateMemoryToMemory(CmdInfo *cmd_info,
+                             const char *input_memory,
+                             size_t input_size,
+                             MpiMemoryBam *output_bam,
+                             double *core_cost);
+int MpiFixmateMemoryToMemory(CmdInfo *cmd_info,
+                             const char *input_memory,
+                             size_t input_size,
+                             MpiMemoryBam *output_bam,
+                             double *core_cost);
+int MpiSortMemoryToMemory(CmdInfo *cmd_info,
+                          const char *input_memory,
+                          size_t input_size,
+                          MpiMemoryBam *output_bam,
+                          double *core_cost);
+int MpiMarkdupMemoryToMemory(CmdInfo *cmd_info,
+                             const char *input_memory,
+                             size_t input_size,
+                             MpiMemoryBam *output_bam,
+                             double *core_cost);
+
+int MpiCommonLoadFileToMemory(const std::string &path,
+                              char **data, size_t *size);
+int MpiCommonScanBgzfBlocksInMemory(
+    const char *base, size_t size, long long body_start,
+    std::vector<long long> *offsets,
+    std::vector<long long> *lengths);
+int MpiCommonSelectBlockRangeFromMemory(
+    char *base, size_t input_size,
+    const std::vector<long long> &offsets,
+    const std::vector<long long> &lengths,
+    long long begin, long long end,
+    char **data, size_t *size);
+int MpiCommonDumpMemoryToFile(const std::string &path,
+                              const char *data, size_t size);
+int MpiCommonInitMemWriter(MemWriter &writer, size_t capacity);
+int MpiCommonBuildBamHeaderMemory(sam_hdr_t *header,
+                                  int compress_level,
+                                  char **data, size_t *size);
+int MpiCommonReadBamHeaderFromMemory(const char *data, size_t size,
+                                     sam_hdr_t **header,
+                                     long long *body_start);
 
 int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      const BamFilterOptions &filter,

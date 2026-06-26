@@ -25,4 +25,5 @@ CmdInfo::CmdInfo() {
     markdup_include_fails_ = false;
     markdup_memory_ = "";
     fixmate_mate_score_ = false;
+    pipeline_memory_ = "";
 }

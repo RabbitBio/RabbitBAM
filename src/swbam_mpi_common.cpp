@@ -124,6 +124,9 @@ int MpiLoadFileToMemory(const std::string &path, char **data, size_t *size) {
     return 0;
 }
 
+int MpiBgzfBlockLengthAt(const char *base, size_t size,
+                         size_t pos, size_t *block_len);
+
 int MpiScanBgzfBlocksInMemory(const char *base, size_t size, long long body_start,
                               std::vector<long long> *offsets,
                               std::vector<long long> *lengths) {
@@ -131,14 +134,12 @@ int MpiScanBgzfBlocksInMemory(const char *base, size_t size, long long body_star
 
     long long pos = body_start;
     while ((unsigned long long)pos < (unsigned long long)size) {
-        if ((unsigned long long)pos + BLOCK_HEADER_LENGTH > (unsigned long long)size) return -1;
-        const unsigned char *header = (const unsigned char *)(base + pos);
-
-        int block_len = (int)header[16] | ((int)header[17] << 8);
-        block_len += 1;
-        if (block_len <= 0 || (unsigned long long)pos + (unsigned long long)block_len > (unsigned long long)size) {
+        size_t block_len_size = 0;
+        if (MpiBgzfBlockLengthAt(base, size, (size_t)pos,
+                                 &block_len_size) != 0) {
             return -1;
         }
+        int block_len = (int)block_len_size;
 
         bool is_eof = block_len == (int)sizeof(kMpiBgzfEofBlock) &&
                       memcmp(base + pos, kMpiBgzfEofBlock, sizeof(kMpiBgzfEofBlock)) == 0;
@@ -253,10 +254,161 @@ void MpiPackLe32(unsigned char *buffer, uint32_t value) {
     buffer[3] = (unsigned char)((value >> 24) & 0xff);
 }
 
+uint32_t MpiReadLe32(const unsigned char *buffer) {
+    return (uint32_t)buffer[0] |
+           ((uint32_t)buffer[1] << 8) |
+           ((uint32_t)buffer[2] << 16) |
+           ((uint32_t)buffer[3] << 24);
+}
+
+int MpiBgzfBlockLengthAt(const char *base, size_t size,
+                         size_t pos, size_t *block_len) {
+    if (!base || !block_len || pos > size ||
+        size - pos < BLOCK_HEADER_LENGTH) {
+        return -1;
+    }
+    const unsigned char *block =
+        (const unsigned char *)(base + pos);
+    if (block[0] != 0x1f || block[1] != 0x8b ||
+        block[2] != 0x08 || block[3] != 0x04 ||
+        block[10] != 0x06 || block[12] != 'B' ||
+        block[13] != 'C' || block[14] != 0x02 ||
+        block[15] != 0x00) {
+        return -1;
+    }
+    int len = (int)block[16] | ((int)block[17] << 8);
+    len++;
+    if (len <= 0 || len > BGZF_MAX_BLOCK_SIZE ||
+        (size_t)len > size - pos) {
+        return -1;
+    }
+    *block_len = (size_t)len;
+    return 0;
+}
+
 void MpiVectorPutLe32(std::vector<unsigned char> *out, uint32_t value) {
     unsigned char buf[4];
     MpiPackLe32(buf, value);
     out->insert(out->end(), buf, buf + 4);
+}
+
+int MpiInflateBgzfBlockForHeader(
+        const char *base, size_t size, size_t pos,
+        struct libdeflate_decompressor *decompressor,
+        std::vector<unsigned char> *raw,
+        size_t *block_len) {
+    if (!base || !decompressor || !raw || !block_len) {
+        return -1;
+    }
+    size_t len = 0;
+    if (MpiBgzfBlockLengthAt(base, size, pos, &len) != 0 ||
+        len <= BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH) {
+        return -1;
+    }
+    const unsigned char *block =
+        (const unsigned char *)(base + pos);
+    uint32_t isize = MpiReadLe32(block + len - 4);
+    if (isize > BGZF_MAX_BLOCK_SIZE) return -1;
+    size_t old_size = raw->size();
+    raw->resize(old_size + isize);
+    size_t actual = 0;
+    enum libdeflate_result ret =
+        libdeflate_deflate_decompress(
+            decompressor,
+            block + BLOCK_HEADER_LENGTH,
+            len - BLOCK_HEADER_LENGTH -
+                BLOCK_FOOTER_LENGTH,
+            raw->data() + old_size, isize, &actual);
+    if (ret != LIBDEFLATE_SUCCESS || actual != isize) {
+        return -1;
+    }
+    uint32_t crc = libdeflate_crc32(
+        0, raw->data() + old_size, isize);
+    if (crc != MpiReadLe32(block + len - 8)) {
+        return -1;
+    }
+    *block_len = len;
+    return 0;
+}
+
+int MpiBgzfBlockStartsWithBamRecord(
+        const char *base, size_t size, size_t pos,
+        struct libdeflate_decompressor *decompressor) {
+    std::vector<unsigned char> raw;
+    raw.reserve(BGZF_BLOCK_SIZE);
+    size_t block_len = 0;
+    if (MpiInflateBgzfBlockForHeader(
+            base, size, pos, decompressor,
+            &raw, &block_len) != 0) {
+        return 0;
+    }
+    if (raw.empty()) return 0;
+    if (raw.size() < 36) return 0;
+    int32_t record_len = (int32_t)MpiReadLe32(raw.data());
+    if (record_len < 32 ||
+        (uint64_t)record_len + 4u > raw.size()) {
+        return 0;
+    }
+    uint32_t x2 = MpiReadLe32(raw.data() + 12);
+    uint32_t x3 = MpiReadLe32(raw.data() + 16);
+    uint32_t l_qname = x2 & 0xffu;
+    uint32_t n_cigar = x3 & 0xffffu;
+    uint32_t l_qseq = MpiReadLe32(raw.data() + 20);
+    uint64_t min_payload =
+        (uint64_t)l_qname + ((uint64_t)n_cigar << 2) +
+        ((uint64_t)l_qseq + 1u) / 2u + (uint64_t)l_qseq;
+    if (l_qname == 0 || min_payload >
+        (uint64_t)record_len - 32u) {
+        return 0;
+    }
+    return 1;
+}
+
+int MpiFindNextBamBodyBgzfBlock(
+        const char *base, size_t size, size_t start,
+        struct libdeflate_decompressor *decompressor,
+        size_t *body_start) {
+    if (!base || !decompressor || !body_start || start > size) {
+        return -1;
+    }
+    for (size_t pos = start; pos + BLOCK_HEADER_LENGTH <= size;
+         ++pos) {
+        size_t len = 0;
+        if (MpiBgzfBlockLengthAt(base, size, pos, &len) != 0) {
+            continue;
+        }
+        if (MpiBgzfBlockStartsWithBamRecord(
+                base, size, pos, decompressor)) {
+            *body_start = pos;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+int MpiParseBamHeaderRaw(const std::vector<unsigned char> &raw,
+                         size_t *header_raw_size,
+                         uint32_t *text_len) {
+    if (raw.size() < 8) return 1;
+    if (memcmp(raw.data(), "BAM\1", 4) != 0) return -1;
+    uint32_t l_text = MpiReadLe32(raw.data() + 4);
+    size_t pos = 8u + (size_t)l_text;
+    if (pos > raw.size()) return 1;
+    if (raw.size() - pos < 4) return 1;
+    uint32_t n_ref = MpiReadLe32(raw.data() + pos);
+    pos += 4;
+    for (uint32_t i = 0; i < n_ref; ++i) {
+        if (raw.size() - pos < 4) return 1;
+        uint32_t l_name = MpiReadLe32(raw.data() + pos);
+        pos += 4;
+        if ((size_t)l_name > raw.size() - pos) return 1;
+        pos += (size_t)l_name;
+        if (raw.size() - pos < 4) return 1;
+        pos += 4;
+    }
+    *header_raw_size = pos;
+    *text_len = l_text;
+    return 0;
 }
 
 int MpiFindSamBodyStartInMemory(const char *base, size_t size, long long *body_start) {
@@ -529,6 +681,134 @@ int MpiCommonBuildBamHeaderMemory(sam_hdr_t *header,
                                   char **data, size_t *size) {
     return MpiBuildBamHeaderMemory(
         header, compress_level, data, size);
+}
+
+int MpiCommonReadBamHeaderFromMemory(const char *data, size_t size,
+                                     sam_hdr_t **header,
+                                     long long *body_start) {
+    if (header) *header = nullptr;
+    if (body_start) *body_start = 0;
+    if (!data || !header || !body_start || size == 0) {
+        return -1;
+    }
+
+    std::vector<unsigned char> raw;
+    raw.reserve(64 * 1024);
+    struct libdeflate_decompressor *decompressor =
+        libdeflate_alloc_decompressor();
+    if (!decompressor) return -1;
+
+    int ret = -1;
+    size_t pos = 0;
+    while (pos < size) {
+        size_t block_len = 0;
+        if (MpiInflateBgzfBlockForHeader(
+                data, size, pos, decompressor,
+                &raw, &block_len) != 0) {
+            break;
+        }
+        pos += block_len;
+
+        size_t header_raw_size = 0;
+        uint32_t text_len = 0;
+        int parse_state = MpiParseBamHeaderRaw(
+            raw, &header_raw_size, &text_len);
+        if (parse_state < 0) break;
+        if (parse_state > 0) continue;
+
+        if (raw.size() != header_raw_size) break;
+        sam_hdr_t *parsed = sam_hdr_parse(
+            (size_t)text_len, (const char *)raw.data() + 8);
+        if (!parsed) break;
+        size_t aligned_body_start = 0;
+        if (MpiFindNextBamBodyBgzfBlock(
+                data, size, pos, decompressor,
+                &aligned_body_start) != 0) {
+            sam_hdr_destroy(parsed);
+            break;
+        }
+        *header = parsed;
+        *body_start = (long long)aligned_body_start;
+        ret = 0;
+        break;
+    }
+
+    libdeflate_free_decompressor(decompressor);
+    return ret;
+}
+
+void MpiMemoryBamFree(MpiMemoryBam *bam) {
+    if (!bam) return;
+    free(bam->data);
+    bam->data = nullptr;
+    bam->size = 0;
+}
+
+int MpiBroadcastMemoryBam(MpiMemoryBam *bam, int root) {
+    int rank = 0;
+    int comm_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
+
+    int local_ok = bam != nullptr ? 1 : 0;
+    unsigned long long wire_size = 0;
+    if (rank == root && local_ok) {
+        wire_size = (unsigned long long)bam->size;
+        if ((size_t)wire_size != bam->size ||
+            (bam->size > 0 && bam->data == nullptr)) {
+            local_ok = 0;
+        }
+    }
+
+    MPI_Bcast(&wire_size, 1, MPI_UNSIGNED_LONG_LONG,
+              root, MPI_COMM_WORLD);
+    if (rank != root && local_ok) {
+        if (wire_size > (unsigned long long)SIZE_MAX) {
+            local_ok = 0;
+        } else {
+            MpiMemoryBamFree(bam);
+            bam->size = (size_t)wire_size;
+            bam->data = bam->size ? (char *)malloc(bam->size) : nullptr;
+            if (bam->size > 0 && !bam->data) {
+                local_ok = 0;
+            }
+        }
+    }
+
+    int global_ok = 0;
+    MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT,
+                  MPI_MIN, MPI_COMM_WORLD);
+    if (!global_ok) return -1;
+
+    const unsigned long long kBroadcastChunk = 16ull * 1024ull * 1024ull;
+    unsigned long long done = 0;
+    const int tag = 7600;
+    local_ok = 1;
+    while (done < wire_size) {
+        int chunk = (int)std::min<unsigned long long>(
+            wire_size - done, kBroadcastChunk);
+        if (rank == root) {
+            for (int dst = 0; dst < comm_size; ++dst) {
+                if (dst == root) continue;
+                if (MPI_Send(bam->data + done, chunk,
+                             MPI_BYTE, dst, tag,
+                             MPI_COMM_WORLD) != MPI_SUCCESS) {
+                    local_ok = 0;
+                }
+            }
+        } else {
+            if (MPI_Recv(bam->data + done, chunk,
+                         MPI_BYTE, root, tag,
+                         MPI_COMM_WORLD,
+                         MPI_STATUS_IGNORE) != MPI_SUCCESS) {
+                local_ok = 0;
+            }
+        }
+        done += (unsigned long long)chunk;
+    }
+    MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT,
+                  MPI_MIN, MPI_COMM_WORLD);
+    return global_ok ? 0 : -1;
 }
 
 int MpiWriteBlockToMem(MemWriter &w, bam_block *block) {

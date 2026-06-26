@@ -94,6 +94,15 @@ int main(int argc, char **argv) {
     fixmate->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
     fixmate->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
 
+    CLI::App *dedup_pipeline = app.add_subcommand("dedup-pipeline", "Run MPI BAM in-memory dedup pipeline: collate -> fixmate -m -> sort -> markdup");
+    dedup_pipeline->add_option("-i,--inFile", cmd_info.in_file_name_, "input BAM name")->required()->check(CLI::ExistingFile);
+    dedup_pipeline->add_option("-o,--outFile", cmd_info.out_file_name_, "final output BAM name")->required();
+    CLI::Option *pipeline_bins_option =
+        dedup_pipeline->add_option("-n,--bins", cmd_info.collate_bins_, "Number of logical QNAME hash bins for collate")->default_val(64);
+    dedup_pipeline->add_option("-m,--memory", cmd_info.pipeline_memory_, "Pipeline memory limit per MPI rank, e.g. 8G or 8192M");
+    dedup_pipeline->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
+    dedup_pipeline->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
+
     CLI11_PARSE(app, argc, argv);
 
     int exit_code = 1;
@@ -105,6 +114,7 @@ int main(int argc, char **argv) {
     bool is_collate = false;
     bool is_markdup = false;
     bool is_fixmate = false;
+    bool is_dedup_pipeline = false;
     if (app.get_subcommands().empty()) {
         if (my_rank == 0) fprintf(stderr, "ERROR: You should input one command.\n");
         goto cleanup;
@@ -121,18 +131,21 @@ int main(int argc, char **argv) {
     is_collate = selected_command->get_name() == "collate";
     is_markdup = selected_command->get_name() == "markdup";
     is_fixmate = selected_command->get_name() == "fixmate";
+    is_dedup_pipeline = selected_command->get_name() == "dedup-pipeline";
     cmd_info.collate_bins_explicit_ =
-        is_collate && collate_bins_option &&
-        collate_bins_option->count() > 0;
-    if (!is_run_all && !is_flagstat && !is_stats && !is_sort && !is_collate && !is_markdup && !is_fixmate) {
-        if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI only supports run_all, flagstat, stats, sort, collate, markdup, and fixmate.\n");
+        (is_collate && collate_bins_option &&
+         collate_bins_option->count() > 0) ||
+        (is_dedup_pipeline && pipeline_bins_option &&
+         pipeline_bins_option->count() > 0);
+    if (!is_run_all && !is_flagstat && !is_stats && !is_sort && !is_collate && !is_markdup && !is_fixmate && !is_dedup_pipeline) {
+        if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI only supports run_all, flagstat, stats, sort, collate, markdup, fixmate, and dedup-pipeline.\n");
         goto cleanup;
     }
     if (is_stats && !stats_basic) {
         if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI stats v1 requires --basic.\n");
         goto cleanup;
     }
-    if ((is_run_all || is_sort || is_collate || is_markdup || is_fixmate) &&
+    if ((is_run_all || is_sort || is_collate || is_markdup || is_fixmate || is_dedup_pipeline) &&
         cmd_info.compress_level_ != 0 &&
         cmd_info.compress_level_ != 1 &&
         cmd_info.compress_level_ != 6) {
@@ -143,19 +156,21 @@ int main(int argc, char **argv) {
     }
 
     t1 = GetTime();
-    exit_code = is_sort ? ProcessSortMPI(&cmd_info)
+    exit_code = is_dedup_pipeline ? ProcessDedupPipelineMPI(&cmd_info)
+                         : (is_sort ? ProcessSortMPI(&cmd_info)
                          : (is_collate ? ProcessCollateMPI(&cmd_info)
                          : (is_markdup ? ProcessMarkdupMPI(&cmd_info)
                                       : (is_fixmate ? ProcessFixmateMPI(&cmd_info)
                                                     : (is_stats ? ProcessStatsMPI(&cmd_info)
-                                                                : (is_flagstat ? ProcessFlagstatMPI(&cmd_info) : ProcessSwBamMPI(&cmd_info))))));
+                                                                : (is_flagstat ? ProcessFlagstatMPI(&cmd_info) : ProcessSwBamMPI(&cmd_info)))))));
     if (my_rank == 0) {
         printf("%s rank0 time is %lf--\n",
-               is_sort ? "ProcessSortMPI" :
+               is_dedup_pipeline ? "ProcessDedupPipelineMPI" :
+               (is_sort ? "ProcessSortMPI" :
                (is_collate ? "ProcessCollateMPI" :
                 (is_markdup ? "ProcessMarkdupMPI" :
                 (is_fixmate ? "ProcessFixmateMPI" :
-                 (is_stats ? "ProcessStatsMPI" : (is_flagstat ? "ProcessFlagstatMPI" : "ProcessSwBamMPI"))))),
+                 (is_stats ? "ProcessStatsMPI" : (is_flagstat ? "ProcessFlagstatMPI" : "ProcessSwBamMPI")))))),
                GetTime() - t1);
     }
 

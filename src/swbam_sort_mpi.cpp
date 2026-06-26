@@ -446,6 +446,461 @@ void MpiSortPrintRankStats(int rank, int comm_size,
 
 } // namespace
 
+int MpiSortMemoryToMemory(CmdInfo *cmd_info,
+                          const char *input_memory_const,
+                          size_t input_size,
+                          MpiMemoryBam *output_bam,
+                          double *core_cost) {
+    double total_t0 = GetTime();
+    int rank = 0;
+    int comm_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
+
+    int exit_code = 1;
+    int local_ok = 1;
+    char *input_file_mem = const_cast<char *>(input_memory_const);
+    sam_hdr_t *hdr = nullptr;
+    char *rank_input_mem = nullptr;
+    char *bam_header_mem = nullptr;
+    char *simulated_write_mem = nullptr;
+    size_t bam_header_size = 0;
+    size_t output_file_size = 0;
+    size_t output_body_start = 0;
+    MemReader reader = {};
+    MemWriter mem_writer = {};
+    MpiSortStats stats = {};
+    std::vector<long long> block_offsets;
+    std::vector<long long> block_lengths;
+    std::vector<long long> body_sizes;
+    std::vector<long long> body_prefixes;
+    long long body_start = 0;
+    long long n_blocks = 0;
+    long long local_block_begin = 0;
+    long long local_block_end = 0;
+    long long local_body_size = 0;
+    long long total_body_size = 0;
+    size_t memory_limit = 0;
+    volatile unsigned long long simulated_write_guard = 0;
+    double body_total_t0 = 0.0;
+    double stage41_cost_max = 0.0;
+    double stage42_cost_max = 0.0;
+    double fused_cost_max = 0.0;
+    double stage44_cost_max = 0.0;
+    double stage45_header_cost_max = 0.0;
+    double stage46_cost_max = 0.0;
+
+    if (output_bam) {
+        output_bam->data = nullptr;
+        output_bam->size = 0;
+    }
+    if (core_cost) *core_cost = 0.0;
+
+    if (!input_file_mem || input_size == 0 || !output_bam ||
+        MpiSortParseMemoryLimit(cmd_info->sort_memory_,
+                                &memory_limit) != 0) {
+        if (rank == 0) {
+            fprintf(stderr,
+                    "ERROR: invalid dedup-pipeline sort input or memory limit.\n");
+        }
+        local_ok = 0;
+    }
+    if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+    {
+        double init_cost_max =
+            MpiSortReduceMaxCost(GetTime() - total_t0);
+        if (rank == 0) {
+            printf("111Complete the initialization cost %lf-----\n",
+                   init_cost_max);
+        }
+    }
+
+    {
+        double header_t0 = GetTime();
+        if (rank == 0 &&
+            MpiCommonReadBamHeaderFromMemory(
+                input_file_mem, input_size,
+                &hdr, &body_start) != 0) {
+            fprintf(stderr,
+                    "ERROR: failed to parse sort pipeline BAM header.\n");
+            local_ok = 0;
+        }
+        MPI_Bcast(&local_ok, 1, MPI_INT, 0,
+                  MPI_COMM_WORLD);
+        MPI_Bcast(&body_start, 1, MPI_LONG_LONG, 0,
+                  MPI_COMM_WORLD);
+        double header_cost_max =
+            MpiSortReduceMaxCost(GetTime() - header_t0);
+        if (rank == 0 && local_ok) {
+            printf("333Complete the head cost %lf---\n",
+                   header_cost_max);
+        }
+    }
+    if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+
+    body_total_t0 = GetTime();
+    {
+        double stage41_t0 = GetTime();
+        if (rank == 0) {
+            printf("Enable MPI BAM SORT mode (%d MPE + %d CPEs)!!!\n",
+                   comm_size, comm_size * 64);
+            printf("MPI BAM output compression level=%d\n",
+                   cmd_info->compress_level_);
+            if (MpiCommonScanBgzfBlocksInMemory(
+                    input_file_mem, input_size, body_start,
+                    &block_offsets, &block_lengths) != 0) {
+                local_ok = 0;
+            }
+            n_blocks = (long long)block_offsets.size();
+            if (n_blocks > (long long)INT_MAX) local_ok = 0;
+            if (local_ok) {
+                printf("MPI BAM scan complete. data_blocks=%lld "
+                       "body_start=%lld header_end=%lld\n",
+                       n_blocks, body_start,
+                       body_start);
+            }
+        }
+        MPI_Bcast(&local_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+        if (!local_ok) goto cleanup;
+        MPI_Bcast(&body_start, 1, MPI_LONG_LONG, 0,
+                  MPI_COMM_WORLD);
+        MPI_Bcast(&n_blocks, 1, MPI_LONG_LONG, 0,
+                  MPI_COMM_WORLD);
+        if (rank != 0) {
+            block_offsets.resize((size_t)n_blocks);
+            block_lengths.resize((size_t)n_blocks);
+        }
+        if (n_blocks > 0) {
+            MPI_Bcast(block_offsets.data(), (int)n_blocks,
+                      MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+            MPI_Bcast(block_lengths.data(), (int)n_blocks,
+                      MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+        }
+        local_block_begin = n_blocks * rank / comm_size;
+        local_block_end = n_blocks * (rank + 1) / comm_size;
+        size_t rank_input_size = 0;
+        if (MpiSortSelectBlockRangeFromMemory(
+                input_file_mem, input_size,
+                block_offsets, block_lengths,
+                local_block_begin, local_block_end,
+                &rank_input_mem, &rank_input_size) != 0) {
+            local_ok = 0;
+        }
+        stage41_cost_max =
+            MpiSortReduceMaxCost(GetTime() - stage41_t0);
+        if (rank == 0 && local_ok) {
+            printf("Complete the 4.1 scan/split/broadcast/select cost %lf\n",
+                   stage41_cost_max);
+        }
+        if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+
+        double stage42_t0 = GetTime();
+        reader.base = rank_input_mem;
+        reader.size = rank_input_size;
+        reader.pos = 0;
+        if (MpiSortInitMemWriter(
+                mem_writer,
+                rank_input_size ? rank_input_size
+                                : 64 * 1024 * 1024) != 0) {
+            local_ok = 0;
+        }
+        int stage42_ok = MpiSortAllRanksOk(local_ok);
+        stage42_cost_max =
+            MpiSortReduceMaxCost(GetTime() - stage42_t0);
+        if (rank == 0 && stage42_ok) {
+            printf("Complete the 4.2 init reader/writer cost %lf\n",
+                   stage42_cost_max);
+        }
+        if (!stage42_ok) goto cleanup;
+
+        size_t estimated =
+            MpiSortEstimateInMemoryNeed(rank_input_size);
+        unsigned long long local_estimate_u64 =
+            estimated == SIZE_MAX ? ULLONG_MAX
+                                  : (unsigned long long)estimated;
+        unsigned long long max_estimate_u64 = 0;
+        MPI_Allreduce(&local_estimate_u64, &max_estimate_u64,
+                      1, MPI_UNSIGNED_LONG_LONG, MPI_MAX,
+                      MPI_COMM_WORLD);
+        int local_external =
+            (memory_limit != 0 && estimated > memory_limit)
+                ? 1 : 0;
+        int use_external = 0;
+        MPI_Allreduce(&local_external, &use_external, 1,
+                      MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        stats.sort_mode = 0;
+        if (rank == 0) {
+            printf("MPI BAM sort selected mode=memory "
+                   "memory_estimate_max=%llu memory_limit=%zu\n",
+                   max_estimate_u64, memory_limit);
+            printf("MPI BAM sort pipeline policy: memory only; "
+                   "external mode is disabled.\n");
+        }
+        if (use_external) {
+            if (rank == 0) {
+                fprintf(stderr,
+                        "ERROR: dedup-pipeline sort memory estimate exceeds -m; external intermediate storage is disabled in v1.\n");
+            }
+            local_ok = 0;
+        }
+        if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+
+        double fused_t0 = GetTime();
+        int fused_ret =
+            FusedBamSortMPI(reader, mem_writer,
+                            local_block_begin, rank,
+                            comm_size, cmd_info->compress_level_,
+                            memory_limit, &stats);
+        if (fused_ret != 0) local_ok = 0;
+        int global_ok = MpiSortAllRanksOk(local_ok);
+        stats.t_fused_actual = GetTime() - fused_t0;
+        fused_cost_max =
+            MpiSortReduceMaxCost(stats.t_fused_actual);
+        if (rank == 0 && global_ok) {
+            printf("Complete the 4.3 FusedBamSortMPI cost %lf\n",
+                   fused_cost_max);
+            printf("FusedBamSortMPI reported cost model=measured-memory-mode\n");
+            printf("FusedBamSortMPI actual wall %lf\n",
+                   fused_cost_max);
+        }
+        if (!global_ok) goto cleanup;
+
+        double stage44_t0 = GetTime();
+        local_body_size = (long long)mem_writer.size;
+        body_sizes.assign((size_t)comm_size, 0);
+        body_prefixes.assign((size_t)comm_size, 0);
+        MPI_Allgather(&local_body_size, 1, MPI_LONG_LONG,
+                      body_sizes.data(), 1, MPI_LONG_LONG,
+                      MPI_COMM_WORLD);
+        total_body_size = 0;
+        for (int i = 0; i < comm_size; ++i) {
+            body_prefixes[(size_t)i] = total_body_size;
+            if (body_sizes[(size_t)i] < 0 ||
+                total_body_size >
+                    LLONG_MAX - body_sizes[(size_t)i]) {
+                local_ok = 0;
+            } else {
+                total_body_size += body_sizes[(size_t)i];
+            }
+        }
+        stage44_cost_max =
+            MpiSortReduceMaxCost(GetTime() - stage44_t0);
+        if (rank == 0) {
+            printf("Complete the 4.4 gather body sizes cost %lf\n",
+                   stage44_cost_max);
+        }
+        if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+
+        double stage45_header_t0 = GetTime();
+        long long output_body_start_ll = 0;
+        long long output_file_size_ll = 0;
+        if (rank == 0) {
+            if (MpiSortUpdateHeaderCoordinate(hdr) != 0 ||
+                MpiSortBuildBamHeaderMemory(
+                    hdr, cmd_info->compress_level_,
+                    &bam_header_mem, &bam_header_size) != 0) {
+                local_ok = 0;
+            }
+            if (local_ok) {
+                unsigned long long final_size =
+                    (unsigned long long)bam_header_size +
+                    (unsigned long long)total_body_size +
+                    (unsigned long long)sizeof(kSortBgzfEofBlock);
+                if (final_size > (unsigned long long)SIZE_MAX ||
+                    final_size > (unsigned long long)LLONG_MAX ||
+                    (unsigned long long)bam_header_size >
+                        (unsigned long long)LLONG_MAX) {
+                    local_ok = 0;
+                } else {
+                    output_body_start = bam_header_size;
+                    output_file_size = (size_t)final_size;
+                    output_body_start_ll =
+                        (long long)output_body_start;
+                    output_file_size_ll =
+                        (long long)output_file_size;
+                }
+            }
+        }
+        int stage45_header_ok = MpiSortAllRanksOk(local_ok);
+        MPI_Bcast(&output_body_start_ll, 1, MPI_LONG_LONG,
+                  0, MPI_COMM_WORLD);
+        MPI_Bcast(&output_file_size_ll, 1, MPI_LONG_LONG,
+                  0, MPI_COMM_WORLD);
+        if (stage45_header_ok) {
+            output_body_start = (size_t)output_body_start_ll;
+            output_file_size = (size_t)output_file_size_ll;
+        }
+        stage45_header_cost_max =
+            MpiSortReduceMaxCost(GetTime() - stage45_header_t0);
+        if (rank == 0 && stage45_header_ok) {
+            printf("Complete the 4.5a header/layout cost %lf\n",
+                   stage45_header_cost_max);
+        }
+        if (!stage45_header_ok) goto cleanup;
+
+        double stage45_malloc_t0 = GetTime();
+        size_t simulated_write_size =
+            local_body_size > 0 ? (size_t)local_body_size : 0;
+        if (rank == 0) {
+            if (output_body_start >
+                SIZE_MAX - simulated_write_size) {
+                local_ok = 0;
+            } else {
+                simulated_write_size += output_body_start;
+            }
+        }
+        if (local_ok && simulated_write_size > 0) {
+            simulated_write_mem =
+                (char *)malloc(simulated_write_size);
+            if (!simulated_write_mem) local_ok = 0;
+        }
+        int stage45_malloc_ok = MpiSortAllRanksOk(local_ok);
+        double stage45_malloc_cost_max =
+            MpiSortReduceMaxCost(GetTime() - stage45_malloc_t0);
+        if (rank == 0 && stage45_malloc_ok) {
+            printf("Complete the 4.5b malloc simulated write memory cost %lf\n",
+                   stage45_malloc_cost_max);
+        }
+        if (!stage45_malloc_ok) goto cleanup;
+
+        double sim_write_t0 = GetTime();
+        size_t simulated_pos = 0;
+        if (rank == 0 && output_body_start > 0) {
+            memcpy(simulated_write_mem + simulated_pos,
+                   bam_header_mem, bam_header_size);
+            simulated_pos += bam_header_size;
+        }
+        if (local_body_size > 0) {
+            memcpy(simulated_write_mem + simulated_pos,
+                   mem_writer.data, (size_t)local_body_size);
+            simulated_pos += (size_t)local_body_size;
+        }
+        if (simulated_pos > 0) {
+            unsigned char *guard_ptr =
+                (unsigned char *)simulated_write_mem;
+            simulated_write_guard += guard_ptr[0];
+            simulated_write_guard += guard_ptr[simulated_pos - 1];
+        }
+        stats.t_write += GetTime() - sim_write_t0;
+        stage46_cost_max =
+            MpiSortReduceMaxCost(stats.t_write);
+        int stage46_ok = MpiSortAllRanksOk(local_ok);
+        if (rank == 0 && stage46_ok) {
+            printf("Complete the 4.6 simulated header/body distributed write cost %lf\n",
+                   stage46_cost_max);
+            printf("Complete the total (4.1~4.6) cost %lf-----\n",
+                   stage41_cost_max + stage42_cost_max +
+                   fused_cost_max + stage44_cost_max +
+                   stage45_header_cost_max + stage46_cost_max);
+        }
+        if (simulated_write_guard == (unsigned long long)-1 &&
+            rank < 0) {
+            fprintf(stderr, "unused simulated write guard %llu\n",
+                    simulated_write_guard);
+        }
+        if (!stage46_ok) goto cleanup;
+
+        double stage47_t0 = GetTime();
+        MpiSortPrintRankStats(rank, comm_size,
+                              stats, mem_writer.size);
+        double stage47_cost_max =
+            MpiSortReduceMaxCost(GetTime() - stage47_t0);
+        if (rank == 0 && local_ok) {
+            printf("Complete the 4.7 rank stats reduce/print cost %lf\n",
+                   stage47_cost_max);
+        }
+
+        double body_total_cost_max =
+            MpiSortReduceMaxCost(GetTime() - body_total_t0);
+        if (rank == 0 && local_ok) {
+            printf("444Complete the total body cost %lf\n",
+                   body_total_cost_max);
+        }
+    }
+
+    {
+        double verify_alloc_t0 = GetTime();
+        if (rank == 0) {
+            output_bam->data =
+                output_file_size ? (char *)malloc(output_file_size)
+                                 : nullptr;
+            output_bam->size = output_file_size;
+            if (output_file_size > 0 && !output_bam->data) {
+                local_ok = 0;
+            }
+            if (local_ok && bam_header_size > 0) {
+                memcpy(output_bam->data, bam_header_mem,
+                       bam_header_size);
+            }
+        }
+        double verify_alloc_cost_max =
+            MpiSortReduceMaxCost(GetTime() - verify_alloc_t0);
+        if (rank == 0 && local_ok) {
+            printf("555Prepare verification output memory cost %lf--\n",
+                   verify_alloc_cost_max);
+        }
+        if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+
+        double verify_gather_t0 = GetTime();
+        if (rank == 0) {
+            if (local_body_size > 0) {
+                memcpy(output_bam->data + output_body_start +
+                           body_prefixes[(size_t)rank],
+                       mem_writer.data, (size_t)local_body_size);
+            }
+            for (int src = 1; src < comm_size; ++src) {
+                long long recv_size = body_sizes[(size_t)src];
+                if (recv_size <= 0) continue;
+                if (MpiSortRecvBytes(
+                        src, 0,
+                        output_bam->data + output_body_start +
+                            body_prefixes[(size_t)src],
+                        recv_size) != 0) {
+                    local_ok = 0;
+                    break;
+                }
+            }
+            if (local_ok) {
+                memcpy(output_bam->data + output_body_start +
+                           total_body_size,
+                       kSortBgzfEofBlock,
+                       sizeof(kSortBgzfEofBlock));
+            }
+        } else if (local_body_size > 0) {
+            if (MpiSortSendBytes(0, 0, mem_writer.data,
+                                 local_body_size) != 0) {
+                local_ok = 0;
+            }
+        }
+        double verify_gather_cost_max =
+            MpiSortReduceMaxCost(GetTime() - verify_gather_t0);
+        if (rank == 0 && local_ok) {
+            printf("555Gather verification output memory cost %lf--\n",
+                   verify_gather_cost_max);
+            printf("555Keep output memory cost 0.000000--\n");
+        }
+        if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+    }
+
+    if (core_cost) {
+        *core_cost = stage41_cost_max + stage42_cost_max +
+                     fused_cost_max + stage44_cost_max +
+                     stage45_header_cost_max + stage46_cost_max;
+    }
+    exit_code = 0;
+
+cleanup:
+    if (mem_writer.data) free(mem_writer.data);
+    if (bam_header_mem) free(bam_header_mem);
+    if (simulated_write_mem) free(simulated_write_mem);
+    if (hdr) sam_hdr_destroy(hdr);
+    if (rank == 0) {
+        printf("666sort total process cost %lf-----\n",
+               GetTime() - total_t0);
+    }
+    return exit_code;
+}
+
 int ProcessSortMPI(CmdInfo *cmd_info) {
 
     //1.相关数据的初始化

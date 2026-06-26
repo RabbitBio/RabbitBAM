@@ -79,6 +79,16 @@ collate_get_decompressor(int id, uint64_t *alloc_cycles) {
     return z;
 }
 
+extern "C" void slave_mpi_collate_release_caches(void *unused) {
+    (void)unused;
+    const int id = _PEN;
+    if (id < 0 || id >= 64) return;
+    if (g_collate_decompressors[id]) {
+        libdeflate_free_decompressor(g_collate_decompressors[id]);
+        g_collate_decompressors[id] = nullptr;
+    }
+}
+
 static int collate_decode_block(
         bam_block *input, bam_block *output,
         struct libdeflate_decompressor *z,

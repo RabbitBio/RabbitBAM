@@ -1090,22 +1090,25 @@ struct CollateMemoryCursor {
     const CollateMemorySegment *segment;
     size_t pos;
     const CollateMeta *meta;
-    const unsigned char *raw;
+    const unsigned char *raw_base;
+    const unsigned char *record;
     size_t raw_size;
 
     CollateMemoryCursor()
         : segment(nullptr), pos(0), meta(nullptr),
-          raw(nullptr), raw_size(0) {}
+          raw_base(nullptr), record(nullptr), raw_size(0) {}
 
     void Refresh() {
         if (!segment || pos >= segment->records.size()) {
             meta = nullptr;
-            raw = nullptr;
+            raw_base = nullptr;
+            record = nullptr;
             raw_size = 0;
             return;
         }
         meta = &segment->records[pos];
-        raw = segment->raw_data + meta->raw_offset;
+        raw_base = segment->raw_data;
+        record = segment->raw_data + meta->raw_offset;
         raw_size = segment->raw_size;
     }
 };
@@ -1150,7 +1153,7 @@ public:
     const unsigned char *raw(int index) const {
         const CollateMemoryCursor &cursor =
             cursors_[(size_t)index];
-        return cursor.raw;
+        return cursor.record;
     }
 
     void current(int index, const CollateMeta **meta,
@@ -1158,7 +1161,7 @@ public:
         const CollateMemoryCursor &cursor =
             cursors_[(size_t)index];
         *meta = cursor.meta;
-        *raw = cursor.raw;
+        *raw = cursor.record;
     }
 
     void advance(int index) {
@@ -1189,8 +1192,8 @@ private:
         const CollateMemoryCursor &b =
             cursors_[(size_t)rhs];
         return CollateCompare(
-                   *a.meta, a.raw, a.raw_size,
-                   *b.meta, b.raw, b.raw_size) < 0;
+                   *a.meta, a.raw_base, a.raw_size,
+                   *b.meta, b.raw_base, b.raw_size) < 0;
     }
 
     int Winner(int lhs, int rhs) const {
@@ -1739,6 +1742,7 @@ static int CollateGatherOutput(
         const MemWriter &local_writer,
         sam_hdr_t *header, int compress_level,
         const std::string &output_path,
+        MpiMemoryBam *output_bam,
         int rank, int comm_size, int bins,
         MpiCollateStats *stats,
         CollateOutputStageCosts *costs,
@@ -1968,16 +1972,24 @@ static int CollateGatherOutput(
     }
 
     double dump_t0 = GetTime();
-    if (rank == 0 && local_ok &&
-        MpiCommonDumpMemoryToFile(
-            output_path, output_memory,
-            output_size) != 0) {
+    if (output_bam) {
+        if (rank == 0 && local_ok) {
+            output_bam->data = output_memory;
+            output_bam->size = output_size;
+            output_memory = nullptr;
+        }
+    } else if (rank == 0 && local_ok &&
+               MpiCommonDumpMemoryToFile(
+                   output_path, output_memory,
+                   output_size) != 0) {
         local_ok = 0;
     }
     double dump_cost =
         CollateReduceMax(GetTime() - dump_t0);
     if (rank == 0 && local_ok) {
-        printf("555Dump memory to output file cost %lf--\n",
+        printf(output_bam
+                   ? "555Keep output memory cost %lf--\n"
+                   : "555Dump memory to output file cost %lf--\n",
                dump_cost);
     }
     free(header_memory);
@@ -3723,6 +3735,288 @@ static void CollatePrintStats(
 
 } // namespace
 
+int MpiCollateMemoryToMemory(CmdInfo *cmd_info,
+                             const char *input_memory_const,
+                             size_t input_size,
+                             MpiMemoryBam *output_bam,
+                             double *core_cost) {
+    double total_t0 = GetTime();
+    int rank = 0;
+    int comm_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
+
+    int exit_code = 1;
+    int local_ok = 1;
+    char *input_memory = const_cast<char *>(input_memory_const);
+    hFILE *input_hfile = nullptr;
+    samFile *input = nullptr;
+    sam_hdr_t *header = nullptr;
+    long long body_start = 0;
+    std::vector<long long> block_offsets;
+    std::vector<long long> block_lengths;
+    long long n_blocks = 0;
+    long long local_begin = 0;
+    long long local_end = 0;
+    char *rank_input = nullptr;
+    size_t rank_input_size = 0;
+    MemReader reader = {};
+    MemWriter writer = {};
+    MpiCollateStats stats = {};
+    CollateOutputStageCosts output_costs = {};
+    size_t memory_limit = 0;
+    int collate_bins = cmd_info->collate_bins_;
+    double body_total_t0 = 0.0;
+    double stage41_cost = 0.0;
+    double stage42_cost = 0.0;
+    double stage43_cost = 0.0;
+
+    if (output_bam) {
+        output_bam->data = nullptr;
+        output_bam->size = 0;
+    }
+    if (core_cost) *core_cost = 0.0;
+
+    if (!input_memory || input_size == 0 || !output_bam ||
+        collate_bins <= 0 ||
+        CollateParseMemory(cmd_info->collate_memory_,
+                           &memory_limit) != 0) {
+        if (rank == 0) {
+            fprintf(stderr,
+                    "ERROR: invalid dedup-pipeline collate input, bins, or memory limit.\n");
+        }
+        local_ok = 0;
+    }
+    if (local_ok && !cmd_info->collate_bins_explicit_) {
+        collate_bins =
+            CollateAlignDefaultBins(collate_bins, comm_size);
+    }
+    if (!CollateAllRanksOk(local_ok)) goto cleanup;
+    {
+        double cost = CollateReduceMax(GetTime() - total_t0);
+        if (rank == 0) {
+            printf("111Complete the initialization cost %lf-----\n",
+                   cost);
+        }
+    }
+
+    {
+        double t0 = GetTime();
+        input_hfile = hopen("mem:", "rb:",
+                            input_memory, input_size);
+        if (input_hfile) {
+            input = (samFile *)hts_hopen(
+                input_hfile, "data", "rb");
+            if (input) input_hfile = nullptr;
+        }
+        if (!input) local_ok = 0;
+        if (local_ok) header = sam_hdr_read(input);
+        if (!header) local_ok = 0;
+        if (local_ok &&
+            input->format.format != bam &&
+            input->format.format != binary_format) {
+            if (rank == 0) {
+                fprintf(stderr,
+                        "ERROR: RabbitBAM-MPI collate only supports BAM input.\n");
+            }
+            local_ok = 0;
+        }
+        if (local_ok) {
+            body_start =
+                (long long)input->fp.bgzf->block_address;
+            if (body_start < 0 ||
+                (unsigned long long)body_start >
+                    input_size) {
+                local_ok = 0;
+            }
+        }
+        double cost =
+            CollateReduceMax(GetTime() - t0);
+        if (rank == 0 && local_ok) {
+            printf("333Complete the head cost %lf---\n",
+                   cost);
+        }
+    }
+    if (!CollateAllRanksOk(local_ok)) goto cleanup;
+
+    body_total_t0 = GetTime();
+    {
+        double t0 = GetTime();
+        if (rank == 0) {
+            printf("Enable MPI BAM COLLATE mode "
+                   "(%d MPE + %d CPEs)!!!\n",
+                   comm_size, comm_size * 64);
+            if (!cmd_info->collate_bins_explicit_ &&
+                collate_bins != cmd_info->collate_bins_) {
+                printf("MPI BAM collate auto bins=%d -> %d "
+                       "for %d ranks\n",
+                       cmd_info->collate_bins_,
+                       collate_bins, comm_size);
+            }
+            printf("MPI BAM collate bins=%d compression=%d\n",
+                   collate_bins, cmd_info->compress_level_);
+            if (MpiCommonScanBgzfBlocksInMemory(
+                    input_memory, input_size, body_start,
+                    &block_offsets, &block_lengths) != 0) {
+                local_ok = 0;
+            }
+            n_blocks = (long long)block_offsets.size();
+            if (n_blocks > INT_MAX) local_ok = 0;
+        }
+        MPI_Bcast(&local_ok, 1, MPI_INT, 0,
+                  MPI_COMM_WORLD);
+        if (!local_ok) goto cleanup;
+        MPI_Bcast(&n_blocks, 1, MPI_LONG_LONG, 0,
+                  MPI_COMM_WORLD);
+        if (rank != 0) {
+            block_offsets.resize((size_t)n_blocks);
+            block_lengths.resize((size_t)n_blocks);
+        }
+        if (n_blocks > 0) {
+            MPI_Bcast(block_offsets.data(), (int)n_blocks,
+                      MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+            MPI_Bcast(block_lengths.data(), (int)n_blocks,
+                      MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+        }
+        local_begin = n_blocks * rank / comm_size;
+        local_end = n_blocks * (rank + 1) / comm_size;
+        if (MpiCommonSelectBlockRangeFromMemory(
+                input_memory, input_size,
+                block_offsets, block_lengths,
+                local_begin, local_end,
+                &rank_input, &rank_input_size) != 0) {
+            local_ok = 0;
+        }
+        stage41_cost = CollateReduceMax(GetTime() - t0);
+        if (rank == 0 && local_ok) {
+            printf("MPI BAM scan complete. data_blocks=%lld "
+                   "body_start=%lld\n",
+                   n_blocks, body_start);
+            printf("Complete the 4.1 scan/split/broadcast/select cost %lf\n",
+                   stage41_cost);
+        }
+    }
+    if (!CollateAllRanksOk(local_ok)) goto cleanup;
+
+    {
+        double t0 = GetTime();
+        reader.base = rank_input;
+        reader.size = rank_input_size;
+        reader.pos = 0;
+        if (MpiCommonInitMemWriter(
+                writer, rank_input_size
+                    ? rank_input_size
+                    : 1024 * 1024) != 0) {
+            local_ok = 0;
+        }
+        stage42_cost =
+            CollateReduceMax(GetTime() - t0);
+        if (rank == 0 && local_ok) {
+            printf("Complete the 4.2 init reader/writer cost %lf\n",
+                   stage42_cost);
+        }
+    }
+    if (!CollateAllRanksOk(local_ok)) goto cleanup;
+
+    {
+        size_t estimate =
+            rank_input_size >
+                    (SIZE_MAX -
+                     256ull * 1024 * 1024) / 6
+                ? SIZE_MAX
+                : rank_input_size * 6 +
+                      256ull * 1024 * 1024;
+        unsigned long long local_estimate =
+            estimate == SIZE_MAX
+                ? ULLONG_MAX
+                : (unsigned long long)estimate;
+        unsigned long long max_estimate = 0;
+        MPI_Allreduce(&local_estimate, &max_estimate, 1,
+                      MPI_UNSIGNED_LONG_LONG, MPI_MAX,
+                      MPI_COMM_WORLD);
+        int local_external =
+            memory_limit != 0 &&
+            estimate > memory_limit;
+        int use_external = 0;
+        MPI_Allreduce(&local_external, &use_external, 1,
+                      MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        stats.mode = 0;
+        if (rank == 0) {
+            printf("MPI BAM collate selected mode=memory "
+                   "memory_estimate_max=%llu memory_limit=%zu\n",
+                   max_estimate, memory_limit);
+            printf("MPI BAM collate pipeline policy: memory only; "
+                   "external mode is disabled.\n");
+        }
+        if (use_external) {
+            if (rank == 0) {
+                fprintf(stderr,
+                        "ERROR: dedup-pipeline collate memory estimate exceeds -m; external intermediate storage is disabled in v1.\n");
+            }
+            local_ok = 0;
+        }
+        if (!CollateAllRanksOk(local_ok)) goto cleanup;
+
+        double t0 = GetTime();
+        int ret = FusedBamMemoryCollateMPI(
+            reader, writer, local_begin,
+            rank, comm_size, collate_bins,
+            cmd_info->compress_level_,
+            memory_limit, &stats);
+        if (ret != 0) local_ok = 0;
+        int global_ok = CollateAllRanksOk(local_ok);
+        stage43_cost =
+            CollateReduceMax(GetTime() - t0);
+        double actual_max =
+            CollateReduceMax(stats.t_actual);
+        if (rank == 0 && global_ok) {
+            printf("Complete the 4.3 FusedBamCollateMPI cost %lf\n",
+                   stage43_cost);
+            printf("FusedBamCollateMPI actual wall %lf\n",
+                   actual_max);
+        }
+        if (!global_ok) goto cleanup;
+    }
+
+    if (CollateGatherOutput(
+            writer, header,
+            cmd_info->compress_level_,
+            cmd_info->out_file_name_,
+            output_bam,
+            rank, comm_size,
+            collate_bins,
+            &stats, &output_costs,
+            stage41_cost, stage42_cost,
+            stage43_cost, body_total_t0) != 0) {
+        local_ok = 0;
+    }
+    if (!CollateAllRanksOk(local_ok)) goto cleanup;
+    if (core_cost) {
+        *core_cost = stage41_cost + stage42_cost + stage43_cost +
+                     output_costs.stage44 +
+                     output_costs.stage45_header +
+                     output_costs.stage46;
+    }
+    exit_code = 0;
+
+cleanup:
+    if (input) {
+        if (sam_close(input) < 0) exit_code = 1;
+        input = nullptr;
+    }
+    if (input_hfile &&
+        hclose(input_hfile) != 0) {
+        exit_code = 1;
+    }
+    if (header) sam_hdr_destroy(header);
+    free(writer.data);
+    if (rank == 0) {
+        printf("666collate total process cost %lf-----\n",
+               GetTime() - total_t0);
+    }
+    return exit_code;
+}
+
 int ProcessCollateMPI(CmdInfo *cmd_info) {
     double total_t0 = GetTime();
     int rank = 0;
@@ -4037,6 +4331,7 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
             writer, header,
             cmd_info->compress_level_,
             cmd_info->out_file_name_,
+            nullptr,
             rank, comm_size,
             collate_bins,
             &stats, &output_costs,

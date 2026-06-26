@@ -147,6 +147,21 @@ static inline struct libdeflate_compressor *sort_get_reused_mpi_compressor(
     return z;
 }
 
+extern "C" void slave_mpi_sort_release_caches(void *unused) {
+    (void)unused;
+    const int id = _PEN;
+    if (id < 0 || id >= 64) return;
+    if (g_sort_mpi_compressors[id]) {
+        libdeflate_free_compressor(g_sort_mpi_compressors[id]);
+        g_sort_mpi_compressors[id] = nullptr;
+        g_sort_mpi_compressor_levels[id] = 0;
+    }
+    if (g_sort_decompressors[id]) {
+        libdeflate_free_decompressor(g_sort_decompressors[id]);
+        g_sort_decompressors[id] = nullptr;
+    }
+}
+
 static int sort_bgzf_uncompress_reuse(uint8_t *dst, size_t *dlen,
                                       const uint8_t *src, size_t slen,
                                       uint32_t expected_crc,

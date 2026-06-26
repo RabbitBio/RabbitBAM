@@ -40,6 +40,9 @@ int MpiCommonInitMemWriter(MemWriter &w, size_t cap);
 int MpiCommonBuildBamHeaderMemory(
     sam_hdr_t *hdr, int compress_level,
     char **data, size_t *size);
+int MpiCommonReadBamHeaderFromMemory(
+    const char *data, size_t size,
+    sam_hdr_t **header, long long *body_start);
 
 namespace {
 
@@ -798,9 +801,13 @@ static int FmStreamLocalGroups(
             if (decomp[b].status != 0) {
                 fprintf(stderr,
                         "[rank %d] ERROR: fixmate decode failed "
-                        "block=%d status=%d record=%d.\n",
+                        "block=%d status=%d record=%d "
+                        "actual=%lld limit=%lld limit_id=%d.\n",
                         rank, b, decomp[b].status,
-                        decomp[b].record_index);
+                        decomp[b].record_index,
+                        decomp[b].actual_value,
+                        decomp[b].limit_value,
+                        decomp[b].limit_id);
                 FmFreeBlockSet(&input);
                 FmFreeBlockSet(&uncompressed);
                 FmFreeRecordSet(&record_set);
@@ -1062,6 +1069,7 @@ static void FmPrintStats(
 static int FmGatherOutput(
         const MemWriter &local_writer, sam_hdr_t *header,
         int compress_level, const std::string &output_path,
+        MpiMemoryBam *output_bam,
         int rank, int comm_size, MpiFixmateStats *stats,
         FmOutputStageCosts *costs,
         double stage41_cost, double stage42_cost,
@@ -1278,7 +1286,13 @@ static int FmGatherOutput(
     }
 
     double dump_t0 = GetTime();
-    if (rank == 0 &&
+    if (output_bam) {
+        if (rank == 0) {
+            output_bam->data = output_memory;
+            output_bam->size = output_size;
+            output_memory = nullptr;
+        }
+    } else if (rank == 0 &&
         MpiCommonDumpMemoryToFile(
             output_path, output_memory, output_size) != 0) {
         fprintf(stderr,
@@ -1288,7 +1302,9 @@ static int FmGatherOutput(
     }
     const double dump_cost = FmReduceMax(GetTime() - dump_t0);
     if (rank == 0 && local_ok) {
-        printf("555Dump memory to output file cost %lf--\n",
+        printf(output_bam
+                   ? "555Keep output memory cost %lf--\n"
+                   : "555Dump memory to output file cost %lf--\n",
                dump_cost);
     }
     free(header_memory);
@@ -1461,6 +1477,256 @@ static void FmPrintStats(
 }
 
 } // namespace
+
+int MpiFixmateMemoryToMemory(CmdInfo *cmd_info,
+                             const char *input_memory_const,
+                             size_t input_size,
+                             MpiMemoryBam *output_bam,
+                             double *core_cost) {
+    double total_t0 = GetTime();
+    int rank = 0;
+    int comm_size = 1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
+
+    int exit_code = 1;
+    int local_ok = 1;
+    char *input_memory = const_cast<char *>(input_memory_const);
+    sam_hdr_t *header = nullptr;
+    long long body_start = 0;
+    std::vector<long long> block_offsets;
+    std::vector<long long> block_lengths;
+    long long n_blocks = 0;
+    long long local_begin = 0;
+    long long local_end = 0;
+    char *rank_input = nullptr;
+    size_t rank_input_size = 0;
+    MemReader reader = {};
+    MemWriter middle = {};
+    MemWriter prefix = {};
+    MemWriter suffix = {};
+    FmStoredGroup leading;
+    FmStoredGroup trailing;
+    int single_group = 0;
+    int continues_previous = 0;
+    MpiFixmateStats stats = {};
+    FmOutputStageCosts output_stage_costs = {};
+    double stage41_cost = 0.0;
+    double stage42_cost = 0.0;
+    double stage43_cost = 0.0;
+    double body_total_t0 = 0.0;
+
+    if (output_bam) {
+        output_bam->data = nullptr;
+        output_bam->size = 0;
+    }
+    if (core_cost) *core_cost = 0.0;
+
+    if (!input_memory || input_size == 0 || !output_bam ||
+        !cmd_info->fixmate_mate_score_) {
+        if (rank == 0) {
+            fprintf(stderr,
+                    "ERROR: dedup-pipeline fixmate requires non-empty BAM input and -m mode.\n");
+        }
+        local_ok = 0;
+    }
+    if (!FmAllRanksOk(local_ok)) goto cleanup;
+    {
+        const double cost = FmReduceMax(GetTime() - total_t0);
+        if (rank == 0) {
+            printf("111Complete the initialization cost %lf-----\n",
+                   cost);
+        }
+    }
+
+    {
+        double t0 = GetTime();
+        if (rank == 0 &&
+            MpiCommonReadBamHeaderFromMemory(
+                input_memory, input_size, &header,
+                &body_start) != 0) {
+            fprintf(stderr,
+                    "ERROR: failed to parse fixmate pipeline BAM header.\n");
+            local_ok = 0;
+        }
+        if (rank == 0 && local_ok) {
+            kstring_t order = {0, 0, nullptr};
+            if (sam_hdr_find_tag_hd(header, "SO", &order) == 0 &&
+                order.s && strcmp(order.s, "coordinate") == 0) {
+                if (rank == 0) {
+                    fprintf(stderr,
+                            "ERROR: fixmate requires name-collated or "
+                            "queryname-sorted input, not coordinate order.\n");
+                }
+                local_ok = 0;
+            }
+            free(order.s);
+        }
+        MPI_Bcast(&local_ok, 1, MPI_INT, 0,
+                  MPI_COMM_WORLD);
+        MPI_Bcast(&body_start, 1, MPI_LONG_LONG, 0,
+                  MPI_COMM_WORLD);
+        const double cost = FmReduceMax(GetTime() - t0);
+        if (rank == 0 && local_ok) {
+            printf("333Complete the head cost %lf---\n", cost);
+        }
+    }
+    if (!FmAllRanksOk(local_ok)) goto cleanup;
+
+    body_total_t0 = GetTime();
+    {
+        double t0 = GetTime();
+        if (rank == 0) {
+            printf("Enable MPI BAM FIXMATE -m mode "
+                   "(%d MPE + %d CPEs)!!!\n",
+                   comm_size, comm_size * 64);
+            printf("MPI BAM output compression level=%d\n",
+                   cmd_info->compress_level_);
+            if (MpiCommonScanBgzfBlocksInMemory(
+                    input_memory, input_size, body_start,
+                    &block_offsets, &block_lengths) != 0) {
+                local_ok = 0;
+            }
+            n_blocks = (long long)block_offsets.size();
+            if (n_blocks > INT_MAX) local_ok = 0;
+        }
+        MPI_Bcast(&local_ok, 1, MPI_INT, 0,
+                  MPI_COMM_WORLD);
+        if (!local_ok) goto cleanup;
+        MPI_Bcast(&n_blocks, 1, MPI_LONG_LONG, 0,
+                  MPI_COMM_WORLD);
+        if (rank != 0) {
+            block_offsets.resize((size_t)n_blocks);
+            block_lengths.resize((size_t)n_blocks);
+        }
+        if (n_blocks > 0) {
+            MPI_Bcast(block_offsets.data(), (int)n_blocks,
+                      MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+            MPI_Bcast(block_lengths.data(), (int)n_blocks,
+                      MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+        }
+        local_begin = n_blocks * rank / comm_size;
+        local_end = n_blocks * (rank + 1) / comm_size;
+        if (MpiCommonSelectBlockRangeFromMemory(
+                input_memory, input_size,
+                block_offsets, block_lengths,
+                local_begin, local_end,
+                &rank_input, &rank_input_size) != 0) {
+            local_ok = 0;
+        }
+        stage41_cost = FmReduceMax(GetTime() - t0);
+        if (rank == 0 && local_ok) {
+            printf("MPI BAM scan complete. data_blocks=%lld "
+                   "body_start=%lld\n", n_blocks, body_start);
+            printf("Complete the 4.1 scan/split/broadcast/select cost %lf\n",
+                   stage41_cost);
+        }
+    }
+    if (!FmAllRanksOk(local_ok)) goto cleanup;
+
+    {
+        double t0 = GetTime();
+        reader.base = rank_input;
+        reader.size = rank_input_size;
+        reader.pos = 0;
+        if (MpiCommonInitMemWriter(
+                middle, rank_input_size ?
+                    rank_input_size : 1024 * 1024) != 0 ||
+            MpiCommonInitMemWriter(prefix, 1024 * 1024) != 0 ||
+            MpiCommonInitMemWriter(suffix, 1024 * 1024) != 0) {
+            local_ok = 0;
+        }
+        stage42_cost = FmReduceMax(GetTime() - t0);
+        if (rank == 0 && local_ok) {
+            printf("Complete the 4.2 init reader/writer cost %lf\n",
+                   stage42_cost);
+        }
+    }
+    if (!FmAllRanksOk(local_ok)) goto cleanup;
+
+    {
+        double fused_t0 = GetTime();
+        if (FmStreamLocalGroups(
+                reader, cmd_info->compress_level_,
+                &middle, &leading, &trailing,
+                &single_group, rank, &stats) != 0) {
+            local_ok = 0;
+        }
+        if (!FmAllRanksOkTimed(local_ok, &stats)) goto cleanup;
+
+        if (FmExchangeBoundaryGroups(
+                &leading, &trailing, single_group,
+                rank, comm_size, &continues_previous,
+                &stats) != 0) {
+            local_ok = 0;
+        }
+        if (!FmAllRanksOkTimed(local_ok, &stats)) goto cleanup;
+
+        if (!leading.empty()) {
+            if (single_group) {
+                if (!continues_previous &&
+                    FmProcessStoredGroup(
+                        &leading, cmd_info->compress_level_,
+                        &prefix, rank, &stats) != 0) {
+                    local_ok = 0;
+                }
+            } else {
+                if (!continues_previous &&
+                    FmProcessStoredGroup(
+                        &leading, cmd_info->compress_level_,
+                        &prefix, rank, &stats) != 0) {
+                    local_ok = 0;
+                }
+                if (local_ok &&
+                    FmProcessStoredGroup(
+                        &trailing, cmd_info->compress_level_,
+                        &suffix, rank, &stats) != 0) {
+                    local_ok = 0;
+                }
+            }
+        }
+        if (local_ok &&
+            FmPrependAppend(&middle, prefix, suffix) != 0) {
+            local_ok = 0;
+        }
+        if (!FmAllRanksOkTimed(local_ok, &stats)) goto cleanup;
+        stats.t_fused_total = GetTime() - fused_t0;
+        stage43_cost = FmReduceMax(stats.t_fused_total);
+        if (rank == 0 && local_ok) {
+            printf("Complete the 4.3 FusedFixmateMPI cost %lf\n",
+                   stage43_cost);
+        }
+    }
+    if (!FmAllRanksOk(local_ok)) goto cleanup;
+
+    if (FmGatherOutput(
+            middle, header, cmd_info->compress_level_,
+            cmd_info->out_file_name_, output_bam,
+            rank, comm_size, &stats, &output_stage_costs,
+            stage41_cost, stage42_cost, stage43_cost,
+            body_total_t0) != 0) {
+        local_ok = 0;
+    }
+    if (!FmAllRanksOk(local_ok)) goto cleanup;
+    if (core_cost) {
+        *core_cost = stage41_cost + stage42_cost + stage43_cost +
+                     output_stage_costs.stage44 +
+                     output_stage_costs.stage45_header +
+                     output_stage_costs.stage46;
+    }
+    exit_code = 0;
+
+cleanup:
+    if (header) sam_hdr_destroy(header);
+    free(middle.data);
+    free(prefix.data);
+    free(suffix.data);
+    if (rank == 0) {
+        printf("666fixmate total process cost %lf-----\n",
+               GetTime() - total_t0);
+    }
+    return exit_code;
+}
 
 int ProcessFixmateMPI(CmdInfo *cmd_info) {
     double total_t0 = GetTime();
@@ -1717,7 +1983,7 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
 
     if (FmGatherOutput(
             middle, header, cmd_info->compress_level_,
-            cmd_info->out_file_name_, rank, comm_size,
+            cmd_info->out_file_name_, nullptr, rank, comm_size,
             &stats, &output_stage_costs,
             stage41_cost, stage42_cost, stage43_cost,
             body_total_t0) != 0) {

@@ -101,6 +101,7 @@ list(APPEND MPI_SRC_FILES
     "${CMAKE_SOURCE_DIR}/src/swbam_markdup_mpi.cpp"
     "${CMAKE_SOURCE_DIR}/src/swbam_markdup_stream_mpi.cpp"
     "${CMAKE_SOURCE_DIR}/src/swbam_fixmate_mpi.cpp"
+    "${CMAKE_SOURCE_DIR}/src/swbam_dedup_pipeline_mpi.cpp"
 )
 list(REMOVE_DUPLICATES MPI_SRC_FILES)
 
@@ -176,6 +177,13 @@ if(PLATFORM_SUNWAY)
 else()
     # For x86, only compile src files
     add_executable(${PROJECT_NAME} ${SINGLE_SRC_FILES})
+endif()
+
+add_executable(markdup_verify_fast
+    bench/markdup_verify_fast.cpp
+)
+if(PLATFORM_SUNWAY)
+    target_compile_options(markdup_verify_fast PRIVATE ${HOST_FLAGS})
 endif()
 
 # Link libraries

@@ -35,6 +35,7 @@ public:
     bool markdup_include_fails_;
     std::string markdup_memory_;
     bool fixmate_mate_score_;
+    std::string pipeline_memory_;
 
 };
 
