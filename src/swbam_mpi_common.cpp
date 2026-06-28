@@ -746,9 +746,7 @@ void MpiMemoryBamFree(MpiMemoryBam *bam) {
 
 int MpiBroadcastMemoryBam(MpiMemoryBam *bam, int root) {
     int rank = 0;
-    int comm_size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
 
     int local_ok = bam != nullptr ? 1 : 0;
     unsigned long long wire_size = 0;
@@ -782,27 +780,13 @@ int MpiBroadcastMemoryBam(MpiMemoryBam *bam, int root) {
 
     const unsigned long long kBroadcastChunk = 16ull * 1024ull * 1024ull;
     unsigned long long done = 0;
-    const int tag = 7600;
     local_ok = 1;
     while (done < wire_size) {
         int chunk = (int)std::min<unsigned long long>(
             wire_size - done, kBroadcastChunk);
-        if (rank == root) {
-            for (int dst = 0; dst < comm_size; ++dst) {
-                if (dst == root) continue;
-                if (MPI_Send(bam->data + done, chunk,
-                             MPI_BYTE, dst, tag,
-                             MPI_COMM_WORLD) != MPI_SUCCESS) {
-                    local_ok = 0;
-                }
-            }
-        } else {
-            if (MPI_Recv(bam->data + done, chunk,
-                         MPI_BYTE, root, tag,
-                         MPI_COMM_WORLD,
-                         MPI_STATUS_IGNORE) != MPI_SUCCESS) {
-                local_ok = 0;
-            }
+        if (MPI_Bcast(bam->data + done, chunk, MPI_BYTE,
+                      root, MPI_COMM_WORLD) != MPI_SUCCESS) {
+            local_ok = 0;
         }
         done += (unsigned long long)chunk;
     }

@@ -171,6 +171,8 @@ int ProcessDedupPipelineMPI(CmdInfo *cmd_info) {
     double p2_cost = 0.0;
     double p3_cost = 0.0;
     double p4_cost = 0.0;
+    double p0_load_cost = 0.0;
+    double p0_broadcast_cost = 0.0;
     double broadcast_cost = 0.0;
 
     if (cmd_info->markdup_remove_dups_ ||
@@ -196,6 +198,7 @@ int ProcessDedupPipelineMPI(CmdInfo *cmd_info) {
 
     {
         double t0 = GetTime();
+        double load_t0 = GetTime();
         if (rank == 0 &&
             MpiCommonLoadFileToMemory(cmd_info->in_file_name_,
                                       &current.data,
@@ -205,17 +208,24 @@ int ProcessDedupPipelineMPI(CmdInfo *cmd_info) {
                     cmd_info->in_file_name_.c_str());
             local_ok = 0;
         }
-        if (!PipelineAllRanksOk(local_ok)) goto cleanup;
+        int load_ok = PipelineAllRanksOk(local_ok);
+        p0_load_cost = PipelineReduceMax(GetTime() - load_t0);
+        if (!load_ok) goto cleanup;
+        double broadcast_t0 = GetTime();
         if (MpiBroadcastMemoryBam(&current, 0) != 0) {
             local_ok = 0;
         }
+        p0_broadcast_cost =
+            PipelineReduceMax(GetTime() - broadcast_t0);
         p0_cost = PipelineReduceMax(GetTime() - t0);
-        if (rank == 0 && local_ok) {
-            printf("P0 load input memory/broadcast cost %lf size=%zu\n",
+        int p0_ok = PipelineAllRanksOk(local_ok);
+        if (rank == 0 && p0_ok) {
+            printf("P0 load input memory cost %lf broadcast %lf total %lf size=%zu\n",
+                   p0_load_cost, p0_broadcast_cost,
                    p0_cost, current.size);
         }
+        if (!p0_ok) goto cleanup;
     }
-    if (!PipelineAllRanksOk(local_ok)) goto cleanup;
 
     {
         CmdInfo stage = *cmd_info;
@@ -351,8 +361,6 @@ int ProcessDedupPipelineMPI(CmdInfo *cmd_info) {
             local_ok = 0;
         }
         if (!PipelineAllRanksOk(local_ok)) goto cleanup;
-        PipelineReleaseSlaveCaches("P4 markdup", rank);
-        PipelineResetSlaveRuntime("P4 markdup", rank);
         if (PipelineMaybeDebugDump("markdup",
                                    final_bam, rank) != 0) {
             local_ok = 0;
