@@ -33,6 +33,8 @@ public:
     bool markdup_remove_dups_;
     bool markdup_clear_;
     bool markdup_include_fails_;
+    bool markdup_streaming_;
+    int markdup_max_read_length_;
     std::string markdup_memory_;
     bool fixmate_mate_score_;
     std::string pipeline_memory_;

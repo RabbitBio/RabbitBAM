@@ -190,10 +190,12 @@ int ProcessDedupPipelineMPI(CmdInfo *cmd_info) {
                "(%d MPE + %d CPEs)!!!\n",
                comm_size, comm_size * 64);
         printf("dedup-pipeline stages: collate -> fixmate -m -> sort -> markdup\n");
-        printf("dedup-pipeline compression=%d memory='%s' bins=%d\n",
+        printf("dedup-pipeline compression=%d memory='%s' bins=%d "
+               "markdup=coordinate-stream max_read_length=%d\n",
                cmd_info->compress_level_,
                cmd_info->pipeline_memory_.c_str(),
-               cmd_info->collate_bins_);
+               cmd_info->collate_bins_,
+               cmd_info->markdup_max_read_length_);
     }
 
     {
@@ -351,6 +353,9 @@ int ProcessDedupPipelineMPI(CmdInfo *cmd_info) {
         stage.markdup_memory_ = cmd_info->pipeline_memory_;
         stage.markdup_remove_dups_ = false;
         stage.markdup_clear_ = false;
+        stage.markdup_streaming_ = true;
+        stage.markdup_max_read_length_ =
+            cmd_info->markdup_max_read_length_;
         double t0 = GetTime();
         if (MpiMarkdupMemoryToMemory(&stage, current.data,
                                      current.size, &final_bam,

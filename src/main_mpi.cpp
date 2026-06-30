@@ -83,6 +83,8 @@ int main(int argc, char **argv) {
     markdup->add_flag("-r,--remove-dups", cmd_info.markdup_remove_dups_, "Remove duplicate records")->default_val(false);
     markdup->add_flag("-c,--clear", cmd_info.markdup_clear_, "Clear existing duplicate flags and dt/do tags first")->default_val(false);
     markdup->add_flag("--include-fails", cmd_info.markdup_include_fails_, "Include QC-fail records in duplicate detection")->default_val(false);
+    markdup->add_flag("--stream", cmd_info.markdup_streaming_, "Use bounded-memory coordinate streaming markdup")->default_val(false);
+    markdup->add_option("-l,--max-read-length", cmd_info.markdup_max_read_length_, "Expected maximum read length for streaming eviction")->default_val(300)->check(CLI::PositiveNumber);
     markdup->add_option("-m,--memory", cmd_info.markdup_memory_, "Markdup candidate memory limit per MPI rank, e.g. 4G or 4096M");
     markdup->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
     markdup->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
@@ -100,6 +102,7 @@ int main(int argc, char **argv) {
     CLI::Option *pipeline_bins_option =
         dedup_pipeline->add_option("-n,--bins", cmd_info.collate_bins_, "Number of logical QNAME hash bins for collate")->default_val(64);
     dedup_pipeline->add_option("-m,--memory", cmd_info.pipeline_memory_, "Pipeline memory limit per MPI rank, e.g. 8G or 8192M");
+    dedup_pipeline->add_option("-l,--max-read-length", cmd_info.markdup_max_read_length_, "Expected maximum read length for streaming markdup eviction")->default_val(300)->check(CLI::PositiveNumber);
     dedup_pipeline->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
     dedup_pipeline->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
 

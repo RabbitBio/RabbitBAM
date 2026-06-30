@@ -23,6 +23,8 @@ CmdInfo::CmdInfo() {
     markdup_remove_dups_ = false;
     markdup_clear_ = false;
     markdup_include_fails_ = false;
+    markdup_streaming_ = false;
+    markdup_max_read_length_ = 300;
     markdup_memory_ = "";
     fixmate_mate_score_ = false;
     pipeline_memory_ = "";

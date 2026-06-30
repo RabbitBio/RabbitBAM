@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <new>
 #include <vector>
 
 namespace {
@@ -98,6 +99,37 @@ struct MdFlatBestTable {
         if (!keys || !hashes || !best || !used) return -1;
         init_t0 = GetTime();
         memset(used, 0, capacity);
+        filled = 0;
+        if (init_time) *init_time += GetTime() - init_t0;
+        return 0;
+    }
+
+    int Prepare(size_t expected, double *alloc_time,
+                double *init_time) {
+        double init_t0 = GetTime();
+        const size_t wanted = MdNextTableCapacity(expected);
+        if (expected > 0 && wanted == 0) {
+            if (init_time) *init_time += GetTime() - init_t0;
+            return -1;
+        }
+        if (wanted > capacity) {
+            if (init_time) *init_time += GetTime() - init_t0;
+            Free();
+            capacity = wanted;
+            mask = capacity - 1;
+            const double alloc_t0 = GetTime();
+            keys = (MpiMarkdupKeyShared *)aligned_alloc_custom(
+                64, capacity * sizeof(MpiMarkdupKeyShared));
+            hashes = (uint64_t *)aligned_alloc_custom(
+                64, capacity * sizeof(uint64_t));
+            best = (size_t *)aligned_alloc_custom(
+                64, capacity * sizeof(size_t));
+            used = aligned_alloc_custom(64, capacity);
+            if (alloc_time) *alloc_time += GetTime() - alloc_t0;
+            if (!keys || !hashes || !best || !used) return -1;
+            init_t0 = GetTime();
+        }
+        if (capacity > 0) memset(used, 0, capacity);
         filled = 0;
         if (init_time) *init_time += GetTime() - init_t0;
         return 0;
@@ -201,6 +233,369 @@ static int MdPushDuplicateStream(
 }
 
 } // namespace
+
+struct MpiMarkdupStreamingWindow {
+    int comm_size;
+    int64_t max_read_length;
+    int32_t first_ref;
+    int64_t first_coord;
+    int32_t last_ref;
+    int64_t last_coord;
+    size_t peak_working_bytes;
+    std::vector<MpiMarkdupCandidateShared> carry;
+    std::vector<unsigned char> carry_qnames;
+    std::vector<MpiMarkdupCandidateShared> next_carry;
+    std::vector<unsigned char> next_qnames;
+    MdFlatBestTable pair_best;
+    MdFlatBestTable single_best;
+    std::vector<size_t> pair_slots;
+    std::vector<size_t> single_slots;
+    std::vector<size_t> marker_indices;
+    std::vector<size_t> marker_carry_indices;
+
+    MpiMarkdupStreamingWindow()
+        : comm_size(1), max_read_length(300),
+          first_ref(0), first_coord(0),
+          last_ref(0), last_coord(0),
+          peak_working_bytes(0) {}
+};
+
+namespace {
+
+static bool MdWindowBoundaryKey(
+        const MpiMarkdupStreamingWindow *window,
+        const MpiMarkdupKeyShared &key) {
+    if (window->first_ref > 0 && key.this_ref == window->first_ref &&
+        key.this_coord >=
+            window->first_coord - window->max_read_length &&
+        key.this_coord <=
+            window->first_coord + window->max_read_length) {
+        return true;
+    }
+    return window->last_ref > 0 && key.this_ref == window->last_ref &&
+           key.this_coord >=
+               window->last_coord - window->max_read_length &&
+           key.this_coord <=
+               window->last_coord + window->max_read_length;
+}
+
+static bool MdWindowExpired(
+        const MpiMarkdupStreamingWindow *window,
+        const MpiMarkdupKeyShared &key,
+        int progress_tid, int progress_pos) {
+    if (progress_tid < 0) return true;
+    const int32_t progress_ref = progress_tid + 1;
+    const int64_t progress_coord = (int64_t)progress_pos + 1;
+    if (key.this_ref < progress_ref) return true;
+    if (key.this_ref > progress_ref) return false;
+    return key.this_coord + window->max_read_length <= progress_coord;
+}
+
+static bool MdWindowKeepKey(
+        const MpiMarkdupStreamingWindow *window,
+        const MpiMarkdupKeyShared &key,
+        int progress_tid, int progress_pos) {
+    return MdWindowBoundaryKey(window, key) ||
+           !MdWindowExpired(window, key, progress_tid, progress_pos);
+}
+
+static size_t MdFlatTableBytes(const MdFlatBestTable &table) {
+    const size_t stride = sizeof(MpiMarkdupKeyShared) +
+        sizeof(uint64_t) + sizeof(size_t) + 1;
+    return table.capacity > SIZE_MAX / stride
+        ? SIZE_MAX : table.capacity * stride;
+}
+
+} // namespace
+
+MpiMarkdupStreamingWindow *MpiMarkdupStreamingWindowCreate(
+        int comm_size, int max_read_length,
+        int range_first_tid, int range_first_pos,
+        int range_last_tid, int range_last_pos) {
+    if (comm_size <= 0 || max_read_length <= 0) return nullptr;
+    MpiMarkdupStreamingWindow *window =
+        new (std::nothrow) MpiMarkdupStreamingWindow();
+    if (!window) return nullptr;
+    window->comm_size = comm_size;
+    window->max_read_length = max_read_length;
+    window->first_ref = range_first_tid >= 0
+        ? range_first_tid + 1 : 0;
+    window->first_coord = range_first_pos >= 0
+        ? (int64_t)range_first_pos + 1 : 0;
+    window->last_ref = range_last_tid >= 0
+        ? range_last_tid + 1 : 0;
+    window->last_coord = range_last_pos >= 0
+        ? (int64_t)range_last_pos + 1 : 0;
+    return window;
+}
+
+void MpiMarkdupStreamingWindowDestroy(
+        MpiMarkdupStreamingWindow *window) {
+    delete window;
+}
+
+int MpiMarkdupStreamingWindowProcess(
+        MpiMarkdupStreamingWindow *window,
+        const std::vector<MpiMarkdupCandidateShared> &owner_candidates,
+        const std::vector<unsigned char> &owner_qnames,
+        int progress_tid, int progress_pos,
+        std::vector<std::vector<uint64_t> > *duplicates_by_source,
+        MpiMarkdupStats *stats) {
+    if (!window || !duplicates_by_source || !stats) return -1;
+    if (duplicates_by_source->size() != (size_t)window->comm_size) {
+        duplicates_by_source->assign(
+            (size_t)window->comm_size, std::vector<uint64_t>());
+    }
+    const double group_t0 = GetTime();
+    const size_t carry_count = window->carry.size();
+    const size_t total = carry_count + owner_candidates.size();
+    auto candidate_at = [&](size_t index)
+        -> const MpiMarkdupCandidateShared & {
+        return index < carry_count
+            ? window->carry[index]
+            : owner_candidates[index - carry_count];
+    };
+    auto qnames_at = [&](size_t index)
+        -> const std::vector<unsigned char> & {
+        return index < carry_count
+            ? window->carry_qnames : owner_qnames;
+    };
+    auto pair_better = [&](size_t a_index, size_t b_index) -> bool {
+        const MpiMarkdupCandidateShared &a = candidate_at(a_index);
+        const MpiMarkdupCandidateShared &b = candidate_at(b_index);
+        if (a.qc_fail != b.qc_fail) return a.qc_fail < b.qc_fail;
+        if (a.score != b.score) return a.score > b.score;
+        const std::vector<unsigned char> &a_qnames = qnames_at(a_index);
+        const std::vector<unsigned char> &b_qnames = qnames_at(b_index);
+        if (a.qname_offset > a_qnames.size() ||
+            a.qname_len > a_qnames.size() - (size_t)a.qname_offset ||
+            b.qname_offset > b_qnames.size() ||
+            b.qname_len > b_qnames.size() - (size_t)b.qname_offset) {
+            return a.global_order < b.global_order;
+        }
+        const size_t common = std::min(
+            (size_t)a.qname_len, (size_t)b.qname_len);
+        const int qcmp = common ? memcmp(
+            a_qnames.data() + (size_t)a.qname_offset,
+            b_qnames.data() + (size_t)b.qname_offset,
+            common) : 0;
+        if (qcmp != 0) return qcmp < 0;
+        if (a.qname_len != b.qname_len) {
+            return a.qname_len < b.qname_len;
+        }
+        return a.global_order < b.global_order;
+    };
+
+    size_t pair_expected = 0;
+    size_t single_expected = 0;
+    for (size_t i = 0; i < total; ++i) {
+        const MpiMarkdupCandidateShared &candidate = candidate_at(i);
+        if (!candidate.key.single) pair_expected++;
+        else if (!candidate.paired_marker) single_expected++;
+    }
+    if (window->pair_best.Prepare(
+            pair_expected, &stats->t_flat_alloc,
+            &stats->t_flat_init) != 0 ||
+        window->single_best.Prepare(
+            single_expected, &stats->t_flat_alloc,
+            &stats->t_flat_init) != 0) {
+        return -1;
+    }
+    window->pair_slots.clear();
+    window->single_slots.clear();
+    window->marker_indices.clear();
+    window->marker_carry_indices.clear();
+
+    const double probe_t0 = GetTime();
+    int status = 0;
+    for (size_t i = 0; i < total; ++i) {
+        const MpiMarkdupCandidateShared &candidate = candidate_at(i);
+        const uint64_t hash = MdHashKeyFlat(candidate.key);
+        size_t slot = 0;
+        int inserted = 0;
+        if (!candidate.key.single) {
+            if (window->pair_best.FindOrInsert(
+                    candidate.key, hash, i, &slot,
+                    &inserted) != 0) {
+                status = -1;
+                break;
+            }
+            // Only winners close enough to cross a batch/rank boundary need
+            // a second visit during carry construction.
+            if (inserted && MdWindowKeepKey(
+                    window, candidate.key,
+                    progress_tid, progress_pos)) {
+                window->pair_slots.push_back(slot);
+            }
+            if (inserted) continue;
+            const size_t old_best = window->pair_best.best[slot];
+            const MpiMarkdupCandidateShared &best =
+                candidate_at(old_best);
+            if (pair_better(i, old_best)) {
+                if (MdPushDuplicateStream(best, window->comm_size,
+                                          duplicates_by_source) != 0) {
+                    status = -1;
+                    break;
+                }
+                window->pair_best.best[slot] = i;
+            } else if (MdPushDuplicateStream(
+                           candidate, window->comm_size,
+                           duplicates_by_source) != 0) {
+                status = -1;
+                break;
+            }
+            stats->pair_duplicates++;
+            continue;
+        }
+        if (candidate.paired_marker) {
+            window->marker_indices.push_back(i);
+            if (MdWindowKeepKey(window, candidate.key,
+                                progress_tid, progress_pos)) {
+                window->marker_carry_indices.push_back(i);
+            }
+            continue;
+        }
+        if (window->single_best.FindOrInsert(
+                candidate.key, hash, i, &slot,
+                &inserted) != 0) {
+            status = -1;
+            break;
+        }
+        if (inserted && MdWindowKeepKey(
+                window, candidate.key,
+                progress_tid, progress_pos)) {
+            window->single_slots.push_back(slot);
+        }
+        if (inserted) continue;
+        const size_t old_best = window->single_best.best[slot];
+        const MpiMarkdupCandidateShared &best = candidate_at(old_best);
+        if (candidate.score > best.score ||
+            (candidate.score == best.score &&
+             candidate.global_order < best.global_order)) {
+            if (MdPushDuplicateStream(best, window->comm_size,
+                                      duplicates_by_source) != 0) {
+                status = -1;
+                break;
+            }
+            window->single_best.best[slot] = i;
+        } else if (MdPushDuplicateStream(
+                       candidate, window->comm_size,
+                       duplicates_by_source) != 0) {
+            status = -1;
+            break;
+        }
+        stats->single_duplicates++;
+    }
+    const double probe_dt = GetTime() - probe_t0;
+    stats->t_flat_probe += probe_dt;
+    stats->t_group_sort += probe_dt;
+    if (status != 0) return -1;
+
+    const double finalize_t0 = GetTime();
+    window->next_carry.clear();
+    window->next_qnames.clear();
+    auto keep = [&](size_t index) -> int {
+        const MpiMarkdupCandidateShared &input = candidate_at(index);
+        if (!MdWindowKeepKey(window, input.key,
+                             progress_tid, progress_pos)) {
+            return 0;
+        }
+        MpiMarkdupCandidateShared candidate = input;
+        if (!candidate.key.single) {
+            const std::vector<unsigned char> &qnames = qnames_at(index);
+            if (candidate.qname_offset > qnames.size() ||
+                candidate.qname_len > qnames.size() -
+                    (size_t)candidate.qname_offset) {
+                return -1;
+            }
+            const size_t qbase = window->next_qnames.size();
+            if (candidate.qname_len > 0) {
+                window->next_qnames.insert(
+                    window->next_qnames.end(),
+                    qnames.data() +
+                        (size_t)candidate.qname_offset,
+                    qnames.data() +
+                        (size_t)candidate.qname_offset +
+                        candidate.qname_len);
+            }
+            candidate.qname_offset = (uint64_t)qbase;
+        }
+        window->next_carry.push_back(candidate);
+        return 0;
+    };
+    for (size_t m = 0; m < window->marker_indices.size(); ++m) {
+        const size_t i = window->marker_indices[m];
+        const MpiMarkdupCandidateShared &marker = candidate_at(i);
+        size_t single_slot = 0;
+        if (window->single_best.FindExisting(
+                marker.key, MdHashKeyFlat(marker.key),
+                &single_slot) &&
+            window->single_best.best[single_slot] != SIZE_MAX) {
+            const MpiMarkdupCandidateShared &candidate =
+                candidate_at(window->single_best.best[single_slot]);
+            if (MdPushDuplicateStream(
+                    candidate, window->comm_size,
+                    duplicates_by_source) != 0) {
+                return -1;
+            }
+            window->single_best.best[single_slot] = SIZE_MAX;
+            stats->single_duplicates++;
+        }
+    }
+    for (size_t m = 0; m < window->marker_carry_indices.size(); ++m) {
+        if (keep(window->marker_carry_indices[m]) != 0) return -1;
+    }
+    for (size_t i = 0; i < window->pair_slots.size(); ++i) {
+        const size_t slot = window->pair_slots[i];
+        if (keep(window->pair_best.best[slot]) != 0) return -1;
+    }
+    for (size_t i = 0; i < window->single_slots.size(); ++i) {
+        const size_t slot = window->single_slots[i];
+        if (window->single_best.best[slot] != SIZE_MAX &&
+            keep(window->single_best.best[slot]) != 0) return -1;
+    }
+    size_t working_bytes =
+        window->carry.capacity() * sizeof(MpiMarkdupCandidateShared) +
+        window->carry_qnames.capacity() +
+        window->next_carry.capacity() *
+            sizeof(MpiMarkdupCandidateShared) +
+        window->next_qnames.capacity() +
+        window->pair_slots.capacity() * sizeof(size_t) +
+        window->single_slots.capacity() * sizeof(size_t) +
+        window->marker_indices.capacity() * sizeof(size_t) +
+        window->marker_carry_indices.capacity() * sizeof(size_t);
+    const size_t pair_bytes = MdFlatTableBytes(window->pair_best);
+    const size_t single_bytes = MdFlatTableBytes(window->single_best);
+    if (pair_bytes == SIZE_MAX || single_bytes == SIZE_MAX ||
+        pair_bytes > SIZE_MAX - working_bytes ||
+        single_bytes > SIZE_MAX - working_bytes - pair_bytes) {
+        window->peak_working_bytes = SIZE_MAX;
+    } else {
+        working_bytes += pair_bytes + single_bytes;
+        window->peak_working_bytes = std::max(
+            window->peak_working_bytes, working_bytes);
+    }
+    window->carry.swap(window->next_carry);
+    window->carry_qnames.swap(window->next_qnames);
+    const double finalize_dt = GetTime() - finalize_t0;
+    stats->t_flat_finalize += finalize_dt;
+    stats->t_group_scan += finalize_dt;
+    stats->t_group += GetTime() - group_t0;
+    return 0;
+}
+
+size_t MpiMarkdupStreamingWindowMemory(
+        const MpiMarkdupStreamingWindow *window) {
+    if (!window) return 0;
+    if (window->peak_working_bytes == SIZE_MAX) return SIZE_MAX;
+    const size_t carry_bytes = window->carry.capacity() *
+        sizeof(MpiMarkdupCandidateShared);
+    if (window->carry_qnames.capacity() > SIZE_MAX - carry_bytes) {
+        return SIZE_MAX;
+    }
+    return std::max(window->peak_working_bytes,
+                    carry_bytes + window->carry_qnames.capacity());
+}
 
 int MpiMarkdupFindDuplicatesStreamingHash(
         std::vector<MpiMarkdupCandidateShared> *owner_candidates,

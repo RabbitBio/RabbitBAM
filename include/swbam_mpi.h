@@ -352,6 +352,23 @@ int MpiMarkdupMemoryToMemory(CmdInfo *cmd_info,
                              MpiMemoryBam *output_bam,
                              double *core_cost);
 
+struct MpiMarkdupStreamingWindow;
+MpiMarkdupStreamingWindow *MpiMarkdupStreamingWindowCreate(
+    int comm_size, int max_read_length,
+    int range_first_tid, int range_first_pos,
+    int range_last_tid, int range_last_pos);
+void MpiMarkdupStreamingWindowDestroy(
+    MpiMarkdupStreamingWindow *window);
+int MpiMarkdupStreamingWindowProcess(
+    MpiMarkdupStreamingWindow *window,
+    const std::vector<MpiMarkdupCandidateShared> &owner_candidates,
+    const std::vector<unsigned char> &owner_qnames,
+    int progress_tid, int progress_pos,
+    std::vector<std::vector<uint64_t> > *duplicates_by_source,
+    MpiMarkdupStats *stats);
+size_t MpiMarkdupStreamingWindowMemory(
+    const MpiMarkdupStreamingWindow *window);
+
 int MpiCommonLoadFileToMemory(const std::string &path,
                               char **data, size_t *size);
 int MpiCommonScanBgzfBlocksInMemory(
