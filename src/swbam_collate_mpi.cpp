@@ -273,11 +273,10 @@ struct CollateLocalLess {
     }
 };
 
-static bool CollateTryBucketSortRecords(
-        std::vector<CollateMeta> *records,
+static bool CollateTryBucketSortRange(
+        CollateMeta *records, size_t n,
         const unsigned char *raw, size_t raw_size,
         int bins) {
-    const size_t n = records->size();
     if (n < 262144 || bins <= 0 || bins > 4096) {
         return false;
     }
@@ -303,7 +302,7 @@ static bool CollateTryBucketSortRecords(
     }
 
     for (size_t i = 0; i < n; ++i) {
-        const CollateMeta &meta = (*records)[i];
+        const CollateMeta &meta = records[i];
         if (meta.bin >= (uint32_t)bins) {
             return false;
         }
@@ -328,7 +327,7 @@ static bool CollateTryBucketSortRecords(
     if (!tmp) return false;
 
     for (size_t i = 0; i < n; ++i) {
-        const CollateMeta &meta = (*records)[i];
+        const CollateMeta &meta = records[i];
         const size_t bucket =
             (size_t)meta.bin * hash_buckets +
             (size_t)(meta.hash >> 24);
@@ -345,7 +344,7 @@ static bool CollateTryBucketSortRecords(
         }
     }
 
-    memcpy(records->data(), tmp, n * sizeof(CollateMeta));
+    memcpy(records, tmp, n * sizeof(CollateMeta));
     aligned_free_custom((unsigned char *)tmp);
     return true;
 }
@@ -355,8 +354,9 @@ static void CollateSortRecords(
         const unsigned char *raw, size_t raw_size,
         int bins, MpiCollateStats *stats) {
     double t0 = GetTime();
-    if (!CollateTryBucketSortRecords(
-            records, raw, raw_size, bins)) {
+    if (!CollateTryBucketSortRange(
+            records->data(), records->size(),
+            raw, raw_size, bins)) {
         std::sort(
             records->begin(), records->end(),
             CollateLocalLess{raw, raw_size});
@@ -2305,25 +2305,30 @@ static int CollateArenaAppendBlock(
 }
 
 static void CollateSortArena(
-        CollateRunArena *arena,
+        CollateRunArena *arena, int bins,
         MpiCollateStats *stats) {
     double t0 = GetTime();
-    std::sort(
-        arena->records(),
-        arena->records() + arena->record_count,
-        CollatePointerLess{
-            arena->data, arena->raw_used});
+    if (!CollateTryBucketSortRange(
+            arena->records(), arena->record_count,
+            arena->data, arena->raw_used, bins)) {
+        std::sort(
+            arena->records(),
+            arena->records() + arena->record_count,
+            CollatePointerLess{
+                arena->data, arena->raw_used});
+    }
     stats->t_local_sort += GetTime() - t0;
 }
 
 static int CollateSpillArena(
         CollateRunArena *arena,
+        int bins,
         CollateTempStore *store,
         unsigned char *scratch, size_t scratch_size,
         MpiCollateStats *stats,
         std::vector<CollateRun> *runs) {
     if (arena->record_count == 0) return 0;
-    CollateSortArena(arena, stats);
+    CollateSortArena(arena, bins, stats);
     CollateRun run;
     if (CollateAppendExtent(
             store->runs_fd, &store->runs_end,
@@ -2438,7 +2443,7 @@ static int CollateExtractRuns(
                 GetTime() - merge_t0;
             if (append == 1) {
                 if (CollateSpillArena(
-                        arena, store, scratch,
+                        arena, bins, store, scratch,
                         scratch_size, stats, runs) != 0) {
                     result = -1;
                     break;
@@ -2473,7 +2478,7 @@ static int CollateExtractRuns(
     stats->t_extract_free += GetTime() - free_t0;
     if (result != 0) return result;
     if (arena->record_count > 0) {
-        CollateSortArena(arena, stats);
+        CollateSortArena(arena, bins, stats);
         CollateRun resident;
         resident.resident = true;
         resident.extent.record_count =
@@ -2603,6 +2608,8 @@ static int CollateExchangeRuns(
         CollateRunArena *arena,
         CollateTempStore *store,
         int rank, int comm_size, int bins,
+        size_t exchange_raw_capacity,
+        size_t exchange_meta_bytes,
         unsigned char *scratch, size_t scratch_size,
         std::vector<CollateSegment> *segments,
         MpiCollateStats *stats) {
@@ -2612,12 +2619,8 @@ static int CollateExchangeRuns(
         &local_runs, &max_runs, 1,
         MPI_UNSIGNED_LONG_LONG, MPI_MAX,
         MPI_COMM_WORLD);
-    const size_t raw_capacity =
-        std::min<size_t>(
-            kCollateExchangeRaw, 8ull * 1024 * 1024);
-    const size_t meta_bytes =
-        std::min<size_t>(
-            kCollateExchangeMeta, 1ull * 1024 * 1024);
+    const size_t raw_capacity = exchange_raw_capacity;
+    const size_t meta_bytes = exchange_meta_bytes;
     const size_t meta_capacity =
         meta_bytes / sizeof(CollateMeta);
     std::vector<CollateMeta> send_meta(meta_capacity);
@@ -2638,6 +2641,7 @@ static int CollateExchangeRuns(
             has_run ? arena->records() : nullptr;
         size_t record_count =
             has_run ? arena->record_count : 0;
+        double bound_t0 = GetTime();
         std::vector<size_t> bounds(
             (size_t)comm_size + 1, record_count);
         bounds[0] = 0;
@@ -2653,6 +2657,7 @@ static int CollateExchangeRuns(
             bounds[(size_t)owner + 1] = pos;
         }
         if (pos != record_count) return -1;
+        stats->t_exchange_bound += GetTime() - bound_t0;
 
         double exchange_t0 = GetTime();
         for (int step = 0; step < comm_size; ++step) {
@@ -2670,6 +2675,7 @@ static int CollateExchangeRuns(
             bool recv_done = false;
             if (step == 0) {
                 while (send_pos < send_end) {
+                    double pack_t0 = GetTime();
                     size_t raw_bytes = 0;
                     size_t chunk_end =
                         CollateChunkEndPtr(
@@ -2686,8 +2692,13 @@ static int CollateExchangeRuns(
                             send_meta.data(),
                             send_raw.data(),
                             send_raw.size(),
-                            &raw_bytes) != 0 ||
-                        CollateAppendSegmentChunk(
+                            &raw_bytes) != 0) {
+                        return -1;
+                    }
+                    stats->t_exchange_self_pack +=
+                        GetTime() - pack_t0;
+                    double append_t0 = GetTime();
+                    if (CollateAppendSegmentChunk(
                             store, send_meta.data(),
                             chunk_end - send_pos,
                             send_raw.data(), raw_bytes,
@@ -2695,6 +2706,13 @@ static int CollateExchangeRuns(
                             stats, &segment) != 0) {
                         return -1;
                     }
+                    stats->t_exchange_self_append +=
+                        GetTime() - append_t0;
+                    stats->exchange_self_records +=
+                        (long long)(chunk_end - send_pos);
+                    stats->exchange_self_raw_bytes +=
+                        (long long)raw_bytes;
+                    ++stats->exchange_chunks;
                     send_pos = chunk_end;
                 }
                 recv_done = true;
@@ -2703,6 +2721,7 @@ static int CollateExchangeRuns(
                     size_t send_raw_bytes = 0;
                     size_t chunk_end = send_pos;
                     if (!send_done) {
+                        double pack_t0 = GetTime();
                         chunk_end =
                             CollateChunkEndPtr(
                                 records, send_pos,
@@ -2722,6 +2741,8 @@ static int CollateExchangeRuns(
                                 &send_raw_bytes) != 0) {
                             return -1;
                         }
+                        stats->t_exchange_remote_pack +=
+                            GetTime() - pack_t0;
                     }
                     unsigned long long send_header[3] = {
                         (unsigned long long)
@@ -2776,15 +2797,24 @@ static int CollateExchangeRuns(
                         return -1;
                     }
                     stats->t_mpi += GetTime() - mpi_t0;
-                    if (recv_count > 0 &&
-                        CollateAppendSegmentChunk(
+                    if (recv_count > 0) {
+                        double append_t0 = GetTime();
+                        if (CollateAppendSegmentChunk(
                             store, recv_meta.data(),
                             recv_count,
                             recv_raw.data(),
                             recv_raw_bytes,
                             scratch, scratch_size,
                             stats, &segment) != 0) {
-                        return -1;
+                            return -1;
+                        }
+                        stats->t_exchange_recv_append +=
+                            GetTime() - append_t0;
+                        stats->exchange_remote_records +=
+                            (long long)recv_count;
+                        stats->exchange_remote_raw_bytes +=
+                            (long long)recv_raw_bytes;
+                        ++stats->exchange_chunks;
                     }
                     send_pos = chunk_end;
                     send_done = send_header[2] != 0;
@@ -3254,9 +3284,33 @@ static int FusedBamExternalCollateMPI(
         int compress_level, size_t memory_limit,
         const std::string &temp_prefix,
         MpiCollateStats *stats) {
+    const size_t compact_exchange_raw = 8ull * 1024 * 1024;
+    const size_t compact_exchange_meta = 1ull * 1024 * 1024;
+    const size_t minimum_arena = 32ull * 1024 * 1024;
+    const size_t full_exchange_workspace =
+        2ull * kCollateExchangeRaw +
+        2ull * kCollateExchangeMeta;
+    const size_t common_fixed =
+        kCollateControlReserve + kCollateSimScratch;
+    const size_t full_phase_workspace = std::max(
+        CollateExtractWorkspaceBytes(),
+        std::max(full_exchange_workspace,
+                 CollateCompressWorkspaceBytes()));
+    const size_t full_fixed =
+        common_fixed + full_phase_workspace;
+    const size_t estimated_run_bytes =
+        reader.size > SIZE_MAX / 6
+            ? SIZE_MAX : reader.size * 6;
+    const int use_full_exchange =
+        memory_limit > full_fixed + minimum_arena &&
+        memory_limit - full_fixed >= estimated_run_bytes;
+    const size_t exchange_raw_capacity = use_full_exchange
+        ? kCollateExchangeRaw : compact_exchange_raw;
+    const size_t exchange_meta_bytes = use_full_exchange
+        ? kCollateExchangeMeta : compact_exchange_meta;
     const size_t exchange_workspace =
-        2ull * (8ull * 1024 * 1024) +
-        2ull * (1ull * 1024 * 1024);
+        2ull * exchange_raw_capacity +
+        2ull * exchange_meta_bytes;
     const size_t phase_workspace = std::max(
         CollateExtractWorkspaceBytes(),
         std::max(exchange_workspace,
@@ -3265,8 +3319,6 @@ static int FusedBamExternalCollateMPI(
         kCollateControlReserve +
         kCollateSimScratch +
         phase_workspace;
-    const size_t minimum_arena =
-        32ull * 1024 * 1024;
     if (memory_limit <= fixed + minimum_arena) {
         if (rank == 0) {
             fprintf(
@@ -3300,6 +3352,12 @@ static int FusedBamExternalCollateMPI(
         goto cleanup;
     }
     arena.reset();
+    if (rank == 0) {
+        printf("MPI BAM collate external exchange buffers "
+               "raw=%zu meta=%zu arena=%zu\n",
+               exchange_raw_capacity,
+               exchange_meta_bytes, arena.capacity);
+    }
     stats->run_arena_bytes =
         (long long)arena.capacity;
     stats->tracked_peak_bytes =
@@ -3319,6 +3377,8 @@ static int FusedBamExternalCollateMPI(
     if (CollateExchangeRuns(
             runs, &arena, &store,
             rank, comm_size, bins,
+            exchange_raw_capacity,
+            exchange_meta_bytes,
             scratch, kCollateSimScratch,
             &segments, stats) != 0) {
         goto cleanup;
@@ -3365,6 +3425,8 @@ static int FusedBamExternalCollateMPI(
 
 cleanup:
     stats->t_actual = GetTime() - wall_t0;
+    // Real temp I/O is removed; CollateSimulateCopy runs outside the
+    // measured syscalls, so its memory-copy cost remains in t_fused.
     stats->t_fused =
         stats->t_actual -
         stats->t_temp_read_actual -
@@ -3729,6 +3791,11 @@ static void CollatePrintStats(
             global_long[9], global_long[8],
             global_long[15], global_long[16],
             max_long[17], max_long[18]);
+        if (stats.mode) {
+            printf("  external_time_model per-rank simulated="
+                   "actual-temp_write_actual-temp_read_actual; "
+                   "memory-copy simulation remains included\n");
+        }
         fflush(stdout);
     }
 }
