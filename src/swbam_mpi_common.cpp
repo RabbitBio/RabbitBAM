@@ -1,4 +1,5 @@
 #include "swbam_mpi.h"
+#include "swbam/io.h"
 
 #include <algorithm>
 #include <climits>
@@ -80,48 +81,7 @@ double MpiReduceMaxCost(double local_cost) {
 }
 
 int MpiLoadFileToMemory(const std::string &path, char **data, size_t *size) {
-    *data = nullptr;
-    *size = 0;
-
-    FILE *fp = fopen(path.c_str(), "rb");
-    if (!fp) return -1;
-    if (fseeko(fp, 0, SEEK_END) != 0) {
-        fclose(fp);
-        return -1;
-    }
-
-    off_t end = ftello(fp);
-    if (end < 0) {
-        fclose(fp);
-        return -1;
-    }
-    if (fseeko(fp, 0, SEEK_SET) != 0) {
-        fclose(fp);
-        return -1;
-    }
-
-    if ((unsigned long long)end > (unsigned long long)SIZE_MAX) {
-        fclose(fp);
-        return -1;
-    }
-
-    *size = (size_t)end;
-    *data = *size ? (char *)malloc(*size) : nullptr;
-    if (*size > 0 && !*data) {
-        fclose(fp);
-        return -1;
-    }
-
-    if (*size > 0 && fread(*data, 1, *size, fp) != *size) {
-        fclose(fp);
-        free(*data);
-        *data = nullptr;
-        *size = 0;
-        return -1;
-    }
-
-    fclose(fp);
-    return 0;
+    return swbam::LoadFileToMemory(path, data, size);
 }
 
 int MpiBgzfBlockLengthAt(const char *base, size_t size,
@@ -130,27 +90,8 @@ int MpiBgzfBlockLengthAt(const char *base, size_t size,
 int MpiScanBgzfBlocksInMemory(const char *base, size_t size, long long body_start,
                               std::vector<long long> *offsets,
                               std::vector<long long> *lengths) {
-    if (!base || body_start < 0 || (unsigned long long)body_start > (unsigned long long)size) return -1;
-
-    long long pos = body_start;
-    while ((unsigned long long)pos < (unsigned long long)size) {
-        size_t block_len_size = 0;
-        if (MpiBgzfBlockLengthAt(base, size, (size_t)pos,
-                                 &block_len_size) != 0) {
-            return -1;
-        }
-        int block_len = (int)block_len_size;
-
-        bool is_eof = block_len == (int)sizeof(kMpiBgzfEofBlock) &&
-                      memcmp(base + pos, kMpiBgzfEofBlock, sizeof(kMpiBgzfEofBlock)) == 0;
-        if (is_eof) break;
-
-        offsets->push_back(pos);
-        lengths->push_back(block_len);
-        pos += block_len;
-    }
-
-    return 0;
+    return swbam::ScanBgzfBlocksInMemory(
+        base, size, body_start, offsets, lengths);
 }
 
 int MpiSelectBlockRangeFromMemory(char *base, size_t input_size,
@@ -160,20 +101,9 @@ int MpiSelectBlockRangeFromMemory(char *base, size_t input_size,
                                   long long end,
                                   char **data,
                                   size_t *size) {
-    *data = nullptr;
-    *size = 0;
-    if (begin >= end) return 0;
-
-    long long start = offsets[(size_t)begin];
-    long long stop = offsets[(size_t)(end - 1)] + lengths[(size_t)(end - 1)];
-    if (start < 0 || stop < start || (unsigned long long)stop > (unsigned long long)input_size) return -1;
-
-    long long total = stop - start;
-    if ((unsigned long long)total > (unsigned long long)SIZE_MAX) return -1;
-
-    *size = (size_t)total;
-    *data = base + start;
-    return 0;
+    return swbam::SelectBlockRangeFromMemory(
+        base, input_size, offsets, lengths,
+        begin, end, data, size);
 }
 
 int MpiDumpMemoryToFile(const std::string &path, const char *data, size_t size) {

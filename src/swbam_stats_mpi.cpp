@@ -1,19 +1,15 @@
 #include "swbam_mpi.h"
+#include "swbam/cpe_pipeline.h"
+#include "swbam/io.h"
+#include "swbam/mpi_runtime.h"
 
 #include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <utility>
 #include <stdint.h>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <vector>
-
-#ifdef PLATFORM_SUNWAY
-#include <athread.h>
-#endif
 
 #include <mpi.h>
 
@@ -27,13 +23,6 @@ const int kStatsNB = 64;
 const int kStatsMaxInsertSize = 8000;
 const int kStatsInsertBins = kStatsMaxInsertSize + 1;
 const double kStatsInsertMainBulk = 0.99;
-
-const unsigned char kStatsBgzfEofBlock[28] = {
-    0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
-    0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00
-};
 
 enum StatsLongId {
     STATS_NREADS_1ST = 0,
@@ -128,174 +117,6 @@ struct MpiStatsPerf {
     double t_count;
     double t_fused_total;
 };
-
-struct MpiStatsBlockSet {
-    bam_block *blocks;
-    unsigned char *data;
-    int n;
-};
-
-bool MpiStatsIsBamLikeFormat(int format) {
-    return format == bam || format == binary_format;
-}
-
-bool MpiStatsIsSamLikeFormat(int format) {
-    return format == sam || format == text_format;
-}
-
-int MpiStatsNormalizeFormat(int format) {
-    if (MpiStatsIsBamLikeFormat(format)) return bam;
-    if (MpiStatsIsSamLikeFormat(format)) return sam;
-    return format;
-}
-
-int MpiStatsAllRanksOk(int local_ok) {
-    int global_ok = 0;
-    MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
-    return global_ok;
-}
-
-double MpiStatsReduceMaxCost(double local_cost) {
-    double max_cost = 0.0;
-    MPI_Reduce(&local_cost, &max_cost, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-    return max_cost;
-}
-
-int MpiStatsLoadFileToMemory(const std::string &path, char **data, size_t *size) {
-    *data = nullptr;
-    *size = 0;
-
-    FILE *fp = fopen(path.c_str(), "rb");
-    if (!fp) return -1;
-    if (fseeko(fp, 0, SEEK_END) != 0) {
-        fclose(fp);
-        return -1;
-    }
-
-    off_t end = ftello(fp);
-    if (end < 0) {
-        fclose(fp);
-        return -1;
-    }
-    if (fseeko(fp, 0, SEEK_SET) != 0) {
-        fclose(fp);
-        return -1;
-    }
-    if ((unsigned long long)end > (unsigned long long)SIZE_MAX) {
-        fclose(fp);
-        return -1;
-    }
-
-    *size = (size_t)end;
-    *data = *size ? (char *)malloc(*size) : nullptr;
-    if (*size > 0 && !*data) {
-        fclose(fp);
-        return -1;
-    }
-    if (*size > 0 && fread(*data, 1, *size, fp) != *size) {
-        fclose(fp);
-        free(*data);
-        *data = nullptr;
-        *size = 0;
-        return -1;
-    }
-
-    fclose(fp);
-    return 0;
-}
-
-int MpiStatsScanBgzfBlocksInMemory(const char *base, size_t size, long long body_start,
-                                   std::vector<long long> *offsets,
-                                   std::vector<long long> *lengths) {
-    if (!base || body_start < 0 ||
-        (unsigned long long)body_start > (unsigned long long)size) {
-        return -1;
-    }
-
-    long long pos = body_start;
-    while ((unsigned long long)pos < (unsigned long long)size) {
-        if ((unsigned long long)pos + BLOCK_HEADER_LENGTH > (unsigned long long)size) return -1;
-        const unsigned char *header = (const unsigned char *)(base + pos);
-        int block_len = (int)header[16] | ((int)header[17] << 8);
-        block_len += 1;
-        if (block_len <= 0 ||
-            (unsigned long long)pos + (unsigned long long)block_len > (unsigned long long)size) {
-            return -1;
-        }
-
-        bool is_eof = block_len == (int)sizeof(kStatsBgzfEofBlock) &&
-                      memcmp(base + pos, kStatsBgzfEofBlock, sizeof(kStatsBgzfEofBlock)) == 0;
-        if (is_eof) break;
-
-        offsets->push_back(pos);
-        lengths->push_back(block_len);
-        pos += block_len;
-    }
-
-    return 0;
-}
-
-int MpiStatsSelectBlockRangeFromMemory(char *base, size_t input_size,
-                                       const std::vector<long long> &offsets,
-                                       const std::vector<long long> &lengths,
-                                       long long begin,
-                                       long long end,
-                                       char **data,
-                                       size_t *size) {
-    *data = nullptr;
-    *size = 0;
-    if (begin >= end) return 0;
-
-    long long start = offsets[(size_t)begin];
-    long long stop = offsets[(size_t)(end - 1)] + lengths[(size_t)(end - 1)];
-    if (start < 0 || stop < start ||
-        (unsigned long long)stop > (unsigned long long)input_size) {
-        return -1;
-    }
-    long long total = stop - start;
-    if ((unsigned long long)total > (unsigned long long)SIZE_MAX) return -1;
-
-    *data = base + start;
-    *size = (size_t)total;
-    return 0;
-}
-
-int MpiStatsAllocateBlockSet(MpiStatsBlockSet *set, int n) {
-    set->n = n;
-    set->blocks = (bam_block *)aligned_alloc_custom(64, (size_t)n * sizeof(bam_block));
-    set->data = aligned_alloc_custom(64, (size_t)n * BGZF_MAX_BLOCK_SIZE);
-    if (!set->blocks || !set->data) return -1;
-    memset(set->blocks, 0, (size_t)n * sizeof(bam_block));
-    for (int i = 0; i < n; ++i) {
-        set->blocks[i].data = set->data + (size_t)i * BGZF_MAX_BLOCK_SIZE;
-        set->blocks[i].block_id = i;
-    }
-    return 0;
-}
-
-void MpiStatsFreeBlockSet(MpiStatsBlockSet *set) {
-    if (set->blocks) aligned_free_custom((unsigned char *)set->blocks);
-    if (set->data) aligned_free_custom(set->data);
-    set->blocks = nullptr;
-    set->data = nullptr;
-    set->n = 0;
-}
-
-int MpiStatsMemReadBlock(char *base, size_t size, size_t &pos, bam_block *block) {
-    if (pos >= size) return -1;
-    if (pos + BLOCK_HEADER_LENGTH > size) return -1;
-    int bsize = (int)(unsigned char)base[pos + 16] |
-                ((int)(unsigned char)base[pos + 17] << 8);
-    bsize += 1;
-    if (bsize <= 0 || pos + (size_t)bsize > size) return -1;
-    memcpy(block->data, base + pos, (size_t)bsize);
-    block->length = bsize;
-    block->pos = 0;
-    block->errcode = 0;
-    block->block_address = (int64_t)pos;
-    pos += (size_t)bsize;
-    return bsize;
-}
 
 BamFilterOptions MpiStatsNoFilter() {
     BamFilterOptions filter;
@@ -878,171 +699,168 @@ void MpiStatsPrintOrientationDiag(const MpiBasicStatsCounts &counts) {
            counts.orient_diag[ORIENT_DIAG_ISIZE_POS]);
 }
 
-int FusedStatsMPI(MemReader &reader,
+class StatsBasicCpeOperator : public swbam::cpe::CpeBatchOperator {
+public:
+    StatsBasicCpeOperator(MpiBasicStatsCounts *counts,
+                          MpiStatsSortState *sort_state,
+                          MpiStatsPerf *perf,
+                          int collect_diag)
+        : counts_(counts), sort_state_(sort_state), perf_(perf),
+          collect_diag_(collect_diag), count_slices_(nullptr),
+          scratch_data_(nullptr) {
+        memset(paras_, 0, sizeof(paras_));
+    }
+
+    const char *name() const { return "stats-basic"; }
+    size_t batch_capacity() const { return kStatsNB; }
+
+    int Initialize() {
+        if (!counts_ || !sort_state_) return -1;
+        memset(counts_, 0, sizeof(*counts_));
+        if (perf_) memset(perf_, 0, sizeof(*perf_));
+        memset(sort_state_, 0, sizeof(*sort_state_));
+        sort_state_->sorted = 1;
+        sort_state_->first_tid = -1;
+        sort_state_->last_tid = -1;
+        count_slices_ = (MpiStatsBasicCountSlice *)aligned_alloc_custom(
+            64, (size_t)kStatsNB * sizeof(MpiStatsBasicCountSlice));
+        scratch_data_ = aligned_alloc_custom(
+            64, (size_t)kStatsNB * MPI_BAM_BLOCK_ARENA_SIZE);
+        if (!count_slices_ || !scratch_data_) return -1;
+        memset(count_slices_, 0,
+               (size_t)kStatsNB * sizeof(MpiStatsBasicCountSlice));
+        return 0;
+    }
+
+    void Shutdown() {
+        if (count_slices_) {
+            aligned_free_custom((unsigned char *)count_slices_);
+            count_slices_ = nullptr;
+        }
+        if (scratch_data_) {
+            aligned_free_custom(scratch_data_);
+            scratch_data_ = nullptr;
+        }
+    }
+
+    int Prepare(const swbam::BgzfBlockBatch &compressed,
+                swbam::BgzfBlockBatch *decoded,
+                size_t active_blocks) {
+        for (int b = 0; b < kStatsNB; ++b) {
+            MpiStatsBasicCountPara &para = paras_[b];
+            para.block_id = b;
+            para.scratch_data = scratch_data_ +
+                (size_t)b * MPI_BAM_BLOCK_ARENA_SIZE;
+            para.scratch_capacity = MPI_BAM_BLOCK_ARENA_SIZE;
+            para.counts = &count_slices_[b];
+            para.collect_diag = collect_diag_;
+            para.n_total_records = 0;
+            para.record_index = 0;
+            para.actual_value = 0;
+            para.limit_value = 0;
+            para.limit_id = BOUNDS_LIMIT_NONE;
+            memset(&para.sort_state, 0, sizeof(para.sort_state));
+            para.sort_state.sorted = 1;
+            para.sort_state.first_tid = -1;
+            para.sort_state.last_tid = -1;
+            para.decomp_alloc_cycles = 0;
+            para.decomp_inflate_cycles = 0;
+            para.decomp_crc_cycles = 0;
+            para.decomp_parse_cycles = 0;
+            para.decomp_total_cycles = 0;
+            if ((size_t)b < active_blocks) {
+                para.input_block = const_cast<bam_block *>(
+                    &compressed.blocks()[b]);
+                para.un_comp_block = &decoded->blocks()[b];
+                para.status = 0;
+            } else {
+                para.input_block = nullptr;
+                para.un_comp_block = nullptr;
+                para.status = -1;
+            }
+        }
+        return 0;
+    }
+
+    void *kernel_entry() const {
+        return (void *)slave_mpi_stats_basic_count;
+    }
+    void *kernel_arguments() { return paras_; }
+
+    void ObserveKernel(double wall_seconds, size_t active_blocks) {
+        if (!perf_) return;
+        MpiStatsAccumulateDecompDetail(
+            paras_, (int)active_blocks, wall_seconds, perf_);
+    }
+
+    int Validate(size_t active_blocks) const {
+        for (size_t b = 0; b < active_blocks; ++b) {
+            const MpiStatsBasicCountPara &para = paras_[b];
+            if (para.status == 0) continue;
+            if (para.status == -3) {
+                fprintf(stderr,
+                        "ERROR: MPI stats capacity exceeded on input block %zu. limit_id=%d limit=%lld actual=%lld record=%d.\n",
+                        b, para.limit_id, para.limit_value,
+                        para.actual_value, para.record_index);
+            } else {
+                fprintf(stderr,
+                        "ERROR: MPI stats count failed on input block %zu with status %d. record=%d actual=%lld limit_id=%d.\n",
+                        b, para.status, para.record_index,
+                        para.actual_value, para.limit_id);
+            }
+            return -1;
+        }
+        return 0;
+    }
+
+    int Consume(size_t active_blocks, long long *records_processed) {
+        long long records = 0;
+        for (size_t b = 0; b < active_blocks; ++b) {
+            records += paras_[b].n_total_records;
+            MpiStatsMergeBlockSort(paras_[b].sort_state, sort_state_);
+        }
+        if (records_processed) *records_processed = records;
+        return 0;
+    }
+
+    int Finish() {
+        for (int b = 0; b < kStatsNB; ++b) {
+            MpiStatsMergeSlice(count_slices_[b], counts_);
+        }
+        return 0;
+    }
+
+private:
+    MpiBasicStatsCounts *counts_;
+    MpiStatsSortState *sort_state_;
+    MpiStatsPerf *perf_;
+    int collect_diag_;
+    MpiStatsBasicCountPara paras_[kStatsNB];
+    MpiStatsBasicCountSlice *count_slices_;
+    unsigned char *scratch_data_;
+};
+
+int FusedStatsMPI(const swbam::BamInputBackend &input,
+                  const swbam::BgzfBlockSpan *spans,
+                  size_t span_count,
                   MpiBasicStatsCounts *counts,
                   MpiStatsSortState *sort_state,
                   MpiStatsPerf *perf,
                   int collect_diag) {
-    double fused_t0 = GetTime();
-    int ret = -1;
-    MpiStatsBasicCountPara paras[kStatsNB];
-    MpiStatsBlockSet input_a = {};
-    MpiStatsBlockSet input_b = {};
-    MpiStatsBlockSet un_a = {};
-    MpiStatsBlockSet un_b = {};
-    MpiStatsBasicCountSlice *count_slices = nullptr;
-    unsigned char *scratch_data = nullptr;
-    const size_t scratch_stride = MPI_BAM_BLOCK_ARENA_SIZE;
-    MpiStatsBlockSet *cur_input = nullptr;
-    MpiStatsBlockSet *next_input = nullptr;
-    MpiStatsBlockSet *cur_un = nullptr;
-    MpiStatsBlockSet *next_un = nullptr;
-    int n_blocks = 0;
-
-    auto do_read_group = [&](MpiStatsBlockSet *input_blocks, int *n_blocks) -> int {
-        double read_t0 = GetTime();
-        int count = 0;
-        for (int b = 0; b < kStatsNB; ++b) {
-            bam_block *blk = &input_blocks->blocks[b];
-            int read_ret = MpiStatsMemReadBlock(reader.base, reader.size, reader.pos, blk);
-            if (read_ret < 0 || blk->length == 28) break;
-            blk->block_id = b;
-            blk->pos = 0;
-            count++;
-        }
-        *n_blocks = count;
-        if (perf) perf->t_read += GetTime() - read_t0;
-        return 0;
-    };
-
-    if (counts) memset(counts, 0, sizeof(*counts));
-    if (perf) memset(perf, 0, sizeof(*perf));
-    if (sort_state) {
-        memset(sort_state, 0, sizeof(*sort_state));
-        sort_state->sorted = 1;
-        sort_state->first_tid = -1;
-        sort_state->last_tid = -1;
+    StatsBasicCpeOperator op(
+        counts, sort_state, perf, collect_diag);
+    swbam::cpe::CpeReadPipelineTiming timing;
+    const int ret = swbam::cpe::RunCpeReadPipeline(
+        input, spans, span_count, &op, &timing);
+    if (perf) {
+        perf->input_blocks = timing.input_blocks;
+        perf->group_count = timing.batch_count;
+        perf->total_records = timing.total_records;
+        perf->t_read = timing.read;
+        perf->t_decomp = timing.kernel;
+        perf->t_count = timing.consume;
+        perf->t_fused_total = timing.total;
     }
-
-    count_slices = (MpiStatsBasicCountSlice *)aligned_alloc_custom(
-        64, (size_t)kStatsNB * sizeof(MpiStatsBasicCountSlice));
-    scratch_data = aligned_alloc_custom(64, (size_t)kStatsNB * scratch_stride);
-    if (MpiStatsAllocateBlockSet(&input_a, kStatsNB) != 0 ||
-        MpiStatsAllocateBlockSet(&input_b, kStatsNB) != 0 ||
-        MpiStatsAllocateBlockSet(&un_a, kStatsNB) != 0 ||
-        MpiStatsAllocateBlockSet(&un_b, kStatsNB) != 0 ||
-        !count_slices || !scratch_data) {
-        fprintf(stderr, "ERROR: failed to allocate MPI stats workspace.\n");
-        goto cleanup;
-    }
-    memset(count_slices, 0, (size_t)kStatsNB * sizeof(MpiStatsBasicCountSlice));
-
-    cur_input = &input_a;
-    next_input = &input_b;
-    cur_un = &un_a;
-    next_un = &un_b;
-    if (do_read_group(cur_input, &n_blocks) != 0) goto cleanup;
-    while (n_blocks > 0) {
-        if (perf) {
-            perf->input_blocks += n_blocks;
-            perf->group_count++;
-        }
-
-        for (int b = 0; b < kStatsNB; ++b) {
-            paras[b].block_id = b;
-            paras[b].scratch_data = scratch_data + (size_t)b * scratch_stride;
-            paras[b].scratch_capacity = scratch_stride;
-            paras[b].counts = &count_slices[b];
-            paras[b].collect_diag = collect_diag;
-            paras[b].n_total_records = 0;
-            paras[b].record_index = 0;
-            paras[b].actual_value = 0;
-            paras[b].limit_value = 0;
-            paras[b].limit_id = BOUNDS_LIMIT_NONE;
-            memset(&paras[b].sort_state, 0, sizeof(paras[b].sort_state));
-            paras[b].sort_state.sorted = 1;
-            paras[b].sort_state.first_tid = -1;
-            paras[b].sort_state.last_tid = -1;
-            paras[b].decomp_alloc_cycles = 0;
-            paras[b].decomp_inflate_cycles = 0;
-            paras[b].decomp_crc_cycles = 0;
-            paras[b].decomp_parse_cycles = 0;
-            paras[b].decomp_total_cycles = 0;
-            if (b < n_blocks) {
-                paras[b].input_block = &cur_input->blocks[b];
-                paras[b].un_comp_block = &cur_un->blocks[b];
-                paras[b].status = 0;
-            } else {
-                paras[b].input_block = nullptr;
-                paras[b].un_comp_block = nullptr;
-                paras[b].status = -1;
-            }
-        }
-
-        double decomp_t0 = GetTime();
-        __real_athread_spawn((void *)slave_mpi_stats_basic_count, paras, 1);
-        int next_n_blocks = 0;
-        #ifdef ENABLE_MASKING
-        if (do_read_group(next_input, &next_n_blocks) != 0) goto cleanup;
-        #endif
-        athread_join();
-        double decomp_wall = GetTime() - decomp_t0;
-        #ifndef ENABLE_MASKING
-        if (do_read_group(next_input, &next_n_blocks) != 0) goto cleanup;
-        #endif
-        if (perf) {
-            perf->t_decomp += decomp_wall;
-            MpiStatsAccumulateDecompDetail(paras, n_blocks, decomp_wall, perf);
-        }
-
-        for (int b = 0; b < n_blocks; ++b) {
-            if (paras[b].status != 0) {
-                if (paras[b].status == -3) {
-                    fprintf(stderr,
-                            "ERROR: MPI stats capacity exceeded on input block %d. limit_id=%d limit=%lld actual=%lld record=%d.\n",
-                            b, paras[b].limit_id, paras[b].limit_value,
-                            paras[b].actual_value, paras[b].record_index);
-                } else {
-                    fprintf(stderr,
-                            "ERROR: MPI stats count failed on input block %d "
-                            "with status %d. record=%d actual=%lld limit_id=%d.\n",
-                            b, paras[b].status, paras[b].record_index,
-                            paras[b].actual_value, paras[b].limit_id);
-                }
-                goto cleanup;
-            }
-        }
-
-        double count_t0 = GetTime();
-        for (int b = 0; b < n_blocks; ++b) {
-            if (perf) perf->total_records += paras[b].n_total_records;
-            if (sort_state) MpiStatsMergeBlockSort(paras[b].sort_state, sort_state);
-        }
-        if (perf) perf->t_count += GetTime() - count_t0;
-
-        std::swap(cur_input, next_input);
-        std::swap(cur_un, next_un);
-        n_blocks = next_n_blocks;
-    }
-
-    if (counts) {
-        double count_t0 = GetTime();
-        for (int b = 0; b < kStatsNB; ++b) {
-            MpiStatsMergeSlice(count_slices[b], counts);
-        }
-        if (perf) perf->t_count += GetTime() - count_t0;
-    }
-
-    ret = 0;
-
-cleanup:
-    if (perf) perf->t_fused_total = GetTime() - fused_t0;
-    if (count_slices) aligned_free_custom((unsigned char *)count_slices);
-    if (scratch_data) aligned_free_custom(scratch_data);
-    MpiStatsFreeBlockSet(&input_a);
-    MpiStatsFreeBlockSet(&input_b);
-    MpiStatsFreeBlockSet(&un_a);
-    MpiStatsFreeBlockSet(&un_b);
     return ret;
 }
 
@@ -1058,19 +876,8 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
 
     int exit_code = 1;
     int local_ok = 1;
-    samFile *sin = nullptr;
-    sam_hdr_t *hdr = nullptr;
-    hFILE *input_mem_hfile = nullptr;
-    char *input_file_mem = nullptr;
-    size_t input_file_size = 0;
-    char *rank_input_mem = nullptr;
-    size_t rank_input_size = 0;
-    long long body_start = 0;
-    long long n_blocks = 0;
-    int input_format = -1;
-    std::vector<long long> block_offsets;
-    std::vector<long long> block_lengths;
-    MemReader reader = {};
+    swbam::MemoryBamInput input;
+    swbam::mpi::MpiBamInputPlan input_plan;
     MpiBasicStatsCounts local_counts = {};
     MpiBasicStatsCounts global_counts = {};
     MpiStatsSortState local_sort = {};
@@ -1078,82 +885,46 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
     MpiStatsPerf global_perf = {};
 
     double init_cost = GetTime() - t_init;
-    double init_cost_max = MpiStatsReduceMaxCost(init_cost);
+    double init_cost_max = swbam::mpi::ReduceMaxCost(init_cost);
     if (rank == 0) {
         printf("111Complete the initialization cost %lf-----\n", init_cost_max);
     }
 
     {
         double preload_t0 = GetTime();
-        if (MpiStatsLoadFileToMemory(cmd_info->in_file_name_, &input_file_mem, &input_file_size) != 0) {
+        if (input.Load(cmd_info->in_file_name_) != 0) {
             fprintf(stderr, "[rank %d] ERROR: cannot preload input %s into memory\n",
                     rank, cmd_info->in_file_name_.c_str());
             local_ok = 0;
         }
         double preload_cost = GetTime() - preload_t0;
-        double preload_cost_max = MpiStatsReduceMaxCost(preload_cost);
+        double preload_cost_max = swbam::mpi::ReduceMaxCost(preload_cost);
         if (rank == 0 && local_ok) printf("222Complete the memory cost %lf--\n", preload_cost_max);
     }
-    if (!MpiStatsAllRanksOk(local_ok)) goto cleanup;
+    if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
 
     {
         double header_t0 = GetTime();
 
-        input_mem_hfile = hopen("mem:", "rb:", input_file_mem, input_file_size);
-        if (!input_mem_hfile) {
-            fprintf(stderr, "[rank %d] ERROR: cannot open preloaded BAM memory for %s\n",
+        if (input.ParseHeader() != 0) {
+            fprintf(stderr, "[rank %d] ERROR: cannot read BAM header from %s\n",
                     rank, cmd_info->in_file_name_.c_str());
             local_ok = 0;
         }
-        if (local_ok) {
-            sin = (samFile *)hts_hopen(input_mem_hfile, "data", "rb");
-            if (!sin) {
-                fprintf(stderr, "[rank %d] ERROR: cannot create HTS input handle from memory\n", rank);
-                if (hclose(input_mem_hfile) != 0) {
-                    fprintf(stderr, "[rank %d] ERROR: closing failed HTS memory handle failed.\n", rank);
-                }
-                input_mem_hfile = nullptr;
-                input_file_mem = nullptr;
-                input_file_size = 0;
-                local_ok = 0;
-            } else {
-                input_mem_hfile = nullptr;
-            }
-        }
-
-        if (local_ok) {
-            hdr = sam_hdr_read(sin);
-            if (!hdr) {
-                fprintf(stderr, "[rank %d] ERROR: cannot read header from %s\n",
-                        rank, cmd_info->in_file_name_.c_str());
-                local_ok = 0;
-            }
-        }
-        if (local_ok) {
-            input_format = MpiStatsNormalizeFormat(sin->format.format);
-            if (input_format != bam) {
+        if (local_ok && input.format() != bam) {
                 if (rank == 0) {
                     fprintf(stderr, "ERROR: RabbitBAM-MPI stats --basic only supports BAM input in v1.\n");
                 }
                 local_ok = 0;
-            }
-        }
-        if (local_ok) {
-            body_start = (long long)sin->fp.bgzf->block_address;
-            if (body_start < 0 ||
-                (unsigned long long)body_start > (unsigned long long)input_file_size) {
-                fprintf(stderr, "[rank %d] ERROR: invalid BAM body start offset %lld.\n", rank, body_start);
-                local_ok = 0;
-            }
         }
 
         double header_cost = GetTime() - header_t0;
-        double header_cost_max = MpiStatsReduceMaxCost(header_cost);
+        double header_cost_max = swbam::mpi::ReduceMaxCost(header_cost);
         if (rank == 0 && local_ok) {
             printf("333Complete the head cost %lf---\n", header_cost_max);
         }
     }
-    if (!MpiStatsAllRanksOk(local_ok)) goto cleanup;
+    if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
 
     {
         double body_total_t0 = GetTime();
@@ -1162,70 +933,45 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
         if (rank == 0) {
             printf("Enable MPI STATS --basic mode (%d MPE + %d CPEs)!!!\n",
                    comm_size, comm_size * 64);
-            if (MpiStatsScanBgzfBlocksInMemory(input_file_mem, input_file_size, body_start,
-                                               &block_offsets, &block_lengths) != 0) {
-                fprintf(stderr, "ERROR: failed to scan input BGZF blocks for stats.\n");
-                local_ok = 0;
-            }
-            n_blocks = (long long)block_offsets.size();
-            if (local_ok && n_blocks > (long long)INT_MAX) {
-                fprintf(stderr, "ERROR: too many BGZF blocks for MPI_Bcast in RabbitBAM-MPI stats v1.\n");
-                local_ok = 0;
-            }
-            if (local_ok) {
-                printf("MPI BAM scan complete. data_blocks=%lld body_start=%lld header_end=%lld\n",
-                       n_blocks, body_start, (long long)sin->fp.bgzf->block_address);
-            }
         }
-
-        MPI_Bcast(&local_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        if (!local_ok) goto cleanup;
-        MPI_Bcast(&body_start, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        MPI_Bcast(&n_blocks, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        if (rank != 0) {
-            block_offsets.resize((size_t)n_blocks);
-            block_lengths.resize((size_t)n_blocks);
-        }
-        if (n_blocks > 0) {
-            MPI_Bcast(block_offsets.data(), (int)n_blocks, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-            MPI_Bcast(block_lengths.data(), (int)n_blocks, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        }
-
-        long long begin = n_blocks * rank / comm_size;
-        long long end = n_blocks * (rank + 1) / comm_size;
-        if (MpiStatsSelectBlockRangeFromMemory(input_file_mem, input_file_size,
-                                               block_offsets, block_lengths,
-                                               begin, end,
-                                               &rank_input_mem, &rank_input_size) != 0) {
-            fprintf(stderr, "[rank %d] ERROR: failed to select assigned BGZF block range [%lld, %lld) from memory.\n",
-                    rank, begin, end);
+        if (swbam::mpi::PrepareMpiBamInputPlan(
+                input, &input_plan) != 0) {
+            if (rank == 0) {
+                fprintf(stderr, "ERROR: failed to prepare BGZF input plan for stats.\n");
+            }
             local_ok = 0;
         }
+        if (rank == 0 && local_ok) {
+            printf("MPI BAM scan complete. data_blocks=%lld body_start=%lld header_end=%lld\n",
+                   (long long)input_plan.blocks.size(),
+                   (long long)input_plan.body_offset,
+                   (long long)input.body_offset());
+        }
         double stage41_cost = GetTime() - stage41_t0;
-        double stage41_cost_max = MpiStatsReduceMaxCost(stage41_cost);
+        double stage41_cost_max = swbam::mpi::ReduceMaxCost(stage41_cost);
         if (rank == 0 && local_ok) {
             printf("Complete the 4.1 scan/split/broadcast/select cost %lf\n", stage41_cost_max);
         }
-        if (!MpiStatsAllRanksOk(local_ok)) goto cleanup;
+        if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
 
         double stage42_t0 = GetTime();
-        reader.base = rank_input_mem;
-        reader.size = rank_input_size;
-        reader.pos = 0;
         double stage42_cost = GetTime() - stage42_t0;
-        double stage42_cost_max = MpiStatsReduceMaxCost(stage42_cost);
+        double stage42_cost_max = swbam::mpi::ReduceMaxCost(stage42_cost);
         if (rank == 0) {
             printf("Complete the 4.2 init reader cost %lf\n", stage42_cost_max);
         }
 
         double stage43_t0 = GetTime();
         const int collect_diag = cmd_info->verbose_ ? 1 : 0;
-        if (FusedStatsMPI(reader, &local_counts, &local_sort, &local_perf, collect_diag) != 0) {
+        if (FusedStatsMPI(input, input_plan.rank_spans(),
+                          input_plan.rank_block_count(),
+                          &local_counts, &local_sort, &local_perf,
+                          collect_diag) != 0) {
             local_ok = 0;
         }
         double stage43_cost = GetTime() - stage43_t0;
-        int global_ok = MpiStatsAllRanksOk(local_ok);
-        double stage43_cost_max = MpiStatsReduceMaxCost(stage43_cost);
+        int global_ok = swbam::mpi::AllRanksOk(local_ok);
+        double stage43_cost_max = swbam::mpi::ReduceMaxCost(stage43_cost);
         if (rank == 0 && global_ok) {
             printf("Complete the 4.3 FusedStatsMPI cost %lf\n", stage43_cost_max);
         }
@@ -1274,7 +1020,7 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
                    6, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
 
         double stage44_cost = GetTime() - stage44_t0;
-        double stage44_cost_max = MpiStatsReduceMaxCost(stage44_cost);
+        double stage44_cost_max = swbam::mpi::ReduceMaxCost(stage44_cost);
         if (rank == 0) {
             int is_sorted = MpiStatsIsSortedGlobal(comm_size, global_sort_values);
             MpiStatsPrintBasic(global_counts, is_sorted);
@@ -1299,7 +1045,7 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
         }
 
         double body_total_cost = GetTime() - body_total_t0;
-        double body_total_cost_max = MpiStatsReduceMaxCost(body_total_cost);
+        double body_total_cost_max = swbam::mpi::ReduceMaxCost(body_total_cost);
         if (rank == 0) {
             printf("444Complete the total body cost %lf\n", body_total_cost_max);
         }
@@ -1310,22 +1056,9 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
 cleanup:
     {
         double close_t0 = GetTime();
-        if (hdr) sam_hdr_destroy(hdr);
-        if (sin) {
-            int ret = hts_close(sin);
-            if (ret < 0) fprintf(stderr, "[rank %d] ERROR: closing input failed.\n", rank);
-            input_file_mem = nullptr;
-        } else if (input_mem_hfile) {
-            if (hclose(input_mem_hfile) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: closing memory hFILE failed.\n", rank);
-            }
-            input_file_mem = nullptr;
-        } else if (input_file_mem) {
-            free(input_file_mem);
-            input_file_mem = nullptr;
-        }
+        input.Close();
         double close_cost = GetTime() - close_t0;
-        double close_cost_max = MpiStatsReduceMaxCost(close_cost);
+        double close_cost_max = swbam::mpi::ReduceMaxCost(close_cost);
         if (rank == 0) printf("666close the files cost %lf-----\n", close_cost_max);
     }
 

@@ -109,6 +109,35 @@ if(PLATFORM_SUNWAY)
     set(SUNWAY_MPI_ROOT "/usr/sw/mpi/mpi_20220608_SEA" CACHE PATH "Sunway MPI installation root")
     set(SUNWAY_MPI_LIB_DIR "${SUNWAY_MPI_ROOT}/lib/single_static")
 
+    add_library(swbam_io STATIC
+        lib/swbam_io.cpp
+    )
+    target_compile_options(swbam_io PRIVATE ${HOST_FLAGS})
+    target_include_directories(swbam_io PUBLIC
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/ext/htslib-1.20
+    )
+
+    add_library(swbam_mpi_runtime STATIC
+        lib/swbam_mpi_runtime.cpp
+    )
+    target_compile_options(swbam_mpi_runtime PRIVATE ${HOST_FLAGS})
+    target_include_directories(swbam_mpi_runtime PUBLIC
+        ${CMAKE_SOURCE_DIR}/include
+        ${SUNWAY_MPI_ROOT}/include
+    )
+    target_link_libraries(swbam_mpi_runtime PUBLIC swbam_io)
+
+    add_library(swbam_cpe_runtime STATIC
+        lib/swbam_cpe_pipeline.cpp
+    )
+    target_compile_options(swbam_cpe_runtime PRIVATE ${HOST_FLAGS})
+    target_include_directories(swbam_cpe_runtime PUBLIC
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/ext/htslib-1.20
+    )
+    target_link_libraries(swbam_cpe_runtime PUBLIC swbam_io)
+
     # For Sunway, also compile slave code
     file(GLOB SLAVE_FILES "slave/*.cpp")
     file(GLOB SLAVE_C_FILES   "slave/*.c")
@@ -203,6 +232,9 @@ if(PLATFORM_SUNWAY)
         z
     )
     target_link_libraries(RabbitBAM-MPI PRIVATE
+        swbam_cpe_runtime
+        swbam_mpi_runtime
+        swbam_io
         pthread
         rt
         deflate
