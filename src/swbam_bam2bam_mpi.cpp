@@ -1,4 +1,5 @@
 #include "swbam_mpi.h"
+#include "swbam/io.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -17,6 +18,33 @@ extern "C" {
 }
 
 namespace {
+
+class MpiMemWriterOutput : public swbam::BamOutputBackend {
+public:
+    explicit MpiMemWriterOutput(MemWriter *writer)
+        : writer_(writer), written_(0) {}
+
+    int Write(const void *data, size_t size) {
+        if (!writer_ || (!data && size != 0) ||
+            size > UINT64_MAX - written_) {
+            return -1;
+        }
+        if (size == 0) return 0;
+        if (MpiWriteBytesToMem(
+                *writer_, static_cast<const char *>(data), size) != 0) {
+            return -1;
+        }
+        written_ += size;
+        return 0;
+    }
+
+    int Flush() { return 0; }
+    uint64_t bytes_written() const { return written_; }
+
+private:
+    MemWriter *writer_;
+    uint64_t written_;
+};
 
 struct MpiBlockSet {
     bam_block *blocks;
@@ -334,7 +362,12 @@ int MpiMemReadBlock(char *base, size_t size, size_t &pos, bam_block *block) {
 
 } // namespace
 
-int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
+static int FusedBamToBamCoreMPI(
+                     MemReader *reader,
+                     const swbam::BamInputBackend *backend,
+                     const swbam::BgzfBlockSpan *spans,
+                     size_t span_count,
+                     MemWriter &mem_writer,
                      const BamFilterOptions &filter,
                      int compress_level,
                      MpiBamToBamStats *stats) {
@@ -346,7 +379,7 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
 
     Bam2BamPara paras[NB];
     Comp_Para comp_a[NB], comp_b[NB];
-    MpiBlockSet input_blocks = {};
+    swbam::BgzfBlockBatch input_blocks;
     MpiBlockSet un_blocks = {};
     MpiBlockSet comp_un_a = {};
     MpiBlockSet comp_un_b = {};
@@ -354,8 +387,11 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
     MpiBlockSet out_b = {};
     MpiRecordSet record_set = {};
     MpiFlatPackWorkspace pack_workspace;
+    MpiMemWriterOutput output(&mem_writer);
+    size_t backend_position = 0;
 
-    if (MpiAllocateBlockSet(&input_blocks, NB) != 0 ||
+    if ((!reader && !backend) || (backend && span_count > 0 && !spans) ||
+        input_blocks.Allocate(NB) != 0 ||
         MpiAllocateBlockSet(&un_blocks, NB) != 0 ||
         MpiAllocateBlockSet(&comp_un_a, NB) != 0 ||
         MpiAllocateBlockSet(&comp_un_b, NB) != 0 ||
@@ -385,7 +421,9 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         double flush_t0 = GetTime();
         for (int k = 0; k < NB; ++k) {
             if (comp_pending[k].status == 0 && comp_pending[k].output_block) {
-                if (MpiWriteBlockToMem(mem_writer, comp_pending[k].output_block) != 0) {
+                if (output.Write(
+                        comp_pending[k].output_block->data,
+                        comp_pending[k].output_block->length) != 0) {
                     fprintf(stderr, "ERROR: MPI bam2bam failed to append compressed block.\n");
                     return -1;
                 }
@@ -401,13 +439,28 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
     auto do_read_group = [&](int *n_blocks) -> int {
         double read_t0 = GetTime();
         int count = 0;
-        for (int b = 0; b < NB; ++b) {
-            bam_block *blk = &input_blocks.blocks[b];
-            int ret = MpiMemReadBlock(reader.base, reader.size, reader.pos, blk);
-            if (ret < 0 || blk->length == 28) break;
-            blk->block_id = b;
-            blk->pos = 0;
-            count++;
+        if (backend) {
+            size_t batch_count = span_count - backend_position;
+            if (batch_count > (size_t)NB) batch_count = NB;
+            if (backend->ReadBatch(
+                    batch_count > 0 ? spans + backend_position : nullptr,
+                    batch_count, &input_blocks) != 0) {
+                return -1;
+            }
+            count = (int)batch_count;
+            backend_position += batch_count;
+        } else {
+            for (int b = 0; b < NB; ++b) {
+                bam_block *blk = &input_blocks.blocks()[b];
+                int ret = MpiMemReadBlock(
+                    reader->base, reader->size, reader->pos, blk);
+                if (ret < 0 || blk->length == 28) break;
+                count++;
+            }
+        }
+        for (int b = 0; b < count; ++b) {
+            input_blocks.blocks()[b].block_id = b;
+            input_blocks.blocks()[b].pos = 0;
         }
         *n_blocks = count;
         stats->t_read += GetTime() - read_t0;
@@ -504,7 +557,7 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
             paras[b].decomp_parse_cycles = 0;
             paras[b].decomp_total_cycles = 0;
             if (b < n_blocks) {
-                paras[b].input_block = &input_blocks.blocks[b];
+                paras[b].input_block = &input_blocks.blocks()[b];
                 paras[b].un_comp_block = &un_blocks.blocks[b];
                 paras[b].status = 0;
             } else {
@@ -594,7 +647,6 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
     if (flush_pending() != 0) return -1;
 
     // double free_t0 = GetTime();
-    MpiFreeBlockSet(&input_blocks);
     MpiFreeBlockSet(&un_blocks);
     MpiFreeBlockSet(&comp_un_a);
     MpiFreeBlockSet(&comp_un_b);
@@ -604,4 +656,25 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
     // stats->t_free_workspace += GetTime() - free_t0;
     stats->t_fused_total += GetTime() - fused_t0;
     return 0;
+}
+
+int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
+                     const BamFilterOptions &filter,
+                     int compress_level,
+                     MpiBamToBamStats *stats) {
+    return FusedBamToBamCoreMPI(
+        &reader, nullptr, nullptr, 0, mem_writer,
+        filter, compress_level, stats);
+}
+
+int FusedBamToBamMPI(const swbam::BamInputBackend &input,
+                     const swbam::BgzfBlockSpan *spans,
+                     size_t span_count,
+                     MemWriter &mem_writer,
+                     const BamFilterOptions &filter,
+                     int compress_level,
+                     MpiBamToBamStats *stats) {
+    return FusedBamToBamCoreMPI(
+        nullptr, &input, spans, span_count, mem_writer,
+        filter, compress_level, stats);
 }

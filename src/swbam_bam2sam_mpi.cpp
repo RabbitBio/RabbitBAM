@@ -269,8 +269,12 @@ void MpiAccumulateDecompDetail(const Bam2BamPara *paras,
 
 } // namespace
 
-int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
-                     sam_hdr_t *hdr,
+static int FusedBamToSamCoreMPI(
+                     MemReader *reader,
+                     const swbam::BamInputBackend *backend,
+                     const swbam::BgzfBlockSpan *spans,
+                     size_t span_count,
+                     MemWriter &mem_writer, sam_hdr_t *hdr,
                      MpiBamToSamStats *stats) {
     const int NB = 64;
     const int records_per_block = (int)MPI_RECORDS_PER_BLOCK;
@@ -282,6 +286,7 @@ int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
     double alloc_t0 = GetTime();
     Bam2BamPara paras[NB];
     MpiBamToSamBlockSet input_blocks = {};
+    swbam::BgzfBlockBatch backend_input_blocks;
     MpiBamToSamBlockSet un_blocks = {};
     MpiBamToSamRecordSet record_set = {};
     SamFormatBatch *fmt_cur = nullptr;
@@ -295,8 +300,11 @@ int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
     fmt_prev = (SamFormatBatch *)aligned_alloc_custom(64, sizeof(SamFormatBatch));
     if (fmt_cur) memset(fmt_cur, 0, sizeof(SamFormatBatch));
     if (fmt_prev) memset(fmt_prev, 0, sizeof(SamFormatBatch));
-    if (!fmt_cur || !fmt_prev ||
-        MpiAllocateBamToSamBlockSet(&input_blocks, NB) != 0 ||
+    if (!fmt_cur || !fmt_prev || (!reader && !backend) ||
+        (backend && span_count > 0 && !spans) ||
+        (reader
+             ? MpiAllocateBamToSamBlockSet(&input_blocks, NB)
+             : backend_input_blocks.Allocate(NB)) != 0 ||
         MpiAllocateBamToSamBlockSet(&un_blocks, NB) != 0 ||
         MpiAllocateBamToSamRecordSet(&record_set, NB, records_per_block, block_arena_stride) != 0 ||
         MpiInitSamFormatBatchMPI(fmt_cur, hdr) != 0 ||
@@ -314,6 +322,12 @@ int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
         return -1;
     }
     stats->t_alloc_init += GetTime() - alloc_t0;
+    size_t backend_position = 0;
+
+    auto input_block = [&](int index) -> bam_block * {
+        return backend ? &backend_input_blocks.blocks()[index]
+                       : &input_blocks.blocks[index];
+    };
 
     auto flush_pending_write = [&]() -> int {
         if (!has_pending_write) return 0;
@@ -333,13 +347,28 @@ int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
     auto do_read_group = [&](int *n_blocks) -> int {
         double read_t0 = GetTime();
         int count = 0;
-        for (int b = 0; b < NB; ++b) {
-            bam_block *blk = &input_blocks.blocks[b];
-            int ret = MpiMemReadBamToSamBlock(reader.base, reader.size, reader.pos, blk);
-            if (ret < 0 || blk->length == 28) break;
-            blk->block_id = b;
-            blk->pos = 0;
-            count++;
+        if (backend) {
+            size_t batch_count = span_count - backend_position;
+            if (batch_count > (size_t)NB) batch_count = NB;
+            if (backend->ReadBatch(
+                    batch_count > 0 ? spans + backend_position : nullptr,
+                    batch_count, &backend_input_blocks) != 0) {
+                return -1;
+            }
+            count = (int)batch_count;
+            backend_position += batch_count;
+        } else {
+            for (int b = 0; b < NB; ++b) {
+                bam_block *blk = &input_blocks.blocks[b];
+                int ret = MpiMemReadBamToSamBlock(
+                    reader->base, reader->size, reader->pos, blk);
+                if (ret < 0 || blk->length == 28) break;
+                count++;
+            }
+        }
+        for (int b = 0; b < count; ++b) {
+            input_block(b)->block_id = b;
+            input_block(b)->pos = 0;
         }
         *n_blocks = count;
         stats->t_read += GetTime() - read_t0;
@@ -364,7 +393,7 @@ int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
             paras[b].data_arena_capacity = block_arena_stride;
             paras[b].data_arena_used = 0;
             if (b < n_blocks) {
-                paras[b].input_block = &input_blocks.blocks[b];
+                paras[b].input_block = input_block(b);
                 paras[b].un_comp_block = &un_blocks.blocks[b];
                 paras[b].status = 0;
             }
@@ -475,4 +504,21 @@ cleanup:
     }
     stats->t_fused_total += GetTime() - fused_t0;
     return ret_code;
+}
+
+int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
+                     sam_hdr_t *hdr,
+                     MpiBamToSamStats *stats) {
+    return FusedBamToSamCoreMPI(
+        &reader, nullptr, nullptr, 0, mem_writer, hdr, stats);
+}
+
+int FusedBamToSamMPI(const swbam::BamInputBackend &input,
+                     const swbam::BgzfBlockSpan *spans,
+                     size_t span_count,
+                     MemWriter &mem_writer,
+                     sam_hdr_t *hdr,
+                     MpiBamToSamStats *stats) {
+    return FusedBamToSamCoreMPI(
+        nullptr, &input, spans, span_count, mem_writer, hdr, stats);
 }

@@ -397,7 +397,8 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
 
     int exit_code = 1;
     int local_ok = 1;
-    swbam::MemoryBamInput input;
+    swbam::mpi::MpiBamInput input_handle;
+    swbam::BamInputBackend *input = nullptr;
     swbam::mpi::MpiBamInputPlan input_plan;
     MpiFlagstatCounts local_counts = {};
     MpiFlagstatCounts global_counts = {};
@@ -410,37 +411,26 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
         printf("111Complete the initialization cost %lf-----\n", init_cost_max);
     }
 
-    {
-        double preload_t0 = GetTime();
-        if (input.Load(cmd_info->in_file_name_) != 0) {
-            fprintf(stderr, "[rank %d] ERROR: cannot preload input %s into memory\n",
-                    rank, cmd_info->in_file_name_.c_str());
-            local_ok = 0;
-        }
-        double preload_cost = GetTime() - preload_t0;
-        double preload_cost_max = swbam::mpi::ReduceMaxCost(preload_cost);
-        if (rank == 0 && local_ok) printf("222Complete the memory cost %lf--\n", preload_cost_max);
+    if (!cmd_info || input_handle.Open(
+            cmd_info->in_file_name_, cmd_info->io_backend_,
+            cmd_info->io_memory_limit_) != 0) {
+        fprintf(stderr, "[rank %d] ERROR: cannot open BAM input backend for %s\n",
+                rank, cmd_info ? cmd_info->in_file_name_.c_str() : "(null)");
+        local_ok = 0;
     }
-    if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
+    input = input_handle.backend();
+    if (local_ok && (!input || input->format() != bam)) local_ok = 0;
 
     {
-        double header_t0 = GetTime();
-
-        if (input.ParseHeader() != 0) {
-            fprintf(stderr, "[rank %d] ERROR: cannot read BAM header from %s\n",
-                    rank, cmd_info->in_file_name_.c_str());
-            local_ok = 0;
-        }
-        if (local_ok && input.format() != bam) {
-                if (rank == 0) {
-                    fprintf(stderr, "ERROR: RabbitBAM-MPI flagstat only supports BAM input in v1.\n");
-                }
-                local_ok = 0;
-        }
-
-        double header_cost = GetTime() - header_t0;
-        double header_cost_max = swbam::mpi::ReduceMaxCost(header_cost);
+        const double preload_cost_max = swbam::mpi::ReduceMaxCost(
+            input_handle.data_open_cost());
+        const double header_cost_max = swbam::mpi::ReduceMaxCost(
+            input_handle.header_open_cost());
         if (rank == 0 && local_ok) {
+            printf("MPI BAM input backend=%s auto_memory_budget=%llu\n",
+                   input_handle.selected_backend().c_str(),
+                   (unsigned long long)input_handle.auto_memory_budget());
+            printf("222Complete the input open cost %lf--\n", preload_cost_max);
             printf("333Complete the head cost %lf---\n", header_cost_max);
         }
     }
@@ -455,7 +445,7 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
                    comm_size, comm_size * 64);
         }
         if (swbam::mpi::PrepareMpiBamInputPlan(
-                input, &input_plan) != 0) {
+                *input, &input_plan) != 0) {
             if (rank == 0) {
                 fprintf(stderr, "ERROR: failed to prepare BGZF input plan for flagstat.\n");
             }
@@ -465,7 +455,7 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
             printf("MPI BAM scan complete. data_blocks=%lld body_start=%lld header_end=%lld\n",
                    (long long)input_plan.blocks.size(),
                    (long long)input_plan.body_offset,
-                   (long long)input.body_offset());
+                   (long long)input->body_offset());
         }
         double stage41_cost = GetTime() - stage41_t0;
         double stage41_cost_max = swbam::mpi::ReduceMaxCost(stage41_cost);
@@ -482,7 +472,7 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
         }
 
         double stage43_t0 = GetTime();
-        if (FusedFlagstatMPI(input, input_plan.rank_spans(),
+        if (FusedFlagstatMPI(*input, input_plan.rank_spans(),
                              input_plan.rank_block_count(),
                              &local_counts, &local_stats) != 0) {
             local_ok = 0;
@@ -534,7 +524,7 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
 cleanup:
     {
         double close_t0 = GetTime();
-        input.Close();
+        input_handle.Close();
         double close_cost = GetTime() - close_t0;
         double close_cost_max = swbam::mpi::ReduceMaxCost(close_cost);
         if (rank == 0) printf("666close the files cost %lf-----\n", close_cost_max);

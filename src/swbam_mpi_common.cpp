@@ -1,5 +1,6 @@
 #include "swbam_mpi.h"
 #include "swbam/io.h"
+#include "swbam/mpi_runtime.h"
 
 #include <algorithm>
 #include <climits>
@@ -107,21 +108,13 @@ int MpiSelectBlockRangeFromMemory(char *base, size_t input_size,
 }
 
 int MpiDumpMemoryToFile(const std::string &path, const char *data, size_t size) {
-    FILE *fp = fopen(path.c_str(), "wb");
-    if (!fp) return -1;
-
-    size_t written = 0;
-    while (written < size) {
-        size_t n = fwrite(data + written, 1, size - written, fp);
-        if (n == 0) {
-            fclose(fp);
-            return -1;
-        }
-        written += n;
+    swbam::PosixBamOutput output;
+    if (output.Open(path) != 0 ||
+        output.Write(data, size) != 0 ||
+        output.Flush() != 0) {
+        return -1;
     }
-
-    if (fclose(fp) != 0) return -1;
-    return 0;
+    return output.Close();
 }
 
 int MpiSendBytes(int dst, int tag, const char *data, long long len) {
@@ -342,62 +335,15 @@ int MpiParseBamHeaderRaw(const std::vector<unsigned char> &raw,
 }
 
 int MpiFindSamBodyStartInMemory(const char *base, size_t size, long long *body_start) {
-    if (!base && size > 0) return -1;
-    size_t pos = 0;
-    while (pos < size) {
-        size_t old_pos = pos;
-        size_t end_pos = pos;
-        while (end_pos < size && base[end_pos] != '\n') end_pos++;
-        size_t len = end_pos - old_pos;
-        if (len > 0 && base[old_pos + len - 1] == '\r') len--;
-        if (len > 0 && base[old_pos] != '@') {
-            *body_start = (long long)old_pos;
-            return 0;
-        }
-        if (end_pos < size && base[end_pos] == '\n') end_pos++;
-        pos = end_pos;
-    }
-    *body_start = (long long)size;
-    return 0;
+    return swbam::FindSamBodyStartInMemory(base, size, body_start);
 }
 
 int MpiSplitSamRangesInMemory(const char *base, size_t size, long long body_start,
                               int comm_size,
                               std::vector<long long> *offsets,
                               std::vector<long long> *lengths) {
-    if ((!base && size > 0) || body_start < 0 ||
-        (unsigned long long)body_start > (unsigned long long)size ||
-        comm_size <= 0) {
-        return -1;
-    }
-
-    std::vector<long long> boundaries((size_t)comm_size + 1, body_start);
-    long long body_len = (long long)((unsigned long long)size - (unsigned long long)body_start);
-    boundaries[0] = body_start;
-    boundaries[(size_t)comm_size] = (long long)size;
-    for (int r = 1; r < comm_size; ++r) {
-        long long pos = body_start + body_len * r / comm_size;
-        if (pos < body_start) pos = body_start;
-        if ((unsigned long long)pos > (unsigned long long)size) pos = (long long)size;
-        while (pos > body_start &&
-               (unsigned long long)pos < (unsigned long long)size &&
-               base[pos - 1] != '\n') {
-            pos++;
-        }
-        if (pos < boundaries[(size_t)r - 1]) pos = boundaries[(size_t)r - 1];
-        boundaries[(size_t)r] = pos;
-    }
-
-    offsets->resize((size_t)comm_size);
-    lengths->resize((size_t)comm_size);
-    for (int r = 0; r < comm_size; ++r) {
-        long long start = boundaries[(size_t)r];
-        long long stop = boundaries[(size_t)r + 1];
-        if (stop < start) stop = start;
-        (*offsets)[(size_t)r] = start;
-        (*lengths)[(size_t)r] = stop - start;
-    }
-    return 0;
+    return swbam::SplitSamRangesInMemory(
+        base, size, body_start, comm_size, offsets, lengths);
 }
 
 int MpiAppendBgzfPayloadToMem(MemWriter &w, const unsigned char *src, size_t src_len,
@@ -756,6 +702,13 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
     int local_ok = 1;
     samFile *sin = nullptr;
     sam_hdr_t *hdr = nullptr;
+    swbam::mpi::MpiBamInput backend_input_handle;
+    swbam::BamInputBackend *backend_input = nullptr;
+    swbam::mpi::MpiBamInputPlan backend_plan;
+    swbam::PosixSamInput posix_sam_input;
+    swbam::mpi::MpiIoSamInput mpiio_sam_input;
+    swbam::SamInputBackend *sam_input = nullptr;
+    std::vector<char> rank_sam_storage;
     hFILE *input_mem_hfile = nullptr;
     char *input_file_mem = nullptr;
     size_t input_file_size = 0;
@@ -791,6 +744,16 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
     bool bam_to_bam = false;
     bool bam_to_sam = false;
     bool sam_to_bam = false;
+    bool backend_bam_input =
+        (output_format == bam || output_format == sam) &&
+        MpiHasSuffix(cmd_info->in_file_name_, ".bam");
+    bool streaming_sam_input =
+        output_format == bam &&
+        MpiHasSuffix(cmd_info->in_file_name_, ".sam") &&
+        (cmd_info->io_backend_ == "posix" ||
+         cmd_info->io_backend_ == "mpiio" ||
+         cmd_info->io_backend_ == "auto");
+    bool mpiio_output = cmd_info->io_output_backend_ == "mpiio";
 
     if (cmd_info->validate_bounds_) {
         if (rank == 0) {
@@ -819,14 +782,54 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
     //2.把文件加载到所有rank的内存中，一共6份，每个rank一份，后续每个rank从内存中读取自己的部分进行处理；不计入处理时间
     {
         double preload_t0 = GetTime();
-        if (MpiLoadFileToMemory(cmd_info->in_file_name_, &input_file_mem, &input_file_size) != 0) {
+        if (backend_bam_input) {
+            if (backend_input_handle.Open(
+                    cmd_info->in_file_name_, cmd_info->io_backend_,
+                    cmd_info->io_memory_limit_) != 0) {
+                fprintf(stderr, "[rank %d] ERROR: cannot open BAM input backend for %s\n",
+                        rank, cmd_info->in_file_name_.c_str());
+                local_ok = 0;
+            } else {
+                backend_input = backend_input_handle.backend();
+                input_file_size = backend_input->size();
+                swbam::MemoryBamInput *memory_input =
+                    dynamic_cast<swbam::MemoryBamInput *>(backend_input);
+                if (memory_input) input_file_mem = memory_input->data();
+            }
+        } else if (streaming_sam_input) {
+            sam_input = cmd_info->io_backend_ == "mpiio"
+                ? static_cast<swbam::SamInputBackend *>(&mpiio_sam_input)
+                : static_cast<swbam::SamInputBackend *>(&posix_sam_input);
+            if (sam_input->Open(cmd_info->in_file_name_) != 0) {
+                fprintf(stderr, "[rank %d] ERROR: cannot open streaming SAM input %s\n",
+                        rank, cmd_info->in_file_name_.c_str());
+                local_ok = 0;
+            } else {
+                input_file_size = sam_input->size();
+            }
+        } else if (MpiLoadFileToMemory(
+                       cmd_info->in_file_name_, &input_file_mem,
+                       &input_file_size) != 0) {
             fprintf(stderr, "[rank %d] ERROR: cannot preload input %s into memory\n",
                     rank, cmd_info->in_file_name_.c_str());
             local_ok = 0;
         }
-        double preload_cost = GetTime() - preload_t0;
+        double preload_cost = backend_bam_input
+            ? backend_input_handle.data_open_cost()
+            : GetTime() - preload_t0;
         double preload_cost_max = MpiReduceMaxCost(preload_cost);
-        if (rank == 0 && local_ok) printf("222Complete the memory cost %lf--\n", preload_cost_max);
+        if (rank == 0 && local_ok) {
+            if (backend_bam_input) {
+                printf("MPI BAM input backend=%s auto_memory_budget=%llu\n",
+                       backend_input_handle.selected_backend().c_str(),
+                       (unsigned long long)backend_input_handle.auto_memory_budget());
+            } else if (streaming_sam_input) {
+                printf("MPI SAM input backend=%s\n",
+                       cmd_info->io_backend_ == "mpiio"
+                           ? "mpiio" : "posix");
+            }
+            printf("222Complete the memory/input open cost %lf--\n", preload_cost_max);
+        }
     }
     if (!MpiAllRanksOk(local_ok)) goto cleanup;
 
@@ -835,13 +838,51 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
     {
         double header_t0 = GetTime();
 
-        input_mem_hfile = hopen("mem:", "rb:", input_file_mem, input_file_size);
-        if (!input_mem_hfile) {
-            fprintf(stderr, "[rank %d] ERROR: cannot open preloaded BAM memory for %s\n",
-                    rank, cmd_info->in_file_name_.c_str());
-            local_ok = 0;
+        if (backend_bam_input) {
+            if (!backend_input || backend_input->format() != bam ||
+                !backend_input->header()) {
+                local_ok = 0;
+            } else {
+                hdr = sam_hdr_dup(backend_input->header());
+                if (!hdr) local_ok = 0;
+                input_format = bam;
+                bam_to_bam = output_format == bam;
+                bam_to_sam = output_format == sam;
+                if (!bam_to_bam && !bam_to_sam) local_ok = 0;
+                if (filter_requested && !bam_to_bam) {
+                    if (rank == 0) {
+                        fprintf(stderr, "ERROR: BAM filtering options are only supported for MPI BAM -> BAM.\n");
+                    }
+                    local_ok = 0;
+                }
+                if (bam_to_sam && cmd_info->compress_level_ != 1 &&
+                    rank == 0) {
+                    printf("NOTE: --compress-level=%d is ignored for MPI BAM2SAM because SAM output is plain text.\n",
+                           cmd_info->compress_level_);
+                }
+                body_start = (long long)backend_input->body_offset();
+            }
+        } else if (streaming_sam_input) {
+            if (!sam_input || !sam_input->header()) {
+                local_ok = 0;
+            } else {
+                hdr = sam_hdr_dup(sam_input->header());
+                if (!hdr) local_ok = 0;
+                input_format = sam;
+                sam_to_bam = true;
+                body_start = (long long)sam_input->body_offset();
+            }
+        } else {
+            input_mem_hfile = hopen("mem:", "rb:", input_file_mem, input_file_size);
         }
-        if (local_ok) {
+        if (!input_mem_hfile) {
+            if (!backend_bam_input && !streaming_sam_input) {
+                fprintf(stderr, "[rank %d] ERROR: cannot open preloaded BAM memory for %s\n",
+                        rank, cmd_info->in_file_name_.c_str());
+                local_ok = 0;
+            }
+        }
+        if (local_ok && !backend_bam_input && !streaming_sam_input) {
             sin = (samFile *)hts_hopen(input_mem_hfile, "data", "rb");
             if (!sin) {
                 fprintf(stderr, "[rank %d] ERROR: cannot create HTS input handle from memory\n", rank);
@@ -857,7 +898,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             }
         }
 
-        if (local_ok) {
+        if (local_ok && !backend_bam_input && !streaming_sam_input) {
             hdr = sam_hdr_read(sin);
             if (!hdr) {
                 fprintf(stderr, "[rank %d] ERROR: cannot read header from %s\n",
@@ -865,7 +906,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 local_ok = 0;
             }
         }
-        if (local_ok) {
+        if (local_ok && !backend_bam_input && !streaming_sam_input) {
             input_format = MpiNormalizeFormat(sin->format.format);
             bam_to_bam = input_format == bam && output_format == bam;
             bam_to_sam = input_format == bam && output_format == sam;
@@ -914,8 +955,21 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 }
             }
         }
+        if (local_ok && backend_bam_input && bam_to_bam &&
+            !cmd_info->ref_name_.empty()) {
+            int ref_tid = sam_hdr_name2tid(hdr, cmd_info->ref_name_.c_str());
+            if (ref_tid < 0) {
+                fprintf(stderr, "[rank %d] ERROR: reference name '%s' does not exist in the BAM header.\n",
+                        rank, cmd_info->ref_name_.c_str());
+                local_ok = 0;
+            } else {
+                filter.ref_tid = ref_tid;
+            }
+        }
 
-        double header_cost = GetTime() - header_t0;
+        double header_cost = backend_bam_input
+            ? backend_input_handle.header_open_cost()
+            : GetTime() - header_t0;
         double header_cost_max = MpiReduceMaxCost(header_cost);
         if (rank == 0 && local_ok) {
             // t_total += header_cost_max;
@@ -939,8 +993,10 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             if (bam_to_bam || sam_to_bam) {
                 printf("MPI BAM output compression level=%d\n", cmd_info->compress_level_);
             }
+            printf("MPI output backend=%s\n",
+                   mpiio_output ? "mpiio" : "memory");
 
-            if (input_format == bam) {
+            if (input_format == bam && !backend_bam_input) {
                 if (MpiScanBgzfBlocksInMemory(input_file_mem, input_file_size, body_start,
                                               &block_offsets, &block_lengths) != 0) {
                     fprintf(stderr, "ERROR: failed to scan input BGZF blocks.\n");
@@ -955,9 +1011,14 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                     printf("MPI BAM scan complete. data_blocks=%lld body_start=%lld header_end=%lld\n",
                            n_blocks, body_start, (long long)sin->fp.bgzf->block_address);
                 }
-            } else {
-                if (MpiSplitSamRangesInMemory(input_file_mem, input_file_size, body_start,
-                                              comm_size, &block_offsets, &block_lengths) != 0) {
+            } else if (input_format == sam) {
+                int split_ret = streaming_sam_input
+                    ? sam_input->SplitRanges(
+                          comm_size, &block_offsets, &block_lengths)
+                    : MpiSplitSamRangesInMemory(
+                          input_file_mem, input_file_size, body_start,
+                          comm_size, &block_offsets, &block_lengths);
+                if (split_ret != 0) {
                     fprintf(stderr, "ERROR: failed to split SAM body ranges for MPI ranks.\n");
                     local_ok = 0;
                 }
@@ -969,23 +1030,70 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             }
         }
 
-        //把 block 信息广播给所有 rank
-        MPI_Bcast(&local_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        if (!local_ok) goto cleanup;
-        MPI_Bcast(&body_start, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        MPI_Bcast(&n_blocks, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        if (rank != 0) {
-            block_offsets.resize((size_t)n_blocks);
-            block_lengths.resize((size_t)n_blocks);
+        if (backend_bam_input) {
+            if (swbam::mpi::PrepareMpiBamInputPlan(
+                    *backend_input, &backend_plan) != 0) {
+                fprintf(stderr, "[rank %d] ERROR: failed to prepare MPI BAM input plan.\n", rank);
+                local_ok = 0;
+            } else {
+                body_start = (long long)backend_plan.body_offset;
+                n_blocks = (long long)backend_plan.blocks.size();
+                if (rank == 0) {
+                    printf("MPI BAM scan complete. data_blocks=%lld body_start=%lld header_end=%lld backend=%s\n",
+                           n_blocks, body_start, body_start,
+                           backend_input_handle.selected_backend().c_str());
+                }
+            }
+        } else {
+            // 把 block 信息广播给所有 rank。
+            MPI_Bcast(&local_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+            if (!local_ok) goto cleanup;
+            MPI_Bcast(&body_start, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+            MPI_Bcast(&n_blocks, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+            if (rank != 0) {
+                block_offsets.resize((size_t)n_blocks);
+                block_lengths.resize((size_t)n_blocks);
+            }
+            if (n_blocks > 0) {
+                MPI_Bcast(block_offsets.data(), (int)n_blocks, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+                MPI_Bcast(block_lengths.data(), (int)n_blocks, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+            }
         }
-        if (n_blocks > 0) {
-            MPI_Bcast(block_offsets.data(), (int)n_blocks, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-            MPI_Bcast(block_lengths.data(), (int)n_blocks, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        }
+        if (!MpiAllRanksOk(local_ok)) goto cleanup;
 
-        //按 rank 切分 block 范围，每个 rank 直接使用预加载输入内存中的连续窗口
+        // 按 rank 切分 block 范围。memory 保留连续窗口快速路径，
+        // POSIX 只计算当前 rank 的压缩字节数，4.3 内按 batch 读取。
         size_t rank_input_size = 0;
-        if (input_format == bam) {
+        if (backend_bam_input) {
+            for (size_t i = backend_plan.rank_begin;
+                 i < backend_plan.rank_end; ++i) {
+                const size_t block_size =
+                    (size_t)backend_plan.blocks[i].compressed_size;
+                if (block_size > SIZE_MAX - rank_input_size) {
+                    fprintf(stderr, "[rank %d] ERROR: assigned BAM byte count overflows size_t.\n", rank);
+                    local_ok = 0;
+                    break;
+                }
+                rank_input_size += block_size;
+            }
+            if (local_ok && input_file_mem &&
+                backend_plan.rank_begin < backend_plan.rank_end) {
+                const swbam::BgzfBlockSpan &first =
+                    backend_plan.blocks[backend_plan.rank_begin];
+                const swbam::BgzfBlockSpan &last =
+                    backend_plan.blocks[backend_plan.rank_end - 1];
+                const uint64_t range_end =
+                    last.offset + (uint64_t)last.compressed_size;
+                if (range_end < first.offset ||
+                    range_end > (uint64_t)input_file_size ||
+                    range_end - first.offset != (uint64_t)rank_input_size) {
+                    fprintf(stderr, "[rank %d] ERROR: memory backend assigned BAM blocks are not contiguous.\n", rank);
+                    local_ok = 0;
+                } else {
+                    rank_input_mem = input_file_mem + (size_t)first.offset;
+                }
+            }
+        } else if (input_format == bam) {
             long long begin = n_blocks * rank / comm_size;
             long long end = n_blocks * (rank + 1) / comm_size;
             if (MpiSelectBlockRangeFromMemory(input_file_mem, input_file_size,
@@ -1008,8 +1116,21 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                             rank, start, len);
                     local_ok = 0;
                 } else {
-                    rank_input_mem = input_file_mem + start;
-                    rank_input_size = (size_t)len;
+                    if (streaming_sam_input) {
+                        if (sam_input->ReadRange(
+                                (uint64_t)start, (size_t)len,
+                                &rank_sam_storage) != 0) {
+                            fprintf(stderr, "[rank %d] ERROR: failed to read assigned POSIX SAM range.\n", rank);
+                            local_ok = 0;
+                        } else {
+                            rank_input_mem = rank_sam_storage.empty()
+                                ? nullptr : rank_sam_storage.data();
+                            rank_input_size = rank_sam_storage.size();
+                        }
+                    } else {
+                        rank_input_mem = input_file_mem + start;
+                        rank_input_size = (size_t)len;
+                    }
                 }
             }
         }
@@ -1022,9 +1143,11 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         //4.2 初始化内存 reader 和 writer
         double stage42_t0 = GetTime();
         if (local_ok) {
-            reader.base = rank_input_mem;
-            reader.size = rank_input_size;
-            reader.pos = 0;
+            if (!backend_bam_input || input_file_mem) {
+                reader.base = rank_input_mem;
+                reader.size = rank_input_size;
+                reader.pos = 0;
+            }
             size_t writer_capacity = rank_input_size ? rank_input_size : 64 * 1024 * 1024;
             if (bam_to_sam && rank_input_size > 0) {
                 if (rank_input_size > SIZE_MAX / 5) {
@@ -1055,7 +1178,14 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                                  (bam_to_sam ? "FusedBamToSamMPI" : "FusedBamToBamMPI");
         double FusedBamToBamMPI_t0 = GetTime();
         if (bam_to_sam) {
-            if (FusedBamToSamMPI(reader, mem_writer, hdr, &sam_stats) != 0) {
+            int ret = backend_bam_input && !input_file_mem
+                ? FusedBamToSamMPI(
+                      *backend_input, backend_plan.rank_spans(),
+                      backend_plan.rank_block_count(), mem_writer,
+                      hdr, &sam_stats)
+                : FusedBamToSamMPI(
+                      reader, mem_writer, hdr, &sam_stats);
+            if (ret != 0) {
                 fprintf(stderr, "[rank %d] ERROR: MPI bam2sam fused 1CG body failed.\n", rank);
                 local_ok = 0;
             }
@@ -1065,7 +1195,15 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 local_ok = 0;
             }
         } else {
-            if (FusedBamToBamMPI(reader, mem_writer, filter, cmd_info->compress_level_, &stats) != 0) {
+            int ret = backend_bam_input && !input_file_mem
+                ? FusedBamToBamMPI(
+                      *backend_input, backend_plan.rank_spans(),
+                      backend_plan.rank_block_count(), mem_writer,
+                      filter, cmd_info->compress_level_, &stats)
+                : FusedBamToBamMPI(
+                      reader, mem_writer, filter,
+                      cmd_info->compress_level_, &stats);
+            if (ret != 0) {
                 fprintf(stderr, "[rank %d] ERROR: MPI bam2bam fused 1CG body failed.\n", rank);
                 local_ok = 0;
             }
@@ -1128,7 +1266,17 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                              (unsigned long long)total_body_size +
                              (unsigned long long)sizeof(kMpiBgzfEofBlock);
             } else {
-                output_body_start = (size_t)body_start;
+                if (backend_bam_input && !input_file_mem) {
+                    if (MpiBuildBamHeaderMemory(
+                            hdr, cmd_info->compress_level_,
+                            &bam_header_mem, &bam_header_size) != 0) {
+                        fprintf(stderr, "ERROR: failed to build MPI BAM2BAM output header in memory.\n");
+                        local_ok = 0;
+                    }
+                    output_body_start = bam_header_size;
+                } else {
+                    output_body_start = (size_t)body_start;
+                }
                 final_size = (unsigned long long)output_body_start +
                              (unsigned long long)total_body_size +
                              (unsigned long long)sizeof(kMpiBgzfEofBlock);
@@ -1203,8 +1351,14 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                     simulated_pos += bam_header_size;
                 }
             } else {
-                memcpy(simulated_write_mem + simulated_pos, input_file_mem, output_body_start);
-                simulated_pos += output_body_start;
+                const char *header_data =
+                    backend_bam_input && !input_file_mem
+                        ? bam_header_mem : input_file_mem;
+                if (output_body_start > 0) {
+                    memcpy(simulated_write_mem + simulated_pos,
+                           header_data, output_body_start);
+                    simulated_pos += output_body_start;
+                }
             }
         }
         if (local_body_size > 0) {
@@ -1434,8 +1588,68 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         }
     }
 
-    //5. rank 0 为验证结果汇总输出内存并写入文件，不计入处理时间
-    {
+    //5. 输出不计入核心处理时间。MPI-IO 路径跳过 rank0 全量 gather。
+    if (mpiio_output) {
+        double mpiio_t0 = GetTime();
+        swbam::mpi::MpiFileOutput output;
+        if (output.Open(cmd_info->out_file_name_,
+                        (uint64_t)output_file_size) != 0) {
+            fprintf(stderr, "[rank %d] ERROR: failed to open MPI-IO output %s.\n",
+                    rank, cmd_info->out_file_name_.c_str());
+            local_ok = 0;
+        }
+        int mpiio_open_ok = MpiAllRanksOk(local_ok);
+        if (mpiio_open_ok) {
+            if (rank == 0 && output_body_start > 0) {
+                const char *header_data = nullptr;
+                if (bam_to_sam) {
+                    header_data = sam_header_text;
+                } else if (sam_to_bam ||
+                           (backend_bam_input && !input_file_mem)) {
+                    header_data = bam_header_mem;
+                } else {
+                    header_data = input_file_mem;
+                }
+                if (output.WriteAt(0, header_data,
+                                   (uint64_t)output_body_start) != 0) {
+                    fprintf(stderr, "ERROR: failed to write MPI-IO output header.\n");
+                    local_ok = 0;
+                }
+            }
+            if (local_body_size > 0 &&
+                output.WriteAt(
+                    (uint64_t)output_body_start + (uint64_t)local_prefix,
+                    mem_writer.data, (uint64_t)local_body_size) != 0) {
+                fprintf(stderr, "[rank %d] ERROR: failed to write MPI-IO output body.\n", rank);
+                local_ok = 0;
+            }
+            if (rank == 0 && !bam_to_sam &&
+                output.WriteAt(
+                    (uint64_t)output_body_start + (uint64_t)total_body_size,
+                    kMpiBgzfEofBlock,
+                    (uint64_t)sizeof(kMpiBgzfEofBlock)) != 0) {
+                fprintf(stderr, "ERROR: failed to write MPI-IO BGZF EOF.\n");
+                local_ok = 0;
+            }
+        }
+        int mpiio_write_ok = MpiAllRanksOk(local_ok);
+        if (mpiio_write_ok && output.Sync() != 0) {
+            fprintf(stderr, "[rank %d] ERROR: failed to sync MPI-IO output.\n", rank);
+            local_ok = 0;
+        }
+        MpiAllRanksOk(local_ok);
+        if (output.Close() != 0) {
+            fprintf(stderr, "[rank %d] ERROR: failed to close MPI-IO output.\n", rank);
+            local_ok = 0;
+        }
+        int mpiio_close_ok = MpiAllRanksOk(local_ok);
+        double mpiio_cost = GetTime() - mpiio_t0;
+        double mpiio_cost_max = MpiReduceMaxCost(mpiio_cost);
+        if (rank == 0 && mpiio_close_ok) {
+            printf("555Distributed MPI-IO output cost %lf--\n", mpiio_cost_max);
+        }
+        if (!mpiio_open_ok || !mpiio_write_ok || !mpiio_close_ok) goto cleanup;
+    } else {
         double verify_alloc_t0 = GetTime();
         if (rank == 0) {
             output_file_mem = output_file_size ? (char *)malloc(output_file_size) : nullptr;
@@ -1449,7 +1663,13 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 } else if (sam_to_bam) {
                     if (bam_header_size > 0) memcpy(output_file_mem, bam_header_mem, bam_header_size);
                 } else {
-                    if (output_body_start > 0) memcpy(output_file_mem, input_file_mem, output_body_start);
+                    const char *header_data =
+                        backend_bam_input && !input_file_mem
+                            ? bam_header_mem : input_file_mem;
+                    if (output_body_start > 0) {
+                        memcpy(output_file_mem, header_data,
+                               output_body_start);
+                    }
                 }
             }
         }
@@ -1522,7 +1742,14 @@ cleanup:
         if (bam_header_mem) free(bam_header_mem);
         if (simulated_write_mem) free(simulated_write_mem);
         if (hdr) sam_hdr_destroy(hdr);
-        if (sin) {
+        if (backend_bam_input) {
+            input_file_mem = nullptr;
+            backend_input = nullptr;
+            backend_input_handle.Close();
+        } else if (streaming_sam_input) {
+            if (sam_input) sam_input->Close();
+            sam_input = nullptr;
+        } else if (sin) {
             int ret = hts_close(sin);
             if (ret < 0) fprintf(stderr, "[rank %d] ERROR: closing input failed.\n", rank);
             input_file_mem = nullptr;

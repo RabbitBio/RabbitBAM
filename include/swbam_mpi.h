@@ -2,6 +2,7 @@
 #define SWBAM_MPI_H
 
 #include "swbam.h"
+#include "swbam/io.h"
 
 #include <cstddef>
 #include <string>
@@ -323,6 +324,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info);
 int ProcessBamToBamMPI(CmdInfo *cmd_info);
 int ProcessFlagstatMPI(CmdInfo *cmd_info);
 int ProcessStatsMPI(CmdInfo *cmd_info);
+int ProcessIoCheckMPI(CmdInfo *cmd_info);
 int ProcessSortMPI(CmdInfo *cmd_info);
 int ProcessMarkdupMPI(CmdInfo *cmd_info);
 int ProcessFixmateMPI(CmdInfo *cmd_info);
@@ -395,7 +397,20 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      const BamFilterOptions &filter,
                      int compress_level,
                      MpiBamToBamStats *stats);
+int FusedBamToBamMPI(const swbam::BamInputBackend &input,
+                     const swbam::BgzfBlockSpan *spans,
+                     size_t span_count,
+                     MemWriter &mem_writer,
+                     const BamFilterOptions &filter,
+                     int compress_level,
+                     MpiBamToBamStats *stats);
 int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
+                     sam_hdr_t *hdr,
+                     MpiBamToSamStats *stats);
+int FusedBamToSamMPI(const swbam::BamInputBackend &input,
+                     const swbam::BgzfBlockSpan *spans,
+                     size_t span_count,
+                     MemWriter &mem_writer,
                      sam_hdr_t *hdr,
                      MpiBamToSamStats *stats);
 int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,

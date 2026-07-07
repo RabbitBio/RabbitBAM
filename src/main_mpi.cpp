@@ -9,6 +9,8 @@
 
 #include <cstdio>
 #include <mpi.h>
+#include <string>
+#include <vector>
 
 int main(int argc, char **argv) {
     double t0 = GetTime();
@@ -38,6 +40,17 @@ int main(int argc, char **argv) {
     CLI::App *run_all = app.add_subcommand("run_all", "Run MPI conversion (BAM -> BAM, BAM -> SAM, and SAM -> BAM implemented)");
     run_all->add_option("-i,--inFile", cmd_info.in_file_name_, "input sam/bam name")->required()->check(CLI::ExistingFile);
     run_all->add_option("-o,--outFile", cmd_info.out_file_name_, "output sam/bam name")->required();
+    run_all->add_option("--io-backend", cmd_info.io_backend_,
+                        "Input backend: memory, posix, mpiio, or auto")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+    run_all->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
+                        "Per-rank memory input limit used by --io-backend auto")
+        ->default_val("8G");
+    run_all->add_option("--io-output-backend", cmd_info.io_output_backend_,
+                        "Output backend: memory or mpiio")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
     run_all->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
     run_all->add_flag("--validate-bounds", cmd_info.validate_bounds_, "Boundary validation is not supported by RabbitBAM-MPI")->default_val(false);
     run_all->add_option("--min-mapq", cmd_info.min_mapq_, "Keep reads with MAPQ >= value");
@@ -51,12 +64,31 @@ int main(int argc, char **argv) {
 
     CLI::App *flagstat = app.add_subcommand("flagstat", "Run MPI BAM flagstat");
     flagstat->add_option("-i,--inFile", cmd_info.in_file_name_, "input bam name")->required()->check(CLI::ExistingFile);
+    flagstat->add_option("--io-backend", cmd_info.io_backend_,
+                         "Input backend: memory, posix, mpiio, or auto")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+    flagstat->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
+                         "Per-rank memory input limit used by --io-backend auto")
+        ->default_val("8G");
     flagstat->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
 
     CLI::App *stats = app.add_subcommand("stats", "Run MPI BAM stats");
     stats->add_option("-i,--inFile", cmd_info.in_file_name_, "input bam name")->required()->check(CLI::ExistingFile);
+    stats->add_option("--io-backend", cmd_info.io_backend_,
+                      "Input backend: memory, posix, mpiio, or auto")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+    stats->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
+                      "Per-rank memory input limit used by --io-backend auto")
+        ->default_val("8G");
     stats->add_flag("--basic", stats_basic, "Only output samtools stats SN summary numbers")->default_val(false);
     stats->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
+
+    CLI::App *io_check = app.add_subcommand(
+        "io-check", "Validate the generic MPI BGZF decode pipeline");
+    io_check->add_option("-i,--inFile", cmd_info.in_file_name_,
+                         "input bam name")->required()->check(CLI::ExistingFile);
 
     CLI::App *sort = app.add_subcommand("sort", "Run MPI BAM coordinate sort");
     sort->add_option("-i,--inFile", cmd_info.in_file_name_, "input bam name")->required()->check(CLI::ExistingFile);
@@ -113,6 +145,7 @@ int main(int argc, char **argv) {
     bool is_run_all = false;
     bool is_flagstat = false;
     bool is_stats = false;
+    bool is_io_check = false;
     bool is_sort = false;
     bool is_collate = false;
     bool is_markdup = false;
@@ -130,6 +163,7 @@ int main(int argc, char **argv) {
     is_run_all = selected_command->get_name() == "run_all";
     is_flagstat = selected_command->get_name() == "flagstat";
     is_stats = selected_command->get_name() == "stats";
+    is_io_check = selected_command->get_name() == "io-check";
     is_sort = selected_command->get_name() == "sort";
     is_collate = selected_command->get_name() == "collate";
     is_markdup = selected_command->get_name() == "markdup";
@@ -140,8 +174,8 @@ int main(int argc, char **argv) {
          collate_bins_option->count() > 0) ||
         (is_dedup_pipeline && pipeline_bins_option &&
          pipeline_bins_option->count() > 0);
-    if (!is_run_all && !is_flagstat && !is_stats && !is_sort && !is_collate && !is_markdup && !is_fixmate && !is_dedup_pipeline) {
-        if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI only supports run_all, flagstat, stats, sort, collate, markdup, fixmate, and dedup-pipeline.\n");
+    if (!is_run_all && !is_flagstat && !is_stats && !is_io_check && !is_sort && !is_collate && !is_markdup && !is_fixmate && !is_dedup_pipeline) {
+        if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI only supports run_all, flagstat, stats, io-check, sort, collate, markdup, fixmate, and dedup-pipeline.\n");
         goto cleanup;
     }
     if (is_stats && !stats_basic) {
@@ -159,21 +193,23 @@ int main(int argc, char **argv) {
     }
 
     t1 = GetTime();
-    exit_code = is_dedup_pipeline ? ProcessDedupPipelineMPI(&cmd_info)
+    exit_code = is_io_check ? ProcessIoCheckMPI(&cmd_info)
+                         : (is_dedup_pipeline ? ProcessDedupPipelineMPI(&cmd_info)
                          : (is_sort ? ProcessSortMPI(&cmd_info)
                          : (is_collate ? ProcessCollateMPI(&cmd_info)
                          : (is_markdup ? ProcessMarkdupMPI(&cmd_info)
                                       : (is_fixmate ? ProcessFixmateMPI(&cmd_info)
                                                     : (is_stats ? ProcessStatsMPI(&cmd_info)
-                                                                : (is_flagstat ? ProcessFlagstatMPI(&cmd_info) : ProcessSwBamMPI(&cmd_info)))))));
+                                                                : (is_flagstat ? ProcessFlagstatMPI(&cmd_info) : ProcessSwBamMPI(&cmd_info))))))));
     if (my_rank == 0) {
         printf("%s rank0 time is %lf--\n",
-               is_dedup_pipeline ? "ProcessDedupPipelineMPI" :
+               is_io_check ? "ProcessIoCheckMPI" :
+               (is_dedup_pipeline ? "ProcessDedupPipelineMPI" :
                (is_sort ? "ProcessSortMPI" :
                (is_collate ? "ProcessCollateMPI" :
                 (is_markdup ? "ProcessMarkdupMPI" :
                 (is_fixmate ? "ProcessFixmateMPI" :
-                 (is_stats ? "ProcessStatsMPI" : (is_flagstat ? "ProcessFlagstatMPI" : "ProcessSwBamMPI")))))),
+                 (is_stats ? "ProcessStatsMPI" : (is_flagstat ? "ProcessFlagstatMPI" : "ProcessSwBamMPI"))))))),
                GetTime() - t1);
     }
 

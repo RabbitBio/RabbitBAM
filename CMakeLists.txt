@@ -130,6 +130,12 @@ if(PLATFORM_SUNWAY)
 
     add_library(swbam_cpe_runtime STATIC
         lib/swbam_cpe_pipeline.cpp
+        lib/swbam_cpe_write_pipeline.cpp
+        lib/swbam_generic_compress.cpp
+        lib/swbam_generic_decode.cpp
+        lib/swbam_raw_bam.cpp
+        lib/swbam_raw_bam_filter.cpp
+        lib/swbam_raw_bam_writer.cpp
     )
     target_compile_options(swbam_cpe_runtime PRIVATE ${HOST_FLAGS})
     target_include_directories(swbam_cpe_runtime PUBLIC
@@ -152,6 +158,47 @@ if(PLATFORM_SUNWAY)
     # Include slave_zlib source files (compile with -mslave)
     # Only files in slave_zlib directory, not subdirectories
     file(GLOB SLAVE_ZLIB_FILES "slave/slave_zlib/*.c")
+
+    set(SWBAM_CPE_CORE_FILES
+        slave/core/slave_bgzf_codec.cpp
+        slave/core/slave_bam_parser.cpp
+    )
+    add_library(swbam_cpe_core_objects OBJECT ${SWBAM_CPE_CORE_FILES})
+    target_compile_options(swbam_cpe_core_objects PRIVATE ${SLAVE_FLAGS})
+    target_include_directories(swbam_cpe_core_objects PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/ext/htslib-1.20
+        ${CMAKE_SOURCE_DIR}/ext/libdeflate-1.20
+        ${CMAKE_SOURCE_DIR}/slave/slave_zlib
+    )
+    target_compile_definitions(swbam_cpe_core_objects PRIVATE PLATFORM_SUNWAY)
+
+    set(SWBAM_CPE_OPERATOR_FILES
+        slave/operators/slave_decode_operator.cpp
+        slave/operators/slave_compress_operator.cpp
+        slave/operators/slave_flagstat_operator.cpp
+        slave/operators/slave_stats_basic_operator.cpp
+    )
+    add_library(swbam_cpe_operator_objects OBJECT ${SWBAM_CPE_OPERATOR_FILES})
+    target_compile_options(swbam_cpe_operator_objects PRIVATE ${SLAVE_FLAGS})
+    target_include_directories(swbam_cpe_operator_objects PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/ext/htslib-1.20
+        ${CMAKE_SOURCE_DIR}/ext/libdeflate-1.20
+        ${CMAKE_SOURCE_DIR}/slave/slave_zlib
+    )
+    target_compile_definitions(swbam_cpe_operator_objects PRIVATE PLATFORM_SUNWAY)
+
+    add_library(swbam_cpe_bam_transform_objects OBJECT
+        slave/operators/slave_bam_filter_operator.cpp)
+    target_compile_options(swbam_cpe_bam_transform_objects PRIVATE ${SLAVE_FLAGS})
+    target_include_directories(swbam_cpe_bam_transform_objects PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/ext/htslib-1.20
+        ${CMAKE_SOURCE_DIR}/ext/libdeflate-1.20
+        ${CMAKE_SOURCE_DIR}/slave/slave_zlib
+    )
+    target_compile_definitions(swbam_cpe_bam_transform_objects PRIVATE PLATFORM_SUNWAY)
     
     # Create object library for slave code with special flags
     add_library(slave_objects OBJECT ${SINGLE_SLAVE_FILES} ${SLAVE_C_FILES} ${SLAVE_ZLIB_FILES})
@@ -162,7 +209,9 @@ if(PLATFORM_SUNWAY)
         ${CMAKE_SOURCE_DIR}/ext/libdeflate-1.20
         ${CMAKE_SOURCE_DIR}/slave/slave_zlib
     )
-    target_compile_definitions(slave_objects PRIVATE PLATFORM_SUNWAY)
+    target_compile_definitions(slave_objects PRIVATE
+        PLATFORM_SUNWAY
+        SWBAM_CPE_OPERATOR_SPLIT)
     add_library(slave_cgs_objects OBJECT ${SLAVE_FILES} ${SLAVE_C_FILES} ${SLAVE_ZLIB_FILES})
     target_compile_options(slave_cgs_objects PRIVATE ${SLAVE_FLAGS})
     target_include_directories(slave_cgs_objects PRIVATE
@@ -174,13 +223,21 @@ if(PLATFORM_SUNWAY)
     target_compile_definitions(slave_cgs_objects PRIVATE PLATFORM_SUNWAY ENABLE_CGS_BAM2BAM ENABLE_CGS_BAM2SAM ENABLE_CGS_SAM2BAM)
     
     # Main executable with host code and slave objects
-    add_executable(${PROJECT_NAME} ${SINGLE_SRC_FILES} $<TARGET_OBJECTS:slave_objects>)
+    add_executable(${PROJECT_NAME} ${SINGLE_SRC_FILES}
+        $<TARGET_OBJECTS:slave_objects>
+        $<TARGET_OBJECTS:swbam_cpe_core_objects>)
     # Apply host flags to all source files in src directory
     target_compile_options(${PROJECT_NAME} PRIVATE ${HOST_FLAGS})
-    add_executable(RabbitBAM-CGS ${CGS_SRC_FILES} $<TARGET_OBJECTS:slave_cgs_objects>)
+    add_executable(RabbitBAM-CGS ${CGS_SRC_FILES}
+        $<TARGET_OBJECTS:slave_cgs_objects>
+        $<TARGET_OBJECTS:swbam_cpe_core_objects>)
     target_compile_options(RabbitBAM-CGS PRIVATE ${HOST_FLAGS})
     target_compile_definitions(RabbitBAM-CGS PRIVATE PLATFORM_SUNWAY ENABLE_CGS_BAM2BAM ENABLE_CGS_BAM2SAM ENABLE_CGS_SAM2BAM)
-    add_executable(RabbitBAM-MPI ${MPI_SRC_FILES} $<TARGET_OBJECTS:slave_objects>)
+    add_executable(RabbitBAM-MPI ${MPI_SRC_FILES}
+        $<TARGET_OBJECTS:slave_objects>
+        $<TARGET_OBJECTS:swbam_cpe_bam_transform_objects>
+        $<TARGET_OBJECTS:swbam_cpe_core_objects>
+        $<TARGET_OBJECTS:swbam_cpe_operator_objects>)
     target_compile_options(RabbitBAM-MPI PRIVATE ${HOST_FLAGS})
     target_compile_definitions(RabbitBAM-MPI PRIVATE PLATFORM_SUNWAY ENABLE_MPI_BAM2BAM)
     target_include_directories(RabbitBAM-MPI PRIVATE ${SUNWAY_MPI_ROOT}/include)
