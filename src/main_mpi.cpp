@@ -112,6 +112,17 @@ int main(int argc, char **argv) {
     CLI::App *markdup = app.add_subcommand("markdup", "Run MPI BAM duplicate marking");
     markdup->add_option("-i,--inFile", cmd_info.in_file_name_, "coordinate-sorted fixmate BAM name")->required()->check(CLI::ExistingFile);
     markdup->add_option("-o,--outFile", cmd_info.out_file_name_, "output bam name")->required();
+    markdup->add_option("--io-backend", cmd_info.io_backend_,
+                        "Input backend: memory, posix, mpiio, or auto")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+    markdup->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
+                        "Per-rank memory input limit used by --io-backend auto")
+        ->default_val("8G");
+    markdup->add_option("--io-output-backend", cmd_info.io_output_backend_,
+                        "Output backend: memory or mpiio")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
     markdup->add_flag("-r,--remove-dups", cmd_info.markdup_remove_dups_, "Remove duplicate records")->default_val(false);
     markdup->add_flag("-c,--clear", cmd_info.markdup_clear_, "Clear existing duplicate flags and dt/do tags first")->default_val(false);
     markdup->add_flag("--include-fails", cmd_info.markdup_include_fails_, "Include QC-fail records in duplicate detection")->default_val(false);
@@ -124,6 +135,17 @@ int main(int argc, char **argv) {
     CLI::App *fixmate = app.add_subcommand("fixmate", "Run MPI BAM fixmate");
     fixmate->add_option("-i,--inFile", cmd_info.in_file_name_, "name-collated or queryname-sorted BAM name")->required()->check(CLI::ExistingFile);
     fixmate->add_option("-o,--outFile", cmd_info.out_file_name_, "output bam name")->required();
+    fixmate->add_option("--io-backend", cmd_info.io_backend_,
+                        "Input backend: memory, posix, mpiio, or auto")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+    fixmate->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
+                        "Per-rank memory input limit used by --io-backend auto")
+        ->default_val("8G");
+    fixmate->add_option("--io-output-backend", cmd_info.io_output_backend_,
+                        "Output backend: memory or mpiio")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
     fixmate->add_flag("-m", cmd_info.fixmate_mate_score_, "Add mate score ms tags")->required();
     fixmate->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
     fixmate->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);

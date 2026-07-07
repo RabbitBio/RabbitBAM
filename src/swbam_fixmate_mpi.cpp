@@ -1,4 +1,5 @@
 #include "swbam_mpi.h"
+#include "swbam/mpi_runtime.h"
 
 #include <algorithm>
 #include <climits>
@@ -239,6 +240,20 @@ static int FmReadGroup(MemReader &reader, FmBlockSet *input,
     *n_blocks = count;
     stats->t_read += GetTime() - t0;
     return 0;
+}
+
+static int FmReadGroup(
+        swbam::BgzfSpanBatchReader *reader,
+        swbam::BgzfBlockBatch *input,
+        int *n_blocks, MpiFixmateStats *stats) {
+    if (!reader || !input || !n_blocks || !stats) return -1;
+    double t0 = GetTime();
+    size_t count = 0;
+    const int ret = reader->ReadNext(input, &count);
+    if (ret == 0 && count > (size_t)INT_MAX) return -1;
+    *n_blocks = ret == 0 ? (int)count : 0;
+    stats->t_read += GetTime() - t0;
+    return ret;
 }
 
 static void FmInitDecompPara(
@@ -755,33 +770,67 @@ static void FmBuildRanges(
     }
 }
 
-static int FmStreamLocalGroups(
-        MemReader &reader, int compress_level,
+static int FmStreamLocalGroupsCore(
+        MemReader *memory_reader,
+        const swbam::BamInputBackend *backend,
+        const swbam::BgzfBlockSpan *spans,
+        size_t span_count,
+        int compress_level,
         MemWriter *middle_writer,
         FmStoredGroup *leading,
         FmStoredGroup *trailing,
         int *single_group,
         int rank, MpiFixmateStats *stats) {
+    if ((!memory_reader && !backend) ||
+        (memory_reader && backend)) {
+        return -1;
+    }
     const int records_per_block = (int)MPI_RECORDS_PER_BLOCK;
     FmBlockSet input = {};
     FmBlockSet uncompressed = {};
     FmRecordSet record_set = {};
+    swbam::BgzfBlockBatch backend_input;
+    swbam::BgzfSpanBatchReader backend_reader(
+        backend, spans, span_count);
+    const bool use_backend = backend != nullptr;
     Bam2BamPara decomp[kFixmateNB];
-    if (FmAllocateBlockSet(&input, kFixmateNB) != 0 ||
+    if ((!use_backend &&
+         FmAllocateBlockSet(&input, kFixmateNB) != 0) ||
+        (use_backend &&
+         backend_input.Allocate(kFixmateNB) != 0) ||
         FmAllocateBlockSet(&uncompressed, kFixmateNB) != 0 ||
         FmAllocateRecordSet(
             &record_set, kFixmateNB, records_per_block,
             MPI_BAM_BLOCK_ARENA_SIZE) != 0) {
-        FmFreeBlockSet(&input);
+        if (!use_backend) FmFreeBlockSet(&input);
         FmFreeBlockSet(&uncompressed);
         FmFreeRecordSet(&record_set);
         return -1;
     }
+    if (use_backend) {
+        input.blocks = backend_input.blocks();
+        input.n = kFixmateNB;
+    }
+    const auto release_workspaces = [&]() {
+        if (!use_backend) FmFreeBlockSet(&input);
+        FmFreeBlockSet(&uncompressed);
+        FmFreeRecordSet(&record_set);
+    };
+    const auto read_group = [&](int *n_blocks) {
+        return use_backend
+            ? FmReadGroup(&backend_reader, &backend_input,
+                          n_blocks, stats)
+            : FmReadGroup(*memory_reader, &input,
+                          n_blocks, stats);
+    };
 
     FmStoredGroup pending;
     bool leading_ready = false;
     int n_blocks = 0;
-    FmReadGroup(reader, &input, &n_blocks, stats);
+    if (read_group(&n_blocks) != 0) {
+        release_workspaces();
+        return -1;
+    }
     while (n_blocks > 0) {
         for (int b = 0; b < kFixmateNB; ++b) {
             FmInitDecompPara(
@@ -808,9 +857,7 @@ static int FmStreamLocalGroups(
                         decomp[b].actual_value,
                         decomp[b].limit_value,
                         decomp[b].limit_id);
-                FmFreeBlockSet(&input);
-                FmFreeBlockSet(&uncompressed);
-                FmFreeRecordSet(&record_set);
+                release_workspaces();
                 return -1;
             }
             stats->input_blocks++;
@@ -830,9 +877,7 @@ static int FmStreamLocalGroups(
                        bam_get_qname(records[cursor])) {
                 if (FmAppendStoredRecord(
                         &pending, records[cursor]) != 0) {
-                    FmFreeBlockSet(&input);
-                    FmFreeBlockSet(&uncompressed);
-                    FmFreeRecordSet(&record_set);
+                    release_workspaces();
                     return -1;
                 }
                 ++cursor;
@@ -846,9 +891,7 @@ static int FmStreamLocalGroups(
                     if (FmProcessStoredGroup(
                             &pending, compress_level,
                             middle_writer, rank, stats) != 0) {
-                        FmFreeBlockSet(&input);
-                        FmFreeBlockSet(&uncompressed);
-                        FmFreeRecordSet(&record_set);
+                        release_workspaces();
                         return -1;
                     }
                     t0 = GetTime();
@@ -867,9 +910,7 @@ static int FmStreamLocalGroups(
                         leading, records,
                         ranges[0].first,
                         ranges[0].second) != 0) {
-                    FmFreeBlockSet(&input);
-                    FmFreeBlockSet(&uncompressed);
-                    FmFreeRecordSet(&record_set);
+                    release_workspaces();
                     return -1;
                 }
                 leading_ready = true;
@@ -881,9 +922,7 @@ static int FmStreamLocalGroups(
                         records, ranges, direct_begin, last,
                         compress_level, middle_writer,
                         rank, stats) != 0) {
-                    FmFreeBlockSet(&input);
-                    FmFreeBlockSet(&uncompressed);
-                    FmFreeRecordSet(&record_set);
+                    release_workspaces();
                     return -1;
                 }
                 t0 = GetTime();
@@ -892,14 +931,15 @@ static int FmStreamLocalGroups(
                     &pending, records,
                     ranges[last].first,
                     ranges[last].second) != 0) {
-                FmFreeBlockSet(&input);
-                FmFreeBlockSet(&uncompressed);
-                FmFreeRecordSet(&record_set);
+                release_workspaces();
                 return -1;
             }
         }
         stats->t_group_scan += GetTime() - t0;
-        FmReadGroup(reader, &input, &n_blocks, stats);
+        if (read_group(&n_blocks) != 0) {
+            release_workspaces();
+            return -1;
+        }
     }
 
     if (!pending.empty()) {
@@ -913,10 +953,37 @@ static int FmStreamLocalGroups(
     } else {
         *single_group = leading_ready ? 1 : 0;
     }
-    FmFreeBlockSet(&input);
-    FmFreeBlockSet(&uncompressed);
-    FmFreeRecordSet(&record_set);
+    release_workspaces();
     return 0;
+}
+
+static int FmStreamLocalGroups(
+        MemReader &reader, int compress_level,
+        MemWriter *middle_writer,
+        FmStoredGroup *leading,
+        FmStoredGroup *trailing,
+        int *single_group,
+        int rank, MpiFixmateStats *stats) {
+    return FmStreamLocalGroupsCore(
+        &reader, nullptr, nullptr, 0, compress_level,
+        middle_writer, leading, trailing, single_group,
+        rank, stats);
+}
+
+static int FmStreamLocalGroups(
+        const swbam::BamInputBackend &backend,
+        const swbam::BgzfBlockSpan *spans,
+        size_t span_count,
+        int compress_level,
+        MemWriter *middle_writer,
+        FmStoredGroup *leading,
+        FmStoredGroup *trailing,
+        int *single_group,
+        int rank, MpiFixmateStats *stats) {
+    return FmStreamLocalGroupsCore(
+        nullptr, &backend, spans, span_count,
+        compress_level, middle_writer, leading, trailing,
+        single_group, rank, stats);
 }
 
 static int FmPreviousNonempty(
@@ -1069,7 +1136,7 @@ static void FmPrintStats(
 static int FmGatherOutput(
         const MemWriter &local_writer, sam_hdr_t *header,
         int compress_level, const std::string &output_path,
-        MpiMemoryBam *output_bam,
+        MpiMemoryBam *output_bam, bool mpiio_output,
         int rank, int comm_size, MpiFixmateStats *stats,
         FmOutputStageCosts *costs,
         double stage41_cost, double stage42_cost,
@@ -1222,6 +1289,53 @@ static int FmGatherOutput(
             printf("444Complete the total body cost %lf\n",
                    body_total_cost);
         }
+    }
+
+    if (!output_bam && mpiio_output) {
+        unsigned long long layout[2] = {0, 0};
+        if (rank == 0) {
+            layout[0] = (unsigned long long)header_size;
+            layout[1] = (unsigned long long)output_size;
+        }
+        MPI_Bcast(layout, 2, MPI_UNSIGNED_LONG_LONG, 0,
+                  MPI_COMM_WORLD);
+
+        double write_t0 = GetTime();
+        swbam::mpi::MpiFileOutput output;
+        if (output.Open(output_path, layout[1]) != 0) {
+            local_ok = 0;
+        }
+        if (FmAllRanksOk(local_ok)) {
+            if (rank == 0 && header_size > 0 &&
+                output.WriteAt(0, header_memory, header_size) != 0) {
+                local_ok = 0;
+            }
+            if (local_writer.size > 0 &&
+                output.WriteAt(
+                    layout[0] +
+                        (unsigned long long)offsets[(size_t)rank],
+                    local_writer.data, local_writer.size) != 0) {
+                local_ok = 0;
+            }
+            if (rank == 0 &&
+                output.WriteAt(
+                    layout[0] + (unsigned long long)total_body,
+                    kFixmateBgzfEofBlock,
+                    sizeof(kFixmateBgzfEofBlock)) != 0) {
+                local_ok = 0;
+            }
+        }
+        const int writes_ok = FmAllRanksOk(local_ok);
+        if (writes_ok && output.Sync() != 0) local_ok = 0;
+        if (output.Close() != 0) local_ok = 0;
+        const double write_cost =
+            FmReduceMax(GetTime() - write_t0);
+        if (rank == 0 && local_ok) {
+            printf("555MPI-IO distributed output cost %lf--\n",
+                   write_cost);
+        }
+        free(header_memory);
+        return FmAllRanksOk(local_ok) ? 0 : -1;
     }
 
     double verify_alloc_t0 = GetTime();
@@ -1701,7 +1815,7 @@ int MpiFixmateMemoryToMemory(CmdInfo *cmd_info,
 
     if (FmGatherOutput(
             middle, header, cmd_info->compress_level_,
-            cmd_info->out_file_name_, output_bam,
+            cmd_info->out_file_name_, output_bam, false,
             rank, comm_size, &stats, &output_stage_costs,
             stage41_cost, stage42_cost, stage43_cost,
             body_total_t0) != 0) {
@@ -1737,18 +1851,13 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
 
     int exit_code = 1;
     int local_ok = 1;
-    char *input_memory = nullptr;
-    size_t input_size = 0;
-    hFILE *input_hfile = nullptr;
-    samFile *input = nullptr;
+    swbam::mpi::MpiBamInput input_handle;
+    swbam::BamInputBackend *input_backend = nullptr;
+    swbam::MemoryBamInput *memory_input = nullptr;
+    swbam::mpi::MpiBamInputPlan input_plan;
     sam_hdr_t *header = nullptr;
     long long body_start = 0;
-    std::vector<long long> block_offsets;
-    std::vector<long long> block_lengths;
     long long n_blocks = 0;
-    long long local_begin = 0;
-    long long local_end = 0;
-    char *rank_input = nullptr;
     size_t rank_input_size = 0;
     MemReader reader = {};
     MemWriter middle = {};
@@ -1782,41 +1891,40 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
     }
 
     {
-        double t0 = GetTime();
-        if (MpiCommonLoadFileToMemory(
-                cmd_info->in_file_name_,
-                &input_memory, &input_size) != 0) {
+        if (input_handle.Open(
+                cmd_info->in_file_name_, cmd_info->io_backend_,
+                cmd_info->io_memory_limit_) != 0) {
             fprintf(stderr,
-                    "[rank %d] ERROR: cannot preload fixmate input %s.\n",
+                    "[rank %d] ERROR: cannot open fixmate input %s.\n",
                     rank, cmd_info->in_file_name_.c_str());
             local_ok = 0;
         }
-        const double cost = FmReduceMax(GetTime() - t0);
+        input_backend = input_handle.backend();
+        if (local_ok && (!input_backend ||
+                         input_backend->format() != bam)) {
+            local_ok = 0;
+        }
+        memory_input = dynamic_cast<swbam::MemoryBamInput *>(
+            input_backend);
+        const double cost = FmReduceMax(
+            input_handle.data_open_cost());
         if (rank == 0 && local_ok) {
-            printf("222Complete the memory cost %lf--\n", cost);
+            printf("MPI BAM input backend=%s "
+                   "auto_memory_budget=%llu\n",
+                   input_handle.selected_backend().c_str(),
+                   (unsigned long long)
+                       input_handle.auto_memory_budget());
+            printf("222Complete the input open cost %lf--\n", cost);
         }
     }
     if (!FmAllRanksOk(local_ok)) goto cleanup;
 
     {
         double t0 = GetTime();
-        input_hfile = hopen("mem:", "rb:", input_memory, input_size);
-        if (input_hfile) {
-            input = (samFile *)hts_hopen(
-                input_hfile, "data", "rb");
-            if (input) input_hfile = nullptr;
+        if (local_ok && input_backend->header()) {
+            header = sam_hdr_dup(input_backend->header());
         }
-        if (!input) local_ok = 0;
-        if (local_ok) header = sam_hdr_read(input);
         if (!header) local_ok = 0;
-        if (local_ok && input->format.format != bam &&
-            input->format.format != binary_format) {
-            if (rank == 0) {
-                fprintf(stderr,
-                        "ERROR: RabbitBAM-MPI fixmate only supports BAM input.\n");
-            }
-            local_ok = 0;
-        }
         if (local_ok) {
             kstring_t order = {0, 0, nullptr};
             if (sam_hdr_find_tag_hd(header, "SO", &order) == 0 &&
@@ -1831,14 +1939,15 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
             free(order.s);
         }
         if (local_ok) {
-            body_start =
-                (long long)input->fp.bgzf->block_address;
-            if (body_start < 0 ||
-                (unsigned long long)body_start > input_size) {
+            body_start = (long long)input_backend->body_offset();
+            if (body_start < 0 || (unsigned long long)body_start >
+                    (unsigned long long)input_backend->size()) {
                 local_ok = 0;
             }
         }
-        const double cost = FmReduceMax(GetTime() - t0);
+        const double local_header_cost =
+            input_handle.header_open_cost() + GetTime() - t0;
+        const double cost = FmReduceMax(local_header_cost);
         if (rank == 0 && local_ok) {
             printf("333Complete the head cost %lf---\n", cost);
         }
@@ -1854,36 +1963,48 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
                    comm_size, comm_size * 64);
             printf("MPI BAM output compression level=%d\n",
                    cmd_info->compress_level_);
-            if (MpiCommonScanBgzfBlocksInMemory(
-                    input_memory, input_size, body_start,
-                    &block_offsets, &block_lengths) != 0) {
+        }
+        if (swbam::mpi::PrepareMpiBamInputPlan(
+                *input_backend, &input_plan) != 0) {
+            local_ok = 0;
+        }
+        n_blocks = (long long)input_plan.blocks.size();
+        rank_input_size = 0;
+        for (size_t i = input_plan.rank_begin;
+             local_ok && i < input_plan.rank_end; ++i) {
+            const size_t block_size =
+                input_plan.blocks[i].compressed_size;
+            if (block_size > SIZE_MAX - rank_input_size) {
+                local_ok = 0;
+            } else {
+                rank_input_size += block_size;
+            }
+        }
+        if (local_ok && memory_input &&
+            input_plan.rank_block_count() > 0) {
+            const swbam::BgzfBlockSpan *rank_spans =
+                input_plan.rank_spans();
+            const uint64_t start = rank_spans[0].offset;
+            uint64_t expected = start;
+            for (size_t i = 0;
+                 local_ok && i < input_plan.rank_block_count(); ++i) {
+                if (rank_spans[i].offset != expected) {
+                    local_ok = 0;
+                } else {
+                    expected += rank_spans[i].compressed_size;
+                }
+            }
+            if (local_ok &&
+                (start > memory_input->size() ||
+                 rank_input_size > memory_input->size() -
+                     (size_t)start)) {
                 local_ok = 0;
             }
-            n_blocks = (long long)block_offsets.size();
-            if (n_blocks > INT_MAX) local_ok = 0;
-        }
-        MPI_Bcast(&local_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        if (!local_ok) goto cleanup;
-        MPI_Bcast(&n_blocks, 1, MPI_LONG_LONG, 0,
-                  MPI_COMM_WORLD);
-        if (rank != 0) {
-            block_offsets.resize((size_t)n_blocks);
-            block_lengths.resize((size_t)n_blocks);
-        }
-        if (n_blocks > 0) {
-            MPI_Bcast(block_offsets.data(), (int)n_blocks,
-                      MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-            MPI_Bcast(block_lengths.data(), (int)n_blocks,
-                      MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        }
-        local_begin = n_blocks * rank / comm_size;
-        local_end = n_blocks * (rank + 1) / comm_size;
-        if (MpiCommonSelectBlockRangeFromMemory(
-                input_memory, input_size,
-                block_offsets, block_lengths,
-                local_begin, local_end,
-                &rank_input, &rank_input_size) != 0) {
-            local_ok = 0;
+            if (local_ok) {
+                reader.base = memory_input->data() + (size_t)start;
+                reader.size = rank_input_size;
+                reader.pos = 0;
+            }
         }
         stage41_cost = FmReduceMax(GetTime() - t0);
         if (rank == 0 && local_ok) {
@@ -1897,9 +2018,6 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
 
     {
         double t0 = GetTime();
-        reader.base = rank_input;
-        reader.size = rank_input_size;
-        reader.pos = 0;
         if (MpiCommonInitMemWriter(
                 middle, rank_input_size ?
                     rank_input_size : 1024 * 1024) != 0 ||
@@ -1924,10 +2042,18 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
     {
         double fused_t0 = GetTime();
         // 1. FmStreamLocalGroups：先处理本 rank 内部完整 group
-        if (FmStreamLocalGroups(
+        const int stream_ret = memory_input
+            ? FmStreamLocalGroups(
                 reader, cmd_info->compress_level_,
                 &middle, &leading, &trailing,
-                &single_group, rank, &stats) != 0) {
+                &single_group, rank, &stats)
+            : FmStreamLocalGroups(
+                *input_backend, input_plan.rank_spans(),
+                input_plan.rank_block_count(),
+                cmd_info->compress_level_,
+                &middle, &leading, &trailing,
+                &single_group, rank, &stats);
+        if (stream_ret != 0) {
             local_ok = 0;
         }
         if (!FmAllRanksOkTimed(local_ok, &stats)) goto cleanup;
@@ -1983,7 +2109,9 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
 
     if (FmGatherOutput(
             middle, header, cmd_info->compress_level_,
-            cmd_info->out_file_name_, nullptr, rank, comm_size,
+            cmd_info->out_file_name_, nullptr,
+            cmd_info->io_output_backend_ == "mpiio",
+            rank, comm_size,
             &stats, &output_stage_costs,
             stage41_cost, stage42_cost, stage43_cost,
             body_total_t0) != 0) {
@@ -1993,16 +2121,8 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
     exit_code = 0;
 
 cleanup:
-    if (input) {
-        if (sam_close(input) < 0) exit_code = 1;
-        input = nullptr;
-    }
-    if (input_hfile) {
-        hclose(input_hfile);
-        input_hfile = nullptr;
-    }
     if (header) sam_hdr_destroy(header);
-    free(input_memory);
+    input_handle.Close();
     free(middle.data);
     free(prefix.data);
     free(suffix.data);

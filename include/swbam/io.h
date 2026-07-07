@@ -21,6 +21,7 @@ public:
     ~BgzfBlockBatch();
 
     int Allocate(size_t capacity);
+    int Attach(bam_block *blocks, size_t capacity);
     void Release();
 
     bam_block *blocks() { return blocks_; }
@@ -34,6 +35,7 @@ private:
     bam_block *blocks_;
     unsigned char *data_;
     size_t capacity_;
+    bool owns_storage_;
 };
 
 class BamInputBackend {

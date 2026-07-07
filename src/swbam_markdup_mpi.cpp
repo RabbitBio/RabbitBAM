@@ -1,4 +1,5 @@
 #include "swbam_mpi.h"
+#include "swbam/mpi_runtime.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -408,6 +409,55 @@ static int MdReadGroup(MemReader &reader, MdBlockSet *input,
     return 0;
 }
 
+class MdInputPass {
+public:
+    explicit MdInputPass(MemReader *reader)
+        : memory_reader_(reader), backend_(nullptr), spans_(nullptr),
+          span_count_(0), position_(0) {}
+
+    MdInputPass(const swbam::BamInputBackend *backend,
+                const swbam::BgzfBlockSpan *spans,
+                size_t span_count)
+        : memory_reader_(nullptr), backend_(backend), spans_(spans),
+          span_count_(span_count), position_(0) {}
+
+    bool uses_backend() const { return backend_ != nullptr; }
+
+    void Reset() {
+        if (memory_reader_) memory_reader_->pos = 0;
+        position_ = 0;
+    }
+
+    int Read(MdBlockSet *input, swbam::BgzfBlockBatch *view,
+             int *n_blocks, MpiMarkdupStats *stats) {
+        if (!input || !n_blocks || !stats) return -1;
+        if (!backend_) {
+            if (!memory_reader_) return -1;
+            return MdReadGroup(*memory_reader_, input, n_blocks, stats);
+        }
+        if (!view || (span_count_ > 0 && !spans_) ||
+            position_ > span_count_) {
+            return -1;
+        }
+        double t0 = GetTime();
+        size_t count = span_count_ - position_;
+        if (count > view->capacity()) count = view->capacity();
+        const int ret = count > 0
+            ? backend_->ReadBatch(spans_ + position_, count, view) : 0;
+        if (ret == 0) position_ += count;
+        *n_blocks = ret == 0 ? (int)count : 0;
+        stats->t_read += GetTime() - t0;
+        return ret;
+    }
+
+private:
+    MemReader *memory_reader_;
+    const swbam::BamInputBackend *backend_;
+    const swbam::BgzfBlockSpan *spans_;
+    size_t span_count_;
+    size_t position_;
+};
+
 static const char *MdExtractErrorText(int status) {
     switch (status) {
     case -10:
@@ -432,8 +482,8 @@ typedef int (*MdCandidateBatchConsumer)(
     int progress_tid, int progress_pos,
     uint64_t records_so_far);
 
-static int MdExtractCandidates(
-        MemReader &reader, long long global_block_begin,
+static int MdExtractCandidatesPass(
+        MdInputPass &source, long long global_block_begin,
         int rank, int include_fails, size_t memory_limit,
         std::vector<MpiMarkdupCandidateShared> *local_candidates,
         std::vector<unsigned char> *local_qnames,
@@ -465,6 +515,7 @@ static int MdExtractCandidates(
 
     MdExtractSlot slots[2];
     memset(slots, 0, sizeof(slots));
+    swbam::BgzfBlockBatch input_views[2];
 
     auto free_slot = [](MdExtractSlot *slot) {
         MdFreeBlockSet(&slot->input);
@@ -493,6 +544,12 @@ static int MdExtractCandidates(
                     "[rank %d] ERROR: failed to allocate markdup "
                     "candidate pipeline workspace.\n",
                     rank);
+            free_slots();
+            return -1;
+        }
+        if (source.uses_backend() &&
+            input_views[s].Attach(
+                slots[s].input.blocks, kMarkdupNB) != 0) {
             free_slots();
             return -1;
         }
@@ -538,8 +595,9 @@ static int MdExtractCandidates(
         slot->block_group_base = block_base;
         slot->ordinal_base = ordinal_base;
         slot->ordinal_end = ordinal_base;
-        if (MdReadGroup(reader, &slot->input, &slot->n_blocks,
-                        stats) != 0) {
+        const int slot_index = (int)(slot - slots);
+        if (source.Read(&slot->input, input_views + slot_index,
+                        &slot->n_blocks, stats) != 0) {
             return -1;
         }
         if (slot->n_blocks > 0) {
@@ -831,14 +889,38 @@ static int MdExtractCandidates(
     return 0;
 }
 
+static int MdExtractCandidates(
+        MemReader &reader, long long global_block_begin,
+        int rank, int include_fails, size_t memory_limit,
+        std::vector<MpiMarkdupCandidateShared> *local_candidates,
+        std::vector<unsigned char> *local_qnames,
+        uint64_t *local_records,
+        int *range_has_records,
+        int *range_first_tid, int *range_first_pos,
+        int *range_last_tid, int *range_last_pos,
+        MpiMarkdupStats *stats,
+        MdCandidateBatchConsumer batch_consumer = nullptr,
+        void *batch_context = nullptr,
+        long long target_batches = 0) {
+    MdInputPass source(&reader);
+    return MdExtractCandidatesPass(
+        source, global_block_begin, rank, include_fails,
+        memory_limit, local_candidates, local_qnames,
+        local_records, range_has_records,
+        range_first_tid, range_first_pos,
+        range_last_tid, range_last_pos, stats,
+        batch_consumer, batch_context, target_batches);
+}
+
 static int MdScanRankFirstCoordinate(
-        MemReader reader, int rank,
+        MdInputPass &source, int rank,
         int *range_has_records,
         int *range_first_tid, int *range_first_pos) {
     const int records_per_block = (int)MPI_RECORDS_PER_BLOCK;
     MdBlockSet input = {};
     MdBlockSet uncompressed = {};
     MdRecordSet records = {};
+    swbam::BgzfBlockBatch input_view;
     Bam2BamPara decomp[kMarkdupNB];
     MpiMarkdupStats probe_stats = {};
     int status = -1;
@@ -853,10 +935,14 @@ static int MdScanRankFirstCoordinate(
                             MPI_BAM_BLOCK_ARENA_SIZE) != 0) {
         goto cleanup;
     }
+    if (source.uses_backend() &&
+        input_view.Attach(input.blocks, kMarkdupNB) != 0) {
+        goto cleanup;
+    }
 
     for (;;) {
         int n_blocks = 0;
-        if (MdReadGroup(reader, &input, &n_blocks,
+        if (source.Read(&input, &input_view, &n_blocks,
                         &probe_stats) != 0) {
             goto cleanup;
         }
@@ -3371,8 +3457,8 @@ static void MdInitEmptyComp(Comp_Para *para, int block_id) {
     para->status = -1;
 }
 
-static int MdRewriteOutput(
-        MemReader &reader, const std::vector<uint8_t> &bitmap,
+static int MdRewriteOutputPass(
+        MdInputPass &source, const std::vector<uint8_t> &bitmap,
         uint64_t expected_records, int clear_old,
         int remove_dups, int compress_level,
         MemWriter &writer, int rank,
@@ -3385,6 +3471,7 @@ static int MdRewriteOutput(
     MdBlockSet output_a = {};
     MdBlockSet output_b = {};
     MdRecordSet records = {};
+    swbam::BgzfBlockBatch input_view;
     MdPackWorkspace pack;
     Bam2BamPara decomp[kMarkdupNB];
     MpiMarkdupRewritePara rewrite[kMarkdupNB];
@@ -3404,6 +3491,17 @@ static int MdRewriteOutput(
         fprintf(stderr,
                 "[rank %d] ERROR: failed to allocate markdup rewrite workspace.\n",
                 rank);
+        MdFreeBlockSet(&input);
+        MdFreeBlockSet(&uncompressed);
+        MdFreeBlockSet(&compress_un_a);
+        MdFreeBlockSet(&compress_un_b);
+        MdFreeBlockSet(&output_a);
+        MdFreeBlockSet(&output_b);
+        MdFreeRecordSet(&records);
+        return -1;
+    }
+    if (source.uses_backend() &&
+        input_view.Attach(input.blocks, kMarkdupNB) != 0) {
         MdFreeBlockSet(&input);
         MdFreeBlockSet(&uncompressed);
         MdFreeBlockSet(&compress_un_a);
@@ -3452,7 +3550,7 @@ static int MdRewriteOutput(
     };
 
     auto read_group = [&](int *count) -> int {
-        return MdReadGroup(reader, &input, count, stats);
+        return source.Read(&input, &input_view, count, stats);
     };
 
     auto compress_group = [&](int active_blocks,
@@ -3794,6 +3892,33 @@ static int MdRewriteOutput(
     return 0;
 }
 
+static int MdRewriteOutput(
+        MemReader &reader, const std::vector<uint8_t> &bitmap,
+        uint64_t expected_records, int clear_old,
+        int remove_dups, int compress_level,
+        MemWriter &writer, int rank,
+        MpiMarkdupStats *stats) {
+    MdInputPass source(&reader);
+    return MdRewriteOutputPass(
+        source, bitmap, expected_records, clear_old,
+        remove_dups, compress_level, writer, rank, stats);
+}
+
+static int MdRewriteOutput(
+        const swbam::BamInputBackend &backend,
+        const swbam::BgzfBlockSpan *spans,
+        size_t span_count,
+        const std::vector<uint8_t> &bitmap,
+        uint64_t expected_records, int clear_old,
+        int remove_dups, int compress_level,
+        MemWriter &writer, int rank,
+        MpiMarkdupStats *stats) {
+    MdInputPass source(&backend, spans, span_count);
+    return MdRewriteOutputPass(
+        source, bitmap, expected_records, clear_old,
+        remove_dups, compress_level, writer, rank, stats);
+}
+
 static int MdValidateRankBoundaries(
         int local_has_records, int first_tid, int first_pos,
         int last_tid, int last_pos, int rank, int comm_size) {
@@ -3830,8 +3955,8 @@ static int MdValidateRankBoundaries(
     return 0;
 }
 
-static int MdFindDuplicatesStreamingBatches(
-        MemReader &reader, long long global_block_begin,
+static int MdFindDuplicatesStreamingBatchesPass(
+        MdInputPass &source, long long global_block_begin,
         long long local_block_count,
         int rank, int comm_size, int include_fails,
         int max_read_length, size_t memory_limit,
@@ -3849,9 +3974,9 @@ static int MdFindDuplicatesStreamingBatches(
     int local_ok = 1;
 
     double scan_t0 = GetTime();
-    reader.pos = 0;
+    source.Reset();
     if (MdScanRankFirstCoordinate(
-            reader, rank, &probed_has_records,
+            source, rank, &probed_has_records,
             &probed_first_tid, &probed_first_pos) != 0) {
         local_ok = 0;
     }
@@ -3908,9 +4033,9 @@ static int MdFindDuplicatesStreamingBatches(
     context.bitmap = duplicate_bitmap;
     context.stats = stats;
 
-    reader.pos = 0;
-    const int extract_status = MdExtractCandidates(
-        reader, global_block_begin, rank, include_fails,
+    source.Reset();
+    const int extract_status = MdExtractCandidatesPass(
+        source, global_block_begin, rank, include_fails,
         memory_limit, local_candidates, local_qnames,
         local_records, range_has_records,
         range_first_tid, range_first_pos,
@@ -3945,6 +4070,56 @@ static int MdFindDuplicatesStreamingBatches(
     local_qnames->clear();
     local_qnames->shrink_to_fit();
     return 0;
+}
+
+static int MdFindDuplicatesStreamingBatches(
+        MemReader &reader, long long global_block_begin,
+        long long local_block_count,
+        int rank, int comm_size, int include_fails,
+        int max_read_length, size_t memory_limit,
+        std::vector<MpiMarkdupCandidateShared> *local_candidates,
+        std::vector<unsigned char> *local_qnames,
+        uint64_t *local_records,
+        int *range_has_records,
+        int *range_first_tid, int *range_first_pos,
+        int *range_last_tid, int *range_last_pos,
+        std::vector<uint8_t> *duplicate_bitmap,
+        MpiMarkdupStats *stats) {
+    MdInputPass source(&reader);
+    return MdFindDuplicatesStreamingBatchesPass(
+        source, global_block_begin, local_block_count,
+        rank, comm_size, include_fails, max_read_length,
+        memory_limit, local_candidates, local_qnames,
+        local_records, range_has_records,
+        range_first_tid, range_first_pos,
+        range_last_tid, range_last_pos,
+        duplicate_bitmap, stats);
+}
+
+static int MdFindDuplicatesStreamingBatches(
+        const swbam::BamInputBackend &backend,
+        const swbam::BgzfBlockSpan *spans,
+        size_t span_count,
+        long long global_block_begin,
+        int rank, int comm_size, int include_fails,
+        int max_read_length, size_t memory_limit,
+        std::vector<MpiMarkdupCandidateShared> *local_candidates,
+        std::vector<unsigned char> *local_qnames,
+        uint64_t *local_records,
+        int *range_has_records,
+        int *range_first_tid, int *range_first_pos,
+        int *range_last_tid, int *range_last_pos,
+        std::vector<uint8_t> *duplicate_bitmap,
+        MpiMarkdupStats *stats) {
+    MdInputPass source(&backend, spans, span_count);
+    return MdFindDuplicatesStreamingBatchesPass(
+        source, global_block_begin, (long long)span_count,
+        rank, comm_size, include_fails, max_read_length,
+        memory_limit, local_candidates, local_qnames,
+        local_records, range_has_records,
+        range_first_tid, range_first_pos,
+        range_last_tid, range_last_pos,
+        duplicate_bitmap, stats);
 }
 
 struct MdOutputMemory {
@@ -4141,6 +4316,50 @@ fail:
         output->header_size = 0;
     }
     return -1;
+}
+
+static int MdWriteOutputMpiio(
+        const MemWriter &local_writer,
+        const MdOutputMemory &layout,
+        const std::string &output_path,
+        int rank) {
+    unsigned long long sizes[2] = {0, 0};
+    if (rank == 0) {
+        sizes[0] = (unsigned long long)layout.header_size;
+        sizes[1] = (unsigned long long)layout.size;
+    }
+    MPI_Bcast(sizes, 2, MPI_UNSIGNED_LONG_LONG, 0,
+              MPI_COMM_WORLD);
+
+    int local_ok = 1;
+    swbam::mpi::MpiFileOutput output;
+    if (output.Open(output_path, sizes[1]) != 0) local_ok = 0;
+    if (MdAllRanksOk(local_ok)) {
+        if (rank == 0 && layout.header_size > 0 &&
+            output.WriteAt(0, layout.header_data,
+                           layout.header_size) != 0) {
+            local_ok = 0;
+        }
+        if (local_writer.size > 0 &&
+            output.WriteAt(
+                sizes[0] + (unsigned long long)
+                    layout.body_offsets[(size_t)rank],
+                local_writer.data, local_writer.size) != 0) {
+            local_ok = 0;
+        }
+        if (rank == 0 &&
+            output.WriteAt(
+                sizes[0] +
+                    (unsigned long long)layout.total_body_size,
+                kMarkdupBgzfEofBlock,
+                sizeof(kMarkdupBgzfEofBlock)) != 0) {
+            local_ok = 0;
+        }
+    }
+    const int writes_ok = MdAllRanksOk(local_ok);
+    if (writes_ok && output.Sync() != 0) local_ok = 0;
+    if (output.Close() != 0) local_ok = 0;
+    return MdAllRanksOk(local_ok) ? 0 : -1;
 }
 
 static double MdAccountedFusedTime(const MpiMarkdupStats &stats) {
@@ -4914,18 +5133,15 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
 
     int exit_code = 1;
     int local_ok = 1;
-    char *input_memory = nullptr;
-    size_t input_size = 0;
-    hFILE *input_hfile = nullptr;
-    samFile *input = nullptr;
+    swbam::mpi::MpiBamInput input_handle;
+    swbam::BamInputBackend *input_backend = nullptr;
+    swbam::MemoryBamInput *memory_input = nullptr;
+    swbam::mpi::MpiBamInputPlan input_plan;
     sam_hdr_t *header = nullptr;
     long long body_start = 0;
-    std::vector<long long> block_offsets;
-    std::vector<long long> block_lengths;
     long long n_blocks = 0;
     long long local_block_begin = 0;
     long long local_block_end = 0;
-    char *rank_input = nullptr;
     size_t rank_input_size = 0;
     MemReader reader = {};
     MemWriter writer = {};
@@ -4937,6 +5153,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
     double stage42_cost = 0.0;
     double stage43_cost = 0.0;
     double body_total_t0 = 0.0;
+    const int use_streaming = cmd_info->markdup_streaming_ ? 1 : 0;
 
     std::vector<MpiMarkdupCandidateShared> local_candidates;
     std::vector<unsigned char> local_qnames;
@@ -4969,52 +5186,51 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
     }
 
 
-    // 2. 222Complete the memory cost：每个 rank 预读整个 BAM
+    // 2. 通过公共 backend 打开 BAM；memory 仍是默认快速路径。
     {
-        double t0 = GetTime();
-        if (MpiCommonLoadFileToMemory(
-                cmd_info->in_file_name_,
-                &input_memory, &input_size) != 0) {
+        if (input_handle.Open(
+                cmd_info->in_file_name_, cmd_info->io_backend_,
+                cmd_info->io_memory_limit_) != 0) {
             fprintf(stderr,
-                    "[rank %d] ERROR: cannot preload markdup input %s.\n",
+                    "[rank %d] ERROR: cannot open markdup input %s.\n",
                     rank, cmd_info->in_file_name_.c_str());
             local_ok = 0;
         }
-        double cost = MdReduceMax(GetTime() - t0);
+        input_backend = input_handle.backend();
+        if (local_ok && (!input_backend ||
+                         input_backend->format() != bam)) {
+            local_ok = 0;
+        }
+        memory_input = dynamic_cast<swbam::MemoryBamInput *>(
+            input_backend);
+        if (local_ok && !use_streaming && !memory_input) {
+            if (rank == 0) {
+                fprintf(stderr,
+                        "ERROR: non-streaming markdup currently requires "
+                        "--io-backend memory; use --stream for POSIX/MPI-IO.\n");
+            }
+            local_ok = 0;
+        }
+        double cost = MdReduceMax(input_handle.data_open_cost());
         if (rank == 0 && local_ok) {
-            printf("222Complete the memory cost %lf--\n", cost);
+            printf("MPI BAM input backend=%s "
+                   "auto_memory_budget=%llu\n",
+                   input_handle.selected_backend().c_str(),
+                   (unsigned long long)
+                       input_handle.auto_memory_budget());
+            printf("222Complete the input open cost %lf--\n", cost);
         }
     }
     if (!MdAllRanksOk(local_ok)) goto cleanup;
 
 
-    // 3. 333Complete the head cost：从内存打开 BAM，读 header，检查格式
+    // 3. 读取 backend header 并检查排序方式。
     {
         double t0 = GetTime();
-        input_hfile = hopen("mem:", "rb:",
-                            input_memory, input_size);
-        if (input_hfile) {
-            input = (samFile *)hts_hopen(
-                input_hfile, "data", "rb");
-            if (input) input_hfile = nullptr;
+        if (local_ok && input_backend->header()) {
+            header = sam_hdr_dup(input_backend->header());
         }
-        if (!input) {
-            fprintf(stderr,
-                    "[rank %d] ERROR: cannot open preloaded markdup BAM.\n",
-                    rank);
-            local_ok = 0;
-        }
-        if (local_ok) header = sam_hdr_read(input);
         if (!header) local_ok = 0;
-        if (local_ok &&
-            input->format.format != bam &&
-            input->format.format != binary_format) {
-            if (rank == 0) {
-                fprintf(stderr,
-                        "ERROR: RabbitBAM-MPI markdup only supports BAM input.\n");
-            }
-            local_ok = 0;
-        }
         if (local_ok) {
             kstring_t sort_order = {0, 0, nullptr};
             if (sam_hdr_find_tag_hd(header, "SO",
@@ -5031,15 +5247,14 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
             free(sort_order.s);
         }
         if (local_ok) {
-            body_start =
-                (long long)input->fp.bgzf->block_address;
-            if (body_start < 0 ||
-                (unsigned long long)body_start >
-                    (unsigned long long)input_size) {
+            body_start = (long long)input_backend->body_offset();
+            if (body_start < 0 || (unsigned long long)body_start >
+                    (unsigned long long)input_backend->size()) {
                 local_ok = 0;
             }
         }
-        double cost = MdReduceMax(GetTime() - t0);
+        double cost = MdReduceMax(
+            input_handle.header_open_cost() + GetTime() - t0);
         if (rank == 0 && local_ok) {
             printf("333Complete the head cost %lf---\n", cost);
         }
@@ -5055,39 +5270,50 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                    comm_size, comm_size * 64);
             printf("MPI BAM output compression level=%d\n",
                    cmd_info->compress_level_);
-            if (MpiCommonScanBgzfBlocksInMemory(
-                    input_memory, input_size, body_start,
-                    &block_offsets, &block_lengths) != 0) {
-                fprintf(stderr,
-                        "ERROR: failed to scan markdup input BGZF blocks.\n");
+        }
+        if (swbam::mpi::PrepareMpiBamInputPlan(
+                *input_backend, &input_plan) != 0) {
+            local_ok = 0;
+        }
+        n_blocks = (long long)input_plan.blocks.size();
+        local_block_begin = (long long)input_plan.rank_begin;
+        local_block_end = (long long)input_plan.rank_end;
+        rank_input_size = 0;
+        for (size_t i = input_plan.rank_begin;
+             local_ok && i < input_plan.rank_end; ++i) {
+            const size_t block_size =
+                input_plan.blocks[i].compressed_size;
+            if (block_size > SIZE_MAX - rank_input_size) {
+                local_ok = 0;
+            } else {
+                rank_input_size += block_size;
+            }
+        }
+        if (local_ok && memory_input &&
+            input_plan.rank_block_count() > 0) {
+            const swbam::BgzfBlockSpan *rank_spans =
+                input_plan.rank_spans();
+            const uint64_t start = rank_spans[0].offset;
+            uint64_t expected = start;
+            for (size_t i = 0;
+                 local_ok && i < input_plan.rank_block_count(); ++i) {
+                if (rank_spans[i].offset != expected) {
+                    local_ok = 0;
+                } else {
+                    expected += rank_spans[i].compressed_size;
+                }
+            }
+            if (local_ok &&
+                (start > memory_input->size() ||
+                 rank_input_size > memory_input->size() -
+                     (size_t)start)) {
                 local_ok = 0;
             }
-            n_blocks = (long long)block_offsets.size();
-            if (n_blocks > INT_MAX) local_ok = 0;
-        }
-        MPI_Bcast(&local_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        if (!local_ok) goto cleanup;
-        MPI_Bcast(&n_blocks, 1, MPI_LONG_LONG, 0,
-                  MPI_COMM_WORLD);
-        if (rank != 0) {
-            block_offsets.resize((size_t)n_blocks);
-            block_lengths.resize((size_t)n_blocks);
-        }
-        if (n_blocks > 0) {
-            MPI_Bcast(block_offsets.data(), (int)n_blocks,
-                      MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-            MPI_Bcast(block_lengths.data(), (int)n_blocks,
-                      MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        }
-        local_block_begin = n_blocks * rank / comm_size;
-        local_block_end =
-            n_blocks * (rank + 1) / comm_size;
-        if (MpiCommonSelectBlockRangeFromMemory(
-                input_memory, input_size,
-                block_offsets, block_lengths,
-                local_block_begin, local_block_end,
-                &rank_input, &rank_input_size) != 0) {
-            local_ok = 0;
+            if (local_ok) {
+                reader.base = memory_input->data() + (size_t)start;
+                reader.size = rank_input_size;
+                reader.pos = 0;
+            }
         }
         stage41_cost = MdReduceMax(GetTime() - t0);
         if (rank == 0 && local_ok) {
@@ -5103,9 +5329,6 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
     // 4.2：初始化本 rank 的内存 reader / writer
     {
         double t0 = GetTime();
-        reader.base = rank_input;
-        reader.size = rank_input_size;
-        reader.pos = 0;
         if (MpiCommonInitMemWriter(
                 writer, rank_input_size ?
                             rank_input_size :
@@ -5122,7 +5345,6 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
 
     // 4.3 核心：提取候选、交换、找 duplicate、重写 BAM
     {
-        const int use_streaming = cmd_info->markdup_streaming_ ? 1 : 0;
         if (rank == 0 && use_streaming) {
             printf("MPI BAM markdup algorithm=coordinate-stream "
                    "max_read_length=%d\n",
@@ -5138,7 +5360,8 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                         "WARNING: RABBITBAM_MARKDUP_HASH_OWNER is ignored "
                         "by --stream; coordinate ownership is required.\n");
             }
-            if (MdFindDuplicatesStreamingBatches(
+            const int stream_ret = memory_input
+                ? MdFindDuplicatesStreamingBatches(
                     reader, local_block_begin,
                     local_block_end - local_block_begin,
                     rank, comm_size,
@@ -5149,7 +5372,20 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                     &range_has_records,
                     &range_first_tid, &range_first_pos,
                     &range_last_tid, &range_last_pos,
-                    &duplicate_bitmap, &stats) != 0) {
+                    &duplicate_bitmap, &stats)
+                : MdFindDuplicatesStreamingBatches(
+                    *input_backend, input_plan.rank_spans(),
+                    input_plan.rank_block_count(),
+                    local_block_begin, rank, comm_size,
+                    cmd_info->markdup_include_fails_,
+                    cmd_info->markdup_max_read_length_,
+                    memory_limit, &local_candidates,
+                    &local_qnames, &local_records,
+                    &range_has_records,
+                    &range_first_tid, &range_first_pos,
+                    &range_last_tid, &range_last_pos,
+                    &duplicate_bitmap, &stats);
+            if (stream_ret != 0) {
                 local_ok = 0;
             }
             if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
@@ -5358,13 +5594,19 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
         const int fused_remove_dups =
             remove_dups &&
             (!cmd_info->markdup_clear_ || !legacy_remove_path);
-        reader.pos = 0;
-        if (MdRewriteOutput(
+        if (memory_input) reader.pos = 0;
+        const int rewrite_ret = memory_input
+            ? MdRewriteOutput(
                 reader, duplicate_bitmap, local_records,
-                cmd_info->markdup_clear_,
-                fused_remove_dups,
-                cmd_info->compress_level_,
-                writer, rank, &stats) != 0) {
+                cmd_info->markdup_clear_, fused_remove_dups,
+                cmd_info->compress_level_, writer, rank, &stats)
+            : MdRewriteOutput(
+                *input_backend, input_plan.rank_spans(),
+                input_plan.rank_block_count(), duplicate_bitmap,
+                local_records, cmd_info->markdup_clear_,
+                fused_remove_dups, cmd_info->compress_level_,
+                writer, rank, &stats);
+        if (rewrite_ret != 0) {
             local_ok = 0;
         }
         if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
@@ -5460,6 +5702,24 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
             printf("444Complete the total body cost %lf\n",
                    body_total_cost);
         }
+    }
+
+    if (cmd_info->io_output_backend_ == "mpiio") {
+        double write_t0 = GetTime();
+        if (MdWriteOutputMpiio(
+                writer, output_memory, cmd_info->out_file_name_,
+                rank) != 0) {
+            local_ok = 0;
+        }
+        const double write_cost =
+            MdReduceMax(GetTime() - write_t0);
+        if (rank == 0 && local_ok) {
+            printf("555MPI-IO distributed output cost %lf--\n",
+                   write_cost);
+        }
+        if (!MdAllRanksOk(local_ok)) goto cleanup;
+        exit_code = 0;
+        goto cleanup;
     }
 
     // 5. rank 0 为验证结果汇总输出内存并写入文件，不计入核心处理时间
@@ -5568,24 +5828,7 @@ cleanup:
     if (output_memory.header_data) free(output_memory.header_data);
     if (writer.data) free(writer.data);
     if (header) sam_hdr_destroy(header);
-    if (input) {
-        if (hts_close(input) < 0) {
-            fprintf(stderr,
-                    "[rank %d] ERROR: closing markdup input failed.\n",
-                    rank);
-        }
-        input_memory = nullptr;
-    } else if (input_hfile) {
-        if (hclose(input_hfile) != 0) {
-            fprintf(stderr,
-                    "[rank %d] ERROR: closing markdup memory hFILE failed.\n",
-                    rank);
-        }
-        input_memory = nullptr;
-    } else if (input_memory) {
-        free(input_memory);
-        input_memory = nullptr;
-    }
+    input_handle.Close();
     double close_cost = MdReduceMax(GetTime() - total_t0);
     if (rank == 0) {
         printf("666markdup total process cost %lf-----\n",

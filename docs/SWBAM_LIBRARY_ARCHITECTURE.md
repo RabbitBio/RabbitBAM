@@ -16,7 +16,8 @@ SWBAM 将 BAM 数据搬运、异构流水调度与具体命令语义分离。库
 - `BamInputBackend` 定义输入后端接口。
 - `MemoryBamInput` 保持项目现有的“完整文件加载到内存”模拟 I/O 方式，也是默认
   性能基线。
-- `PosixBamInput` 使用 htslib 读取 header，扫描阶段只读取 BGZF header，处理阶段
+- `PosixBamInput` 使用 htslib 读取 BAM header，扫描阶段按大窗口预读并解析
+  BGZF header，处理阶段
   通过 `preadv` 将一个连续 span batch 直接填入最终 block slots，不要求完整文件
   常驻内存。
 - `BgzfBlockSpan`、`BgzfBlockBatch` 和 `BgzfSpanBatchReader` 提供 BGZF block
@@ -25,6 +26,13 @@ SWBAM 将 BAM 数据搬运、异构流水调度与具体命令语义分离。库
   rank range 与 range read 接口。`PosixSamInput` 只读取每 rank 自己的
   文本范围，不要求每个 rank 常驻完整 SAM。
 - MPI-IO input 放在 MPI runtime 层，而不让 `swbam_io` 依赖 MPI。
+
+磁盘 BGZF scanner 使用 8 MiB 固定窗口顺序预读。窗口内只解析
+18-byte header 中的 `BSIZE`，按 block length 跳转，只在剩余窗口不足
+header/EOF 检查时再发起读取。对 WES_0.25G 约将 `12100` 次小
+`pread` 降为几十次连续读。该策略会顺序预读大部分压缩文件，
+而不是仅读取 header 字节；它以额外顺序带宽换取大量小 I/O 的消除，
+并能预热后续 body read 所需的文件页。
 
 ### `swbam_mpi_runtime`
 
@@ -290,10 +298,21 @@ rank0 组装完整输出内存并 dump；显式选择 MPI-IO 时则使用下述�
   offset 直接写 header/body/EOF，不再在 rank0 汇总完整输出。
 - BAM→BAM、BAM→SAM、SAM→BAM 三种转换均已接入公共 input/output
   backend，且保留各自专用 CPE 融合核心。
+- `fixmate -m` 已接入同一套 `MpiBamInput`、`MpiBamInputPlan` 和
+  `MpiFileOutput`。默认 memory backend 仍从 rank 的连续压缩窗口构造
+  `MemReader`；POSIX/MPI-IO backend 则通过 `BgzfSpanBatchReader` 每批直接
+  填充 64 个 CPE input slots。两条路径共用原 fixmate 解压、QNAME 分组、
+  边界 group 交换、mate tag 重写和压缩核心。
+- standalone `markdup --stream` 已迁移到公共 backend。内部使用可重置的
+  block-pass 适配器，对同一 rank spans 完成首坐标探测、流式候选扫描和最终
+  rewrite 三遍读取；每遍都只保留双槽、每槽64个 BGZF block。memory backend
+  继续走连续 `MemReader`，POSIX/MPI-IO 直接填充原 markdup input slots，
+  duplicate window、跨 rank coordinate ownership 和 CPE rewrite/compress
+  算子保持不变。MPI-IO 输出沿用 header/body-prefix/EOF 分布式布局。
 
 后续阶段：
 
-- 逐步让其他命令使用统一 backend factory；
+- 逐步让 sort、collate 和非流式 markdup 等算法型路径使用统一 backend factory；
 - 将当前每 rank 的完整 compressed body 缓冲改为真正有界的分布式输出策略；
 - 减少 packer chunk 到 write pipeline input 的一次 block copy；
 - 优先用通用闭环迁移 filter 和转换命令，再迁移 sort/collate/markdup 等算法型命令。

@@ -1,5 +1,6 @@
 #include "swbam/io.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -121,10 +122,84 @@ int BgzfBlockLengthFromHeader(const unsigned char *block,
     return 0;
 }
 
+int ScanBgzfBlocksBuffered(int fd, size_t file_size,
+                           uint64_t body_offset,
+                           std::vector<BgzfBlockSpan> *spans) {
+    if (fd < 0 || !spans || body_offset > file_size) return -1;
+
+    const size_t window_capacity = 8u * 1024u * 1024u;
+    std::vector<unsigned char> window;
+    try {
+        window.resize(std::min(window_capacity, file_size));
+    } catch (...) {
+        return -1;
+    }
+    spans->clear();
+    uint64_t window_offset = 0;
+    size_t window_size = 0;
+    bool has_window = false;
+
+    auto view_at = [&](uint64_t offset, size_t required,
+                       const unsigned char **view) -> int {
+        if (!view || offset > file_size ||
+            required > file_size - static_cast<size_t>(offset)) {
+            return -1;
+        }
+        if (has_window && offset >= window_offset) {
+            const uint64_t relative = offset - window_offset;
+            if (relative <= window_size &&
+                required <= window_size - static_cast<size_t>(relative)) {
+                *view = window.data() + static_cast<size_t>(relative);
+                return 0;
+            }
+        }
+
+        const size_t available =
+            file_size - static_cast<size_t>(offset);
+        const size_t read_size = std::min(window.size(), available);
+        if (read_size < required ||
+            ReadAt(fd, offset, window.data(), read_size) != 0) {
+            return -1;
+        }
+        window_offset = offset;
+        window_size = read_size;
+        has_window = true;
+        *view = window.data();
+        return 0;
+    };
+
+    uint64_t offset = body_offset;
+    while (offset < file_size) {
+        const unsigned char *header = nullptr;
+        if (view_at(offset, BLOCK_HEADER_LENGTH, &header) != 0) return -1;
+        size_t block_size = 0;
+        if (BgzfBlockLengthFromHeader(header, &block_size) != 0 ||
+            block_size > file_size - static_cast<size_t>(offset)) {
+            return -1;
+        }
+        if (block_size == sizeof(kBgzfEofBlock)) {
+            const unsigned char *eof = nullptr;
+            if (view_at(offset, sizeof(kBgzfEofBlock), &eof) != 0) {
+                return -1;
+            }
+            if (memcmp(eof, kBgzfEofBlock, sizeof(kBgzfEofBlock)) == 0) {
+                break;
+            }
+        }
+        BgzfBlockSpan span;
+        span.offset = offset;
+        span.compressed_size = static_cast<uint32_t>(block_size);
+        spans->push_back(span);
+        offset += static_cast<uint64_t>(block_size);
+    }
+    return 0;
+}
+
 } // namespace
 
 BgzfBlockBatch::BgzfBlockBatch()
-    : blocks_(nullptr), data_(nullptr), capacity_(0) {}
+    : blocks_(nullptr), data_(nullptr), capacity_(0),
+      owns_storage_(false) {}
 
 BgzfBlockBatch::~BgzfBlockBatch() {
     Release();
@@ -137,6 +212,7 @@ int BgzfBlockBatch::Allocate(size_t capacity) {
         capacity > std::numeric_limits<size_t>::max() / BGZF_MAX_BLOCK_SIZE) {
         return -1;
     }
+    owns_storage_ = true;
     blocks_ = reinterpret_cast<bam_block *>(
         aligned_alloc_custom(64, capacity * sizeof(bam_block)));
     data_ = aligned_alloc_custom(64, capacity * BGZF_MAX_BLOCK_SIZE);
@@ -153,14 +229,24 @@ int BgzfBlockBatch::Allocate(size_t capacity) {
     return 0;
 }
 
+int BgzfBlockBatch::Attach(bam_block *blocks, size_t capacity) {
+    Release();
+    if (!blocks || capacity == 0) return -1;
+    blocks_ = blocks;
+    capacity_ = capacity;
+    owns_storage_ = false;
+    return 0;
+}
+
 void BgzfBlockBatch::Release() {
-    if (blocks_) {
+    if (owns_storage_ && blocks_) {
         aligned_free_custom(reinterpret_cast<unsigned char *>(blocks_));
     }
-    if (data_) aligned_free_custom(data_);
+    if (owns_storage_ && data_) aligned_free_custom(data_);
     blocks_ = nullptr;
     data_ = nullptr;
     capacity_ = 0;
+    owns_storage_ = false;
 }
 
 int LoadFileToMemory(const std::string &path, char **data, size_t *size) {
@@ -571,39 +657,9 @@ int PosixBamInput::ScanBlocks(
         impl_->bam_body_offset > impl_->file_size) {
         return -1;
     }
-    spans->clear();
-    uint64_t offset = impl_->bam_body_offset;
-    unsigned char header_bytes[BLOCK_HEADER_LENGTH];
-    unsigned char eof_bytes[sizeof(kBgzfEofBlock)];
-    while (offset < impl_->file_size) {
-        if (impl_->file_size - (size_t)offset < BLOCK_HEADER_LENGTH ||
-            ReadAt(impl_->fd, offset, header_bytes,
-                   sizeof(header_bytes)) != 0) {
-            return -1;
-        }
-        size_t block_size = 0;
-        if (BgzfBlockLengthFromHeader(
-                header_bytes, &block_size) != 0 ||
-            block_size > impl_->file_size - (size_t)offset) {
-            return -1;
-        }
-        if (block_size == sizeof(kBgzfEofBlock)) {
-            if (ReadAt(impl_->fd, offset, eof_bytes,
-                       sizeof(eof_bytes)) != 0) {
-                return -1;
-            }
-            if (memcmp(eof_bytes, kBgzfEofBlock,
-                       sizeof(kBgzfEofBlock)) == 0) {
-                break;
-            }
-        }
-        BgzfBlockSpan span;
-        span.offset = offset;
-        span.compressed_size = (uint32_t)block_size;
-        spans->push_back(span);
-        offset += block_size;
-    }
-    return 0;
+    return ScanBgzfBlocksBuffered(
+        impl_->fd, impl_->file_size,
+        impl_->bam_body_offset, spans);
 }
 
 int PosixBamInput::ReadBatch(
