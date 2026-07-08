@@ -3461,8 +3461,9 @@ static int MdRewriteOutputPass(
         MdInputPass &source, const std::vector<uint8_t> &bitmap,
         uint64_t expected_records, int clear_old,
         int remove_dups, int compress_level,
-        MemWriter &writer, int rank,
+        swbam::RankBodySink *sink, int rank,
         MpiMarkdupStats *stats) {
+    if (!sink) return -1;
     const int records_per_block = (int)MPI_RECORDS_PER_BLOCK;
     MdBlockSet input = {};
     MdBlockSet uncompressed = {};
@@ -3535,9 +3536,8 @@ static int MdRewriteOutputPass(
         for (int i = 0; i < kMarkdupNB; ++i) {
             if (comp_pending[i].status == 0 &&
                 comp_pending[i].output_block) {
-                if (MpiWriteBlockToMem(
-                        writer,
-                        comp_pending[i].output_block) != 0) {
+                if (swbam::AppendBgzfBlock(
+                        sink, comp_pending[i].output_block) != 0) {
                     return -1;
                 }
                 stats->bgzf_blocks++;
@@ -3676,8 +3676,8 @@ static int MdRewriteOutputPass(
                             rank, i, raw_comp[i].status);
                     return -1;
                 }
-                if (MpiWriteBlockToMem(writer,
-                        output_active->blocks + i) != 0) {
+                if (swbam::AppendBgzfBlock(
+                        sink, output_active->blocks + i) != 0) {
                     return -1;
                 }
                 stats->bgzf_blocks++;
@@ -3728,8 +3728,8 @@ static int MdRewriteOutputPass(
                             rank, i, raw_comp[i].status);
                     return -1;
                 }
-                if (MpiWriteBlockToMem(writer,
-                        output_active->blocks + i) != 0) {
+                if (swbam::AppendBgzfBlock(
+                        sink, output_active->blocks + i) != 0) {
                     return -1;
                 }
                 stats->bgzf_blocks++;
@@ -3826,8 +3826,8 @@ static int MdRewriteOutputPass(
                             rank, i, raw_comp[i].status);
                     return -1;
                 }
-                if (MpiWriteBlockToMem(writer,
-                        output_active->blocks + i) != 0) {
+                if (swbam::AppendBgzfBlock(
+                        sink, output_active->blocks + i) != 0) {
                     return -1;
                 }
                 stats->bgzf_blocks++;
@@ -3899,24 +3899,38 @@ static int MdRewriteOutput(
         MemWriter &writer, int rank,
         MpiMarkdupStats *stats) {
     MdInputPass source(&reader);
+    swbam::MemoryRankBodySink sink(&writer);
     return MdRewriteOutputPass(
         source, bitmap, expected_records, clear_old,
-        remove_dups, compress_level, writer, rank, stats);
+        remove_dups, compress_level, &sink, rank, stats);
 }
 
-static int MdRewriteOutput(
+static int MdRewriteOutputToSink(
+        MemReader &reader,
+        const std::vector<uint8_t> &bitmap,
+        uint64_t expected_records, int clear_old,
+        int remove_dups, int compress_level,
+        swbam::RankBodySink *sink, int rank,
+        MpiMarkdupStats *stats) {
+    MdInputPass source(&reader);
+    return MdRewriteOutputPass(
+        source, bitmap, expected_records, clear_old,
+        remove_dups, compress_level, sink, rank, stats);
+}
+
+static int MdRewriteOutputToSink(
         const swbam::BamInputBackend &backend,
         const swbam::BgzfBlockSpan *spans,
         size_t span_count,
         const std::vector<uint8_t> &bitmap,
         uint64_t expected_records, int clear_old,
         int remove_dups, int compress_level,
-        MemWriter &writer, int rank,
+        swbam::RankBodySink *sink, int rank,
         MpiMarkdupStats *stats) {
     MdInputPass source(&backend, spans, span_count);
     return MdRewriteOutputPass(
         source, bitmap, expected_records, clear_old,
-        remove_dups, compress_level, writer, rank, stats);
+        remove_dups, compress_level, sink, rank, stats);
 }
 
 static int MdValidateRankBoundaries(
@@ -4140,7 +4154,7 @@ struct MdOutputStageCosts {
 };
 
 static int MdPrepareOutputMemory(
-        const MemWriter &local_writer, sam_hdr_t *header,
+        const swbam::RankBodySink &local_body, sam_hdr_t *header,
         int compress_level, int rank, int comm_size,
         MpiMarkdupStats *stats, MdOutputMemory *output,
         MdOutputStageCosts *costs) {
@@ -4155,7 +4169,8 @@ static int MdPrepareOutputMemory(
 
     // 4.4 统计各 rank 输出大小 / gather layout
     double stage44_t0 = GetTime();
-    long long local_size = (long long)local_writer.size;
+    if (local_body.size() > (uint64_t)LLONG_MAX) return -1;
+    long long local_size = (long long)local_body.size();
     std::vector<long long> sizes((size_t)comm_size, 0);
     MPI_Allgather(&local_size, 1, MPI_LONG_LONG,
                   sizes.data(), 1, MPI_LONG_LONG,
@@ -4237,8 +4252,9 @@ static int MdPrepareOutputMemory(
 
     // 4.5b 分配各 rank 的本地模拟写内存，这部分不计入核心处理时间
     stage45_malloc_t0 = GetTime();
-    simulated_write_size = local_writer.size;
-    if (rank == 0) {
+    simulated_write_size = local_body.is_memory()
+        ? (size_t)local_body.size() : 0;
+    if (local_body.is_memory() && rank == 0) {
         if (output->header_size > SIZE_MAX - simulated_write_size) {
             fprintf(stderr,
                     "[rank %d] ERROR: simulated markdup output memory "
@@ -4270,15 +4286,21 @@ static int MdPrepareOutputMemory(
     // 4.6 各 rank 根据逻辑偏移模拟写入高速磁盘内存，只统计 memcpy 时间
     sim_write_t0 = GetTime();
     simulated_pos = 0;
-    if (rank == 0 && output->header_size > 0) {
+    if (local_body.is_memory() &&
+        rank == 0 && output->header_size > 0) {
         memcpy(simulated_write_mem + simulated_pos,
                output->header_data, output->header_size);
         simulated_pos += output->header_size;
     }
-    if (local_writer.size > 0) {
-        memcpy(simulated_write_mem + simulated_pos,
-               local_writer.data, local_writer.size);
-        simulated_pos += local_writer.size;
+    if (local_body.is_memory() && local_body.size() > 0) {
+        if (local_body.size() > SIZE_MAX ||
+            local_body.ReadAt(
+                0, simulated_write_mem + simulated_pos,
+                (size_t)local_body.size()) != 0) {
+            local_ok = 0;
+        } else {
+            simulated_pos += (size_t)local_body.size();
+        }
     }
     if (simulated_pos > 0) {
         unsigned char *guard_ptr =
@@ -4318,8 +4340,20 @@ fail:
     return -1;
 }
 
+static int MdPrepareOutputMemory(
+        const MemWriter &local_writer, sam_hdr_t *header,
+        int compress_level, int rank, int comm_size,
+        MpiMarkdupStats *stats, MdOutputMemory *output,
+        MdOutputStageCosts *costs) {
+    swbam::MemoryRankBodySink sink(
+        const_cast<MemWriter *>(&local_writer));
+    return MdPrepareOutputMemory(
+        sink, header, compress_level, rank, comm_size,
+        stats, output, costs);
+}
+
 static int MdWriteOutputMpiio(
-        const MemWriter &local_writer,
+        const swbam::RankBodySink &local_body,
         const MdOutputMemory &layout,
         const std::string &output_path,
         int rank) {
@@ -4340,12 +4374,29 @@ static int MdWriteOutputMpiio(
                            layout.header_size) != 0) {
             local_ok = 0;
         }
-        if (local_writer.size > 0 &&
-            output.WriteAt(
-                sizes[0] + (unsigned long long)
-                    layout.body_offsets[(size_t)rank],
-                local_writer.data, local_writer.size) != 0) {
-            local_ok = 0;
+        const uint64_t chunk_size = 8ull * 1024ull * 1024ull;
+        std::vector<unsigned char> buffer;
+        if (local_body.size() > 0) {
+            try {
+                buffer.resize((size_t)std::min<uint64_t>(
+                    local_body.size(), chunk_size));
+            } catch (...) {
+                local_ok = 0;
+            }
+        }
+        uint64_t copied = 0;
+        while (local_ok && copied < local_body.size()) {
+            const size_t count = (size_t)std::min<uint64_t>(
+                local_body.size() - copied, buffer.size());
+            if (local_body.ReadAt(
+                    copied, buffer.data(), count) != 0 ||
+                output.WriteAt(
+                    sizes[0] + (unsigned long long)
+                        layout.body_offsets[(size_t)rank] + copied,
+                    buffer.data(), count) != 0) {
+                local_ok = 0;
+            }
+            copied += count;
         }
         if (rank == 0 &&
             output.WriteAt(
@@ -5144,7 +5195,9 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
     long long local_block_end = 0;
     size_t rank_input_size = 0;
     MemReader reader = {};
-    MemWriter writer = {};
+    swbam::AdaptiveRankBodySink rank_body_sink;
+    swbam::RankBodySink *body_sink = &rank_body_sink;
+    uint64_t rank_body_memory_limit = 0;
     size_t memory_limit = 0;
     MpiMarkdupStats stats = {};
     MdOutputMemory output_memory = {};
@@ -5174,6 +5227,17 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
             fprintf(stderr,
                     "ERROR: invalid markdup memory limit '%s'.\n",
                     cmd_info->markdup_memory_.c_str());
+        }
+        local_ok = 0;
+    }
+    if (swbam::ParseByteSize(
+            cmd_info->rank_body_memory_limit_,
+            &rank_body_memory_limit) != 0 ||
+        rank_body_memory_limit == 0) {
+        if (rank == 0) {
+            fprintf(stderr,
+                    "ERROR: invalid rank body memory limit '%s'.\n",
+                    cmd_info->rank_body_memory_limit_.c_str());
         }
         local_ok = 0;
     }
@@ -5329,10 +5393,15 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
     // 4.2：初始化本 rank 的内存 reader / writer
     {
         double t0 = GetTime();
-        if (MpiCommonInitMemWriter(
-                writer, rank_input_size ?
-                            rank_input_size :
-                            64 * 1024 * 1024) != 0) {
+        char prefix[96];
+        snprintf(prefix, sizeof(prefix),
+                 "rabbitbam-markdup-rank-%d.body", rank);
+        if (rank_body_sink.Open(
+                cmd_info->rank_body_backend_,
+                rank_body_memory_limit,
+                rank_input_size ? rank_input_size :
+                                  64 * 1024 * 1024,
+                prefix, cmd_info->rank_body_temp_dir_) != 0) {
             local_ok = 0;
         }
         stage42_cost = MdReduceMax(GetTime() - t0);
@@ -5594,18 +5663,28 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
         const int fused_remove_dups =
             remove_dups &&
             (!cmd_info->markdup_clear_ || !legacy_remove_path);
+        if (remove_dups && !fused_remove_dups &&
+            body_sink && !body_sink->is_memory()) {
+            if (rank == 0) {
+                fprintf(stderr,
+                        "ERROR: legacy two-stage -c -r requires memory "
+                        "rank body; unset RABBITBAM_MARKDUP_LEGACY_REMOVE.\n");
+            }
+            local_ok = 0;
+        }
+        if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
         if (memory_input) reader.pos = 0;
         const int rewrite_ret = memory_input
-            ? MdRewriteOutput(
+            ? MdRewriteOutputToSink(
                 reader, duplicate_bitmap, local_records,
                 cmd_info->markdup_clear_, fused_remove_dups,
-                cmd_info->compress_level_, writer, rank, &stats)
-            : MdRewriteOutput(
+                cmd_info->compress_level_, body_sink, rank, &stats)
+            : MdRewriteOutputToSink(
                 *input_backend, input_plan.rank_spans(),
                 input_plan.rank_block_count(), duplicate_bitmap,
                 local_records, cmd_info->markdup_clear_,
                 fused_remove_dups, cmd_info->compress_level_,
-                writer, rank, &stats);
+                body_sink, rank, &stats);
         if (rewrite_ret != 0) {
             local_ok = 0;
         }
@@ -5614,6 +5693,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
         // 兼容回退路径：设置 RABBITBAM_MARKDUP_LEGACY_REMOVE=1 时，
         // -c -r 仍使用两段式稳定实现，便于和融合路径对照。
         if (remove_dups && !fused_remove_dups) {
+            MemWriter *writer = rank_body_sink.memory_writer();
             MemReader filter_reader = {};
             MemWriter filtered_writer = {};
             MpiBamToBamStats filter_stats = {};
@@ -5626,12 +5706,16 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
             filter.min_read_len = -1;
             filter.max_read_len = -1;
 
-            filter_reader.base = writer.data;
-            filter_reader.size = writer.size;
+            if (!writer) {
+                local_ok = 0;
+            }
+            if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
+            filter_reader.base = writer->data;
+            filter_reader.size = writer->size;
             filter_reader.pos = 0;
             if (MpiCommonInitMemWriter(
                     filtered_writer,
-                    writer.size ? writer.size : 64 * 1024 * 1024) != 0) {
+                    writer->size ? writer->size : 64 * 1024 * 1024) != 0) {
                 local_ok = 0;
             }
             if (!MdAllRanksOkTimed(local_ok, &stats)) {
@@ -5647,8 +5731,8 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                 if (filtered_writer.data) free(filtered_writer.data);
                 goto cleanup;
             }
-            free(writer.data);
-            writer = filtered_writer;
+            free(writer->data);
+            *writer = filtered_writer;
             stats.removed_records += filter_stats.dropped_records;
             stats.bgzf_blocks = filter_stats.bgzf_blocks;
             stats.t_rewrite_decomp += filter_stats.t_decomp_filter;
@@ -5664,8 +5748,22 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
         }
     }
 
+    {
+        const int local_spool = body_sink->is_memory() ? 0 : 1;
+        int spool_ranks = 0;
+        MPI_Reduce(&local_spool, &spool_ranks, 1, MPI_INT,
+                   MPI_SUM, 0, MPI_COMM_WORLD);
+        if (rank == 0) {
+            printf("MPI rank body backend requested=%s "
+                   "memory_ranks=%d spool_ranks=%d\n",
+                   cmd_info->rank_body_backend_.c_str(),
+                   comm_size - spool_ranks, spool_ranks);
+        }
+    }
+
     // 4.4~4.6 MdPrepareOutputMemory：准备最终输出文件内存
-    if (MdPrepareOutputMemory(writer, header,
+    if (!body_sink || body_sink->Flush() != 0 ||
+        MdPrepareOutputMemory(*body_sink, header,
                               cmd_info->compress_level_,
                               rank, comm_size, &stats,
                               &output_memory,
@@ -5707,7 +5805,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
     if (cmd_info->io_output_backend_ == "mpiio") {
         double write_t0 = GetTime();
         if (MdWriteOutputMpiio(
-                writer, output_memory, cmd_info->out_file_name_,
+                *body_sink, output_memory, cmd_info->out_file_name_,
                 rank) != 0) {
             local_ok = 0;
         }
@@ -5750,10 +5848,13 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
 
         double verify_gather_t0 = GetTime();
         if (rank == 0) {
-            if (writer.size > 0) {
-                memcpy(output_memory.data + output_memory.header_size +
-                           output_memory.body_offsets[(size_t)rank],
-                       writer.data, writer.size);
+            if (body_sink->size() > 0 &&
+                body_sink->ReadAt(
+                    0,
+                    output_memory.data + output_memory.header_size +
+                        output_memory.body_offsets[(size_t)rank],
+                    (size_t)body_sink->size()) != 0) {
+                local_ok = 0;
             }
             for (int src = 1; src < comm_size; ++src) {
                 unsigned long long received = 0;
@@ -5782,12 +5883,20 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
         } else {
             unsigned long long sent = 0;
             unsigned long long bytes =
-                (unsigned long long)writer.size;
+                (unsigned long long)body_sink->size();
+            std::vector<unsigned char> chunk_buffer(
+                (size_t)std::min<unsigned long long>(
+                    bytes, (unsigned long long)kMarkdupExchangeChunk));
             while (sent < bytes) {
                 int chunk = (int)std::min(
                     (unsigned long long)kMarkdupExchangeChunk,
                     bytes - sent);
-                MPI_Send(writer.data + sent, chunk, MPI_BYTE,
+                if (body_sink->ReadAt(
+                        sent, chunk_buffer.data(), (size_t)chunk) != 0) {
+                    local_ok = 0;
+                    break;
+                }
+                MPI_Send(chunk_buffer.data(), chunk, MPI_BYTE,
                          0, 4300, MPI_COMM_WORLD);
                 sent += (unsigned long long)chunk;
             }
@@ -5826,8 +5935,8 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
 cleanup:
     if (output_memory.data) free(output_memory.data);
     if (output_memory.header_data) free(output_memory.header_data);
-    if (writer.data) free(writer.data);
     if (header) sam_hdr_destroy(header);
+    if (rank_body_sink.Close() != 0) exit_code = 1;
     input_handle.Close();
     double close_cost = MdReduceMax(GetTime() - total_t0);
     if (rank == 0) {

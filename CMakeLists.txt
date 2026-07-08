@@ -111,6 +111,7 @@ if(PLATFORM_SUNWAY)
 
     add_library(swbam_io STATIC
         lib/swbam_io.cpp
+        lib/swbam_rank_body_sink.cpp
     )
     target_compile_options(swbam_io PRIVATE ${HOST_FLAGS})
     target_include_directories(swbam_io PUBLIC

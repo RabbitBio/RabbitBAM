@@ -19,33 +19,6 @@ extern "C" {
 
 namespace {
 
-class MpiMemWriterOutput : public swbam::BamOutputBackend {
-public:
-    explicit MpiMemWriterOutput(MemWriter *writer)
-        : writer_(writer), written_(0) {}
-
-    int Write(const void *data, size_t size) {
-        if (!writer_ || (!data && size != 0) ||
-            size > UINT64_MAX - written_) {
-            return -1;
-        }
-        if (size == 0) return 0;
-        if (MpiWriteBytesToMem(
-                *writer_, static_cast<const char *>(data), size) != 0) {
-            return -1;
-        }
-        written_ += size;
-        return 0;
-    }
-
-    int Flush() { return 0; }
-    uint64_t bytes_written() const { return written_; }
-
-private:
-    MemWriter *writer_;
-    uint64_t written_;
-};
-
 struct MpiBlockSet {
     bam_block *blocks;
     unsigned char *data;
@@ -367,7 +340,7 @@ static int FusedBamToBamCoreMPI(
                      const swbam::BamInputBackend *backend,
                      const swbam::BgzfBlockSpan *spans,
                      size_t span_count,
-                     MemWriter &mem_writer,
+                     swbam::RankBodySink *body_sink,
                      const BamFilterOptions &filter,
                      int compress_level,
                      MpiBamToBamStats *stats) {
@@ -387,10 +360,10 @@ static int FusedBamToBamCoreMPI(
     MpiBlockSet out_b = {};
     MpiRecordSet record_set = {};
     MpiFlatPackWorkspace pack_workspace;
-    MpiMemWriterOutput output(&mem_writer);
     size_t backend_position = 0;
 
-    if ((!reader && !backend) || (backend && span_count > 0 && !spans) ||
+    if (!body_sink || (!reader && !backend) ||
+        (backend && span_count > 0 && !spans) ||
         input_blocks.Allocate(NB) != 0 ||
         MpiAllocateBlockSet(&un_blocks, NB) != 0 ||
         MpiAllocateBlockSet(&comp_un_a, NB) != 0 ||
@@ -421,7 +394,7 @@ static int FusedBamToBamCoreMPI(
         double flush_t0 = GetTime();
         for (int k = 0; k < NB; ++k) {
             if (comp_pending[k].status == 0 && comp_pending[k].output_block) {
-                if (output.Write(
+                if (body_sink->Append(
                         comp_pending[k].output_block->data,
                         comp_pending[k].output_block->length) != 0) {
                     fprintf(stderr, "ERROR: MPI bam2bam failed to append compressed block.\n");
@@ -662,8 +635,19 @@ int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      const BamFilterOptions &filter,
                      int compress_level,
                      MpiBamToBamStats *stats) {
+    swbam::MemoryRankBodySink body_sink(&mem_writer);
     return FusedBamToBamCoreMPI(
-        &reader, nullptr, nullptr, 0, mem_writer,
+        &reader, nullptr, nullptr, 0, &body_sink,
+        filter, compress_level, stats);
+}
+
+int FusedBamToBamMPI(MemReader &reader,
+                     swbam::RankBodySink &body_sink,
+                     const BamFilterOptions &filter,
+                     int compress_level,
+                     MpiBamToBamStats *stats) {
+    return FusedBamToBamCoreMPI(
+        &reader, nullptr, nullptr, 0, &body_sink,
         filter, compress_level, stats);
 }
 
@@ -674,7 +658,20 @@ int FusedBamToBamMPI(const swbam::BamInputBackend &input,
                      const BamFilterOptions &filter,
                      int compress_level,
                      MpiBamToBamStats *stats) {
+    swbam::MemoryRankBodySink body_sink(&mem_writer);
     return FusedBamToBamCoreMPI(
-        nullptr, &input, spans, span_count, mem_writer,
+        nullptr, &input, spans, span_count, &body_sink,
+        filter, compress_level, stats);
+}
+
+int FusedBamToBamMPI(const swbam::BamInputBackend &input,
+                     const swbam::BgzfBlockSpan *spans,
+                     size_t span_count,
+                     swbam::RankBodySink &body_sink,
+                     const BamFilterOptions &filter,
+                     int compress_level,
+                     MpiBamToBamStats *stats) {
+    return FusedBamToBamCoreMPI(
+        nullptr, &input, spans, span_count, &body_sink,
         filter, compress_level, stats);
 }

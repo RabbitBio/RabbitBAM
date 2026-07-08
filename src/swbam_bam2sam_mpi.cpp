@@ -274,7 +274,7 @@ static int FusedBamToSamCoreMPI(
                      const swbam::BamInputBackend *backend,
                      const swbam::BgzfBlockSpan *spans,
                      size_t span_count,
-                     MemWriter &mem_writer, sam_hdr_t *hdr,
+                     swbam::RankBodySink *body_sink, sam_hdr_t *hdr,
                      MpiBamToSamStats *stats) {
     const int NB = 64;
     const int records_per_block = (int)MPI_RECORDS_PER_BLOCK;
@@ -300,7 +300,7 @@ static int FusedBamToSamCoreMPI(
     fmt_prev = (SamFormatBatch *)aligned_alloc_custom(64, sizeof(SamFormatBatch));
     if (fmt_cur) memset(fmt_cur, 0, sizeof(SamFormatBatch));
     if (fmt_prev) memset(fmt_prev, 0, sizeof(SamFormatBatch));
-    if (!fmt_cur || !fmt_prev || (!reader && !backend) ||
+    if (!body_sink || !fmt_cur || !fmt_prev || (!reader && !backend) ||
         (backend && span_count > 0 && !spans) ||
         (reader
              ? MpiAllocateBamToSamBlockSet(&input_blocks, NB)
@@ -334,8 +334,9 @@ static int FusedBamToSamCoreMPI(
         double write_t0 = GetTime();
         for (int i = 0; i < NB; ++i) {
             kstring_t *ks = &fmt_prev->core_out_lines[i];
-            if (ks->l > 0 && MpiWriteBytesToMem(mem_writer, ks->s, ks->l) != 0) {
-                fprintf(stderr, "ERROR: failed to append MPI SAM text to memory writer.\n");
+            if (ks->l > 0 &&
+                body_sink->Append(ks->s, ks->l) != 0) {
+                fprintf(stderr, "ERROR: failed to append MPI SAM text to rank body sink.\n");
                 return -1;
             }
         }
@@ -509,8 +510,17 @@ cleanup:
 int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
                      sam_hdr_t *hdr,
                      MpiBamToSamStats *stats) {
+    swbam::MemoryRankBodySink body_sink(&mem_writer);
     return FusedBamToSamCoreMPI(
-        &reader, nullptr, nullptr, 0, mem_writer, hdr, stats);
+        &reader, nullptr, nullptr, 0, &body_sink, hdr, stats);
+}
+
+int FusedBamToSamMPI(MemReader &reader,
+                     swbam::RankBodySink &body_sink,
+                     sam_hdr_t *hdr,
+                     MpiBamToSamStats *stats) {
+    return FusedBamToSamCoreMPI(
+        &reader, nullptr, nullptr, 0, &body_sink, hdr, stats);
 }
 
 int FusedBamToSamMPI(const swbam::BamInputBackend &input,
@@ -519,6 +529,17 @@ int FusedBamToSamMPI(const swbam::BamInputBackend &input,
                      MemWriter &mem_writer,
                      sam_hdr_t *hdr,
                      MpiBamToSamStats *stats) {
+    swbam::MemoryRankBodySink body_sink(&mem_writer);
     return FusedBamToSamCoreMPI(
-        nullptr, &input, spans, span_count, mem_writer, hdr, stats);
+        nullptr, &input, spans, span_count, &body_sink, hdr, stats);
+}
+
+int FusedBamToSamMPI(const swbam::BamInputBackend &input,
+                     const swbam::BgzfBlockSpan *spans,
+                     size_t span_count,
+                     swbam::RankBodySink &body_sink,
+                     sam_hdr_t *hdr,
+                     MpiBamToSamStats *stats) {
+    return FusedBamToSamCoreMPI(
+        nullptr, &input, spans, span_count, &body_sink, hdr, stats);
 }

@@ -723,7 +723,8 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
     const char *sam_header_text = nullptr;
     size_t sam_header_len = 0;
     MemReader reader = {};
-    MemWriter mem_writer = {};
+    swbam::AdaptiveRankBodySink body_sink;
+    uint64_t rank_body_memory_limit = 0;
     MpiBamToBamStats stats = {};
     MpiBamToSamStats sam_stats = {};
     MpiSamToBamStats sam2bam_stats = {};
@@ -754,6 +755,18 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
          cmd_info->io_backend_ == "mpiio" ||
          cmd_info->io_backend_ == "auto");
     bool mpiio_output = cmd_info->io_output_backend_ == "mpiio";
+
+    if (swbam::ParseByteSize(
+            cmd_info->rank_body_memory_limit_,
+            &rank_body_memory_limit) != 0 ||
+        rank_body_memory_limit == 0) {
+        if (rank == 0) {
+            fprintf(stderr,
+                    "ERROR: invalid rank body memory limit '%s'.\n",
+                    cmd_info->rank_body_memory_limit_.c_str());
+        }
+        local_ok = 0;
+    }
 
     if (cmd_info->validate_bounds_) {
         if (rank == 0) {
@@ -1160,8 +1173,17 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 writer_capacity = rank_input_size / 2;
                 if (writer_capacity == 0) writer_capacity = 64 * 1024 * 1024;
             }
-            if (local_ok && MpiInitMemWriter(mem_writer, writer_capacity) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: failed to allocate MPI memory writer.\n", rank);
+            char spool_prefix[96];
+            snprintf(spool_prefix, sizeof(spool_prefix),
+                     "rabbitbam-convert-rank-%d.body", rank);
+            if (local_ok && body_sink.Open(
+                    cmd_info->rank_body_backend_,
+                    rank_body_memory_limit, writer_capacity,
+                    spool_prefix,
+                    cmd_info->rank_body_temp_dir_) != 0) {
+                fprintf(stderr,
+                        "[rank %d] ERROR: failed to open rank body sink.\n",
+                        rank);
                 local_ok = 0;
             }
         }
@@ -1181,16 +1203,19 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             int ret = backend_bam_input && !input_file_mem
                 ? FusedBamToSamMPI(
                       *backend_input, backend_plan.rank_spans(),
-                      backend_plan.rank_block_count(), mem_writer,
+                      backend_plan.rank_block_count(), body_sink,
                       hdr, &sam_stats)
                 : FusedBamToSamMPI(
-                      reader, mem_writer, hdr, &sam_stats);
+                      reader, body_sink, hdr, &sam_stats);
             if (ret != 0) {
                 fprintf(stderr, "[rank %d] ERROR: MPI bam2sam fused 1CG body failed.\n", rank);
                 local_ok = 0;
             }
         } else if (sam_to_bam) {
-            if (FusedSamToBamMPI(reader, mem_writer, hdr, cmd_info->compress_level_, &sam2bam_stats) != 0) {
+            if (FusedSamToBamMPI(
+                    reader, body_sink, hdr,
+                    cmd_info->compress_level_,
+                    &sam2bam_stats) != 0) {
                 fprintf(stderr, "[rank %d] ERROR: MPI sam2bam fused 1CG body failed.\n", rank);
                 local_ok = 0;
             }
@@ -1198,10 +1223,10 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             int ret = backend_bam_input && !input_file_mem
                 ? FusedBamToBamMPI(
                       *backend_input, backend_plan.rank_spans(),
-                      backend_plan.rank_block_count(), mem_writer,
+                      backend_plan.rank_block_count(), body_sink,
                       filter, cmd_info->compress_level_, &stats)
                 : FusedBamToBamMPI(
-                      reader, mem_writer, filter,
+                      reader, body_sink, filter,
                       cmd_info->compress_level_, &stats);
             if (ret != 0) {
                 fprintf(stderr, "[rank %d] ERROR: MPI bam2bam fused 1CG body failed.\n", rank);
@@ -1218,9 +1243,27 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
 
         if (!global_ok) goto cleanup;
 
+        {
+            const int local_spool = body_sink.is_memory() ? 0 : 1;
+            int spool_ranks = 0;
+            MPI_Reduce(&local_spool, &spool_ranks, 1, MPI_INT,
+                       MPI_SUM, 0, MPI_COMM_WORLD);
+            if (rank == 0) {
+                printf("MPI rank body backend requested=%s "
+                       "memory_ranks=%d spool_ranks=%d\n",
+                       cmd_info->rank_body_backend_.c_str(),
+                       comm_size - spool_ranks, spool_ranks);
+            }
+        }
+
         //4.4 收集每个 rank 的输出大小
         double stage44_t0 = GetTime();
-        local_body_size = (long long)mem_writer.size;
+        if (body_sink.Flush() != 0 ||
+            body_sink.size() > (uint64_t)LLONG_MAX) {
+            local_ok = 0;
+        }
+        if (!MpiAllRanksOk(local_ok)) goto cleanup;
+        local_body_size = (long long)body_sink.size();
         body_sizes.assign((size_t)comm_size, 0);
         body_prefixes.assign((size_t)comm_size, 0);
         MPI_Allgather(&local_body_size, 1, MPI_LONG_LONG,
@@ -1309,8 +1352,9 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
 
         //4.5b 分配每个 rank 的本地模拟写内存，这部分不计入处理时间
         double stage45_malloc_t0 = GetTime();
-        simulated_write_size = (local_body_size > 0) ? (size_t)local_body_size : 0;
-        if (rank == 0) {
+        simulated_write_size = body_sink.is_memory() &&
+            local_body_size > 0 ? (size_t)local_body_size : 0;
+        if (body_sink.is_memory() && rank == 0) {
             if (output_body_start > SIZE_MAX - simulated_write_size) {
                 fprintf(stderr, "[rank %d] ERROR: simulated output memory estimate overflow.\n", rank);
                 local_ok = 0;
@@ -1339,7 +1383,8 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         long long simulated_write_offset = (long long)output_body_start + local_prefix;
         (void)simulated_write_offset;
         size_t simulated_pos = 0;
-        if (rank == 0 && output_body_start > 0) {
+        if (body_sink.is_memory() &&
+            rank == 0 && output_body_start > 0) {
             if (bam_to_sam) {
                 if (sam_header_len > 0) {
                     memcpy(simulated_write_mem + simulated_pos, sam_header_text, sam_header_len);
@@ -1361,9 +1406,14 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 }
             }
         }
-        if (local_body_size > 0) {
-            memcpy(simulated_write_mem + simulated_pos, mem_writer.data, (size_t)local_body_size);
-            simulated_pos += (size_t)local_body_size;
+        if (body_sink.is_memory() && local_body_size > 0) {
+            if (body_sink.ReadAt(
+                    0, simulated_write_mem + simulated_pos,
+                    (size_t)local_body_size) != 0) {
+                local_ok = 0;
+            } else {
+                simulated_pos += (size_t)local_body_size;
+            }
         }
         if (simulated_pos > 0) {
             unsigned char *guard_ptr = (unsigned char *)simulated_write_mem;
@@ -1431,7 +1481,8 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             double global_double_stats[15] = {};
             MPI_Reduce(local_double_stats, global_double_stats, 15, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
-            MpiPrintRankBamToSamStats(rank, comm_size, sam_stats, mem_writer.size);
+            MpiPrintRankBamToSamStats(
+                rank, comm_size, sam_stats, (size_t)body_sink.size());
             if (rank == 0) {
                 printf("FusedBamToSamMPI finished. ranks=%d in_blocks=%lld groups=%lld total_records=%lld format_tiles=%lld body_bytes=%lld\n",
                        comm_size, global_long_stats[0], global_long_stats[1],
@@ -1486,7 +1537,8 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             MPI_Reduce(local_double_stats, global_double_stats, 22, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
 
-            MpiPrintRankSamToBamStats(rank, comm_size, sam2bam_stats, mem_writer.size);
+            MpiPrintRankSamToBamStats(
+                rank, comm_size, sam2bam_stats, (size_t)body_sink.size());
             if (rank == 0) {
                 printf("FusedSamToBamMPI finished. ranks=%d chunks=%lld chunk_groups=%lld total_records=%lld compress_groups=%lld bgzf_blocks=%lld body_bytes=%lld\n",
                        comm_size, global_long_stats[0], global_long_stats[1],
@@ -1551,7 +1603,8 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             double global_detail_stats[3] = {};
             MPI_Reduce(local_detail_stats, global_detail_stats, 3, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
-            MpiPrintRankStats(rank, comm_size, stats, mem_writer.size);
+            MpiPrintRankStats(
+                rank, comm_size, stats, (size_t)body_sink.size());
             if (rank == 0) {
                 double keep_ratio = global_long_stats[2] > 0
                                     ? (double)global_long_stats[3] / (double)global_long_stats[2]
@@ -1616,12 +1669,33 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                     local_ok = 0;
                 }
             }
-            if (local_body_size > 0 &&
-                output.WriteAt(
-                    (uint64_t)output_body_start + (uint64_t)local_prefix,
-                    mem_writer.data, (uint64_t)local_body_size) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: failed to write MPI-IO output body.\n", rank);
-                local_ok = 0;
+            const size_t chunk_capacity = 8u * 1024u * 1024u;
+            std::vector<unsigned char> chunk;
+            if (local_body_size > 0) {
+                try {
+                    chunk.resize((size_t)std::min<long long>(
+                        local_body_size, (long long)chunk_capacity));
+                } catch (...) {
+                    local_ok = 0;
+                }
+            }
+            uint64_t copied = 0;
+            while (local_ok && copied < (uint64_t)local_body_size) {
+                const size_t count = (size_t)std::min<uint64_t>(
+                    (uint64_t)local_body_size - copied,
+                    chunk.size());
+                if (body_sink.ReadAt(
+                        copied, chunk.data(), count) != 0 ||
+                    output.WriteAt(
+                        (uint64_t)output_body_start +
+                            (uint64_t)local_prefix + copied,
+                        chunk.data(), count) != 0) {
+                    fprintf(stderr,
+                            "[rank %d] ERROR: failed to write MPI-IO "
+                            "output body.\n", rank);
+                    local_ok = 0;
+                }
+                copied += count;
             }
             if (rank == 0 && !bam_to_sam &&
                 output.WriteAt(
@@ -1683,29 +1757,65 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         double verify_gather_t0 = GetTime();
         if (rank == 0) {
             if (local_body_size > 0) {
-                memcpy(output_file_mem + output_body_start + local_prefix,
-                       mem_writer.data, (size_t)local_body_size);
+                if (body_sink.ReadAt(
+                        0,
+                        output_file_mem + output_body_start + local_prefix,
+                        (size_t)local_body_size) != 0) {
+                    local_ok = 0;
+                }
             }
             for (int src = 1; src < comm_size; ++src) {
                 long long recv_size = body_sizes[(size_t)src];
                 if (recv_size <= 0) continue;
-                if (MpiRecvBytes(src, 0,
-                                 output_file_mem + output_body_start + body_prefixes[(size_t)src],
-                                 recv_size) != 0) {
-                    fprintf(stderr, "ERROR: failed to gather MPI rank %d body into output memory.\n", src);
-                    local_ok = 0;
-                    break;
+                long long received = 0;
+                while (received < recv_size) {
+                    const long long count = std::min<long long>(
+                        recv_size - received, 8ll * 1024ll * 1024ll);
+                    if (MpiRecvBytes(
+                            src, 0,
+                            output_file_mem + output_body_start +
+                                body_prefixes[(size_t)src] + received,
+                            count) != 0) {
+                        fprintf(stderr,
+                                "ERROR: failed to gather MPI rank %d "
+                                "body into output memory.\n", src);
+                        local_ok = 0;
+                        break;
+                    }
+                    received += count;
                 }
+                if (!local_ok) break;
             }
             if (local_ok && !bam_to_sam) {
                 memcpy(output_file_mem + output_body_start + total_body_size,
                        kMpiBgzfEofBlock, sizeof(kMpiBgzfEofBlock));
             }
         } else if (local_body_size > 0) {
-            if (MpiSendBytes(0, 0, mem_writer.data, local_body_size) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: failed to send output body to rank 0 for verification dump.\n",
-                        rank);
+            std::vector<unsigned char> chunk;
+            try {
+                chunk.resize((size_t)std::min<long long>(
+                    local_body_size, 8ll * 1024ll * 1024ll));
+            } catch (...) {
                 local_ok = 0;
+            }
+            uint64_t sent = 0;
+            while (local_ok && sent < (uint64_t)local_body_size) {
+                const size_t count = (size_t)std::min<uint64_t>(
+                    (uint64_t)local_body_size - sent,
+                    chunk.size());
+                if (body_sink.ReadAt(
+                        sent, chunk.data(), count) != 0 ||
+                    MpiSendBytes(
+                        0, 0,
+                        reinterpret_cast<const char *>(chunk.data()),
+                        count) != 0) {
+                    fprintf(stderr,
+                            "[rank %d] ERROR: failed to send output "
+                            "body to rank 0 for verification dump.\n",
+                            rank);
+                    local_ok = 0;
+                }
+                sent += count;
             }
         }
         double verify_gather_cost = GetTime() - verify_gather_t0;
@@ -1737,7 +1847,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
 cleanup:
     {
         double close_t0 = GetTime();
-        if (mem_writer.data) free(mem_writer.data);
+        body_sink.Close();
         if (output_file_mem) free(output_file_mem);
         if (bam_header_mem) free(bam_header_mem);
         if (simulated_write_mem) free(simulated_write_mem);

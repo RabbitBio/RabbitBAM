@@ -245,11 +245,35 @@ rank0 组装完整输出内存并 dump；显式选择 MPI-IO 时则使用下述�
 - BAM 输出由 rank0 在末尾写标准 BGZF EOF；
 - 文件在打开时 collective resize，避免覆盖旧文件时留下尾部数据。
 
-该路径不再将所有 body 发往 rank0，也不分配 rank0 完整输出 buffer。
-但每个 rank 当前仍在 `MemWriter` 中保留自己的压缩 body，因为 prefix 只能在
-各 rank 输出长度确定后计算。因此输出峰值从 rank0 约整文件降为每 rank
-约 `output_size / np`，但严格常量内存还需要两遍处理、临时 rank 文件或动态
-全局布局协议。默认 `memory` 路径保留不变，继续用于当前核心性能模拟。
+该路径不再将所有 body 发往 rank0，也不分配 rank0 完整输出 buffer。转换命令、
+standalone fixmate、markdup、sort 和 collate 已接入下述 `RankBodySink`，本地
+body 可以独立选择 memory 或 spool。默认 `memory` 路径保留不变，继续用于当前
+核心性能模拟。
+
+## RankBodySink：rank 本地输出抽象
+
+`swbam_io` 提供只读的 `RankBodySource` 和可追加的 `RankBodySink`。它们只出现
+在每批压缩或格式化完成之后，不进入逐 record 热循环，接口包括顺序
+`Append()`、最终 `size()`、分块 `ReadAt()` 和生命周期管理。当前实现包括：
+
+- `MemoryRankBodySink`：兼容包装原 `MemWriter`，保留原容量增长和连续内存布局；
+- `SpoolRankBodySink`：压缩块顺序写入 rank-local 临时文件，最终按 8 MiB
+  分块读出并交给 `MpiFileOutput::WriteAt()`；
+- `AdaptiveRankBodySink`：支持 `memory|spool|auto`。`auto` 先写内存，body 超过
+  `--rank-body-memory-limit` 时将已有内容一次转入 spool，后续继续顺序追加；
+- `SegmentedRankBodySource`：逻辑拼接多个 source，`ReadAt()` 可跨 segment 读取，
+  用于 fixmate 的 prefix/middle/suffix，避免整段 `memmove`。
+
+spool/auto 要求显式提供 `--rank-body-temp-dir`，例如
+`../performance_test/tmp`。临时文件通过 `mkstemp` 创建并立即 unlink，不搜索或
+自动迁移到其他目录；创建失败、空间不足或写入失败会直接报错并提示检查该目录。
+这使性能实验的存储位置和计时口径可控。`Flush()` 不调用 `fsync`：同一文件
+描述符上的后续 `pread` 已能看到此前写入内容，而强制落盘只会增加额外等待。
+
+本地 body 与最终输出已经解耦：`--rank-body-backend` 控制本地存储，
+`--io-output-backend memory|mpiio` 控制最终文件。memory 最终输出仍会在 rank0
+分配完整输出内存，因此只有 `spool/auto + mpiio` 才是输出侧有界内存路径。
+默认 `memory + memory` 保持原性能基线。
 
 ## 文件转换实例
 
@@ -266,8 +290,35 @@ rank0 组装完整输出内存并 dump；显式选择 MPI-IO 时则使用下述�
   上完整复制；要求 memory 模拟时需显式使用默认 `memory`。
 
 三种转换的最终 memory gather 与 MPI-IO offset write 由同一布局逻辑处理。
-因此公共库负责存储、分区、batch 与生命周期，命令仍负责 SAM 语义和
-高性能融合算子。
+三种融合核心现在直接接受 `RankBodySink`，因此 BAM→SAM 的文本膨胀也可在
+阈值处动态 spill。公共库负责存储、分区、batch 与生命周期，命令仍负责 SAM
+语义和高性能融合算子。
+
+## Sort 与 Collate：算法型实例
+
+standalone `sort` 和 `collate` 已完整接入公共 I/O 闭环，同时保留算法专用核心：
+
+- 输入统一由 `MpiBamInput` 打开，由 `PrepareMpiBamInputPlan` 建立全局 BGZF
+  block 索引并切分 rank 范围；
+- memory backend 继续从完整输入的连续 rank 窗口构造 `MemReader`，保持原热路径；
+- POSIX/MPI-IO backend 使用 `BgzfSpanBatchReader` 直接填充算法已有的64个
+  `bam_block` slots，不聚合整段 rank 压缩输入；
+- sort 的内排 extract、严格外排 run generation，以及 collate 的 memory extract、
+  external run generation 都消费相同 block batch；全局 block index 仍来自 input
+  plan，稳定排序和 QNAME 元数据语义不变；
+- 压缩端直接向 `RankBodySink` 追加 BGZF block。memory-to-memory pipeline 通过
+  `MemoryRankBodySink` 包装旧 `MemWriter`，因此四阶段融合流程的存储策略不变；
+- standalone 最终输出由同一 `RankBodySource` 服务 memory gather 或
+  `MpiFileOutput` 分布式写入。
+
+这里公共库只管理“数据如何进入批次、body 如何保存和最终如何输出”。sort 的
+sample/partition/exchange/k-way merge、严格外排，collate 的 hash/bin、ring
+exchange、raw arena、loser tree 和外排归并仍在命令实例中。它们属于算法专用
+融合算子，不应塞进通用 BAM I/O 接口。
+
+两类临时文件必须区分：`-T/--temp-prefix` 管理 sort/collate 算法外排的
+run/segment；`--rank-body-temp-dir` 只管理最终压缩 body 的 spool。两者可以指向
+同一目录，但分别配置、分别计时；库不会自动寻找其他磁盘。
 
 ## 当前完成边界
 
@@ -309,11 +360,18 @@ rank0 组装完整输出内存并 dump；显式选择 MPI-IO 时则使用下述�
   继续走连续 `MemReader`，POSIX/MPI-IO 直接填充原 markdup input slots，
   duplicate window、跨 rank coordinate ownership 和 CPE rewrite/compress
   算子保持不变。MPI-IO 输出沿用 header/body-prefix/EOF 分布式布局。
+- `RankBodySource`、`AdaptiveRankBodySink` 和 `SegmentedRankBodySource` 已进入
+  `swbam_io`。三种转换、standalone fixmate 和 markdup 均支持独立的
+  `--rank-body-backend memory|spool|auto`；fixmate 通过三段 source 保持边界
+  group 输出顺序，pipeline 的 memory-to-memory 接口保持连续内存实现。
+- standalone `sort` 和 `collate` 已成为算法型公共 I/O 实例，支持
+  `memory|posix|mpiio|auto` 输入、`memory|spool|auto` rank body 和
+  `memory|mpiio` 最终输出；内排、外排和 CPE 融合核心保持原实现。
 
 后续阶段：
 
-- 逐步让 sort、collate 和非流式 markdup 等算法型路径使用统一 backend factory；
-- 将当前每 rank 的完整 compressed body 缓冲改为真正有界的分布式输出策略；
+- 评估非流式 markdup 是否值得接入 streaming backend，或继续作为 memory
+  flat-hash 极致性能实例；
 - 减少 packer chunk 到 write pipeline input 的一次 block copy；
 - 优先用通用闭环迁移 filter 和转换命令，再迁移 sort/collate/markdup 等算法型命令。
 

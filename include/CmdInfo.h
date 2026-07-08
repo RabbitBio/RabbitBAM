@@ -27,6 +27,9 @@ public:
     std::string io_backend_;
     std::string io_output_backend_;
     std::string io_memory_limit_;
+    std::string rank_body_backend_;
+    std::string rank_body_memory_limit_;
+    std::string rank_body_temp_dir_;
     std::string sort_memory_;
     std::string sort_temp_prefix_;
     int collate_bins_;

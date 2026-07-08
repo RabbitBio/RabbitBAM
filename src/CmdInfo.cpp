@@ -17,6 +17,9 @@ CmdInfo::CmdInfo() {
     io_backend_ = "memory";
     io_output_backend_ = "memory";
     io_memory_limit_ = "8G";
+    rank_body_backend_ = "memory";
+    rank_body_memory_limit_ = "8G";
+    rank_body_temp_dir_ = "";
     sort_memory_ = "";
     sort_temp_prefix_ = "";
     collate_bins_ = 64;

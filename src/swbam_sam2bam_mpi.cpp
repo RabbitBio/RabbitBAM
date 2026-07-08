@@ -473,9 +473,10 @@ int MpiBuildSamChunkPieces(MpiSamParseBatch *batch,
 
 } // namespace
 
-int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
-                     sam_hdr_t *hdr,
-                     int compress_level,
+static int FusedSamToBamSinkMPI(
+                     MemReader &reader,
+                     swbam::RankBodySink *body_sink,
+                     sam_hdr_t *hdr, int compress_level,
                      MpiSamToBamStats *stats) {
     const int NB = 64;
     MpiSamToBamStats local_stats = {};
@@ -504,7 +505,7 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
 
     if (parse_batch) memset(parse_batch, 0, sizeof(MpiSamParseBatch));
 
-    if (!batch || !parse_batch || !batch_text_storage || !batch_bam_lens_storage || !batch_bam_offsets_storage ||
+    if (!body_sink || !batch || !parse_batch || !batch_text_storage || !batch_bam_lens_storage || !batch_bam_offsets_storage ||
         MpiInitSamParseBatch(batch, batch_text_storage, batch_bam_lens_storage,
                              batch_bam_offsets_storage) != 0 ||
         MpiAllocateSamToBamBlockSet(&comp_un_a, NB) != 0 ||
@@ -577,8 +578,9 @@ int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
         double write_t0 = GetTime();
         for (int k = 0; k < NB; ++k) {
             if (comp_pending[k].status == 0 && comp_pending[k].output_block) {
-                if (MpiWriteBlockToMem(mem_writer, comp_pending[k].output_block) != 0) {
-                    fprintf(stderr, "ERROR: failed to append MPI sam2bam compressed block.\n");
+                if (swbam::AppendBgzfBlock(
+                        body_sink, comp_pending[k].output_block) != 0) {
+                    fprintf(stderr, "ERROR: failed to append MPI sam2bam compressed block to rank body sink.\n");
                     return -1;
                 }
                 stats->bgzf_blocks++;
@@ -857,4 +859,22 @@ cleanup:
     }
     stats->t_fused_total += GetTime() - fused_t0;
     return ret_code;
+}
+
+int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
+                     sam_hdr_t *hdr,
+                     int compress_level,
+                     MpiSamToBamStats *stats) {
+    swbam::MemoryRankBodySink body_sink(&mem_writer);
+    return FusedSamToBamSinkMPI(
+        reader, &body_sink, hdr, compress_level, stats);
+}
+
+int FusedSamToBamMPI(MemReader &reader,
+                     swbam::RankBodySink &body_sink,
+                     sam_hdr_t *hdr,
+                     int compress_level,
+                     MpiSamToBamStats *stats) {
+    return FusedSamToBamSinkMPI(
+        reader, &body_sink, hdr, compress_level, stats);
 }

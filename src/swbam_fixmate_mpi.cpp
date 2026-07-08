@@ -407,7 +407,7 @@ static void FmInitEmptyComp(Comp_Para *para, int block_id) {
 static int FmCompressPlans(
         const std::vector<bam1_t *> &records,
         const std::vector<uint32_t> &bam_lens,
-        int compress_level, MemWriter *writer,
+        int compress_level, swbam::RankBodySink *writer,
         int rank, MpiFixmateStats *stats) {
     double workspace_t0 = GetTime();
     FmBlockSet un_a = {};
@@ -481,8 +481,8 @@ static int FmCompressPlans(
         for (int i = 0; i < pending_count; ++i) {
             if (pending[i].status != 0 ||
                 !pending[i].output_block ||
-                MpiWriteBlockToMem(
-                    *writer, pending[i].output_block) != 0) {
+                swbam::AppendBgzfBlock(
+                    writer, pending[i].output_block) != 0) {
                 return -1;
             }
             stats->bgzf_blocks++;
@@ -558,7 +558,7 @@ static int FmCompressPlans(
 static int FmProcessGroups(
         std::vector<bam1_t *> records,
         const std::vector<MpiFixmateGroupShared> &groups,
-        int compress_level, MemWriter *writer,
+        int compress_level, swbam::RankBodySink *writer,
         int rank, MpiFixmateStats *stats) {
     if (records.empty()) return 0;
     double alloc_t0 = GetTime();
@@ -707,7 +707,7 @@ static int FmProcessGroups(
 
 static int FmProcessStoredGroup(
         FmStoredGroup *group, int compress_level,
-        MemWriter *writer, int rank,
+        swbam::RankBodySink *writer, int rank,
         MpiFixmateStats *stats) {
     double setup_t0 = GetTime();
     std::vector<bam1_t> records;
@@ -729,7 +729,7 @@ static int FmProcessDirectRange(
         const std::vector<bam1_t *> &all_records,
         const std::vector<std::pair<size_t, size_t> > &ranges,
         size_t range_begin, size_t range_end,
-        int compress_level, MemWriter *writer,
+        int compress_level, swbam::RankBodySink *writer,
         int rank, MpiFixmateStats *stats) {
     if (range_begin >= range_end) return 0;
     double setup_t0 = GetTime();
@@ -776,7 +776,7 @@ static int FmStreamLocalGroupsCore(
         const swbam::BgzfBlockSpan *spans,
         size_t span_count,
         int compress_level,
-        MemWriter *middle_writer,
+        swbam::RankBodySink *middle_writer,
         FmStoredGroup *leading,
         FmStoredGroup *trailing,
         int *single_group,
@@ -959,7 +959,7 @@ static int FmStreamLocalGroupsCore(
 
 static int FmStreamLocalGroups(
         MemReader &reader, int compress_level,
-        MemWriter *middle_writer,
+        swbam::RankBodySink *middle_writer,
         FmStoredGroup *leading,
         FmStoredGroup *trailing,
         int *single_group,
@@ -975,7 +975,7 @@ static int FmStreamLocalGroups(
         const swbam::BgzfBlockSpan *spans,
         size_t span_count,
         int compress_level,
-        MemWriter *middle_writer,
+        swbam::RankBodySink *middle_writer,
         FmStoredGroup *leading,
         FmStoredGroup *trailing,
         int *single_group,
@@ -1134,7 +1134,8 @@ static void FmPrintStats(
         const MpiFixmateStats &stats, int rank, int comm_size);
 
 static int FmGatherOutput(
-        const MemWriter &local_writer, sam_hdr_t *header,
+        const swbam::RankBodySource &local_writer,
+        sam_hdr_t *header,
         int compress_level, const std::string &output_path,
         MpiMemoryBam *output_bam, bool mpiio_output,
         int rank, int comm_size, MpiFixmateStats *stats,
@@ -1144,7 +1145,8 @@ static int FmGatherOutput(
     memset(costs, 0, sizeof(*costs));
 
     double stage44_t0 = GetTime();
-    long long local_size = (long long)local_writer.size;
+    if (local_writer.size() > (uint64_t)LLONG_MAX) return -1;
+    long long local_size = (long long)local_writer.size();
     std::vector<long long> sizes((size_t)comm_size, 0);
     MPI_Allgather(&local_size, 1, MPI_LONG_LONG,
                   sizes.data(), 1, MPI_LONG_LONG,
@@ -1208,9 +1210,10 @@ static int FmGatherOutput(
     }
 
     double stage45_malloc_t0 = GetTime();
-    const size_t simulated_write_size =
-        local_writer.size +
-        (rank == 0 ? header_size + sizeof(kFixmateBgzfEofBlock) : 0);
+    const size_t simulated_write_size = local_writer.is_memory()
+        ? (size_t)local_writer.size() +
+            (rank == 0 ? header_size + sizeof(kFixmateBgzfEofBlock) : 0)
+        : 0;
     char *simulated_write_mem =
         simulated_write_size ? (char *)malloc(simulated_write_size)
                              : nullptr;
@@ -1232,17 +1235,21 @@ static int FmGatherOutput(
     double stage46_t0 = GetTime();
     volatile unsigned long long simulated_guard = 0;
     size_t simulated_pos = 0;
-    if (rank == 0 && header_size > 0) {
+    if (local_writer.is_memory() && rank == 0 && header_size > 0) {
         memcpy(simulated_write_mem + simulated_pos,
                header_memory, header_size);
         simulated_pos += header_size;
     }
-    if (local_writer.size > 0) {
-        memcpy(simulated_write_mem + simulated_pos,
-               local_writer.data, local_writer.size);
-        simulated_pos += local_writer.size;
+    if (local_writer.is_memory() && local_writer.size() > 0) {
+        if (local_writer.ReadAt(
+                0, simulated_write_mem + simulated_pos,
+                (size_t)local_writer.size()) != 0) {
+            local_ok = 0;
+        } else {
+            simulated_pos += (size_t)local_writer.size();
+        }
     }
-    if (rank == 0) {
+    if (local_writer.is_memory() && rank == 0) {
         memcpy(simulated_write_mem + simulated_pos,
                kFixmateBgzfEofBlock,
                sizeof(kFixmateBgzfEofBlock));
@@ -1310,12 +1317,29 @@ static int FmGatherOutput(
                 output.WriteAt(0, header_memory, header_size) != 0) {
                 local_ok = 0;
             }
-            if (local_writer.size > 0 &&
-                output.WriteAt(
-                    layout[0] +
-                        (unsigned long long)offsets[(size_t)rank],
-                    local_writer.data, local_writer.size) != 0) {
-                local_ok = 0;
+            std::vector<unsigned char> chunk;
+            if (local_writer.size() > 0) {
+                try {
+                    chunk.resize((size_t)std::min<uint64_t>(
+                        local_writer.size(), 8ull * 1024ull * 1024ull));
+                } catch (...) {
+                    local_ok = 0;
+                }
+            }
+            uint64_t copied = 0;
+            while (local_ok && copied < local_writer.size()) {
+                const size_t count = (size_t)std::min<uint64_t>(
+                    local_writer.size() - copied, chunk.size());
+                if (local_writer.ReadAt(
+                        copied, chunk.data(), count) != 0 ||
+                    output.WriteAt(
+                        layout[0] +
+                            (unsigned long long)offsets[(size_t)rank] +
+                            copied,
+                        chunk.data(), count) != 0) {
+                    local_ok = 0;
+                }
+                copied += count;
             }
             if (rank == 0 &&
                 output.WriteAt(
@@ -1359,9 +1383,11 @@ static int FmGatherOutput(
     double gather_t0 = GetTime();
     if (rank == 0) {
         memcpy(output_memory, header_memory, header_size);
-        if (local_writer.size) {
-            memcpy(output_memory + header_size,
-                   local_writer.data, local_writer.size);
+        if (local_writer.size() &&
+            local_writer.ReadAt(
+                0, output_memory + header_size,
+                (size_t)local_writer.size()) != 0) {
+            local_ok = 0;
         }
         for (int source = 1; source < comm_size; ++source) {
             unsigned long long received = 0;
@@ -1383,12 +1409,20 @@ static int FmGatherOutput(
                sizeof(kFixmateBgzfEofBlock));
     } else {
         unsigned long long sent = 0;
-        const unsigned long long bytes = local_writer.size;
+        const unsigned long long bytes = local_writer.size();
+        std::vector<unsigned char> chunk_buffer(
+            (size_t)std::min<unsigned long long>(
+                bytes, (unsigned long long)kFixmateExchangeChunk));
         while (sent < bytes) {
             const int chunk = (int)std::min(
                 (unsigned long long)kFixmateExchangeChunk,
                 bytes - sent);
-            MPI_Send(local_writer.data + sent, chunk, MPI_BYTE,
+            if (local_writer.ReadAt(
+                    sent, chunk_buffer.data(), (size_t)chunk) != 0) {
+                local_ok = 0;
+                break;
+            }
+            MPI_Send(chunk_buffer.data(), chunk, MPI_BYTE,
                      0, 5200, MPI_COMM_WORLD);
             sent += (unsigned long long)chunk;
         }
@@ -1619,6 +1653,9 @@ int MpiFixmateMemoryToMemory(CmdInfo *cmd_info,
     MemWriter middle = {};
     MemWriter prefix = {};
     MemWriter suffix = {};
+    swbam::MemoryRankBodySink middle_sink(&middle);
+    swbam::MemoryRankBodySink prefix_sink(&prefix);
+    swbam::MemoryRankBodySink suffix_sink(&suffix);
     FmStoredGroup leading;
     FmStoredGroup trailing;
     int single_group = 0;
@@ -1762,7 +1799,7 @@ int MpiFixmateMemoryToMemory(CmdInfo *cmd_info,
         double fused_t0 = GetTime();
         if (FmStreamLocalGroups(
                 reader, cmd_info->compress_level_,
-                &middle, &leading, &trailing,
+                &middle_sink, &leading, &trailing,
                 &single_group, rank, &stats) != 0) {
             local_ok = 0;
         }
@@ -1781,20 +1818,20 @@ int MpiFixmateMemoryToMemory(CmdInfo *cmd_info,
                 if (!continues_previous &&
                     FmProcessStoredGroup(
                         &leading, cmd_info->compress_level_,
-                        &prefix, rank, &stats) != 0) {
+                        &prefix_sink, rank, &stats) != 0) {
                     local_ok = 0;
                 }
             } else {
                 if (!continues_previous &&
                     FmProcessStoredGroup(
                         &leading, cmd_info->compress_level_,
-                        &prefix, rank, &stats) != 0) {
+                        &prefix_sink, rank, &stats) != 0) {
                     local_ok = 0;
                 }
                 if (local_ok &&
                     FmProcessStoredGroup(
                         &trailing, cmd_info->compress_level_,
-                        &suffix, rank, &stats) != 0) {
+                        &suffix_sink, rank, &stats) != 0) {
                     local_ok = 0;
                 }
             }
@@ -1814,7 +1851,7 @@ int MpiFixmateMemoryToMemory(CmdInfo *cmd_info,
     if (!FmAllRanksOk(local_ok)) goto cleanup;
 
     if (FmGatherOutput(
-            middle, header, cmd_info->compress_level_,
+            middle_sink, header, cmd_info->compress_level_,
             cmd_info->out_file_name_, output_bam, false,
             rank, comm_size, &stats, &output_stage_costs,
             stage41_cost, stage42_cost, stage43_cost,
@@ -1860,9 +1897,13 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
     long long n_blocks = 0;
     size_t rank_input_size = 0;
     MemReader reader = {};
-    MemWriter middle = {};
     MemWriter prefix = {};
     MemWriter suffix = {};
+    swbam::AdaptiveRankBodySink middle_sink;
+    swbam::MemoryRankBodySink prefix_sink(&prefix);
+    swbam::MemoryRankBodySink suffix_sink(&suffix);
+    swbam::SegmentedRankBodySource body_source;
+    uint64_t rank_body_memory_limit = 0;
     FmStoredGroup leading;
     FmStoredGroup trailing;
     int single_group = 0;
@@ -1878,6 +1919,17 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
         if (rank == 0) {
             fprintf(stderr,
                     "ERROR: RabbitBAM-MPI fixmate v1 requires -m.\n");
+        }
+        local_ok = 0;
+    }
+    if (swbam::ParseByteSize(
+            cmd_info->rank_body_memory_limit_,
+            &rank_body_memory_limit) != 0 ||
+        rank_body_memory_limit == 0) {
+        if (rank == 0) {
+            fprintf(stderr,
+                    "ERROR: invalid rank body memory limit '%s'.\n",
+                    cmd_info->rank_body_memory_limit_.c_str());
         }
         local_ok = 0;
     }
@@ -2018,9 +2070,15 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
 
     {
         double t0 = GetTime();
-        if (MpiCommonInitMemWriter(
-                middle, rank_input_size ?
-                    rank_input_size : 1024 * 1024) != 0 ||
+        char spool_prefix[96];
+        snprintf(spool_prefix, sizeof(spool_prefix),
+                 "rabbitbam-fixmate-rank-%d.body", rank);
+        if (middle_sink.Open(
+                cmd_info->rank_body_backend_,
+                rank_body_memory_limit,
+                rank_input_size ? rank_input_size : 1024 * 1024,
+                spool_prefix,
+                cmd_info->rank_body_temp_dir_) != 0 ||
             MpiCommonInitMemWriter(prefix, 1024 * 1024) != 0 ||
             MpiCommonInitMemWriter(suffix, 1024 * 1024) != 0) {
             local_ok = 0;
@@ -2045,13 +2103,13 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
         const int stream_ret = memory_input
             ? FmStreamLocalGroups(
                 reader, cmd_info->compress_level_,
-                &middle, &leading, &trailing,
+                &middle_sink, &leading, &trailing,
                 &single_group, rank, &stats)
             : FmStreamLocalGroups(
                 *input_backend, input_plan.rank_spans(),
                 input_plan.rank_block_count(),
                 cmd_info->compress_level_,
-                &middle, &leading, &trailing,
+                &middle_sink, &leading, &trailing,
                 &single_group, rank, &stats);
         if (stream_ret != 0) {
             local_ok = 0;
@@ -2074,27 +2132,28 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
                     // FmProcessStoredGroup：真正对一个 QNAME group 做 fixmate
                     FmProcessStoredGroup(
                         &leading, cmd_info->compress_level_,
-                        &prefix, rank, &stats) != 0) {
+                        &prefix_sink, rank, &stats) != 0) {
                     local_ok = 0;
                 }
             } else {
                 if (!continues_previous &&
                     FmProcessStoredGroup(
                         &leading, cmd_info->compress_level_,
-                        &prefix, rank, &stats) != 0) {
+                        &prefix_sink, rank, &stats) != 0) {
                     local_ok = 0;
                 }
                 if (local_ok &&
                     FmProcessStoredGroup(
                         &trailing, cmd_info->compress_level_,
-                        &suffix, rank, &stats) != 0) {
+                        &suffix_sink, rank, &stats) != 0) {
                     local_ok = 0;
                 }
             }
         }
         if (local_ok &&
-            // 4. FmPrependAppend：把 prefix / suffix 拼回 middle
-            FmPrependAppend(&middle, prefix, suffix) != 0) {
+            (body_source.Add(&prefix_sink) != 0 ||
+             body_source.Add(&middle_sink) != 0 ||
+             body_source.Add(&suffix_sink) != 0)) {
             local_ok = 0;
         }
         if (!FmAllRanksOkTimed(local_ok, &stats)) goto cleanup;
@@ -2107,8 +2166,21 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
     }
     if (!FmAllRanksOk(local_ok)) goto cleanup;
 
+    {
+        const int local_spool = middle_sink.is_memory() ? 0 : 1;
+        int spool_ranks = 0;
+        MPI_Reduce(&local_spool, &spool_ranks, 1, MPI_INT,
+                   MPI_SUM, 0, MPI_COMM_WORLD);
+        if (rank == 0) {
+            printf("MPI rank body backend requested=%s "
+                   "memory_ranks=%d spool_ranks=%d\n",
+                   cmd_info->rank_body_backend_.c_str(),
+                   comm_size - spool_ranks, spool_ranks);
+        }
+    }
+
     if (FmGatherOutput(
-            middle, header, cmd_info->compress_level_,
+            body_source, header, cmd_info->compress_level_,
             cmd_info->out_file_name_, nullptr,
             cmd_info->io_output_backend_ == "mpiio",
             rank, comm_size,
@@ -2123,7 +2195,7 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
 cleanup:
     if (header) sam_hdr_destroy(header);
     input_handle.Close();
-    free(middle.data);
+    middle_sink.Close();
     free(prefix.data);
     free(suffix.data);
     if (rank == 0) {

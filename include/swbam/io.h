@@ -221,6 +221,131 @@ private:
     PosixBamOutput &operator=(const PosixBamOutput &);
 };
 
+class RankBodySource {
+public:
+    virtual ~RankBodySource() {}
+
+    virtual uint64_t size() const = 0;
+    virtual int ReadAt(uint64_t offset, void *data,
+                       size_t size) const = 0;
+    virtual bool is_memory() const = 0;
+};
+
+class RankBodySink : public RankBodySource {
+public:
+    virtual ~RankBodySink() {}
+
+    virtual int Append(const void *data, size_t size) = 0;
+    virtual int Flush() = 0;
+};
+
+class MemoryRankBodySink : public RankBodySink {
+public:
+    explicit MemoryRankBodySink(MemWriter *writer);
+
+    int Append(const void *data, size_t size);
+    int Flush() { return 0; }
+    uint64_t size() const;
+    int ReadAt(uint64_t offset, void *data, size_t size) const;
+    bool is_memory() const { return true; }
+
+    MemWriter *writer() { return writer_; }
+    const MemWriter *writer() const { return writer_; }
+
+private:
+    MemWriter *writer_;
+};
+
+class SpoolRankBodySink : public RankBodySink {
+public:
+    SpoolRankBodySink();
+    ~SpoolRankBodySink();
+
+    int Open(const std::string &path, bool remove_on_close = true);
+    int OpenTemporary(const std::string &directory,
+                      const std::string &prefix);
+    int Close();
+    int Append(const void *data, size_t size);
+    int Flush();
+    uint64_t size() const;
+    int ReadAt(uint64_t offset, void *data, size_t size) const;
+    bool is_memory() const { return false; }
+    const std::string &path() const { return path_; }
+
+private:
+    SpoolRankBodySink(const SpoolRankBodySink &);
+    SpoolRankBodySink &operator=(const SpoolRankBodySink &);
+
+    int fd_;
+    uint64_t size_;
+    std::string path_;
+    bool remove_on_close_;
+};
+
+class AdaptiveRankBodySink : public RankBodySink {
+public:
+    AdaptiveRankBodySink();
+    ~AdaptiveRankBodySink();
+
+    int Open(const std::string &requested_backend,
+             uint64_t memory_limit, size_t initial_capacity,
+             const std::string &spool_prefix,
+             const std::string &spool_directory);
+    int Close();
+    int Append(const void *data, size_t size);
+    int Flush();
+    uint64_t size() const;
+    int ReadAt(uint64_t offset, void *data, size_t size) const;
+    bool is_memory() const;
+
+    const std::string &requested_backend() const {
+        return requested_backend_;
+    }
+    const std::string &selected_backend() const {
+        return selected_backend_;
+    }
+    MemWriter *memory_writer();
+    const MemWriter *memory_writer() const;
+
+private:
+    AdaptiveRankBodySink(const AdaptiveRankBodySink &);
+    AdaptiveRankBodySink &operator=(const AdaptiveRankBodySink &);
+
+    int OpenSpool();
+    int SpillToSpool();
+    int AppendToSpool(const void *data, size_t size);
+
+    MemWriter memory_;
+    MemoryRankBodySink memory_sink_;
+    SpoolRankBodySink spool_sink_;
+    std::string requested_backend_;
+    std::string selected_backend_;
+    std::string spool_prefix_;
+    std::string spool_directory_;
+    uint64_t memory_limit_;
+    bool opened_;
+};
+
+class SegmentedRankBodySource : public RankBodySource {
+public:
+    SegmentedRankBodySource();
+
+    void Clear();
+    int Add(const RankBodySource *source);
+    uint64_t size() const { return total_size_; }
+    int ReadAt(uint64_t offset, void *data, size_t size) const;
+    bool is_memory() const;
+    size_t segment_count() const { return segments_.size(); }
+
+private:
+    std::vector<const RankBodySource *> segments_;
+    std::vector<uint64_t> offsets_;
+    uint64_t total_size_;
+};
+
+int AppendBgzfBlock(RankBodySink *sink, const bam_block *block);
+int ParseByteSize(const std::string &text, uint64_t *value);
+
 int LoadFileToMemory(const std::string &path, char **data, size_t *size);
 int ScanBgzfBlocksInMemory(const char *base, size_t size, long long body_start,
                            std::vector<long long> *offsets,

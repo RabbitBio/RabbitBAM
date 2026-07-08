@@ -51,6 +51,15 @@ int main(int argc, char **argv) {
                         "Output backend: memory or mpiio")
         ->default_val("memory")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
+    run_all->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
+                        "Per-rank body storage: memory, spool, or auto")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "spool", "auto"}));
+    run_all->add_option("--rank-body-memory-limit", cmd_info.rank_body_memory_limit_,
+                        "Per-rank body memory limit used by --rank-body-backend auto")
+        ->default_val("8G");
+    run_all->add_option("--rank-body-temp-dir", cmd_info.rank_body_temp_dir_,
+                        "Temporary directory required by spool/auto rank body storage");
     run_all->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
     run_all->add_flag("--validate-bounds", cmd_info.validate_bounds_, "Boundary validation is not supported by RabbitBAM-MPI")->default_val(false);
     run_all->add_option("--min-mapq", cmd_info.min_mapq_, "Keep reads with MAPQ >= value");
@@ -93,6 +102,26 @@ int main(int argc, char **argv) {
     CLI::App *sort = app.add_subcommand("sort", "Run MPI BAM coordinate sort");
     sort->add_option("-i,--inFile", cmd_info.in_file_name_, "input bam name")->required()->check(CLI::ExistingFile);
     sort->add_option("-o,--outFile", cmd_info.out_file_name_, "output bam name")->required();
+    sort->add_option("--io-backend", cmd_info.io_backend_,
+                     "Input backend: memory, posix, mpiio, or auto")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+    sort->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
+                     "Per-rank memory input limit used by --io-backend auto")
+        ->default_val("8G");
+    sort->add_option("--io-output-backend", cmd_info.io_output_backend_,
+                     "Output backend: memory or mpiio")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
+    sort->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
+                     "Per-rank body storage: memory, spool, or auto")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "spool", "auto"}));
+    sort->add_option("--rank-body-memory-limit", cmd_info.rank_body_memory_limit_,
+                     "Per-rank body memory limit used by --rank-body-backend auto")
+        ->default_val("8G");
+    sort->add_option("--rank-body-temp-dir", cmd_info.rank_body_temp_dir_,
+                     "Temporary directory required by spool/auto rank body storage");
     sort->add_option("-m,--memory", cmd_info.sort_memory_, "Sort memory limit per MPI rank, e.g. 4G or 4096M");
     sort->add_option("-T,--temp-prefix", cmd_info.sort_temp_prefix_,
                      "External sort temporary prefix or directory");
@@ -102,6 +131,26 @@ int main(int argc, char **argv) {
     CLI::App *collate = app.add_subcommand("collate", "Run MPI BAM name collation");
     collate->add_option("-i,--inFile", cmd_info.in_file_name_, "input BAM name")->required()->check(CLI::ExistingFile);
     collate->add_option("-o,--outFile", cmd_info.out_file_name_, "output BAM name")->required();
+    collate->add_option("--io-backend", cmd_info.io_backend_,
+                        "Input backend: memory, posix, mpiio, or auto")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+    collate->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
+                        "Per-rank memory input limit used by --io-backend auto")
+        ->default_val("8G");
+    collate->add_option("--io-output-backend", cmd_info.io_output_backend_,
+                        "Output backend: memory or mpiio")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
+    collate->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
+                        "Per-rank body storage: memory, spool, or auto")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "spool", "auto"}));
+    collate->add_option("--rank-body-memory-limit", cmd_info.rank_body_memory_limit_,
+                        "Per-rank body memory limit used by --rank-body-backend auto")
+        ->default_val("8G");
+    collate->add_option("--rank-body-temp-dir", cmd_info.rank_body_temp_dir_,
+                        "Temporary directory required by spool/auto rank body storage");
     CLI::Option *collate_bins_option =
         collate->add_option("-n,--bins", cmd_info.collate_bins_, "Number of logical QNAME hash bins")->default_val(64);
     collate->add_option("-m,--memory", cmd_info.collate_memory_, "Collate memory limit per MPI rank, e.g. 4G or 4096M");
@@ -123,6 +172,15 @@ int main(int argc, char **argv) {
                         "Output backend: memory or mpiio")
         ->default_val("memory")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
+    markdup->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
+                        "Per-rank body storage: memory, spool, or auto")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "spool", "auto"}));
+    markdup->add_option("--rank-body-memory-limit", cmd_info.rank_body_memory_limit_,
+                        "Per-rank body memory limit used by --rank-body-backend auto")
+        ->default_val("8G");
+    markdup->add_option("--rank-body-temp-dir", cmd_info.rank_body_temp_dir_,
+                        "Temporary directory required by spool/auto rank body storage");
     markdup->add_flag("-r,--remove-dups", cmd_info.markdup_remove_dups_, "Remove duplicate records")->default_val(false);
     markdup->add_flag("-c,--clear", cmd_info.markdup_clear_, "Clear existing duplicate flags and dt/do tags first")->default_val(false);
     markdup->add_flag("--include-fails", cmd_info.markdup_include_fails_, "Include QC-fail records in duplicate detection")->default_val(false);
@@ -146,6 +204,15 @@ int main(int argc, char **argv) {
                         "Output backend: memory or mpiio")
         ->default_val("memory")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
+    fixmate->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
+                        "Per-rank body storage: memory, spool, or auto")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "spool", "auto"}));
+    fixmate->add_option("--rank-body-memory-limit", cmd_info.rank_body_memory_limit_,
+                        "Per-rank body memory limit used by --rank-body-backend auto")
+        ->default_val("8G");
+    fixmate->add_option("--rank-body-temp-dir", cmd_info.rank_body_temp_dir_,
+                        "Temporary directory required by spool/auto rank body storage");
     fixmate->add_flag("-m", cmd_info.fixmate_mate_score_, "Add mate score ms tags")->required();
     fixmate->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
     fixmate->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);

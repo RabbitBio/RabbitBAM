@@ -1,4 +1,5 @@
 #include "swbam_mpi.h"
+#include "swbam/mpi_runtime.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -484,8 +485,102 @@ static int CollateEstimateRawBytes(
     return 0;
 }
 
-static int CollateExtractAll(
-        MemReader &reader, long long global_block_begin,
+class CollateBatchReader {
+public:
+    virtual ~CollateBatchReader() {}
+    virtual int Read(CollateBlockSet *blocks, int *count) = 0;
+};
+
+class CollateMemoryBatchReader : public CollateBatchReader {
+public:
+    explicit CollateMemoryBatchReader(MemReader *reader)
+        : reader_(reader) {}
+
+    int Read(CollateBlockSet *blocks, int *count) {
+        if (!reader_ || !blocks || !count) return -1;
+        if (reader_->pos >= reader_->size) {
+            *count = 0;
+            return 0;
+        }
+        int n = 0;
+        for (int b = 0; b < kCollateCpes; ++b) {
+            if (CollateMemReadBlock(
+                    *reader_, &blocks->blocks[b]) != 0) {
+                return -1;
+            }
+            blocks->blocks[b].block_id = b;
+            ++n;
+            if (reader_->pos >= reader_->size) break;
+        }
+        *count = n;
+        return 0;
+    }
+
+private:
+    MemReader *reader_;
+};
+
+class CollateBackendBatchReader : public CollateBatchReader {
+public:
+    CollateBackendBatchReader(
+            const swbam::BamInputBackend *input,
+            const swbam::BgzfBlockSpan *spans, size_t count)
+        : reader_(input, spans, count) {}
+
+    int Read(CollateBlockSet *blocks, int *count) {
+        if (!blocks || !count) return -1;
+        swbam::BgzfBlockBatch batch;
+        if (batch.Attach(blocks->blocks, kCollateCpes) != 0) return -1;
+        size_t n = 0;
+        if (reader_.ReadNext(&batch, &n) != 0 || n > kCollateCpes) {
+            return -1;
+        }
+        *count = (int)n;
+        return 0;
+    }
+
+private:
+    swbam::BgzfSpanBatchReader reader_;
+};
+
+static int CollateEstimateRawBytes(
+        const swbam::BamInputBackend &input,
+        const swbam::BgzfBlockSpan *spans, size_t span_count,
+        size_t *raw_bytes) {
+    CollateBlockSet blocks;
+    if (CollateAllocateBlockSet(&blocks, kCollateCpes) != 0) {
+        return -1;
+    }
+    CollateBackendBatchReader reader(&input, spans, span_count);
+    size_t total = 0;
+    int result = 0;
+    while (true) {
+        int count = 0;
+        if (reader.Read(&blocks, &count) != 0) {
+            result = -1;
+            break;
+        }
+        if (count == 0) break;
+        for (int i = 0; i < count; ++i) {
+            const uint32_t isize = CollateBgzfISize(blocks.blocks[i]);
+            if (isize > BGZF_MAX_BLOCK_SIZE ||
+                (size_t)isize > SIZE_MAX - total) {
+                result = -1;
+                break;
+            }
+            total += (size_t)isize;
+        }
+        if (result != 0) break;
+    }
+    CollateFreeBlockSet(&blocks);
+    if (result == 0) *raw_bytes = total;
+    return result;
+}
+
+static int CollateExtractAllImpl(
+        CollateBatchReader *block_reader,
+        size_t raw_capacity,
+        long long global_block_begin,
         int bins, std::vector<CollateMeta> *records,
         CollateRawArena *raw,
         MpiCollateStats *stats) {
@@ -499,9 +594,7 @@ static int CollateExtractAll(
     stats->t_extract_alloc += GetTime() - alloc_t0;
 
     double resize_t0 = GetTime();
-    size_t raw_capacity = 0;
-    if (raw->data ||
-        CollateEstimateRawBytes(reader, &raw_capacity) != 0) {
+    if (raw->data) {
         stats->t_extract_raw_resize +=
             GetTime() - resize_t0;
         double free_t0 = GetTime();
@@ -527,15 +620,13 @@ static int CollateExtractAll(
     MpiCollateExtractPara paras[kCollateCpes];
     long long local_block = 0;
     int ret = 0;
-    while (reader.pos < reader.size) {
+    while (true) {
         int n_blocks = 0;
         size_t group_raw = 0;
         double read_t0 = GetTime();
-        for (int b = 0; b < kCollateCpes; ++b) {
-            if (CollateMemReadBlock(
-                    reader, &ws.input.blocks[b]) != 0) {
-                break;
-            }
+        const int read_ret = block_reader->Read(
+            &ws.input, &n_blocks);
+        for (int b = 0; b < n_blocks; ++b) {
             uint32_t isize =
                 CollateBgzfISize(ws.input.blocks[b]);
             if (isize > BGZF_MAX_BLOCK_SIZE) {
@@ -547,9 +638,9 @@ static int CollateExtractAll(
                 (size_t)b * BGZF_MAX_BLOCK_SIZE;
             ws.output.blocks[b].length = isize;
             group_raw += isize;
-            ++n_blocks;
         }
         stats->t_extract_read += GetTime() - read_t0;
+        if (read_ret != 0) ret = -1;
         if (ret != 0 || n_blocks == 0) break;
         const size_t group_begin = raw->size;
         if (group_raw > raw->capacity - group_begin) {
@@ -639,6 +730,40 @@ static int CollateExtractAll(
             (long long)records->size();
     }
     return ret;
+}
+
+static int CollateExtractAll(
+        MemReader &reader, long long global_block_begin,
+        int bins, std::vector<CollateMeta> *records,
+        CollateRawArena *raw, MpiCollateStats *stats) {
+    size_t raw_capacity = 0;
+    double estimate_t0 = GetTime();
+    const int estimate_ret = CollateEstimateRawBytes(
+        reader, &raw_capacity);
+    stats->t_extract_raw_resize += GetTime() - estimate_t0;
+    if (estimate_ret != 0) return -1;
+    CollateMemoryBatchReader block_reader(&reader);
+    return CollateExtractAllImpl(
+        &block_reader, raw_capacity, global_block_begin,
+        bins, records, raw, stats);
+}
+
+static int CollateExtractAll(
+        const swbam::BamInputBackend &input,
+        const swbam::BgzfBlockSpan *spans, size_t span_count,
+        long long global_block_begin,
+        int bins, std::vector<CollateMeta> *records,
+        CollateRawArena *raw, MpiCollateStats *stats) {
+    size_t raw_capacity = 0;
+    double estimate_t0 = GetTime();
+    const int estimate_ret = CollateEstimateRawBytes(
+        input, spans, span_count, &raw_capacity);
+    stats->t_extract_raw_resize += GetTime() - estimate_t0;
+    if (estimate_ret != 0) return -1;
+    CollateBackendBatchReader block_reader(&input, spans, span_count);
+    return CollateExtractAllImpl(
+        &block_reader, raw_capacity, global_block_begin,
+        bins, records, raw, stats);
 }
 
 static size_t CollateChunkEnd(
@@ -1228,7 +1353,7 @@ static void CollateCountGroup(
 static int CollateCompressStream(
         const std::function<int(
             const unsigned char **, uint32_t *)> &next,
-        int compress_level, MemWriter *writer,
+        int compress_level, swbam::RankBodySink *body_sink,
         MpiCollateStats *stats) {
     CollateBlockSet payload_a, payload_b;
     CollateBlockSet output_a, output_b;
@@ -1402,8 +1527,8 @@ static int CollateCompressStream(
         for (int i = 0; i < pending_count; ++i) {
             if (pending[i].status != 0 ||
                 !pending[i].output_block ||
-                MpiWriteBlockToMem(
-                    *writer,
+                swbam::AppendBgzfBlock(
+                    body_sink,
                     pending[i].output_block) != 0) {
                 return -1;
             }
@@ -1541,7 +1666,7 @@ static int CollateCompressMemoryStream(
         CollateMemoryLoserTree *tree,
         std::string *previous,
         uint32_t *previous_hash,
-        int compress_level, MemWriter *writer,
+        int compress_level, swbam::RankBodySink *body_sink,
         MpiCollateStats *stats) {
     CollateBlockSet payload_a, payload_b;
     CollateBlockSet output_a, output_b;
@@ -1580,8 +1705,8 @@ static int CollateCompressMemoryStream(
         for (int i = 0; i < pending_count; ++i) {
             if (pending[i].status != 0 ||
                 !pending[i].output_block ||
-                MpiWriteBlockToMem(
-                    *writer,
+                swbam::AppendBgzfBlock(
+                    body_sink,
                     pending[i].output_block) != 0) {
                 return -1;
             }
@@ -1686,7 +1811,7 @@ static void CollateCountGroup(
 
 static int CollateMergeMemory(
         const std::vector<CollateMemorySegment> &segments,
-        int compress_level, MemWriter *writer,
+        int compress_level, swbam::RankBodySink *body_sink,
         MpiCollateStats *stats) {
     CollateMemoryLoserTree tree(&segments);
     std::string previous;
@@ -1694,7 +1819,7 @@ static int CollateMergeMemory(
     double t0 = GetTime();
     int ret = CollateCompressMemoryStream(
         &tree, &previous, &previous_hash,
-        compress_level, writer, stats);
+        compress_level, body_sink, stats);
     stats->t_merge += GetTime() - t0;
     return ret;
 }
@@ -1739,10 +1864,11 @@ static void CollatePrintStats(
         int rank, int comm_size, int bins);
 
 static int CollateGatherOutput(
-        const MemWriter &local_writer,
+        const swbam::RankBodySource &local_body,
         sam_hdr_t *header, int compress_level,
         const std::string &output_path,
         MpiMemoryBam *output_bam,
+        bool mpiio_output,
         int rank, int comm_size, int bins,
         MpiCollateStats *stats,
         CollateOutputStageCosts *costs,
@@ -1751,8 +1877,10 @@ static int CollateGatherOutput(
     memset(costs, 0, sizeof(*costs));
 
     double stage44_t0 = GetTime();
-    long long local_size =
-        (long long)local_writer.size;
+    const int local_size_ok =
+        local_body.size() <= (uint64_t)LLONG_MAX ? 1 : 0;
+    if (!CollateAllRanksOk(local_size_ok)) return -1;
+    long long local_size = (long long)local_body.size();
     std::vector<long long> sizes(
         (size_t)comm_size, 0);
     MPI_Allgather(
@@ -1821,11 +1949,23 @@ static int CollateGatherOutput(
     }
 
     double stage45_malloc_t0 = GetTime();
+    const size_t simulation_body_size = local_body.is_memory()
+        ? (size_t)local_body.size()
+        : (size_t)std::min<uint64_t>(
+              local_body.size(), 8ull * 1024ull * 1024ull);
     const size_t simulated_write_size =
-        local_writer.size +
+        simulation_body_size +
         (rank == 0 ? header_size +
                          sizeof(kCollateBgzfEofBlock)
                    : 0);
+    std::vector<unsigned char> source_chunk;
+    if (!local_body.is_memory() && local_body.size() > 0) {
+        try {
+            source_chunk.resize(simulation_body_size);
+        } catch (...) {
+            local_ok = 0;
+        }
+    }
     char *simulated_write_mem =
         simulated_write_size
             ? (char *)malloc(simulated_write_size)
@@ -1845,23 +1985,55 @@ static int CollateGatherOutput(
         return -1;
     }
 
-    double stage46_t0 = GetTime();
+    double stage46_cost = 0.0;
+    double source_read_cost = 0.0;
     volatile unsigned long long simulated_guard = 0;
     size_t simulated_pos = 0;
     if (rank == 0 && header_size > 0) {
+        double copy_t0 = GetTime();
         memcpy(simulated_write_mem + simulated_pos,
                header_memory, header_size);
+        stage46_cost += GetTime() - copy_t0;
         simulated_pos += header_size;
     }
-    if (local_writer.size > 0) {
-        memcpy(simulated_write_mem + simulated_pos,
-               local_writer.data, local_writer.size);
-        simulated_pos += local_writer.size;
+    if (local_body.size() > 0) {
+        if (local_body.is_memory()) {
+            double copy_t0 = GetTime();
+            if (local_body.ReadAt(
+                    0, simulated_write_mem + simulated_pos,
+                    (size_t)local_body.size()) != 0) {
+                local_ok = 0;
+            }
+            stage46_cost += GetTime() - copy_t0;
+            simulated_pos += (size_t)local_body.size();
+        } else {
+            uint64_t copied = 0;
+            const size_t destination = simulated_pos;
+            while (local_ok && copied < local_body.size()) {
+                const size_t count = (size_t)std::min<uint64_t>(
+                    local_body.size() - copied, source_chunk.size());
+                double read_t0 = GetTime();
+                if (local_body.ReadAt(
+                        copied, source_chunk.data(), count) != 0) {
+                    local_ok = 0;
+                    break;
+                }
+                source_read_cost += GetTime() - read_t0;
+                double copy_t0 = GetTime();
+                memcpy(simulated_write_mem + destination,
+                       source_chunk.data(), count);
+                stage46_cost += GetTime() - copy_t0;
+                copied += count;
+            }
+            simulated_pos += simulation_body_size;
+        }
     }
     if (rank == 0) {
+        double copy_t0 = GetTime();
         memcpy(simulated_write_mem + simulated_pos,
                kCollateBgzfEofBlock,
                sizeof(kCollateBgzfEofBlock));
+        stage46_cost += GetTime() - copy_t0;
         simulated_pos += sizeof(kCollateBgzfEofBlock);
     }
     if (simulated_write_size > 0) {
@@ -1873,11 +2045,16 @@ static int CollateGatherOutput(
     }
     (void)simulated_guard;
     (void)simulated_pos;
-    costs->stage46 =
-        CollateReduceMax(GetTime() - stage46_t0);
+    costs->stage46 = CollateReduceMax(stage46_cost);
+    const double source_read_cost_max =
+        CollateReduceMax(source_read_cost);
     if (rank == 0) {
         printf("Complete the 4.6 simulated header/body distributed write cost %lf\n",
                costs->stage46);
+        if (source_read_cost_max > 0.0) {
+            printf("Rank body source read diagnostic cost %lf\n",
+                   source_read_cost_max);
+        }
         const double core_total =
             stage41_cost + stage42_cost + stage43_cost +
             costs->stage44 + costs->stage45_header +
@@ -1909,6 +2086,63 @@ static int CollateGatherOutput(
         }
     }
 
+    if (!output_bam && mpiio_output) {
+        unsigned long long layout[2] = {0, 0};
+        if (rank == 0) {
+            layout[0] = (unsigned long long)header_size;
+            layout[1] = (unsigned long long)output_size;
+        }
+        MPI_Bcast(layout, 2, MPI_UNSIGNED_LONG_LONG, 0,
+                  MPI_COMM_WORLD);
+        double write_t0 = GetTime();
+        swbam::mpi::MpiFileOutput output;
+        if (output.Open(output_path, layout[1]) != 0) local_ok = 0;
+        if (CollateAllRanksOk(local_ok)) {
+            if (rank == 0 && header_size > 0 &&
+                output.WriteAt(0, header_memory, header_size) != 0) {
+                local_ok = 0;
+            }
+            const size_t capacity = (size_t)std::min<uint64_t>(
+                local_body.size(), 8ull * 1024ull * 1024ull);
+            try {
+                source_chunk.resize(capacity);
+            } catch (...) {
+                local_ok = 0;
+            }
+            uint64_t copied = 0;
+            while (local_ok && copied < local_body.size()) {
+                const size_t count = (size_t)std::min<uint64_t>(
+                    local_body.size() - copied, source_chunk.size());
+                if (local_body.ReadAt(
+                        copied, source_chunk.data(), count) != 0 ||
+                    output.WriteAt(
+                        layout[0] + (uint64_t)offsets[(size_t)rank] + copied,
+                        source_chunk.data(), count) != 0) {
+                    local_ok = 0;
+                }
+                copied += count;
+            }
+            if (rank == 0 &&
+                output.WriteAt(
+                    layout[0] + (uint64_t)body_size,
+                    kCollateBgzfEofBlock,
+                    sizeof(kCollateBgzfEofBlock)) != 0) {
+                local_ok = 0;
+            }
+        }
+        const int writes_ok = CollateAllRanksOk(local_ok);
+        if (writes_ok && output.Sync() != 0) local_ok = 0;
+        if (output.Close() != 0) local_ok = 0;
+        const double write_cost =
+            CollateReduceMax(GetTime() - write_t0);
+        if (rank == 0 && local_ok) {
+            printf("555MPI-IO distributed output cost %lf--\n",
+                   write_cost);
+        }
+        free(header_memory);
+        return CollateAllRanksOk(local_ok) ? 0 : -1;
+    }
+
     double verify_alloc_t0 = GetTime();
     if (rank == 0) {
         output_memory =
@@ -1936,28 +2170,55 @@ static int CollateGatherOutput(
 
     double verify_gather_t0 = GetTime();
     if (rank == 0) {
-        if (local_writer.size) {
-            memcpy(output_memory + header_size,
-                   local_writer.data,
-                   local_writer.size);
+        if (local_body.size() &&
+            local_body.ReadAt(
+                0, output_memory + header_size,
+                (size_t)local_body.size()) != 0) {
+            local_ok = 0;
         }
         for (int src = 1; src < comm_size; ++src) {
-            if (CollateRecvBytes(
-                    src, 5700,
-                    output_memory + header_size +
-                        offsets[(size_t)src],
-                    sizes[(size_t)src]) != 0) {
-                local_ok = 0;
+            long long received = 0;
+            while (received < sizes[(size_t)src]) {
+                const long long count = std::min<long long>(
+                    sizes[(size_t)src] - received,
+                    8ll * 1024ll * 1024ll);
+                if (CollateRecvBytes(
+                        src, 5700,
+                        output_memory + header_size +
+                            offsets[(size_t)src] + received,
+                        count) != 0) {
+                    local_ok = 0;
+                    break;
+                }
+                received += count;
             }
+            if (!local_ok) break;
         }
         memcpy(output_memory + header_size +
                    body_size,
                kCollateBgzfEofBlock,
                sizeof(kCollateBgzfEofBlock));
-    } else if (CollateSendBytes(
-                   0, 5700, local_writer.data,
-                   local_size) != 0) {
-        local_ok = 0;
+    } else if (local_size > 0) {
+        const size_t capacity = (size_t)std::min<long long>(
+            local_size, 8ll * 1024ll * 1024ll);
+        try {
+            source_chunk.resize(capacity);
+        } catch (...) {
+            local_ok = 0;
+        }
+        uint64_t sent = 0;
+        while (local_ok && sent < local_body.size()) {
+            const size_t count = (size_t)std::min<uint64_t>(
+                local_body.size() - sent, source_chunk.size());
+            if (local_body.ReadAt(
+                    sent, source_chunk.data(), count) != 0 ||
+                CollateSendBytes(
+                    0, 5700, (const char *)source_chunk.data(),
+                    (long long)count) != 0) {
+                local_ok = 0;
+            }
+            sent += count;
+        }
     }
     double verify_gather_cost =
         CollateReduceMax(GetTime() - verify_gather_t0);
@@ -1995,6 +2256,24 @@ static int CollateGatherOutput(
     free(header_memory);
     free(output_memory);
     return CollateAllRanksOk(local_ok) ? 0 : -1;
+}
+
+static int CollateGatherOutput(
+        const MemWriter &local_writer,
+        sam_hdr_t *header, int compress_level,
+        const std::string &output_path,
+        MpiMemoryBam *output_bam,
+        int rank, int comm_size, int bins,
+        MpiCollateStats *stats,
+        CollateOutputStageCosts *costs,
+        double stage41_cost, double stage42_cost,
+        double stage43_cost, double body_total_t0) {
+    swbam::MemoryRankBodySink body(
+        const_cast<MemWriter *>(&local_writer));
+    return CollateGatherOutput(
+        body, header, compress_level, output_path, output_bam,
+        false, rank, comm_size, bins, stats, costs,
+        stage41_cost, stage42_cost, stage43_cost, body_total_t0);
 }
 
 /*
@@ -2343,8 +2622,9 @@ static int CollateSpillArena(
     return 0;
 }
 
-static int CollateExtractRuns(
-        MemReader &reader, long long global_block_begin,
+static int CollateExtractRunsImpl(
+        CollateBatchReader *block_reader,
+        long long global_block_begin,
         int bins, CollateRunArena *arena,
         CollateTempStore *store,
         unsigned char *scratch, size_t scratch_size,
@@ -2361,14 +2641,12 @@ static int CollateExtractRuns(
     MpiCollateExtractPara paras[kCollateCpes];
     long long local_block = 0;
     int result = 0;
-    while (reader.pos < reader.size) {
+    while (true) {
         int n_blocks = 0;
         double read_t0 = GetTime();
-        for (int b = 0; b < kCollateCpes; ++b) {
-            if (CollateMemReadBlock(
-                    reader, &ws.input.blocks[b]) != 0) {
-                break;
-            }
+        const int read_ret = block_reader->Read(
+            &ws.input, &n_blocks);
+        for (int b = 0; b < n_blocks; ++b) {
             uint32_t isize =
                 CollateBgzfISize(ws.input.blocks[b]);
             if (isize > BGZF_MAX_BLOCK_SIZE) {
@@ -2397,9 +2675,9 @@ static int CollateExtractRuns(
             paras[b].n_bins = bins;
             paras[b].global_block_index =
                 global_block_begin + local_block + b;
-            ++n_blocks;
         }
         stats->t_extract_read += GetTime() - read_t0;
+        if (read_ret != 0) result = -1;
         double setup_t0 = GetTime();
         for (int b = n_blocks; b < kCollateCpes; ++b) {
             memset(&paras[b], 0, sizeof(paras[b]));
@@ -2492,6 +2770,34 @@ static int CollateExtractRuns(
     }
     stats->runs = (long long)runs->size();
     return 0;
+}
+
+static int CollateExtractRuns(
+        MemReader &reader, long long global_block_begin,
+        int bins, CollateRunArena *arena,
+        CollateTempStore *store,
+        unsigned char *scratch, size_t scratch_size,
+        std::vector<CollateRun> *runs,
+        MpiCollateStats *stats) {
+    CollateMemoryBatchReader block_reader(&reader);
+    return CollateExtractRunsImpl(
+        &block_reader, global_block_begin, bins, arena, store,
+        scratch, scratch_size, runs, stats);
+}
+
+static int CollateExtractRuns(
+        const swbam::BamInputBackend &input,
+        const swbam::BgzfBlockSpan *spans, size_t span_count,
+        long long global_block_begin,
+        int bins, CollateRunArena *arena,
+        CollateTempStore *store,
+        unsigned char *scratch, size_t scratch_size,
+        std::vector<CollateRun> *runs,
+        MpiCollateStats *stats) {
+    CollateBackendBatchReader block_reader(&input, spans, span_count);
+    return CollateExtractRunsImpl(
+        &block_reader, global_block_begin, bins, arena, store,
+        scratch, scratch_size, runs, stats);
 }
 
 static int CollateLoadRun(
@@ -3215,7 +3521,8 @@ static int CollateMergeExternal(
         const std::vector<CollateSegment> &segments,
         int compress_level, size_t fan_in,
         unsigned char *scratch, size_t scratch_size,
-        MemWriter *writer, MpiCollateStats *stats) {
+        swbam::RankBodySink *body_sink,
+        MpiCollateStats *stats) {
     const size_t stride =
         kCollateCursorMeta + kCollateCursorRaw;
     std::vector<unsigned char> cursor_memory(
@@ -3272,13 +3579,18 @@ static int CollateMergeExternal(
     };
     double t0 = GetTime();
     int ret = CollateCompressStream(
-        next, compress_level, writer, stats);
+        next, compress_level, body_sink, stats);
     stats->t_merge += GetTime() - t0;
     return ret;
 }
 
-static int FusedBamExternalCollateMPI(
-        MemReader &reader, MemWriter &writer,
+static int FusedBamExternalCollateMPIImpl(
+        MemReader *reader,
+        const swbam::BamInputBackend *input,
+        const swbam::BgzfBlockSpan *spans,
+        size_t span_count,
+        size_t compressed_input_size,
+        swbam::RankBodySink &body_sink,
         long long global_block_begin,
         int rank, int comm_size, int bins,
         int compress_level, size_t memory_limit,
@@ -3299,8 +3611,8 @@ static int FusedBamExternalCollateMPI(
     const size_t full_fixed =
         common_fixed + full_phase_workspace;
     const size_t estimated_run_bytes =
-        reader.size > SIZE_MAX / 6
-            ? SIZE_MAX : reader.size * 6;
+        compressed_input_size > SIZE_MAX / 6
+            ? SIZE_MAX : compressed_input_size * 6;
     const int use_full_exchange =
         memory_limit > full_fixed + minimum_arena &&
         memory_limit - full_fixed >= estimated_run_bytes;
@@ -3364,12 +3676,17 @@ static int FusedBamExternalCollateMPI(
         (long long)(arena.capacity + fixed);
 
     {
-        int local_extract_ok =
-            CollateExtractRuns(
-                reader, global_block_begin, bins,
-                &arena, &store, scratch,
-                kCollateSimScratch, &runs,
-                stats) == 0;
+        int extract_ret = reader
+            ? CollateExtractRuns(
+                  *reader, global_block_begin, bins,
+                  &arena, &store, scratch,
+                  kCollateSimScratch, &runs, stats)
+            : CollateExtractRuns(
+                  *input, spans, span_count,
+                  global_block_begin, bins,
+                  &arena, &store, scratch,
+                  kCollateSimScratch, &runs, stats);
+        int local_extract_ok = extract_ret == 0;
         if (!CollateAllRanksOk(local_extract_ok)) {
             goto cleanup;
         }
@@ -3417,7 +3734,7 @@ static int FusedBamExternalCollateMPI(
             CollateMergeExternal(
                 segments, compress_level, fan_in,
                 scratch, kCollateSimScratch,
-                &writer, stats) != 0) {
+                &body_sink, stats) != 0) {
             goto cleanup;
         }
     }
@@ -3438,8 +3755,42 @@ cleanup:
     return result;
 }
 
-static int FusedBamMemoryCollateMPI(
-        MemReader &reader, MemWriter &writer,
+static int FusedBamExternalCollateMPI(
+        MemReader &reader, swbam::RankBodySink &body_sink,
+        long long global_block_begin,
+        int rank, int comm_size, int bins,
+        int compress_level, size_t memory_limit,
+        const std::string &temp_prefix,
+        MpiCollateStats *stats) {
+    return FusedBamExternalCollateMPIImpl(
+        &reader, nullptr, nullptr, 0, reader.size, body_sink,
+        global_block_begin, rank, comm_size, bins,
+        compress_level, memory_limit, temp_prefix, stats);
+}
+
+static int FusedBamExternalCollateMPI(
+        const swbam::BamInputBackend &input,
+        const swbam::BgzfBlockSpan *spans, size_t span_count,
+        size_t compressed_input_size,
+        swbam::RankBodySink &body_sink,
+        long long global_block_begin,
+        int rank, int comm_size, int bins,
+        int compress_level, size_t memory_limit,
+        const std::string &temp_prefix,
+        MpiCollateStats *stats) {
+    return FusedBamExternalCollateMPIImpl(
+        nullptr, &input, spans, span_count,
+        compressed_input_size, body_sink,
+        global_block_begin, rank, comm_size, bins,
+        compress_level, memory_limit, temp_prefix, stats);
+}
+
+static int FusedBamMemoryCollateMPIImpl(
+        MemReader *reader,
+        const swbam::BamInputBackend *input,
+        const swbam::BgzfBlockSpan *spans,
+        size_t span_count,
+        swbam::RankBodySink &body_sink,
         long long global_block_begin,
         int rank, int comm_size, int bins,
         int compress_level, size_t memory_limit,
@@ -3452,9 +3803,15 @@ static int FusedBamMemoryCollateMPI(
     std::vector<CollateMemorySegment> segments;
     // 这一步会读取本 rank 输入，解析所有 BAM records，
     // 把 metadata 放进 records，把原始 BAM record bytes 放进 raw。
-    int local_extract_ok = CollateExtractAll(
-            reader, global_block_begin, bins,
-            &records, &raw, stats) == 0;
+    int extract_ret = reader
+        ? CollateExtractAll(
+              *reader, global_block_begin, bins,
+              &records, &raw, stats)
+        : CollateExtractAll(
+              *input, spans, span_count,
+              global_block_begin, bins,
+              &records, &raw, stats);
+    int local_extract_ok = extract_ret == 0;
     if (!CollateAllRanksOk(local_extract_ok)) {
         return -1;
     }
@@ -3527,12 +3884,63 @@ static int FusedBamMemoryCollateMPI(
     // 6. 合并 segments 并输出
     if (CollateMergeMemory(
             segments, compress_level,
-            &writer, stats) != 0) {
+            &body_sink, stats) != 0) {
         return -1;
     }
     stats->t_actual = GetTime() - wall_t0;
     stats->t_fused = stats->t_actual;
     return 0;
+}
+
+static int FusedBamMemoryCollateMPI(
+        MemReader &reader, swbam::RankBodySink &body_sink,
+        long long global_block_begin,
+        int rank, int comm_size, int bins,
+        int compress_level, size_t memory_limit,
+        MpiCollateStats *stats) {
+    return FusedBamMemoryCollateMPIImpl(
+        &reader, nullptr, nullptr, 0, body_sink,
+        global_block_begin, rank, comm_size, bins,
+        compress_level, memory_limit, stats);
+}
+
+static int FusedBamMemoryCollateMPI(
+        const swbam::BamInputBackend &input,
+        const swbam::BgzfBlockSpan *spans, size_t span_count,
+        swbam::RankBodySink &body_sink,
+        long long global_block_begin,
+        int rank, int comm_size, int bins,
+        int compress_level, size_t memory_limit,
+        MpiCollateStats *stats) {
+    return FusedBamMemoryCollateMPIImpl(
+        nullptr, &input, spans, span_count, body_sink,
+        global_block_begin, rank, comm_size, bins,
+        compress_level, memory_limit, stats);
+}
+
+static int FusedBamMemoryCollateMPI(
+        MemReader &reader, MemWriter &writer,
+        long long global_block_begin,
+        int rank, int comm_size, int bins,
+        int compress_level, size_t memory_limit,
+        MpiCollateStats *stats) {
+    swbam::MemoryRankBodySink body_sink(&writer);
+    return FusedBamMemoryCollateMPI(
+        reader, body_sink, global_block_begin, rank, comm_size,
+        bins, compress_level, memory_limit, stats);
+}
+
+static int FusedBamExternalCollateMPI(
+        MemReader &reader, MemWriter &writer,
+        long long global_block_begin,
+        int rank, int comm_size, int bins,
+        int compress_level, size_t memory_limit,
+        const std::string &temp_prefix,
+        MpiCollateStats *stats) {
+    swbam::MemoryRankBodySink body_sink(&writer);
+    return FusedBamExternalCollateMPI(
+        reader, body_sink, global_block_begin, rank, comm_size,
+        bins, compress_level, memory_limit, temp_prefix, stats);
 }
 
 static void CollatePrintStats(
@@ -4093,24 +4501,23 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
 
     int exit_code = 1;
     int local_ok = 1;
-    char *input_memory = nullptr;
-    size_t input_size = 0;
-    hFILE *input_hfile = nullptr;
-    samFile *input = nullptr;
+    swbam::mpi::MpiBamInput input_handle;
+    swbam::BamInputBackend *input_backend = nullptr;
+    swbam::MemoryBamInput *memory_input = nullptr;
+    swbam::mpi::MpiBamInputPlan input_plan;
     sam_hdr_t *header = nullptr;
     long long body_start = 0;
-    std::vector<long long> block_offsets;
-    std::vector<long long> block_lengths;
     long long n_blocks = 0;
     long long local_begin = 0;
     long long local_end = 0;
     char *rank_input = nullptr;
     size_t rank_input_size = 0;
     MemReader reader = {};
-    MemWriter writer = {};
+    swbam::AdaptiveRankBodySink rank_body_sink;
     MpiCollateStats stats = {};
     CollateOutputStageCosts output_costs = {};
     size_t memory_limit = 0;
+    uint64_t rank_body_memory_limit = 0;
     int collate_bins = cmd_info->collate_bins_;
     std::string temp_prefix;
     double body_total_t0 = 0.0;
@@ -4127,6 +4534,17 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
             fprintf(
                 stderr,
                 "ERROR: invalid collate bins or memory limit.\n");
+        }
+        local_ok = 0;
+    }
+    if (swbam::ParseByteSize(
+            cmd_info->rank_body_memory_limit_,
+            &rank_body_memory_limit) != 0 ||
+        rank_body_memory_limit == 0) {
+        if (rank == 0) {
+            fprintf(stderr,
+                    "ERROR: invalid rank body memory limit '%s'.\n",
+                    cmd_info->rank_body_memory_limit_.c_str());
         }
         local_ok = 0;
     }
@@ -4159,22 +4577,31 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
     }
 
     {
-        double t0 = GetTime();
-        if (MpiCommonLoadFileToMemory(
-                cmd_info->in_file_name_,
-                &input_memory, &input_size) != 0) {
+        if (input_handle.Open(
+                cmd_info->in_file_name_, cmd_info->io_backend_,
+                cmd_info->io_memory_limit_) != 0) {
             fprintf(
                 stderr,
-                "[rank %d] ERROR: cannot preload collate input %s.\n",
+                "[rank %d] ERROR: cannot open collate input %s.\n",
                 rank,
                 cmd_info->in_file_name_.c_str());
             local_ok = 0;
         }
-        double cost =
-            CollateReduceMax(GetTime() - t0);
+        input_backend = input_handle.backend();
+        if (local_ok && (!input_backend ||
+                         input_backend->format() != bam)) {
+            local_ok = 0;
+        }
+        memory_input = dynamic_cast<swbam::MemoryBamInput *>(
+            input_backend);
+        double cost = CollateReduceMax(
+            input_handle.data_open_cost());
         if (rank == 0 && local_ok) {
+            printf("MPI BAM input backend=%s auto_memory_budget=%llu\n",
+                   input_handle.selected_backend().c_str(),
+                   (unsigned long long)input_handle.auto_memory_budget());
             printf(
-                "222Complete the memory cost %lf--\n",
+                "222Complete the input open cost %lf--\n",
                 cost);
         }
     }
@@ -4182,37 +4609,20 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
 
     {
         double t0 = GetTime();
-        input_hfile = hopen(
-            "mem:", "rb:", input_memory, input_size);
-        if (input_hfile) {
-            input = (samFile *)hts_hopen(
-                input_hfile, "data", "rb");
-            if (input) input_hfile = nullptr;
+        if (local_ok && input_backend->header()) {
+            header = sam_hdr_dup(input_backend->header());
         }
-        if (!input) local_ok = 0;
-        if (local_ok) header = sam_hdr_read(input);
         if (!header) local_ok = 0;
-        if (local_ok &&
-            input->format.format != bam &&
-            input->format.format != binary_format) {
-            if (rank == 0) {
-                fprintf(
-                    stderr,
-                    "ERROR: RabbitBAM-MPI collate only supports BAM input.\n");
-            }
-            local_ok = 0;
-        }
         if (local_ok) {
-            body_start =
-                (long long)input->fp.bgzf->block_address;
+            body_start = (long long)input_backend->body_offset();
             if (body_start < 0 ||
                 (unsigned long long)body_start >
-                    input_size) {
+                    (unsigned long long)input_backend->size()) {
                 local_ok = 0;
             }
         }
-        double cost =
-            CollateReduceMax(GetTime() - t0);
+        double cost = CollateReduceMax(
+            input_handle.header_open_cost() + GetTime() - t0);
         if (rank == 0 && local_ok) {
             printf(
                 "333Complete the head cost %lf---\n",
@@ -4241,46 +4651,47 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
                 "MPI BAM collate bins=%d compression=%d\n",
                 collate_bins,
                 cmd_info->compress_level_);
-            if (MpiCommonScanBgzfBlocksInMemory(
-                    input_memory, input_size,
-                    body_start, &block_offsets,
-                    &block_lengths) != 0) {
+        }
+        if (swbam::mpi::PrepareMpiBamInputPlan(
+                *input_backend, &input_plan) != 0) {
+            local_ok = 0;
+        }
+        n_blocks = (long long)input_plan.blocks.size();
+        local_begin = (long long)input_plan.rank_begin;
+        local_end = (long long)input_plan.rank_end;
+        rank_input_size = 0;
+        for (size_t i = input_plan.rank_begin;
+             local_ok && i < input_plan.rank_end; ++i) {
+            const size_t block_size = input_plan.blocks[i].compressed_size;
+            if (block_size > SIZE_MAX - rank_input_size) {
+                local_ok = 0;
+            } else {
+                rank_input_size += block_size;
+            }
+        }
+        if (local_ok && memory_input && input_plan.rank_block_count() > 0) {
+            const swbam::BgzfBlockSpan *spans = input_plan.rank_spans();
+            const uint64_t start = spans[0].offset;
+            uint64_t expected = start;
+            for (size_t i = 0;
+                 local_ok && i < input_plan.rank_block_count(); ++i) {
+                if (spans[i].offset != expected) {
+                    local_ok = 0;
+                } else {
+                    expected += spans[i].compressed_size;
+                }
+            }
+            if (local_ok &&
+                (start > memory_input->size() ||
+                 rank_input_size > memory_input->size() - (size_t)start)) {
                 local_ok = 0;
             }
-            n_blocks =
-                (long long)block_offsets.size();
-            if (n_blocks > INT_MAX) local_ok = 0;
-        }
-        MPI_Bcast(
-            &local_ok, 1, MPI_INT, 0,
-            MPI_COMM_WORLD);
-        if (!local_ok) goto cleanup;
-        MPI_Bcast(
-            &n_blocks, 1, MPI_LONG_LONG, 0,
-            MPI_COMM_WORLD);
-        if (rank != 0) {
-            block_offsets.resize((size_t)n_blocks);
-            block_lengths.resize((size_t)n_blocks);
-        }
-        if (n_blocks > 0) {
-            MPI_Bcast(
-                block_offsets.data(), (int)n_blocks,
-                MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-            MPI_Bcast(
-                block_lengths.data(), (int)n_blocks,
-                MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        }
-        local_begin =
-            n_blocks * rank / comm_size;
-        local_end =
-            n_blocks * (rank + 1) / comm_size;
-        if (MpiCommonSelectBlockRangeFromMemory(
-                input_memory, input_size,
-                block_offsets, block_lengths,
-                local_begin, local_end,
-                &rank_input,
-                &rank_input_size) != 0) {
-            local_ok = 0;
+            if (local_ok) {
+                rank_input = memory_input->data() + (size_t)start;
+                reader.base = rank_input;
+                reader.size = rank_input_size;
+                reader.pos = 0;
+            }
         }
         double cost =
             CollateReduceMax(GetTime() - t0);
@@ -4299,13 +4710,18 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
 
     {
         double t0 = GetTime();
-        reader.base = rank_input;
-        reader.size = rank_input_size;
-        reader.pos = 0;
-        if (MpiCommonInitMemWriter(
-                writer, rank_input_size
-                    ? rank_input_size
-                    : 1024 * 1024) != 0) {
+        char spool_prefix[96];
+        snprintf(spool_prefix, sizeof(spool_prefix),
+                 "rabbitbam-collate-rank-%d.body", rank);
+        if (rank_body_sink.Open(
+                cmd_info->rank_body_backend_, rank_body_memory_limit,
+                rank_input_size ? rank_input_size : 1024 * 1024,
+                spool_prefix, cmd_info->rank_body_temp_dir_) != 0) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: failed to open collate rank body "
+                    "sink backend=%s temp_dir=%s.\n",
+                    rank, cmd_info->rank_body_backend_.c_str(),
+                    cmd_info->rank_body_temp_dir_.c_str());
             local_ok = 0;
         }
         stage42_cost =
@@ -4357,20 +4773,32 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
 
         //4.3 核心部分
         double t0 = GetTime();
-        int ret = use_external
-            ? FusedBamExternalCollateMPI(
-                  reader, writer, local_begin,
-                  rank, comm_size,
-                  collate_bins,
-                  cmd_info->compress_level_,
-                  memory_limit, temp_prefix, &stats)
-            : FusedBamMemoryCollateMPI(
-                  reader, writer, local_begin,
-                  rank, comm_size,
-                  collate_bins,
-                  cmd_info->compress_level_,
-                  memory_limit,
-                  &stats);
+        int ret = 0;
+        if (memory_input) {
+            ret = use_external
+                ? FusedBamExternalCollateMPI(
+                      reader, rank_body_sink, local_begin,
+                      rank, comm_size, collate_bins,
+                      cmd_info->compress_level_, memory_limit,
+                      temp_prefix, &stats)
+                : FusedBamMemoryCollateMPI(
+                      reader, rank_body_sink, local_begin,
+                      rank, comm_size, collate_bins,
+                      cmd_info->compress_level_, memory_limit, &stats);
+        } else {
+            ret = use_external
+                ? FusedBamExternalCollateMPI(
+                      *input_backend, input_plan.rank_spans(),
+                      input_plan.rank_block_count(), rank_input_size,
+                      rank_body_sink, local_begin, rank, comm_size,
+                      collate_bins, cmd_info->compress_level_,
+                      memory_limit, temp_prefix, &stats)
+                : FusedBamMemoryCollateMPI(
+                      *input_backend, input_plan.rank_spans(),
+                      input_plan.rank_block_count(), rank_body_sink,
+                      local_begin, rank, comm_size, collate_bins,
+                      cmd_info->compress_level_, memory_limit, &stats);
+        }
         if (ret != 0) local_ok = 0;
         int global_ok =
             CollateAllRanksOk(local_ok);
@@ -4394,11 +4822,27 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
         if (!global_ok) goto cleanup;
     }
 
+    if (rank_body_sink.Flush() != 0) local_ok = 0;
+    if (!CollateAllRanksOk(local_ok)) goto cleanup;
+    {
+        const int local_spool = rank_body_sink.is_memory() ? 0 : 1;
+        int spool_ranks = 0;
+        MPI_Reduce(&local_spool, &spool_ranks, 1, MPI_INT,
+                   MPI_SUM, 0, MPI_COMM_WORLD);
+        if (rank == 0) {
+            printf("MPI rank body backend requested=%s "
+                   "memory_ranks=%d spool_ranks=%d\n",
+                   cmd_info->rank_body_backend_.c_str(),
+                   comm_size - spool_ranks, spool_ranks);
+        }
+    }
+
     if (CollateGatherOutput(
-            writer, header,
+            rank_body_sink, header,
             cmd_info->compress_level_,
             cmd_info->out_file_name_,
             nullptr,
+            cmd_info->io_output_backend_ == "mpiio",
             rank, comm_size,
             collate_bins,
             &stats, &output_costs,
@@ -4410,17 +4854,9 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
     exit_code = 0;
 
 cleanup:
-    if (input) {
-        if (sam_close(input) < 0) exit_code = 1;
-        input = nullptr;
-    }
-    if (input_hfile &&
-        hclose(input_hfile) != 0) {
-        exit_code = 1;
-    }
     if (header) sam_hdr_destroy(header);
-    free(input_memory);
-    free(writer.data);
+    input_handle.Close();
+    rank_body_sink.Close();
     if (rank == 0) {
         printf(
             "666collate total process cost %lf-----\n",

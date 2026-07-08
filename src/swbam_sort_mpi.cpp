@@ -1,4 +1,5 @@
 #include "swbam_mpi.h"
+#include "swbam/mpi_runtime.h"
 
 #include <algorithm>
 #include <cctype>
@@ -913,11 +914,11 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
 
     int exit_code = 1;
     int local_ok = 1;
-    samFile *sin = nullptr;
+    swbam::mpi::MpiBamInput input_handle;
+    swbam::BamInputBackend *input_backend = nullptr;
+    swbam::MemoryBamInput *memory_input = nullptr;
+    swbam::mpi::MpiBamInputPlan input_plan;
     sam_hdr_t *hdr = nullptr;
-    hFILE *input_mem_hfile = nullptr;
-    char *input_file_mem = nullptr;
-    size_t input_file_size = 0;
     char *rank_input_mem = nullptr;
     char *bam_header_mem = nullptr;
     size_t bam_header_size = 0;
@@ -927,12 +928,11 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
     size_t output_body_start = 0;
     size_t simulated_write_size = 0;
     MemReader reader = {};
-    MemWriter mem_writer = {};
+    swbam::AdaptiveRankBodySink rank_body_sink;
     MpiSortStats stats = {};
-    std::vector<long long> block_offsets;
-    std::vector<long long> block_lengths;
     std::vector<long long> body_sizes;
     std::vector<long long> body_prefixes;
+    std::vector<unsigned char> body_chunk;
     long long body_start = 0;
     long long n_blocks = 0;
     long long local_block_begin = 0;
@@ -941,11 +941,23 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
     long long local_prefix = 0;
     long long total_body_size = 0;
     size_t memory_limit = 0;
+    uint64_t rank_body_memory_limit = 0;
     std::string sort_temp_prefix;
     volatile unsigned long long simulated_write_guard = 0;
 
     if (MpiSortParseMemoryLimit(cmd_info->sort_memory_, &memory_limit) != 0) {
         if (rank == 0) fprintf(stderr, "ERROR: invalid sort memory limit '%s'.\n", cmd_info->sort_memory_.c_str());
+        local_ok = 0;
+    }
+    if (swbam::ParseByteSize(
+            cmd_info->rank_body_memory_limit_,
+            &rank_body_memory_limit) != 0 ||
+        rank_body_memory_limit == 0) {
+        if (rank == 0) {
+            fprintf(stderr,
+                    "ERROR: invalid rank body memory limit '%s'.\n",
+                    cmd_info->rank_body_memory_limit_.c_str());
+        }
         local_ok = 0;
     }
     if (!cmd_info->sort_temp_prefix_.empty()) {
@@ -965,71 +977,50 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
     }
 
 
-    //2.把文件加载到所有rank的内存中，一共6份，每个rank一份，后续每个rank从内存中读取自己的部分进行处理，
-    //不计入处理时间
+    //2. 通过公共 backend 打开 BAM；memory 仍是默认快速路径。
     {
-        double preload_t0 = GetTime();
-        if (MpiSortLoadFileToMemory(cmd_info->in_file_name_, &input_file_mem, &input_file_size) != 0) {
-            fprintf(stderr, "[rank %d] ERROR: cannot preload input %s into memory\n",
+        if (input_handle.Open(
+                cmd_info->in_file_name_, cmd_info->io_backend_,
+                cmd_info->io_memory_limit_) != 0) {
+            fprintf(stderr, "[rank %d] ERROR: cannot open sort input %s\n",
                     rank, cmd_info->in_file_name_.c_str());
             local_ok = 0;
         }
-        double preload_cost = GetTime() - preload_t0;
-        double preload_cost_max = MpiSortReduceMaxCost(preload_cost);
-        if (rank == 0 && local_ok) printf("222Complete the memory cost %lf--\n", preload_cost_max);
+        input_backend = input_handle.backend();
+        if (local_ok && (!input_backend ||
+                         MpiSortNormalizeFormat(input_backend->format()) != bam)) {
+            local_ok = 0;
+        }
+        memory_input = dynamic_cast<swbam::MemoryBamInput *>(input_backend);
+        double open_cost_max = MpiSortReduceMaxCost(
+            input_handle.data_open_cost());
+        if (rank == 0 && local_ok) {
+            printf("MPI BAM input backend=%s auto_memory_budget=%llu\n",
+                   input_handle.selected_backend().c_str(),
+                   (unsigned long long)input_handle.auto_memory_budget());
+            printf("222Complete the input open cost %lf--\n", open_cost_max);
+        }
     }
     if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
 
 
-    //3.从内存创建 HTSlib 输入句柄并读取 BAM header，顺便判断输入输出格式是否合法，
-    //记录BAM/SAM body的起始位置
+    //3. 从 backend 复制 header，并记录 BAM body 起始位置。
     {
         double header_t0 = GetTime();
-        input_mem_hfile = hopen("mem:", "rb:", input_file_mem, input_file_size);
-        if (!input_mem_hfile) {
-            fprintf(stderr, "[rank %d] ERROR: cannot open preloaded BAM memory for %s\n",
-                    rank, cmd_info->in_file_name_.c_str());
-            local_ok = 0;
+        if (local_ok && input_backend->header()) {
+            hdr = sam_hdr_dup(input_backend->header());
         }
+        if (!hdr) local_ok = 0;
         if (local_ok) {
-            sin = (samFile *)hts_hopen(input_mem_hfile, "data", "rb");
-            if (!sin) {
-                fprintf(stderr, "[rank %d] ERROR: cannot create HTS input handle from memory\n", rank);
-                if (hclose(input_mem_hfile) != 0) {
-                    fprintf(stderr, "[rank %d] ERROR: closing failed HTS memory handle failed.\n", rank);
-                }
-                input_mem_hfile = nullptr;
-                input_file_mem = nullptr;
-                input_file_size = 0;
-                local_ok = 0;
-            } else {
-                input_mem_hfile = nullptr;
-            }
-        }
-        if (local_ok) {
-            hdr = sam_hdr_read(sin);
-            if (!hdr) {
-                fprintf(stderr, "[rank %d] ERROR: cannot read header from %s\n",
-                        rank, cmd_info->in_file_name_.c_str());
-                local_ok = 0;
-            }
-        }
-        if (local_ok) {
-            //sort v1 目前只支持 BAM 输入，不支持 SAM/CRAM
-            int input_format = MpiSortNormalizeFormat(sin->format.format);
-            if (input_format != bam) {
-                if (rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI sort v1 only supports BAM input.\n");
-                local_ok = 0;
-            }
-        }
-        if (local_ok) {
-            body_start = (long long)sin->fp.bgzf->block_address;
-            if (body_start < 0 || (unsigned long long)body_start > (unsigned long long)input_file_size) {
+            body_start = (long long)input_backend->body_offset();
+            if (body_start < 0 || (unsigned long long)body_start >
+                    (unsigned long long)input_backend->size()) {
                 fprintf(stderr, "[rank %d] ERROR: invalid BAM body start offset %lld.\n", rank, body_start);
                 local_ok = 0;
             }
         }
-        double header_cost = GetTime() - header_t0;
+        double header_cost = input_handle.header_open_cost() +
+                             GetTime() - header_t0;
         double header_cost_max = MpiSortReduceMaxCost(header_cost);
         if (rank == 0 && local_ok) printf("333Complete the head cost %lf---\n", header_cost_max);
     }
@@ -1041,72 +1032,78 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
         double body_total_t0 = GetTime();
         double body_t0 = GetTime();
 
-        //4.1 rank 0 扫描 BGZF blocks
+        //4.1 公共 runtime 扫描 BGZF blocks 并按 rank 分区。
         double stage41_t0 = GetTime();
         if (rank == 0) {
             printf("Enable MPI BAM SORT mode (%d MPE + %d CPEs)!!!\n",
                    comm_size, comm_size * 64);
             printf("MPI BAM output compression level=%d\n", cmd_info->compress_level_);
-            if (MpiSortScanBgzfBlocksInMemory(input_file_mem, input_file_size, body_start,
-                                              &block_offsets, &block_lengths) != 0) {
-                fprintf(stderr, "ERROR: failed to scan input BGZF blocks.\n");
+        }
+        if (swbam::mpi::PrepareMpiBamInputPlan(
+                *input_backend, &input_plan) != 0) {
+            local_ok = 0;
+        }
+        n_blocks = (long long)input_plan.blocks.size();
+        local_block_begin = (long long)input_plan.rank_begin;
+        local_block_end = (long long)input_plan.rank_end;
+        size_t rank_input_size = 0;
+        for (size_t i = input_plan.rank_begin;
+             local_ok && i < input_plan.rank_end; ++i) {
+            const size_t block_size = input_plan.blocks[i].compressed_size;
+            if (block_size > SIZE_MAX - rank_input_size) {
                 local_ok = 0;
+            } else {
+                rank_input_size += block_size;
             }
-            n_blocks = (long long)block_offsets.size();
-            if (local_ok && n_blocks > (long long)INT_MAX) {
-                fprintf(stderr, "ERROR: too many BGZF blocks for MPI_Bcast in RabbitBAM-MPI sort v1.\n");
+        }
+        if (local_ok && memory_input && input_plan.rank_block_count() > 0) {
+            const swbam::BgzfBlockSpan *spans = input_plan.rank_spans();
+            const uint64_t start = spans[0].offset;
+            uint64_t expected = start;
+            for (size_t i = 0;
+                 local_ok && i < input_plan.rank_block_count(); ++i) {
+                if (spans[i].offset != expected) {
+                    local_ok = 0;
+                } else {
+                    expected += spans[i].compressed_size;
+                }
+            }
+            if (local_ok &&
+                (start > memory_input->size() ||
+                 rank_input_size > memory_input->size() - (size_t)start)) {
                 local_ok = 0;
             }
             if (local_ok) {
-                printf("MPI BAM scan complete. data_blocks=%lld body_start=%lld header_end=%lld\n",
-                       n_blocks, body_start, (long long)sin->fp.bgzf->block_address);
+                rank_input_mem = memory_input->data() + (size_t)start;
+                reader.base = rank_input_mem;
+                reader.size = rank_input_size;
+                reader.pos = 0;
             }
-        }
-
-        //把 block 信息广播给所有 rank
-        MPI_Bcast(&local_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        if (!local_ok) goto cleanup;
-        MPI_Bcast(&body_start, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        MPI_Bcast(&n_blocks, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        if (rank != 0) {
-            block_offsets.resize((size_t)n_blocks);
-            block_lengths.resize((size_t)n_blocks);
-        }
-        if (n_blocks > 0) {
-            MPI_Bcast(block_offsets.data(), (int)n_blocks, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-            MPI_Bcast(block_lengths.data(), (int)n_blocks, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        }
-
-        //按 rank 切分 block 范围，每个 rank 直接使用预加载输入内存中的连续窗口
-        local_block_begin = n_blocks * rank / comm_size;
-        local_block_end = n_blocks * (rank + 1) / comm_size;
-        size_t rank_input_size = 0;
-        if (MpiSortSelectBlockRangeFromMemory(input_file_mem, input_file_size,
-                                              block_offsets, block_lengths,
-                                              local_block_begin, local_block_end,
-                                              &rank_input_mem, &rank_input_size) != 0) {
-            fprintf(stderr, "[rank %d] ERROR: failed to select assigned BGZF block range [%lld, %lld).\n",
-                    rank, local_block_begin, local_block_end);
-            local_ok = 0;
         }
         double stage41_cost = GetTime() - stage41_t0;
         double stage41_cost_max = MpiSortReduceMaxCost(stage41_cost);
         if (rank == 0 && local_ok) {
+            printf("MPI BAM scan complete. data_blocks=%lld body_start=%lld\n",
+                   n_blocks, body_start);
             printf("Complete the 4.1 scan/split/broadcast/select cost %lf\n", stage41_cost_max);
         }
         if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
 
-        //4.2 初始化每个rank的局部内存 reader 和 writer
+        //4.2 初始化每个 rank 的自适应 body sink。
         double stage42_t0 = GetTime();
-        reader.base = rank_input_mem;
-        reader.size = rank_input_size;
-        reader.pos = 0;
-        {
-            size_t writer_capacity = rank_input_size ? rank_input_size : 64 * 1024 * 1024;
-            if (MpiSortInitMemWriter(mem_writer, writer_capacity) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: failed to allocate MPI sort memory writer.\n", rank);
-                local_ok = 0;
-            }
+        char spool_prefix[96];
+        snprintf(spool_prefix, sizeof(spool_prefix),
+                 "rabbitbam-sort-rank-%d.body", rank);
+        if (rank_body_sink.Open(
+                cmd_info->rank_body_backend_, rank_body_memory_limit,
+                rank_input_size ? rank_input_size : 64 * 1024 * 1024,
+                spool_prefix, cmd_info->rank_body_temp_dir_) != 0) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: failed to open sort rank body sink "
+                    "backend=%s temp_dir=%s.\n",
+                    rank, cmd_info->rank_body_backend_.c_str(),
+                    cmd_info->rank_body_temp_dir_.c_str());
+            local_ok = 0;
         }
         int stage42_ok = MpiSortAllRanksOk(local_ok);
         double stage42_cost = GetTime() - stage42_t0;
@@ -1136,12 +1133,31 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
         }
 
         double fused_t0 = GetTime();
-        int fused_ret = use_external
-            ? FusedBamExternalSortMPI(reader, mem_writer, local_block_begin, rank, comm_size,
-                                      cmd_info->compress_level_, memory_limit,
-                                      sort_temp_prefix.c_str(), &stats)
-            : FusedBamSortMPI(reader, mem_writer, local_block_begin, rank, comm_size,
-                              cmd_info->compress_level_, memory_limit, &stats);
+        int fused_ret = 0;
+        if (memory_input) {
+            fused_ret = use_external
+                ? FusedBamExternalSortMPI(
+                      reader, rank_body_sink, local_block_begin,
+                      rank, comm_size, cmd_info->compress_level_,
+                      memory_limit, sort_temp_prefix.c_str(), &stats)
+                : FusedBamSortMPI(
+                      reader, rank_body_sink, local_block_begin,
+                      rank, comm_size, cmd_info->compress_level_,
+                      memory_limit, &stats);
+        } else {
+            fused_ret = use_external
+                ? FusedBamExternalSortMPI(
+                      *input_backend, input_plan.rank_spans(),
+                      input_plan.rank_block_count(), rank_body_sink,
+                      local_block_begin, rank, comm_size,
+                      cmd_info->compress_level_, memory_limit,
+                      sort_temp_prefix.c_str(), &stats)
+                : FusedBamSortMPI(
+                      *input_backend, input_plan.rank_spans(),
+                      input_plan.rank_block_count(), rank_body_sink,
+                      local_block_begin, rank, comm_size,
+                      cmd_info->compress_level_, memory_limit, &stats);
+        }
         if (fused_ret != 0) {
             fprintf(stderr, "[rank %d] ERROR: MPI BAM sort fused body failed.\n", rank);
             local_ok = 0;
@@ -1176,7 +1192,24 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
 
         //4.4 收集每个 rank 的输出大小
         double stage44_t0 = GetTime();
-        local_body_size = (long long)mem_writer.size;
+        if (rank_body_sink.Flush() != 0 ||
+            rank_body_sink.size() > (uint64_t)LLONG_MAX) {
+            local_ok = 0;
+        }
+        if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+        local_body_size = (long long)rank_body_sink.size();
+        {
+            const int local_spool = rank_body_sink.is_memory() ? 0 : 1;
+            int spool_ranks = 0;
+            MPI_Reduce(&local_spool, &spool_ranks, 1, MPI_INT,
+                       MPI_SUM, 0, MPI_COMM_WORLD);
+            if (rank == 0) {
+                printf("MPI rank body backend requested=%s "
+                       "memory_ranks=%d spool_ranks=%d\n",
+                       cmd_info->rank_body_backend_.c_str(),
+                       comm_size - spool_ranks, spool_ranks);
+            }
+        }
         body_sizes.assign((size_t)comm_size, 0);
         body_prefixes.assign((size_t)comm_size, 0);
         MPI_Allgather(&local_body_size, 1, MPI_LONG_LONG,
@@ -1240,7 +1273,18 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
 
         //4.5b 分配每个 rank 的本地模拟写内存，这部分不计入处理时间
         double stage45_malloc_t0 = GetTime();
-        simulated_write_size = (local_body_size > 0) ? (size_t)local_body_size : 0;
+        const size_t simulation_chunk = 8u * 1024u * 1024u;
+        simulated_write_size = rank_body_sink.is_memory()
+            ? ((local_body_size > 0) ? (size_t)local_body_size : 0)
+            : (size_t)std::min<long long>(local_body_size,
+                                          (long long)simulation_chunk);
+        if (!rank_body_sink.is_memory() && local_body_size > 0) {
+            try {
+                body_chunk.resize(simulated_write_size);
+            } catch (...) {
+                local_ok = 0;
+            }
+        }
         if (rank == 0) {
             if (output_body_start > SIZE_MAX - simulated_write_size) {
                 fprintf(stderr, "[rank %d] ERROR: simulated output memory estimate overflow.\n", rank);
@@ -1266,27 +1310,61 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
         if (!stage45_malloc_ok) goto cleanup;
 
         //4.6 各 rank 根据逻辑偏移模拟写入高速磁盘内存，只统计 memcpy 时间
-        double sim_write_t0 = GetTime();
+        double sim_write_cost = 0.0;
+        double body_source_read_cost = 0.0;
         size_t simulated_pos = 0;
         if (rank == 0 && output_body_start > 0) {
+            double copy_t0 = GetTime();
             memcpy(simulated_write_mem + simulated_pos, bam_header_mem, bam_header_size);
+            sim_write_cost += GetTime() - copy_t0;
             simulated_pos += bam_header_size;
         }
         if (local_body_size > 0) {
-            memcpy(simulated_write_mem + simulated_pos, mem_writer.data, (size_t)local_body_size);
-            simulated_pos += (size_t)local_body_size;
+            const MemWriter *memory_writer = rank_body_sink.memory_writer();
+            if (memory_writer) {
+                double copy_t0 = GetTime();
+                memcpy(simulated_write_mem + simulated_pos,
+                       memory_writer->data, (size_t)local_body_size);
+                sim_write_cost += GetTime() - copy_t0;
+                simulated_pos += (size_t)local_body_size;
+            } else {
+                uint64_t copied = 0;
+                const size_t destination_offset = simulated_pos;
+                while (local_ok && copied < rank_body_sink.size()) {
+                    const size_t count = (size_t)std::min<uint64_t>(
+                        rank_body_sink.size() - copied, body_chunk.size());
+                    double read_t0 = GetTime();
+                    if (rank_body_sink.ReadAt(
+                            copied, body_chunk.data(), count) != 0) {
+                        local_ok = 0;
+                        break;
+                    }
+                    body_source_read_cost += GetTime() - read_t0;
+                    double copy_t0 = GetTime();
+                    memcpy(simulated_write_mem + destination_offset,
+                           body_chunk.data(), count);
+                    sim_write_cost += GetTime() - copy_t0;
+                    copied += count;
+                }
+                simulated_pos += simulated_write_size;
+            }
         }
         if (simulated_pos > 0) {
             unsigned char *guard_ptr = (unsigned char *)simulated_write_mem;
             simulated_write_guard += guard_ptr[0];
             simulated_write_guard += guard_ptr[simulated_pos - 1];
         }
-        double sim_write_cost = GetTime() - sim_write_t0;
         stats.t_write += sim_write_cost;
         global_ok = MpiSortAllRanksOk(local_ok);
         double stage46_cost_max = MpiSortReduceMaxCost(sim_write_cost);
+        double body_source_read_cost_max =
+            MpiSortReduceMaxCost(body_source_read_cost);
         if (rank == 0 && global_ok) {
             printf("Complete the 4.6 simulated header/body distributed write cost %lf\n", stage46_cost_max);
+            if (body_source_read_cost_max > 0.0) {
+                printf("Rank body source read diagnostic cost %lf\n",
+                       body_source_read_cost_max);
+            }
         }
         if (simulated_write_guard == (unsigned long long)-1 && rank < 0) {
             fprintf(stderr, "unused simulated write guard %llu\n", simulated_write_guard);
@@ -1379,7 +1457,8 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
         double global_double_stats[39] = {};
         MPI_Reduce(local_double_stats, global_double_stats, 39, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
 
-        MpiSortPrintRankStats(rank, comm_size, stats, mem_writer.size);
+        MpiSortPrintRankStats(rank, comm_size, stats,
+                              (size_t)rank_body_sink.size());
         if (rank == 0) {
             printf("FusedBamSortMPI finished. mode=%s ranks=%d in_blocks=%lld local_records=%lld received_records=%lld samples=%lld bgzf_blocks=%lld body_bytes=%lld\n",
                    stats.sort_mode == 1 ? "external" : "memory",
@@ -1449,8 +1528,62 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
     }
 
 
-    //5. rank 0 为验证结果汇总输出内存并写入文件，不计入处理时间
+    //5. 最终输出不计入核心时间：memory 汇总到 rank 0，mpiio 分布式直写。
     {
+        if (cmd_info->io_output_backend_ == "mpiio") {
+            double write_t0 = GetTime();
+            swbam::mpi::MpiFileOutput output;
+            if (output.Open(cmd_info->out_file_name_,
+                            (uint64_t)output_file_size) != 0) {
+                local_ok = 0;
+            }
+            if (MpiSortAllRanksOk(local_ok)) {
+                if (rank == 0 && bam_header_size > 0 &&
+                    output.WriteAt(0, bam_header_mem,
+                                   bam_header_size) != 0) {
+                    local_ok = 0;
+                }
+                const size_t chunk_capacity = (size_t)std::min<uint64_t>(
+                    rank_body_sink.size(), 8ull * 1024ull * 1024ull);
+                try {
+                    body_chunk.resize(chunk_capacity);
+                } catch (...) {
+                    local_ok = 0;
+                }
+                uint64_t copied = 0;
+                while (local_ok && copied < rank_body_sink.size()) {
+                    const size_t count = (size_t)std::min<uint64_t>(
+                        rank_body_sink.size() - copied, body_chunk.size());
+                    if (rank_body_sink.ReadAt(
+                            copied, body_chunk.data(), count) != 0 ||
+                        output.WriteAt(
+                            (uint64_t)output_body_start +
+                            (uint64_t)body_prefixes[(size_t)rank] + copied,
+                            body_chunk.data(), count) != 0) {
+                        local_ok = 0;
+                    }
+                    copied += count;
+                }
+                if (rank == 0 &&
+                    output.WriteAt(
+                        (uint64_t)output_body_start +
+                        (uint64_t)total_body_size,
+                        kSortBgzfEofBlock,
+                        sizeof(kSortBgzfEofBlock)) != 0) {
+                    local_ok = 0;
+                }
+            }
+            const int writes_ok = MpiSortAllRanksOk(local_ok);
+            if (writes_ok && output.Sync() != 0) local_ok = 0;
+            if (output.Close() != 0) local_ok = 0;
+            const double write_cost_max = MpiSortReduceMaxCost(
+                GetTime() - write_t0);
+            if (rank == 0 && local_ok) {
+                printf("555MPI-IO distributed output cost %lf--\n",
+                       write_cost_max);
+            }
+            if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+        } else {
         double verify_alloc_t0 = GetTime();
         if (rank == 0) {
             output_file_mem = output_file_size ? (char *)malloc(output_file_size) : nullptr;
@@ -1472,28 +1605,61 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
         double verify_gather_t0 = GetTime();
         if (rank == 0) {
             if (local_body_size > 0) {
-                memcpy(output_file_mem + output_body_start + local_prefix,
-                       mem_writer.data, (size_t)local_body_size);
+                if (rank_body_sink.ReadAt(
+                        0, output_file_mem + output_body_start + local_prefix,
+                        (size_t)local_body_size) != 0) {
+                    local_ok = 0;
+                }
             }
             for (int src = 1; src < comm_size; ++src) {
                 long long recv_size = body_sizes[(size_t)src];
                 if (recv_size <= 0) continue;
-                if (MpiSortRecvBytes(src, 0,
-                                     output_file_mem + output_body_start + body_prefixes[(size_t)src],
-                                     recv_size) != 0) {
-                    fprintf(stderr, "ERROR: failed to gather MPI sort rank %d body into output memory.\n", src);
-                    local_ok = 0;
-                    break;
+                long long received = 0;
+                while (received < recv_size) {
+                    const long long count = std::min<long long>(
+                        recv_size - received, 8ll * 1024ll * 1024ll);
+                    if (MpiSortRecvBytes(
+                            src, 0,
+                            output_file_mem + output_body_start +
+                                body_prefixes[(size_t)src] + received,
+                            count) != 0) {
+                        fprintf(stderr,
+                                "ERROR: failed to gather MPI sort rank %d "
+                                "body into output memory.\n", src);
+                        local_ok = 0;
+                        break;
+                    }
+                    received += count;
                 }
+                if (!local_ok) break;
             }
             if (local_ok) {
                 memcpy(output_file_mem + output_body_start + total_body_size,
                        kSortBgzfEofBlock, sizeof(kSortBgzfEofBlock));
             }
         } else if (local_body_size > 0) {
-            if (MpiSortSendBytes(0, 0, mem_writer.data, local_body_size) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: failed to send sort output body to rank 0.\n", rank);
+            const size_t chunk_capacity = (size_t)std::min<long long>(
+                local_body_size, 8ll * 1024ll * 1024ll);
+            try {
+                body_chunk.resize(chunk_capacity);
+            } catch (...) {
                 local_ok = 0;
+            }
+            uint64_t sent = 0;
+            while (local_ok && sent < rank_body_sink.size()) {
+                const size_t count = (size_t)std::min<uint64_t>(
+                    rank_body_sink.size() - sent, body_chunk.size());
+                if (rank_body_sink.ReadAt(
+                        sent, body_chunk.data(), count) != 0 ||
+                    MpiSortSendBytes(
+                        0, 0, (const char *)body_chunk.data(),
+                        (long long)count) != 0) {
+                    fprintf(stderr,
+                            "[rank %d] ERROR: failed to send sort output "
+                            "body to rank 0.\n", rank);
+                    local_ok = 0;
+                }
+                sent += count;
             }
         }
         double verify_gather_cost = GetTime() - verify_gather_t0;
@@ -1517,6 +1683,7 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
         double dump_cost_max = MpiSortReduceMaxCost(dump_cost);
         if (rank == 0 && local_ok) printf("555Dump memory to output file cost %lf--\n", dump_cost_max);
         if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
+        }
     }
 
     exit_code = 0;
@@ -1526,24 +1693,12 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
 cleanup:
     {
         double close_t0 = GetTime();
-        if (mem_writer.data) free(mem_writer.data);
+        rank_body_sink.Close();
         if (output_file_mem) free(output_file_mem);
         if (bam_header_mem) free(bam_header_mem);
         if (simulated_write_mem) free(simulated_write_mem);
         if (hdr) sam_hdr_destroy(hdr);
-        if (sin) {
-            int ret = hts_close(sin);
-            if (ret < 0) fprintf(stderr, "[rank %d] ERROR: closing input failed.\n", rank);
-            input_file_mem = nullptr;
-        } else if (input_mem_hfile) {
-            if (hclose(input_mem_hfile) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: closing memory hFILE failed.\n", rank);
-            }
-            input_file_mem = nullptr;
-        } else if (input_file_mem) {
-            free(input_file_mem);
-            input_file_mem = nullptr;
-        }
+        input_handle.Close();
         double close_cost = GetTime() - close_t0;
         double close_cost_max = MpiSortReduceMaxCost(close_cost);
         if (rank == 0) printf("666close the files cost %lf-----\n", close_cost_max);
