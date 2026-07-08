@@ -9,6 +9,35 @@ SWBAM 将 BAM 数据搬运、异构流水调度与具体命令语义分离。库
 核心原则是：扩展接口的调用成本只发生在每个 BGZF batch，而不进入逐条 record
 热路径。
 
+## 物理目录与构建目标
+
+公共库和实现实例现在按职责物理分离：
+
+```text
+include/swbam/                  公共 SDK 头文件
+lib/io/                         输入后端、BGZF batch、RankBodySink
+lib/mpi/                        MPI input plan 与分布式输出
+lib/cpe/                        MPE 侧 CPE 读写流水线
+lib/bam/                        raw BAM adapter、filter、writer
+slave/core/                     CPE codec/parser
+slave/operators/                通用和统计类 CPE 算子
+slave/algorithms/               sort/collate/markdup/fixmate 专用 CPE kernel
+apps/mpi/commands/              转换、统计、fixmate 等命令实例
+apps/mpi/algorithms/            sort、collate、markdup 全局算法实例
+apps/mpi/pipelines/             dedup-pipeline 编排
+examples/                       不依赖命令内部类型的 SDK 示例
+```
+
+正式静态库仍为 `swbam_io`、`swbam_mpi_runtime` 和 `swbam_cpe_runtime`。
+`swbam_cpe_kernels` 是传播通用 CPE object files 的 INTERFACE target：Sunway hybrid
+linker 要求从核对象直接参与最终链接，不能把它们先放进普通主核静态 archive。
+sort/collate/markdup/fixmate 专用对象由独立的 `swbam_algorithm_kernels` 提供，
+不会进入普通 SDK 示例。
+
+应用只需链接聚合目标 `swbam::swbam`。`RabbitBAM-MPI` 自身也使用该目标，并额外
+链接 `swbam::algorithm_kernels`，避免主程序和 SDK 示例采用两套不同链接方式。
+公共总头文件是 `swbam/swbam.h`。
+
 ## 分层结构
 
 ### `swbam_io`

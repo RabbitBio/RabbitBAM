@@ -197,6 +197,16 @@ int ScanBgzfBlocksBuffered(int fd, size_t file_size,
 
 } // namespace
 
+BamFilterOptions DefaultBamFilterOptions() {
+    BamFilterOptions options = {};
+    options.min_mapq = -1;
+    options.max_mapq = -1;
+    options.ref_tid = -2;
+    options.min_read_len = -1;
+    options.max_read_len = -1;
+    return options;
+}
+
 BgzfBlockBatch::BgzfBlockBatch()
     : blocks_(nullptr), data_(nullptr), capacity_(0),
       owns_storage_(false) {}

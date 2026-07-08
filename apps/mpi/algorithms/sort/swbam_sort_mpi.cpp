@@ -125,31 +125,6 @@ int MpiSortDumpMemoryToFile(const std::string &path, const char *data, size_t si
     return fclose(fp) == 0 ? 0 : -1;
 }
 
-int MpiSortSendBytes(int dst, int tag, const char *data, long long len) {
-    long long sent = 0;
-    while (sent < len) {
-        int chunk = (int)std::min<long long>(len - sent, INT_MAX);
-        if (MPI_Send((void *)(data + sent), chunk, MPI_BYTE, dst, tag, MPI_COMM_WORLD) != MPI_SUCCESS) {
-            return -1;
-        }
-        sent += chunk;
-    }
-    return 0;
-}
-
-int MpiSortRecvBytes(int src, int tag, char *data, long long len) {
-    long long received = 0;
-    while (received < len) {
-        int chunk = (int)std::min<long long>(len - received, INT_MAX);
-        MPI_Status status;
-        if (MPI_Recv(data + received, chunk, MPI_BYTE, src, tag, MPI_COMM_WORLD, &status) != MPI_SUCCESS) {
-            return -1;
-        }
-        received += chunk;
-    }
-    return 0;
-}
-
 int MpiSortInitMemWriter(MemWriter &w, size_t cap) {
     if (cap == 0) cap = 64 * 1024 * 1024;
     w.data = (char *)malloc(cap);

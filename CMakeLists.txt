@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.13)
 
 # Platform selection (must be before project() to set compiler)
 if(NOT DEFINED PLATFORM)
@@ -7,12 +7,20 @@ endif()
 
 # SWLU option (only available for Sunway platform)
 option(USE_SWLU "Enable SWLU profiling library" OFF)
+option(BUILD_SWBAM_EXAMPLES "Build SWBAM SDK examples" ON)
 
 if(PLATFORM STREQUAL "sunway")
     # Set Sunway compiler before project()
-    set(CMAKE_C_COMPILER swgcc CACHE PATH "C compiler" FORCE)
-    set(CMAKE_CXX_COMPILER swg++ CACHE PATH "C++ compiler" FORCE)
-    message(STATUS "Using Sunway compiler: C=swgcc, CXX=swg++")
+    find_program(SWBAM_SUNWAY_C_COMPILER swgcc HINTS /usr/sw/bin)
+    find_program(SWBAM_SUNWAY_CXX_COMPILER swg++ HINTS /usr/sw/bin)
+    if(NOT SWBAM_SUNWAY_C_COMPILER OR NOT SWBAM_SUNWAY_CXX_COMPILER)
+        message(FATAL_ERROR "Sunway compilers swgcc/swg++ were not found")
+    endif()
+    set(CMAKE_C_COMPILER "${SWBAM_SUNWAY_C_COMPILER}"
+        CACHE FILEPATH "C compiler" FORCE)
+    set(CMAKE_CXX_COMPILER "${SWBAM_SUNWAY_CXX_COMPILER}"
+        CACHE FILEPATH "C++ compiler" FORCE)
+    message(STATUS "Using Sunway compiler: C=${CMAKE_C_COMPILER}, CXX=${CMAKE_CXX_COMPILER}")
 endif()
 
 project(RabbitBAM-X)
@@ -83,35 +91,39 @@ file(GLOB_RECURSE SRC_FILES "src/*.cpp")
 set(MAIN_SRC "${CMAKE_SOURCE_DIR}/src/main.cpp")
 set(CGS_MAIN_SRC "${CMAKE_SOURCE_DIR}/src/main_cgs.cpp")
 file(GLOB CGS_ONLY_SRC "src/*cgs*.cpp")
-file(GLOB MPI_ONLY_SRC "src/*mpi*.cpp")
 set(SINGLE_SRC_FILES ${SRC_FILES})
 list(REMOVE_ITEM SINGLE_SRC_FILES ${CGS_ONLY_SRC})
-list(REMOVE_ITEM SINGLE_SRC_FILES ${MPI_ONLY_SRC})
 set(CGS_SRC_FILES ${SRC_FILES})
 list(REMOVE_ITEM CGS_SRC_FILES ${MAIN_SRC})
-list(REMOVE_ITEM CGS_SRC_FILES ${MPI_ONLY_SRC})
 set(MPI_SRC_FILES ${SRC_FILES})
 list(REMOVE_ITEM MPI_SRC_FILES ${MAIN_SRC})
 list(REMOVE_ITEM MPI_SRC_FILES ${CGS_ONLY_SRC})
-list(APPEND MPI_SRC_FILES
-    "${CMAKE_SOURCE_DIR}/src/swbam_flagstat_mpi.cpp"
-    "${CMAKE_SOURCE_DIR}/src/swbam_stats_mpi.cpp"
-    "${CMAKE_SOURCE_DIR}/src/swbam_sort_mpi.cpp"
-    "${CMAKE_SOURCE_DIR}/src/swbam_sort_fused_mpi.cpp"
-    "${CMAKE_SOURCE_DIR}/src/swbam_markdup_mpi.cpp"
-    "${CMAKE_SOURCE_DIR}/src/swbam_markdup_stream_mpi.cpp"
-    "${CMAKE_SOURCE_DIR}/src/swbam_fixmate_mpi.cpp"
-    "${CMAKE_SOURCE_DIR}/src/swbam_dedup_pipeline_mpi.cpp"
+set(SWBAM_MPI_APP_FILES
+    apps/mpi/main.cpp
+    apps/mpi/commands/swbam_bam2bam_mpi.cpp
+    apps/mpi/commands/swbam_bam2sam_mpi.cpp
+    apps/mpi/commands/swbam_fixmate_mpi.cpp
+    apps/mpi/commands/swbam_flagstat_mpi.cpp
+    apps/mpi/commands/swbam_io_check_mpi.cpp
+    apps/mpi/commands/swbam_mpi_common.cpp
+    apps/mpi/commands/swbam_sam2bam_mpi.cpp
+    apps/mpi/commands/swbam_stats_mpi.cpp
+    apps/mpi/algorithms/sort/swbam_sort_mpi.cpp
+    apps/mpi/algorithms/sort/swbam_sort_fused_mpi.cpp
+    apps/mpi/algorithms/collate/swbam_collate_mpi.cpp
+    apps/mpi/algorithms/markdup/swbam_markdup_mpi.cpp
+    apps/mpi/algorithms/markdup/swbam_markdup_stream_mpi.cpp
+    apps/mpi/pipelines/swbam_dedup_pipeline_mpi.cpp
 )
-list(REMOVE_DUPLICATES MPI_SRC_FILES)
+list(APPEND MPI_SRC_FILES ${SWBAM_MPI_APP_FILES})
 
 if(PLATFORM_SUNWAY)
     set(SUNWAY_MPI_ROOT "/usr/sw/mpi/mpi_20220608_SEA" CACHE PATH "Sunway MPI installation root")
     set(SUNWAY_MPI_LIB_DIR "${SUNWAY_MPI_ROOT}/lib/single_static")
 
     add_library(swbam_io STATIC
-        lib/swbam_io.cpp
-        lib/swbam_rank_body_sink.cpp
+        lib/io/swbam_io.cpp
+        lib/io/swbam_rank_body_sink.cpp
     )
     target_compile_options(swbam_io PRIVATE ${HOST_FLAGS})
     target_include_directories(swbam_io PUBLIC
@@ -120,7 +132,7 @@ if(PLATFORM_SUNWAY)
     )
 
     add_library(swbam_mpi_runtime STATIC
-        lib/swbam_mpi_runtime.cpp
+        lib/mpi/swbam_mpi_runtime.cpp
     )
     target_compile_options(swbam_mpi_runtime PRIVATE ${HOST_FLAGS})
     target_include_directories(swbam_mpi_runtime PUBLIC
@@ -130,13 +142,13 @@ if(PLATFORM_SUNWAY)
     target_link_libraries(swbam_mpi_runtime PUBLIC swbam_io)
 
     add_library(swbam_cpe_runtime STATIC
-        lib/swbam_cpe_pipeline.cpp
-        lib/swbam_cpe_write_pipeline.cpp
-        lib/swbam_generic_compress.cpp
-        lib/swbam_generic_decode.cpp
-        lib/swbam_raw_bam.cpp
-        lib/swbam_raw_bam_filter.cpp
-        lib/swbam_raw_bam_writer.cpp
+        lib/cpe/swbam_cpe_pipeline.cpp
+        lib/cpe/swbam_cpe_write_pipeline.cpp
+        lib/cpe/swbam_generic_compress.cpp
+        lib/cpe/swbam_generic_decode.cpp
+        lib/bam/swbam_raw_bam.cpp
+        lib/bam/swbam_raw_bam_filter.cpp
+        lib/bam/swbam_raw_bam_writer.cpp
     )
     target_compile_options(swbam_cpe_runtime PRIVATE ${HOST_FLAGS})
     target_include_directories(swbam_cpe_runtime PUBLIC
@@ -149,13 +161,15 @@ if(PLATFORM_SUNWAY)
     file(GLOB SLAVE_FILES "slave/*.cpp")
     file(GLOB SLAVE_C_FILES   "slave/*.c")
     file(GLOB CGS_SLAVE_FILES "slave/*cgs*.cpp")
+    set(SWBAM_ALGORITHM_SLAVE_FILES
+        slave/algorithms/sort_mpi.cpp
+        slave/algorithms/collate_mpi.cpp
+        slave/algorithms/markdup_mpi.cpp
+        slave/algorithms/fixmate_mpi.cpp
+    )
     list(REMOVE_ITEM SLAVE_C_FILES "${CMAKE_SOURCE_DIR}/slave/slave_crc32_bench.c")
-    set(SINGLE_SLAVE_FILES ${SLAVE_FILES})
-    list(REMOVE_ITEM SINGLE_SLAVE_FILES ${CGS_SLAVE_FILES})
-    list(APPEND SINGLE_SLAVE_FILES "${CMAKE_SOURCE_DIR}/slave/slave_sort_mpi.cpp")
-    list(APPEND SINGLE_SLAVE_FILES "${CMAKE_SOURCE_DIR}/slave/slave_markdup_mpi.cpp")
-    list(APPEND SINGLE_SLAVE_FILES "${CMAKE_SOURCE_DIR}/slave/slave_fixmate_mpi.cpp")
-    list(REMOVE_DUPLICATES SINGLE_SLAVE_FILES)
+    set(SWBAM_CPE_SUPPORT_FILES ${SLAVE_FILES})
+    list(REMOVE_ITEM SWBAM_CPE_SUPPORT_FILES ${CGS_SLAVE_FILES})
     # Include slave_zlib source files (compile with -mslave)
     # Only files in slave_zlib directory, not subdirectories
     file(GLOB SLAVE_ZLIB_FILES "slave/slave_zlib/*.c")
@@ -201,31 +215,110 @@ if(PLATFORM_SUNWAY)
     )
     target_compile_definitions(swbam_cpe_bam_transform_objects PRIVATE PLATFORM_SUNWAY)
     
-    # Create object library for slave code with special flags
-    add_library(slave_objects OBJECT ${SINGLE_SLAVE_FILES} ${SLAVE_C_FILES} ${SLAVE_ZLIB_FILES})
-    target_compile_options(slave_objects PRIVATE ${SLAVE_FLAGS})
-    target_include_directories(slave_objects PRIVATE
+    # Shared CPE support and algorithm-specific kernels are separate so SDK
+    # clients do not pull sort/collate/markdup/fixmate implementations.
+    add_library(swbam_cpe_support_objects OBJECT
+        ${SWBAM_CPE_SUPPORT_FILES}
+        ${SLAVE_C_FILES}
+        ${SLAVE_ZLIB_FILES})
+    target_compile_options(swbam_cpe_support_objects PRIVATE ${SLAVE_FLAGS})
+    target_include_directories(swbam_cpe_support_objects BEFORE PRIVATE
+        ${CMAKE_SOURCE_DIR}/slave
         ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_SOURCE_DIR}/ext/htslib-1.20
         ${CMAKE_SOURCE_DIR}/ext/libdeflate-1.20
         ${CMAKE_SOURCE_DIR}/slave/slave_zlib
     )
-    target_compile_definitions(slave_objects PRIVATE
+    target_compile_definitions(swbam_cpe_support_objects PRIVATE
         PLATFORM_SUNWAY
         SWBAM_CPE_OPERATOR_SPLIT)
+
+    add_library(swbam_cpe_algorithm_objects OBJECT
+        ${SWBAM_ALGORITHM_SLAVE_FILES})
+    target_compile_options(swbam_cpe_algorithm_objects PRIVATE ${SLAVE_FLAGS})
+    target_include_directories(swbam_cpe_algorithm_objects BEFORE PRIVATE
+        ${CMAKE_SOURCE_DIR}/slave
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/ext/htslib-1.20
+        ${CMAKE_SOURCE_DIR}/ext/libdeflate-1.20
+        ${CMAKE_SOURCE_DIR}/slave/slave_zlib
+    )
+    target_compile_definitions(swbam_cpe_algorithm_objects PRIVATE
+        PLATFORM_SUNWAY
+        SWBAM_CPE_OPERATOR_SPLIT)
+
     add_library(slave_cgs_objects OBJECT ${SLAVE_FILES} ${SLAVE_C_FILES} ${SLAVE_ZLIB_FILES})
     target_compile_options(slave_cgs_objects PRIVATE ${SLAVE_FLAGS})
-    target_include_directories(slave_cgs_objects PRIVATE
+    target_include_directories(slave_cgs_objects BEFORE PRIVATE
+        ${CMAKE_SOURCE_DIR}/slave
         ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_SOURCE_DIR}/ext/htslib-1.20
         ${CMAKE_SOURCE_DIR}/ext/libdeflate-1.20
         ${CMAKE_SOURCE_DIR}/slave/slave_zlib
     )
     target_compile_definitions(slave_cgs_objects PRIVATE PLATFORM_SUNWAY ENABLE_CGS_BAM2BAM ENABLE_CGS_BAM2SAM ENABLE_CGS_SAM2BAM)
+
+    # CPE objects must reach the Sunway hybrid linker directly; placing them
+    # in a normal host archive triggers "hybrid linking using master ld".
+    add_library(swbam_cpe_kernels INTERFACE)
+    target_sources(swbam_cpe_kernels INTERFACE
+        $<TARGET_OBJECTS:swbam_cpe_support_objects>
+        $<TARGET_OBJECTS:swbam_cpe_bam_transform_objects>
+        $<TARGET_OBJECTS:swbam_cpe_core_objects>
+        $<TARGET_OBJECTS:swbam_cpe_operator_objects>
+    )
+
+    add_library(swbam_algorithm_kernels INTERFACE)
+    target_sources(swbam_algorithm_kernels INTERFACE
+        $<TARGET_OBJECTS:swbam_cpe_algorithm_objects>)
+
+    add_library(swbam_sdk INTERFACE)
+    target_link_options(swbam_sdk INTERFACE
+        -mhybrid
+        -Wl,-zmuldefs)
+    target_link_directories(swbam_sdk INTERFACE
+        ${SUNWAY_MPI_LIB_DIR}
+        /usr/sw/lib)
+    target_link_libraries(swbam_sdk INTERFACE
+        swbam_cpe_runtime
+        swbam_mpi_runtime
+        swbam_io
+        swbam_cpe_kernels
+        pthread
+        rt
+        deflate
+        hts
+        z
+        mpicxx
+        mpi
+        swverbs_ft_perf
+        swutils
+        swtm
+        m
+        dl
+    )
+    add_library(swbam::io ALIAS swbam_io)
+    add_library(swbam::mpi_runtime ALIAS swbam_mpi_runtime)
+    add_library(swbam::cpe_runtime ALIAS swbam_cpe_runtime)
+    add_library(swbam::cpe_kernels ALIAS swbam_cpe_kernels)
+    add_library(swbam::algorithm_kernels ALIAS swbam_algorithm_kernels)
+    add_library(swbam::swbam ALIAS swbam_sdk)
+
+    if(BUILD_SWBAM_EXAMPLES)
+        add_executable(swbam-sdk-record-count
+            examples/sdk_record_count.cpp)
+        add_executable(swbam-sdk-filter-bam
+            examples/sdk_filter_bam.cpp)
+        target_compile_options(swbam-sdk-record-count PRIVATE ${HOST_FLAGS})
+        target_compile_options(swbam-sdk-filter-bam PRIVATE ${HOST_FLAGS})
+        target_link_libraries(swbam-sdk-record-count PRIVATE swbam::swbam)
+        target_link_libraries(swbam-sdk-filter-bam PRIVATE swbam::swbam)
+    endif()
     
     # Main executable with host code and slave objects
     add_executable(${PROJECT_NAME} ${SINGLE_SRC_FILES}
-        $<TARGET_OBJECTS:slave_objects>
+        $<TARGET_OBJECTS:swbam_cpe_support_objects>
+        $<TARGET_OBJECTS:swbam_cpe_algorithm_objects>
         $<TARGET_OBJECTS:swbam_cpe_core_objects>)
     # Apply host flags to all source files in src directory
     target_compile_options(${PROJECT_NAME} PRIVATE ${HOST_FLAGS})
@@ -234,11 +327,7 @@ if(PLATFORM_SUNWAY)
         $<TARGET_OBJECTS:swbam_cpe_core_objects>)
     target_compile_options(RabbitBAM-CGS PRIVATE ${HOST_FLAGS})
     target_compile_definitions(RabbitBAM-CGS PRIVATE PLATFORM_SUNWAY ENABLE_CGS_BAM2BAM ENABLE_CGS_BAM2SAM ENABLE_CGS_SAM2BAM)
-    add_executable(RabbitBAM-MPI ${MPI_SRC_FILES}
-        $<TARGET_OBJECTS:slave_objects>
-        $<TARGET_OBJECTS:swbam_cpe_bam_transform_objects>
-        $<TARGET_OBJECTS:swbam_cpe_core_objects>
-        $<TARGET_OBJECTS:swbam_cpe_operator_objects>)
+    add_executable(RabbitBAM-MPI ${MPI_SRC_FILES})
     target_compile_options(RabbitBAM-MPI PRIVATE ${HOST_FLAGS})
     target_compile_definitions(RabbitBAM-MPI PRIVATE PLATFORM_SUNWAY ENABLE_MPI_BAM2BAM)
     target_include_directories(RabbitBAM-MPI PRIVATE ${SUNWAY_MPI_ROOT}/include)
@@ -290,22 +379,8 @@ if(PLATFORM_SUNWAY)
         z
     )
     target_link_libraries(RabbitBAM-MPI PRIVATE
-        swbam_cpe_runtime
-        swbam_mpi_runtime
-        swbam_io
-        pthread
-        rt
-        deflate
-        hts
-        z
-        mpicxx
-        mpi
-        swverbs_ft_perf
-        swutils
-        swtm
-        m
-        dl
-    )
+        swbam::swbam
+        swbam::algorithm_kernels)
     target_link_libraries(RabbitBAM-CRC32-Bench PRIVATE
         pthread
         rt

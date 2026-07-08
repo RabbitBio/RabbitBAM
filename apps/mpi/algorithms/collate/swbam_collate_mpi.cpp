@@ -840,43 +840,6 @@ static int CollateSendRecvBytes(
     return 0;
 }
 
-static int CollateSendBytes(
-        int dst, int tag, const char *data,
-        long long size) {
-    long long sent = 0;
-    while (sent < size) {
-        int count = (int)std::min<long long>(
-            size - sent, INT_MAX);
-        if (MPI_Send(
-                (void *)(data + sent), count,
-                MPI_BYTE, dst, tag,
-                MPI_COMM_WORLD) != MPI_SUCCESS) {
-            return -1;
-        }
-        sent += count;
-    }
-    return 0;
-}
-
-static int CollateRecvBytes(
-        int src, int tag, char *data,
-        long long size) {
-    long long received = 0;
-    while (received < size) {
-        int count = (int)std::min<long long>(
-            size - received, INT_MAX);
-        MPI_Status status;
-        if (MPI_Recv(
-                data + received, count, MPI_BYTE,
-                src, tag, MPI_COMM_WORLD,
-                &status) != MPI_SUCCESS) {
-            return -1;
-        }
-        received += count;
-    }
-    return 0;
-}
-
 static int CollateAppendMemoryChunk(
         const CollateMeta *records, size_t count,
         const unsigned char *raw, size_t raw_size,

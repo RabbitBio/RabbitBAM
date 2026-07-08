@@ -10,6 +10,11 @@
 
 namespace swbam {
 
+typedef ::BamFilterOptions BamFilterOptions;
+
+// Returns the no-op filter used as the safe base for SDK consumers.
+BamFilterOptions DefaultBamFilterOptions();
+
 struct BgzfBlockSpan {
     uint64_t offset;
     uint32_t compressed_size;
