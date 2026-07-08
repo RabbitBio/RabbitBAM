@@ -238,6 +238,18 @@ rank0 组装完整输出内存并 dump；显式选择 MPI-IO 时则使用下述�
 `BamOutputBackend`：前者表示多 rank 全局 offset 布局，后者表示单一顺序字节流，
 将两种语义强行放进同一虚接口会隐藏 collective 约束。
 
+在此之上，`DistributedBamOutput` 统一处理最终 BAM 的公共编排：
+
+- `PrepareBody()` 收集每个 rank 的 body size，计算 body prefix 和总长度；
+- `SetEnvelope()` 广播序列化 header 与 BGZF EOF 的长度，完成全局文件布局；
+- `GatherToRoot()` 以固定8 MiB消息把任意 `RankBodySource` 汇总成完整内存 BAM；
+- `WriteMpiIo()` 使用相同布局将 header、各 rank body 和 EOF 分布式写出。
+
+该对象不负责修改 SAM header，也不参与压缩热路径。命令实例仍决定 `SO/GO/PG`
+语义并生成序列化 header，公共运行时只负责可靠放置这些字节。这样既避免把算法
+语义塞入 I/O 库，也消除了 sort/collate 中重复的 size/prefix、chunk gather 和
+MPI-IO 代码。
+
 `run_all --io-output-backend mpiio` 的布局是：
 
 - rank0 写 `[0, output_body_start)` 的 SAM/BAM header；
@@ -308,8 +320,9 @@ standalone `sort` 和 `collate` 已完整接入公共 I/O 闭环，同时保留�
   plan，稳定排序和 QNAME 元数据语义不变；
 - 压缩端直接向 `RankBodySink` 追加 BGZF block。memory-to-memory pipeline 通过
   `MemoryRankBodySink` 包装旧 `MemWriter`，因此四阶段融合流程的存储策略不变；
-- standalone 最终输出由同一 `RankBodySource` 服务 memory gather 或
-  `MpiFileOutput` 分布式写入。
+- standalone 与 pipeline helper 的最终 body 组装均使用
+  `DistributedBamOutput`；同一 `RankBodySource` 可服务 memory gather 或
+  MPI-IO 分布式写入。
 
 这里公共库只管理“数据如何进入批次、body 如何保存和最终如何输出”。sort 的
 sample/partition/exchange/k-way merge、严格外排，collate 的 hash/bin、ring
@@ -367,13 +380,19 @@ run/segment；`--rank-body-temp-dir` 只管理最终压缩 body 的 spool。两�
 - standalone `sort` 和 `collate` 已成为算法型公共 I/O 实例，支持
   `memory|posix|mpiio|auto` 输入、`memory|spool|auto` rank body 和
   `memory|mpiio` 最终输出；内排、外排和 CPE 融合核心保持原实现。
+- `DistributedBamOutput` 已用于 sort/collate 的 standalone 和
+  memory-to-memory helper，统一 body size/prefix、header/EOF 布局、rank0
+  memory gather 与 MPI-IO 写出。
 
 后续阶段：
 
 - 评估非流式 markdup 是否值得接入 streaming backend，或继续作为 memory
   flat-hash 极致性能实例；
 - 减少 packer chunk 到 write pipeline input 的一次 block copy；
-- 优先用通用闭环迁移 filter 和转换命令，再迁移 sort/collate/markdup 等算法型命令。
+- 将转换、fixmate 和 markdup 中仍然保留的最终输出编排逐步切换到
+  `DistributedBamOutput`；
+- dedup pipeline 暂时仍采用完整内存 BAM 广播，是否进一步改成分布式阶段交接
+  取决于论文是否需要证明超大文件端到端有界处理。
 
 该路线使每个阶段都可以独立验证，同时在公共库逐步完善的过程中保留现有专用
 优化路径。

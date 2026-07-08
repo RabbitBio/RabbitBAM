@@ -125,6 +125,53 @@ private:
     MPI_File file_;
 };
 
+struct DistributedBamLayout {
+    std::vector<uint64_t> body_sizes;
+    std::vector<uint64_t> body_offsets;
+    uint64_t prefix_size;
+    uint64_t total_body_size;
+    uint64_t suffix_size;
+    uint64_t total_size;
+
+    DistributedBamLayout()
+        : prefix_size(0), total_body_size(0),
+          suffix_size(0), total_size(0) {}
+};
+
+// Assembles a serialized BAM prefix, rank-local compressed bodies and EOF.
+// Header construction and algorithm timing remain the caller's responsibility.
+class DistributedBamOutput {
+public:
+    DistributedBamOutput();
+
+    int PrepareBody(const RankBodySource &local_body,
+                    int root = 0, MPI_Comm comm = MPI_COMM_WORLD);
+    int SetEnvelope(uint64_t prefix_size, uint64_t suffix_size);
+    int Prepare(const RankBodySource &local_body,
+                uint64_t prefix_size, uint64_t suffix_size,
+                int root = 0, MPI_Comm comm = MPI_COMM_WORLD);
+    int GatherToRoot(const RankBodySource &local_body,
+                     const void *prefix, const void *suffix,
+                     char **root_data, size_t *root_size,
+                     int mpi_tag = 5700) const;
+    int WriteMpiIo(const std::string &path,
+                   const RankBodySource &local_body,
+                   const void *prefix, const void *suffix) const;
+
+    const DistributedBamLayout &layout() const { return layout_; }
+    uint64_t local_body_offset() const;
+    int rank() const { return rank_; }
+    int root() const { return root_; }
+
+private:
+    MPI_Comm comm_;
+    int rank_;
+    int comm_size_;
+    int root_;
+    bool prepared_;
+    DistributedBamLayout layout_;
+};
+
 int AllRanksOk(int local_ok, MPI_Comm comm = MPI_COMM_WORLD);
 double ReduceMaxCost(double local_cost, int root = 0,
                      MPI_Comm comm = MPI_COMM_WORLD);

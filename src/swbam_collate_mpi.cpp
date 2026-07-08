@@ -1877,28 +1877,14 @@ static int CollateGatherOutput(
     memset(costs, 0, sizeof(*costs));
 
     double stage44_t0 = GetTime();
-    const int local_size_ok =
-        local_body.size() <= (uint64_t)LLONG_MAX ? 1 : 0;
-    if (!CollateAllRanksOk(local_size_ok)) return -1;
-    long long local_size = (long long)local_body.size();
-    std::vector<long long> sizes(
-        (size_t)comm_size, 0);
-    MPI_Allgather(
-        &local_size, 1, MPI_LONG_LONG,
-        sizes.data(), 1, MPI_LONG_LONG,
-        MPI_COMM_WORLD);
-    std::vector<long long> offsets(
-        (size_t)comm_size, 0);
-    long long body_size = 0;
-    for (int i = 0; i < comm_size; ++i) {
-        offsets[(size_t)i] = body_size;
-        if (sizes[(size_t)i] < 0 ||
-            body_size >
-                LLONG_MAX - sizes[(size_t)i]) {
-            return -1;
-        }
-        body_size += sizes[(size_t)i];
+    swbam::mpi::DistributedBamOutput distributed_output;
+    if (distributed_output.PrepareBody(local_body) != 0 ||
+        distributed_output.layout().total_body_size >
+            (uint64_t)LLONG_MAX) {
+        return -1;
     }
+    const long long body_size = (long long)
+        distributed_output.layout().total_body_size;
     costs->stage44 =
         CollateReduceMax(GetTime() - stage44_t0);
     if (rank == 0) {
@@ -1927,15 +1913,21 @@ static int CollateGatherOutput(
                 &header_size) != 0) {
             local_ok = 0;
         }
-        unsigned long long total =
+        const unsigned long long total =
             (unsigned long long)header_size +
             (unsigned long long)body_size +
             sizeof(kCollateBgzfEofBlock);
-        if (local_ok && total <= SIZE_MAX) {
-            output_size = (size_t)total;
-        } else if (local_ok) {
+        if (local_ok && total > SIZE_MAX) {
             local_ok = 0;
         }
+    }
+    if (CollateAllRanksOk(local_ok) &&
+        distributed_output.SetEnvelope(
+            header_size, sizeof(kCollateBgzfEofBlock)) != 0) {
+        local_ok = 0;
+    }
+    if (local_ok) {
+        output_size = (size_t)distributed_output.layout().total_size;
     }
     costs->stage45_header =
         CollateReduceMax(GetTime() - stage45_header_t0);
@@ -2087,52 +2079,12 @@ static int CollateGatherOutput(
     }
 
     if (!output_bam && mpiio_output) {
-        unsigned long long layout[2] = {0, 0};
-        if (rank == 0) {
-            layout[0] = (unsigned long long)header_size;
-            layout[1] = (unsigned long long)output_size;
-        }
-        MPI_Bcast(layout, 2, MPI_UNSIGNED_LONG_LONG, 0,
-                  MPI_COMM_WORLD);
         double write_t0 = GetTime();
-        swbam::mpi::MpiFileOutput output;
-        if (output.Open(output_path, layout[1]) != 0) local_ok = 0;
-        if (CollateAllRanksOk(local_ok)) {
-            if (rank == 0 && header_size > 0 &&
-                output.WriteAt(0, header_memory, header_size) != 0) {
-                local_ok = 0;
-            }
-            const size_t capacity = (size_t)std::min<uint64_t>(
-                local_body.size(), 8ull * 1024ull * 1024ull);
-            try {
-                source_chunk.resize(capacity);
-            } catch (...) {
-                local_ok = 0;
-            }
-            uint64_t copied = 0;
-            while (local_ok && copied < local_body.size()) {
-                const size_t count = (size_t)std::min<uint64_t>(
-                    local_body.size() - copied, source_chunk.size());
-                if (local_body.ReadAt(
-                        copied, source_chunk.data(), count) != 0 ||
-                    output.WriteAt(
-                        layout[0] + (uint64_t)offsets[(size_t)rank] + copied,
-                        source_chunk.data(), count) != 0) {
-                    local_ok = 0;
-                }
-                copied += count;
-            }
-            if (rank == 0 &&
-                output.WriteAt(
-                    layout[0] + (uint64_t)body_size,
-                    kCollateBgzfEofBlock,
-                    sizeof(kCollateBgzfEofBlock)) != 0) {
-                local_ok = 0;
-            }
+        if (distributed_output.WriteMpiIo(
+                output_path, local_body, header_memory,
+                kCollateBgzfEofBlock) != 0) {
+            local_ok = 0;
         }
-        const int writes_ok = CollateAllRanksOk(local_ok);
-        if (writes_ok && output.Sync() != 0) local_ok = 0;
-        if (output.Close() != 0) local_ok = 0;
         const double write_cost =
             CollateReduceMax(GetTime() - write_t0);
         if (rank == 0 && local_ok) {
@@ -2143,87 +2095,16 @@ static int CollateGatherOutput(
         return CollateAllRanksOk(local_ok) ? 0 : -1;
     }
 
-    double verify_alloc_t0 = GetTime();
-    if (rank == 0) {
-        output_memory =
-            output_size ? (char *)malloc(output_size)
-                        : nullptr;
-        if (output_size > 0 && !output_memory) {
-            local_ok = 0;
-        }
-        if (local_ok && header_size > 0) {
-            memcpy(output_memory, header_memory,
-                   header_size);
-        }
-    }
-    double verify_alloc_cost =
-        CollateReduceMax(GetTime() - verify_alloc_t0);
-    if (rank == 0 && local_ok) {
-        printf("555Prepare verification output memory cost %lf--\n",
-               verify_alloc_cost);
-    }
-    if (!CollateAllRanksOk(local_ok)) {
-        free(header_memory);
-        free(output_memory);
-        return -1;
-    }
-
     double verify_gather_t0 = GetTime();
-    if (rank == 0) {
-        if (local_body.size() &&
-            local_body.ReadAt(
-                0, output_memory + header_size,
-                (size_t)local_body.size()) != 0) {
-            local_ok = 0;
-        }
-        for (int src = 1; src < comm_size; ++src) {
-            long long received = 0;
-            while (received < sizes[(size_t)src]) {
-                const long long count = std::min<long long>(
-                    sizes[(size_t)src] - received,
-                    8ll * 1024ll * 1024ll);
-                if (CollateRecvBytes(
-                        src, 5700,
-                        output_memory + header_size +
-                            offsets[(size_t)src] + received,
-                        count) != 0) {
-                    local_ok = 0;
-                    break;
-                }
-                received += count;
-            }
-            if (!local_ok) break;
-        }
-        memcpy(output_memory + header_size +
-                   body_size,
-               kCollateBgzfEofBlock,
-               sizeof(kCollateBgzfEofBlock));
-    } else if (local_size > 0) {
-        const size_t capacity = (size_t)std::min<long long>(
-            local_size, 8ll * 1024ll * 1024ll);
-        try {
-            source_chunk.resize(capacity);
-        } catch (...) {
-            local_ok = 0;
-        }
-        uint64_t sent = 0;
-        while (local_ok && sent < local_body.size()) {
-            const size_t count = (size_t)std::min<uint64_t>(
-                local_body.size() - sent, source_chunk.size());
-            if (local_body.ReadAt(
-                    sent, source_chunk.data(), count) != 0 ||
-                CollateSendBytes(
-                    0, 5700, (const char *)source_chunk.data(),
-                    (long long)count) != 0) {
-                local_ok = 0;
-            }
-            sent += count;
-        }
+    if (distributed_output.GatherToRoot(
+            local_body, header_memory, kCollateBgzfEofBlock,
+            &output_memory, &output_size, 5700) != 0) {
+        local_ok = 0;
     }
     double verify_gather_cost =
         CollateReduceMax(GetTime() - verify_gather_t0);
     if (rank == 0 && local_ok) {
-        printf("555Gather verification output memory cost %lf--\n",
+        printf("555Gather distributed output memory cost %lf--\n",
                verify_gather_cost);
     }
     if (!CollateAllRanksOk(local_ok)) {

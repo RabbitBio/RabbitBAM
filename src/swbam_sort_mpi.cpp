@@ -470,11 +470,11 @@ int MpiSortMemoryToMemory(CmdInfo *cmd_info,
     size_t output_body_start = 0;
     MemReader reader = {};
     MemWriter mem_writer = {};
+    swbam::MemoryRankBodySink output_body(&mem_writer);
+    swbam::mpi::DistributedBamOutput distributed_output;
     MpiSortStats stats = {};
     std::vector<long long> block_offsets;
     std::vector<long long> block_lengths;
-    std::vector<long long> body_sizes;
-    std::vector<long long> body_prefixes;
     long long body_start = 0;
     long long n_blocks = 0;
     long long local_block_begin = 0;
@@ -668,21 +668,13 @@ int MpiSortMemoryToMemory(CmdInfo *cmd_info,
 
         double stage44_t0 = GetTime();
         local_body_size = (long long)mem_writer.size;
-        body_sizes.assign((size_t)comm_size, 0);
-        body_prefixes.assign((size_t)comm_size, 0);
-        MPI_Allgather(&local_body_size, 1, MPI_LONG_LONG,
-                      body_sizes.data(), 1, MPI_LONG_LONG,
-                      MPI_COMM_WORLD);
-        total_body_size = 0;
-        for (int i = 0; i < comm_size; ++i) {
-            body_prefixes[(size_t)i] = total_body_size;
-            if (body_sizes[(size_t)i] < 0 ||
-                total_body_size >
-                    LLONG_MAX - body_sizes[(size_t)i]) {
-                local_ok = 0;
-            } else {
-                total_body_size += body_sizes[(size_t)i];
-            }
+        if (distributed_output.PrepareBody(output_body) != 0 ||
+            distributed_output.layout().total_body_size >
+                (uint64_t)LLONG_MAX) {
+            local_ok = 0;
+        } else {
+            total_body_size = (long long)
+                distributed_output.layout().total_body_size;
         }
         stage44_cost_max =
             MpiSortReduceMaxCost(GetTime() - stage44_t0);
@@ -721,6 +713,11 @@ int MpiSortMemoryToMemory(CmdInfo *cmd_info,
                         (long long)output_file_size;
                 }
             }
+        }
+        if (MpiSortAllRanksOk(local_ok) &&
+            distributed_output.SetEnvelope(
+                bam_header_size, sizeof(kSortBgzfEofBlock)) != 0) {
+            local_ok = 0;
         }
         int stage45_header_ok = MpiSortAllRanksOk(local_ok);
         MPI_Bcast(&output_body_start_ll, 1, MPI_LONG_LONG,
@@ -820,63 +817,16 @@ int MpiSortMemoryToMemory(CmdInfo *cmd_info,
     }
 
     {
-        double verify_alloc_t0 = GetTime();
-        if (rank == 0) {
-            output_bam->data =
-                output_file_size ? (char *)malloc(output_file_size)
-                                 : nullptr;
-            output_bam->size = output_file_size;
-            if (output_file_size > 0 && !output_bam->data) {
-                local_ok = 0;
-            }
-            if (local_ok && bam_header_size > 0) {
-                memcpy(output_bam->data, bam_header_mem,
-                       bam_header_size);
-            }
-        }
-        double verify_alloc_cost_max =
-            MpiSortReduceMaxCost(GetTime() - verify_alloc_t0);
-        if (rank == 0 && local_ok) {
-            printf("555Prepare verification output memory cost %lf--\n",
-                   verify_alloc_cost_max);
-        }
-        if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
-
         double verify_gather_t0 = GetTime();
-        if (rank == 0) {
-            if (local_body_size > 0) {
-                memcpy(output_bam->data + output_body_start +
-                           body_prefixes[(size_t)rank],
-                       mem_writer.data, (size_t)local_body_size);
-            }
-            for (int src = 1; src < comm_size; ++src) {
-                long long recv_size = body_sizes[(size_t)src];
-                if (recv_size <= 0) continue;
-                if (MpiSortRecvBytes(
-                        src, 0,
-                        output_bam->data + output_body_start +
-                            body_prefixes[(size_t)src],
-                        recv_size) != 0) {
-                    local_ok = 0;
-                    break;
-                }
-            }
-            if (local_ok) {
-                memcpy(output_bam->data + output_body_start +
-                           total_body_size,
-                       kSortBgzfEofBlock,
-                       sizeof(kSortBgzfEofBlock));
-            }
-        } else if (local_body_size > 0) {
-            if (MpiSortSendBytes(0, 0, mem_writer.data,
-                                 local_body_size) != 0) {
-                local_ok = 0;
-            }
+        if (distributed_output.GatherToRoot(
+                output_body, bam_header_mem, kSortBgzfEofBlock,
+                &output_bam->data, &output_bam->size, 5800) != 0) {
+            local_ok = 0;
         }
         double verify_gather_cost_max =
             MpiSortReduceMaxCost(GetTime() - verify_gather_t0);
         if (rank == 0 && local_ok) {
-            printf("555Gather verification output memory cost %lf--\n",
+            printf("555Gather distributed output memory cost %lf--\n",
                    verify_gather_cost_max);
             printf("555Keep output memory cost 0.000000--\n");
         }
@@ -929,16 +879,14 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
     size_t simulated_write_size = 0;
     MemReader reader = {};
     swbam::AdaptiveRankBodySink rank_body_sink;
+    swbam::mpi::DistributedBamOutput distributed_output;
     MpiSortStats stats = {};
-    std::vector<long long> body_sizes;
-    std::vector<long long> body_prefixes;
     std::vector<unsigned char> body_chunk;
     long long body_start = 0;
     long long n_blocks = 0;
     long long local_block_begin = 0;
     long long local_block_end = 0;
     long long local_body_size = 0;
-    long long local_prefix = 0;
     long long total_body_size = 0;
     size_t memory_limit = 0;
     uint64_t rank_body_memory_limit = 0;
@@ -1210,16 +1158,13 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
                        comm_size - spool_ranks, spool_ranks);
             }
         }
-        body_sizes.assign((size_t)comm_size, 0);
-        body_prefixes.assign((size_t)comm_size, 0);
-        MPI_Allgather(&local_body_size, 1, MPI_LONG_LONG,
-                      body_sizes.data(), 1, MPI_LONG_LONG, MPI_COMM_WORLD);
-        local_prefix = 0;
-        total_body_size = 0;
-        for (int i = 0; i < comm_size; ++i) {
-            body_prefixes[(size_t)i] = total_body_size;
-            if (i < rank) local_prefix += body_sizes[(size_t)i];
-            total_body_size += body_sizes[(size_t)i];
+        if (distributed_output.PrepareBody(rank_body_sink) != 0 ||
+            distributed_output.layout().total_body_size >
+                (uint64_t)LLONG_MAX) {
+            local_ok = 0;
+        } else {
+            total_body_size = (long long)
+                distributed_output.layout().total_body_size;
         }
         double stage44_cost = GetTime() - stage44_t0;
         double stage44_cost_max = MpiSortReduceMaxCost(stage44_cost);
@@ -1256,6 +1201,11 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
                     output_file_size_ll = (long long)output_file_size;
                 }
             }
+        }
+        if (MpiSortAllRanksOk(local_ok) &&
+            distributed_output.SetEnvelope(
+                bam_header_size, sizeof(kSortBgzfEofBlock)) != 0) {
+            local_ok = 0;
         }
         int stage45_header_ok = MpiSortAllRanksOk(local_ok);
         MPI_Bcast(&output_body_start_ll, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
@@ -1532,50 +1482,11 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
     {
         if (cmd_info->io_output_backend_ == "mpiio") {
             double write_t0 = GetTime();
-            swbam::mpi::MpiFileOutput output;
-            if (output.Open(cmd_info->out_file_name_,
-                            (uint64_t)output_file_size) != 0) {
+            if (distributed_output.WriteMpiIo(
+                    cmd_info->out_file_name_, rank_body_sink,
+                    bam_header_mem, kSortBgzfEofBlock) != 0) {
                 local_ok = 0;
             }
-            if (MpiSortAllRanksOk(local_ok)) {
-                if (rank == 0 && bam_header_size > 0 &&
-                    output.WriteAt(0, bam_header_mem,
-                                   bam_header_size) != 0) {
-                    local_ok = 0;
-                }
-                const size_t chunk_capacity = (size_t)std::min<uint64_t>(
-                    rank_body_sink.size(), 8ull * 1024ull * 1024ull);
-                try {
-                    body_chunk.resize(chunk_capacity);
-                } catch (...) {
-                    local_ok = 0;
-                }
-                uint64_t copied = 0;
-                while (local_ok && copied < rank_body_sink.size()) {
-                    const size_t count = (size_t)std::min<uint64_t>(
-                        rank_body_sink.size() - copied, body_chunk.size());
-                    if (rank_body_sink.ReadAt(
-                            copied, body_chunk.data(), count) != 0 ||
-                        output.WriteAt(
-                            (uint64_t)output_body_start +
-                            (uint64_t)body_prefixes[(size_t)rank] + copied,
-                            body_chunk.data(), count) != 0) {
-                        local_ok = 0;
-                    }
-                    copied += count;
-                }
-                if (rank == 0 &&
-                    output.WriteAt(
-                        (uint64_t)output_body_start +
-                        (uint64_t)total_body_size,
-                        kSortBgzfEofBlock,
-                        sizeof(kSortBgzfEofBlock)) != 0) {
-                    local_ok = 0;
-                }
-            }
-            const int writes_ok = MpiSortAllRanksOk(local_ok);
-            if (writes_ok && output.Sync() != 0) local_ok = 0;
-            if (output.Close() != 0) local_ok = 0;
             const double write_cost_max = MpiSortReduceMaxCost(
                 GetTime() - write_t0);
             if (rank == 0 && local_ok) {
@@ -1584,88 +1495,16 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
             }
             if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
         } else {
-        double verify_alloc_t0 = GetTime();
-        if (rank == 0) {
-            output_file_mem = output_file_size ? (char *)malloc(output_file_size) : nullptr;
-            if (output_file_size > 0 && !output_file_mem) {
-                fprintf(stderr, "ERROR: failed to allocate final MPI sort output buffer.\n");
-                local_ok = 0;
-            }
-            if (local_ok && bam_header_size > 0) {
-                memcpy(output_file_mem, bam_header_mem, bam_header_size);
-            }
-        }
-        double verify_alloc_cost = GetTime() - verify_alloc_t0;
-        double verify_alloc_cost_max = MpiSortReduceMaxCost(verify_alloc_cost);
-        if (rank == 0 && local_ok) {
-            printf("555Prepare verification output memory cost %lf--\n", verify_alloc_cost_max);
-        }
-        if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
-
         double verify_gather_t0 = GetTime();
-        if (rank == 0) {
-            if (local_body_size > 0) {
-                if (rank_body_sink.ReadAt(
-                        0, output_file_mem + output_body_start + local_prefix,
-                        (size_t)local_body_size) != 0) {
-                    local_ok = 0;
-                }
-            }
-            for (int src = 1; src < comm_size; ++src) {
-                long long recv_size = body_sizes[(size_t)src];
-                if (recv_size <= 0) continue;
-                long long received = 0;
-                while (received < recv_size) {
-                    const long long count = std::min<long long>(
-                        recv_size - received, 8ll * 1024ll * 1024ll);
-                    if (MpiSortRecvBytes(
-                            src, 0,
-                            output_file_mem + output_body_start +
-                                body_prefixes[(size_t)src] + received,
-                            count) != 0) {
-                        fprintf(stderr,
-                                "ERROR: failed to gather MPI sort rank %d "
-                                "body into output memory.\n", src);
-                        local_ok = 0;
-                        break;
-                    }
-                    received += count;
-                }
-                if (!local_ok) break;
-            }
-            if (local_ok) {
-                memcpy(output_file_mem + output_body_start + total_body_size,
-                       kSortBgzfEofBlock, sizeof(kSortBgzfEofBlock));
-            }
-        } else if (local_body_size > 0) {
-            const size_t chunk_capacity = (size_t)std::min<long long>(
-                local_body_size, 8ll * 1024ll * 1024ll);
-            try {
-                body_chunk.resize(chunk_capacity);
-            } catch (...) {
-                local_ok = 0;
-            }
-            uint64_t sent = 0;
-            while (local_ok && sent < rank_body_sink.size()) {
-                const size_t count = (size_t)std::min<uint64_t>(
-                    rank_body_sink.size() - sent, body_chunk.size());
-                if (rank_body_sink.ReadAt(
-                        sent, body_chunk.data(), count) != 0 ||
-                    MpiSortSendBytes(
-                        0, 0, (const char *)body_chunk.data(),
-                        (long long)count) != 0) {
-                    fprintf(stderr,
-                            "[rank %d] ERROR: failed to send sort output "
-                            "body to rank 0.\n", rank);
-                    local_ok = 0;
-                }
-                sent += count;
-            }
+        if (distributed_output.GatherToRoot(
+                rank_body_sink, bam_header_mem, kSortBgzfEofBlock,
+                &output_file_mem, &output_file_size, 5801) != 0) {
+            local_ok = 0;
         }
         double verify_gather_cost = GetTime() - verify_gather_t0;
         double verify_gather_cost_max = MpiSortReduceMaxCost(verify_gather_cost);
         if (rank == 0 && local_ok) {
-            printf("555Gather verification output memory cost %lf--\n", verify_gather_cost_max);
+            printf("555Gather distributed output memory cost %lf--\n", verify_gather_cost_max);
         }
         if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
 
