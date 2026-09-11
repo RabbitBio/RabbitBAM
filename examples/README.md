@@ -23,6 +23,12 @@ RawBamRecordConsumer`，统计 records、mapped 和 duplicate 数量：
 ./swbam-sdk-record-count input.bam
 ```
 
+使用内存 backend 并打印不含文件加载的核心时间：
+
+```bash
+./swbam-sdk-record-count input.bam --memory-io
+```
+
 ## filter BAM
 
 `sdk_filter_bam.cpp` 展示 `RawBamFilterConsumer + RawBamWriter +
@@ -30,6 +36,13 @@ PosixBamOutput`，保留 MAPQ 不低于阈值的记录：
 
 ```bash
 ./swbam-sdk-filter-bam input.bam output.bam 20
+```
+
+内存基准模式会先把输入加载到内存、将压缩输出保存在内存中，`timing_core`
+不包含初始加载和最终 dump：
+
+```bash
+./swbam-sdk-filter-bam input.bam output.bam 20 --memory-io
 ```
 
 Sunway CPE object 需要直接交给 hybrid linker，不能先封装进普通主核静态库。
