@@ -25,7 +25,8 @@
 `RunGenericBam1Pipeline` 在 Raw adapter 之后增加一次 MPE 物化。`bam1_t` 和 data
 由可复用对象池持有，同样只在当前 `ConsumeBam1()` 回调期间有效；需要跨回调保存时
 调用 `bam_dup1()`。该路径支持标准 HTSlib accessor，但会产生 payload 复制和解析
-成本，因此不会替代零拷贝 Raw 路径或性能敏感命令的融合 CPE kernel。
+成本。adapter 会直接填充池中目标记录的可复用 `data`，不再经过临时 payload 和
+第二次 `bam_copy1()`；它仍不会替代零拷贝 Raw 路径或性能敏感命令的融合 CPE kernel。
 
 `Bam1Writer` 是该路径的对称写端。输入记录只在 `ConsumeBam1()` 调用期间读取，
 writer 不取得其所有权；编码器移除 HTSlib 的 QNAME 内存 padding，校验数据布局与

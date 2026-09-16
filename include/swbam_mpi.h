@@ -333,6 +333,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info);
 int ProcessFixmateMPI(CmdInfo *cmd_info);
 int ProcessCollateMPI(CmdInfo *cmd_info);
 int ProcessDedupPipelineMPI(CmdInfo *cmd_info);
+int ProcessDedupWorkflowMPI(CmdInfo *cmd_info);
 
 void MpiMemoryBamFree(MpiMemoryBam *bam);
 int MpiBroadcastMemoryBam(MpiMemoryBam *bam, int root);

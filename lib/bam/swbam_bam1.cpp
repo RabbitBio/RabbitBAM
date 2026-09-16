@@ -149,9 +149,8 @@ int ValidateAndUpdateCigar(bam1_t *record) {
 }
 
 int MaterializeRecord(const RawBamRecordView &view, bam1_t *output,
-                      std::vector<unsigned char> *normalized,
                       std::vector<unsigned char> *resize_scratch) {
-    if (!output || !normalized || !resize_scratch || !view.encoded ||
+    if (!output || !resize_scratch || !view.encoded ||
         view.encoded_size < 36 || view.block_size < 32 ||
         (uint64_t)view.block_size + 4 != view.encoded_size) {
         return -1;
@@ -184,49 +183,43 @@ int MaterializeRecord(const RawBamRecordView &view, bam1_t *output,
     if (payload_size > (size_t)INT_MAX - qname_padding) return -1;
     const size_t normalized_size = payload_size + qname_padding;
 
-    try {
-        normalized->resize(normalized_size);
-    } catch (...) {
+    if (GrowBamData(output, normalized_size, resize_scratch) != 0) {
         return -1;
     }
-    memcpy(normalized->data(), payload, raw_qname_length);
-    memset(normalized->data() + raw_qname_length, 0, qname_padding);
-    memcpy(normalized->data() + final_qname_length,
+    unsigned char *normalized = output->data;
+    memcpy(normalized, payload, raw_qname_length);
+    memset(normalized + raw_qname_length, 0, qname_padding);
+    memcpy(normalized + final_qname_length,
            payload + raw_qname_length,
            payload_size - raw_qname_length);
 
     // BAM stores CIGAR words little-endian; bam1_t accessors expect host words.
     unsigned char *normalized_cigar =
-        normalized->data() + final_qname_length;
+        normalized + final_qname_length;
     const unsigned char *encoded_cigar = payload + raw_qname_length;
     for (uint32_t i = 0; i < cigar_count; ++i) {
         WriteHost32(normalized_cigar + (size_t)i * 4,
                     ReadLe32(encoded_cigar + (size_t)i * 4));
     }
 
-    bam1_t source;
-    memset(&source, 0, sizeof(source));
-    source.core.tid = ReadLe32Signed(fields);
-    source.core.pos = ReadLe32Signed(fields + 4);
-    source.core.bin = bin_mq_nl >> 16;
-    source.core.qual = (bin_mq_nl >> 8) & 0xff;
-    source.core.l_qname = final_qname_length;
-    source.core.l_extranul = qname_terminated
+    memset(&output->core, 0, sizeof(output->core));
+    output->core.tid = ReadLe32Signed(fields);
+    output->core.pos = ReadLe32Signed(fields + 4);
+    output->core.bin = bin_mq_nl >> 16;
+    output->core.qual = (bin_mq_nl >> 8) & 0xff;
+    output->core.l_qname = final_qname_length;
+    output->core.l_extranul = qname_terminated
         ? qname_padding : qname_padding - 1;
-    source.core.flag = flag_nc >> 16;
-    source.core.n_cigar = cigar_count;
-    source.core.l_qseq = query_length;
-    source.core.mtid = ReadLe32Signed(fields + 20);
-    source.core.mpos = ReadLe32Signed(fields + 24);
-    source.core.isize = ReadLe32Signed(fields + 28);
-    source.data = normalized->data();
-    source.l_data = (int)normalized_size;
-    source.m_data = normalized_size > UINT32_MAX
-        ? UINT32_MAX : (uint32_t)normalized_size;
-    source.id = 0;
+    output->core.flag = flag_nc >> 16;
+    output->core.n_cigar = cigar_count;
+    output->core.l_qseq = query_length;
+    output->core.mtid = ReadLe32Signed(fields + 20);
+    output->core.mpos = ReadLe32Signed(fields + 24);
+    output->core.isize = ReadLe32Signed(fields + 28);
+    output->l_data = (int)normalized_size;
+    output->id = 0;
 
-    if (!bam_copy1(output, &source) ||
-        NormalizeLongCigar(output, resize_scratch) != 0 ||
+    if (NormalizeLongCigar(output, resize_scratch) != 0 ||
         ValidateAndUpdateCigar(output) != 0) {
         return -1;
     }
@@ -255,7 +248,7 @@ public:
         const double materialize_t0 = GetTime();
         for (size_t i = 0; i < count; ++i) {
             if (MaterializeRecord(records[i], pool_[i],
-                                  &normalized_, &resize_scratch_) != 0) {
+                                  &resize_scratch_) != 0) {
                 return -1;
             }
             batch_[i] = pool_[i];
@@ -308,7 +301,6 @@ private:
     GenericBam1Metrics *metrics_;
     std::vector<bam1_t *> pool_;
     std::vector<const bam1_t *> batch_;
-    std::vector<unsigned char> normalized_;
     std::vector<unsigned char> resize_scratch_;
 };
 

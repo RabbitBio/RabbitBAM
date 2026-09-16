@@ -40,10 +40,13 @@ public:
     bool markdup_clear_;
     bool markdup_include_fails_;
     bool markdup_streaming_;
+    bool markdup_force_two_pass_;
     int markdup_max_read_length_;
     std::string markdup_memory_;
     bool fixmate_mate_score_;
     std::string pipeline_memory_;
+    std::string workflow_temp_prefix_;
+    bool workflow_keep_intermediates_;
 
 };
 

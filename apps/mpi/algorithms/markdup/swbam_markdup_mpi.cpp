@@ -6878,6 +6878,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
     const int use_one_pass = use_streaming &&
         !cmd_info->markdup_remove_dups_ &&
         !cmd_info->markdup_clear_ &&
+        !cmd_info->markdup_force_two_pass_ &&
         !MdEnvFlagEnabled("RABBITBAM_MARKDUP_TWO_PASS");
 
     std::vector<MpiMarkdupCandidateShared> local_candidates;

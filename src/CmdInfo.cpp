@@ -30,8 +30,11 @@ CmdInfo::CmdInfo() {
     markdup_clear_ = false;
     markdup_include_fails_ = false;
     markdup_streaming_ = false;
+    markdup_force_two_pass_ = false;
     markdup_max_read_length_ = 300;
     markdup_memory_ = "";
     fixmate_mate_score_ = false;
     pipeline_memory_ = "";
+    workflow_temp_prefix_ = "";
+    workflow_keep_intermediates_ = false;
 }

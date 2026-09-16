@@ -114,6 +114,7 @@ set(SWBAM_MPI_APP_FILES
     apps/mpi/algorithms/markdup/swbam_markdup_mpi.cpp
     apps/mpi/algorithms/markdup/swbam_markdup_stream_mpi.cpp
     apps/mpi/pipelines/swbam_dedup_pipeline_mpi.cpp
+    apps/mpi/pipelines/swbam_dedup_workflow_mpi.cpp
 )
 list(APPEND MPI_SRC_FILES ${SWBAM_MPI_APP_FILES})
 

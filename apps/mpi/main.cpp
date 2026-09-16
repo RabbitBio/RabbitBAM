@@ -227,6 +227,63 @@ int main(int argc, char **argv) {
     dedup_pipeline->add_option("--compress-level", cmd_info.compress_level_, "MPI BAM output compression level: 0, 1, or 6")->default_val(1);
     dedup_pipeline->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
 
+    CLI::App *dedup_workflow = app.add_subcommand(
+        "dedup-workflow",
+        "Run file-backed MPI BAM workflow: collate -> fixmate -m -> sort -> markdup");
+    dedup_workflow->add_option("-i,--inFile", cmd_info.in_file_name_,
+                               "input BAM name")
+        ->required()->check(CLI::ExistingFile);
+    dedup_workflow->add_option("-o,--outFile", cmd_info.out_file_name_,
+                               "final output BAM name")->required();
+    dedup_workflow->add_option("-T,--temp-prefix",
+                               cmd_info.workflow_temp_prefix_,
+                               "Unique prefix for intermediate BAM and external runs")
+        ->required();
+    CLI::Option *workflow_bins_option =
+        dedup_workflow->add_option("-n,--bins", cmd_info.collate_bins_,
+                                   "Number of logical QNAME hash bins for collate")
+            ->default_val(64);
+    dedup_workflow->add_option("-m,--memory", cmd_info.pipeline_memory_,
+                               "Algorithm memory limit per MPI rank, e.g. 8G")
+        ->required();
+    dedup_workflow->add_option("-l,--max-read-length",
+                               cmd_info.markdup_max_read_length_,
+                               "Maximum read length for coordinate-stream markdup")
+        ->default_val(300)->check(CLI::PositiveNumber);
+    dedup_workflow->add_option("--io-backend", cmd_info.io_backend_,
+                               "Input backend for every stage: memory, posix, mpiio, or auto")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+    dedup_workflow->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
+                               "Per-rank memory input limit used by --io-backend auto")
+        ->default_val("8G");
+    dedup_workflow->add_option("--io-output-backend",
+                               cmd_info.io_output_backend_,
+                               "Output backend for every stage: memory or mpiio")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
+    dedup_workflow->add_option("--rank-body-backend",
+                               cmd_info.rank_body_backend_,
+                               "Per-rank body storage: memory, spool, or auto")
+        ->default_val("memory")
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "spool", "auto"}));
+    dedup_workflow->add_option("--rank-body-memory-limit",
+                               cmd_info.rank_body_memory_limit_,
+                               "Per-rank body memory limit used by auto")
+        ->default_val("8G");
+    dedup_workflow->add_option("--rank-body-temp-dir",
+                               cmd_info.rank_body_temp_dir_,
+                               "Temporary directory required by spool/auto rank body storage");
+    dedup_workflow->add_option("--compress-level", cmd_info.compress_level_,
+                               "MPI BAM output compression level: 0, 1, or 6")
+        ->default_val(1);
+    dedup_workflow->add_flag("--keep-intermediates",
+                             cmd_info.workflow_keep_intermediates_,
+                             "Keep collate/fixmate/sort intermediate BAM files")
+        ->default_val(false);
+    dedup_workflow->add_flag("--verbose", cmd_info.verbose_,
+                             "Enable verbose logging")->default_val(false);
+
     CLI11_PARSE(app, argc, argv);
 
     int exit_code = 1;
@@ -240,6 +297,7 @@ int main(int argc, char **argv) {
     bool is_markdup = false;
     bool is_fixmate = false;
     bool is_dedup_pipeline = false;
+    bool is_dedup_workflow = false;
     if (app.get_subcommands().empty()) {
         if (my_rank == 0) fprintf(stderr, "ERROR: You should input one command.\n");
         goto cleanup;
@@ -258,20 +316,23 @@ int main(int argc, char **argv) {
     is_markdup = selected_command->get_name() == "markdup";
     is_fixmate = selected_command->get_name() == "fixmate";
     is_dedup_pipeline = selected_command->get_name() == "dedup-pipeline";
+    is_dedup_workflow = selected_command->get_name() == "dedup-workflow";
     cmd_info.collate_bins_explicit_ =
         (is_collate && collate_bins_option &&
          collate_bins_option->count() > 0) ||
         (is_dedup_pipeline && pipeline_bins_option &&
-         pipeline_bins_option->count() > 0);
-    if (!is_run_all && !is_flagstat && !is_stats && !is_io_check && !is_sort && !is_collate && !is_markdup && !is_fixmate && !is_dedup_pipeline) {
-        if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI only supports run_all, flagstat, stats, io-check, sort, collate, markdup, fixmate, and dedup-pipeline.\n");
+         pipeline_bins_option->count() > 0) ||
+        (is_dedup_workflow && workflow_bins_option &&
+         workflow_bins_option->count() > 0);
+    if (!is_run_all && !is_flagstat && !is_stats && !is_io_check && !is_sort && !is_collate && !is_markdup && !is_fixmate && !is_dedup_pipeline && !is_dedup_workflow) {
+        if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI only supports run_all, flagstat, stats, io-check, sort, collate, markdup, fixmate, dedup-pipeline, and dedup-workflow.\n");
         goto cleanup;
     }
     if (is_stats && !stats_basic) {
         if (my_rank == 0) fprintf(stderr, "ERROR: RabbitBAM-MPI stats v1 requires --basic.\n");
         goto cleanup;
     }
-    if ((is_run_all || is_sort || is_collate || is_markdup || is_fixmate || is_dedup_pipeline) &&
+    if ((is_run_all || is_sort || is_collate || is_markdup || is_fixmate || is_dedup_pipeline || is_dedup_workflow) &&
         cmd_info.compress_level_ != 0 &&
         cmd_info.compress_level_ != 1 &&
         cmd_info.compress_level_ != 6) {
@@ -283,22 +344,24 @@ int main(int argc, char **argv) {
 
     t1 = GetTime();
     exit_code = is_io_check ? ProcessIoCheckMPI(&cmd_info)
+                         : (is_dedup_workflow ? ProcessDedupWorkflowMPI(&cmd_info)
                          : (is_dedup_pipeline ? ProcessDedupPipelineMPI(&cmd_info)
                          : (is_sort ? ProcessSortMPI(&cmd_info)
                          : (is_collate ? ProcessCollateMPI(&cmd_info)
                          : (is_markdup ? ProcessMarkdupMPI(&cmd_info)
                                       : (is_fixmate ? ProcessFixmateMPI(&cmd_info)
                                                     : (is_stats ? ProcessStatsMPI(&cmd_info)
-                                                                : (is_flagstat ? ProcessFlagstatMPI(&cmd_info) : ProcessSwBamMPI(&cmd_info))))))));
+                                                                : (is_flagstat ? ProcessFlagstatMPI(&cmd_info) : ProcessSwBamMPI(&cmd_info)))))))));
     if (my_rank == 0) {
         printf("%s rank0 time is %lf--\n",
                is_io_check ? "ProcessIoCheckMPI" :
+               (is_dedup_workflow ? "ProcessDedupWorkflowMPI" :
                (is_dedup_pipeline ? "ProcessDedupPipelineMPI" :
                (is_sort ? "ProcessSortMPI" :
                (is_collate ? "ProcessCollateMPI" :
                 (is_markdup ? "ProcessMarkdupMPI" :
                 (is_fixmate ? "ProcessFixmateMPI" :
-                 (is_stats ? "ProcessStatsMPI" : (is_flagstat ? "ProcessFlagstatMPI" : "ProcessSwBamMPI"))))))),
+                 (is_stats ? "ProcessStatsMPI" : (is_flagstat ? "ProcessFlagstatMPI" : "ProcessSwBamMPI")))))))),
                GetTime() - t1);
     }
 

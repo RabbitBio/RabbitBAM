@@ -24,7 +24,7 @@ slave/operators/                通用和统计类 CPE 算子
 slave/algorithms/               sort/collate/markdup/fixmate 专用 CPE kernel
 apps/mpi/commands/              转换、统计、fixmate 等命令实例
 apps/mpi/algorithms/            sort、collate、markdup 全局算法实例
-apps/mpi/pipelines/             dedup-pipeline 编排
+apps/mpi/pipelines/             内存 dedup-pipeline 与 file-backed workflow 编排
 examples/                       不依赖命令内部类型的 SDK 示例
 ```
 
@@ -121,6 +121,8 @@ decode+parse+count 融合 CPE kernel 没有拆开，因此不会增加中间数�
 
 `bam1_t` 通用路径复用上述 Raw batch，而不是新增另一套读取和解压流水线。adapter
 规范化 QNAME padding、CIGAR 和 aux 布局，并维护只随历史最大 batch 增长的对象池；
+物化时先保证池内目标记录容量，再直接写入其 `data`，避免通过临时 normalized
+payload 再调用 `bam_copy1()` 的二次复制。
 consumer 回调结束后记录会被后续 batch 复用，跨回调保存必须调用 `bam_dup1()`。
 这条路径以一次 payload 物化换取与 HTSlib 生态的直接兼容，Raw 路径仍用于简单字段
 扫描，融合 CPE kernel 仍用于内置性能热点。
