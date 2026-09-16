@@ -396,12 +396,18 @@ run/segment；`--rank-body-temp-dir` 只管理最终压缩 body 的 spool。两�
   `MemReader`；POSIX/MPI-IO backend 则通过 `BgzfSpanBatchReader` 每批直接
   填充 64 个 CPE input slots。两条路径共用原 fixmate 解压、QNAME 分组、
   边界 group 交换、mate tag 重写和压缩核心。
-- standalone `markdup --stream` 已迁移到公共 backend。内部使用可重置的
-  block-pass 适配器，对同一 rank spans 完成首坐标探测、流式候选扫描和最终
-  rewrite 三遍读取；每遍都只保留双槽、每槽64个 BGZF block。memory backend
-  继续走连续 `MemReader`，POSIX/MPI-IO 直接填充原 markdup input slots，
-  duplicate window、跨 rank coordinate ownership 和 CPE rewrite/compress
-  算子保持不变。MPI-IO 输出沿用 header/body-prefix/EOF 分布式布局。
+- standalone `markdup --stream` 已迁移到公共 backend。默认标记模式进一步改为
+  单遍坐标滑动窗口：candidate 解压/解析后的 block 所有权从 extract 双槽转移到
+  decoded-block 待定环；owner rank 返回 KEEP/DUP 终态后，本 rank 只压缩并按序
+  写出已经全部确定的前缀 block。它不再进行首坐标预探测和完整 rewrite 重读，
+  也不保存全文件 duplicate bitmap。输出 CPE 压缩会与下一批 MPE candidate
+  exchange/window 处理重叠。memory、POSIX、MPI-IO 输入共用这一核心，输出继续
+  使用 `RankBodySink` 和统一分布式布局。`-r/-c` 暂时保留已验证的两遍路径；
+  `RABBITBAM_MARKDUP_TWO_PASS=1` 可让默认标记回退两遍，便于对照。
+- 单遍 markdup 的工作集由 candidate 双槽、decoded-block 待定环、winner/marker
+  窗口和固定压缩槽组成，统一纳入 `-m` 检查。一般 block 原位修改 FLAG 后直接
+  重压缩；解压 payload 超过 CPE 安全压缩大小的少数 block 才按 BAM record 边界
+  重新分包。当前仍采用“BAM record 不跨 BGZF block”的项目输入约束。
 - `RankBodySource`、`AdaptiveRankBodySink` 和 `SegmentedRankBodySource` 已进入
   `swbam_io`。三种转换、standalone fixmate 和 markdup 均支持独立的
   `--rank-body-backend memory|spool|auto`；fixmate 通过三段 source 保持边界
@@ -415,8 +421,9 @@ run/segment；`--rank-body-temp-dir` 只管理最终压缩 body 的 spool。两�
 
 后续阶段：
 
-- 评估非流式 markdup 是否值得接入 streaming backend，或继续作为 memory
-  flat-hash 极致性能实例；
+- 集群复测单遍 `markdup --stream` 的正确性、峰值内存和核心时间，再决定是否将
+  `-r/-c` 也迁移为单遍输出；无 `--stream` 的 memory flat-hash 路径继续作为
+  极致性能对照；
 - 减少 packer chunk 到 write pipeline input 的一次 block copy；
 - 将转换、fixmate 和 markdup 中仍然保留的最终输出编排逐步切换到
   `DistributedBamOutput`；

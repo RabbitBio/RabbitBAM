@@ -251,6 +251,7 @@ struct MpiMarkdupStats {
     long long mpi_result_bytes;
     long long bgzf_blocks;
     long long tracked_peak_bytes;
+    long long stream_pending_peak_bytes;
     double t_candidate_decomp;
     double t_candidate_extract;
     double t_extract_status;
@@ -284,6 +285,8 @@ struct MpiMarkdupStats {
     double t_rank_sync;
     double t_cpe_launch;
     double t_cpe_sync;
+    double t_stream_buffer;
+    double t_stream_finalize;
     double t_fused_total;
 };
 
@@ -355,6 +358,13 @@ int MpiMarkdupMemoryToMemory(CmdInfo *cmd_info,
                              double *core_cost);
 
 struct MpiMarkdupStreamingWindow;
+enum MpiMarkdupDecisionAction {
+    RB_MARKDUP_DECISION_KEEP = 0,
+    RB_MARKDUP_DECISION_DUPLICATE = 1,
+    RB_MARKDUP_DECISION_PENDING = 2
+};
+typedef int (*MpiMarkdupLocalDecisionFn)(
+    void *opaque, uint64_t ordinal, int action);
 MpiMarkdupStreamingWindow *MpiMarkdupStreamingWindowCreate(
     int comm_size, int max_read_length,
     int range_first_tid, int range_first_pos,
@@ -368,6 +378,32 @@ int MpiMarkdupStreamingWindowProcess(
     int progress_tid, int progress_pos,
     std::vector<std::vector<uint64_t> > *duplicates_by_source,
     MpiMarkdupStats *stats);
+int MpiMarkdupStreamingWindowProcessDecisions(
+    MpiMarkdupStreamingWindow *window,
+    const std::vector<MpiMarkdupCandidateShared> &owner_candidates,
+    const std::vector<unsigned char> &owner_qnames,
+    int progress_tid, int progress_pos,
+    std::vector<std::vector<MpiMarkdupDecisionShared> >
+        *decisions_by_source,
+    MpiMarkdupStats *stats);
+int MpiMarkdupStreamingWindowFinalizeDecisions(
+    MpiMarkdupStreamingWindow *window,
+    std::vector<std::vector<MpiMarkdupDecisionShared> >
+        *decisions_by_source);
+int MpiMarkdupStreamingWindowProcessOptimistic(
+    MpiMarkdupStreamingWindow *window,
+    const std::vector<MpiMarkdupCandidateShared> &owner_candidates,
+    const std::vector<unsigned char> &owner_qnames,
+    int progress_tid, int progress_pos, int local_rank,
+    MpiMarkdupLocalDecisionFn apply_local, void *local_opaque,
+    std::vector<std::vector<MpiMarkdupDecisionShared> >
+        *remote_decisions_by_source,
+    MpiMarkdupStats *stats);
+int MpiMarkdupStreamingWindowFinalizeOptimistic(
+    MpiMarkdupStreamingWindow *window, int local_rank,
+    MpiMarkdupLocalDecisionFn apply_local, void *local_opaque,
+    std::vector<std::vector<MpiMarkdupDecisionShared> >
+        *remote_decisions_by_source);
 size_t MpiMarkdupStreamingWindowMemory(
     const MpiMarkdupStreamingWindow *window);
 

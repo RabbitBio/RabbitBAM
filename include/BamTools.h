@@ -381,6 +381,12 @@ struct MpiMarkdupCandidateShared {
     int32_t source_rank;
 };
 
+struct MpiMarkdupDecisionShared {
+    uint64_t ordinal;
+    uint8_t duplicate;
+    uint8_t pad[7];
+};
+
 struct MpiMarkdupExtractPara {
     int block_id;
     bam1_t **records;

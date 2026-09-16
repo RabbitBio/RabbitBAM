@@ -8,6 +8,9 @@
 
 namespace {
 
+const size_t kMdMarkerFilterBits = 1u << 16;
+const size_t kMdMarkerFilterWords = kMdMarkerFilterBits / 64;
+
 static uint64_t MdMix64(uint64_t value) {
     value += 0x9e3779b97f4a7c15ull;
     value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
@@ -42,6 +45,18 @@ static bool MdKeyEqualFlat(const MpiMarkdupKeyShared &a,
            a.single == b.single &&
            a.leftmost == b.leftmost &&
            a.orientation == b.orientation;
+}
+
+static size_t MdMarkerFilterIndex(const MpiMarkdupKeyShared &key) {
+    uint64_t value = (uint64_t)key.this_coord;
+    value ^= (uint64_t)(uint32_t)key.this_ref *
+             0x9e3779b97f4a7c15ull;
+    value ^= (uint64_t)(uint8_t)key.orientation *
+             0xbf58476d1ce4e5b9ull;
+    value ^= value >> 29;
+    value *= 0x94d049bb133111ebull;
+    value ^= value >> 32;
+    return (size_t)value & (kMdMarkerFilterBits - 1);
 }
 
 static size_t MdNextTableCapacity(size_t expected) {
@@ -225,10 +240,77 @@ static bool MdPairBetterStream(
 
 static int MdPushDuplicateStream(
         const MpiMarkdupCandidateShared &candidate, int comm_size,
-        std::vector<std::vector<uint64_t> > *duplicates_by_source) {
+        std::vector<std::vector<uint64_t> > *duplicates_by_source,
+        std::vector<std::vector<MpiMarkdupDecisionShared> >
+            *decisions_by_source) {
     const int source = candidate.source_rank;
     if (source < 0 || source >= comm_size) return -1;
-    (*duplicates_by_source)[(size_t)source].push_back(candidate.ordinal);
+    if (duplicates_by_source) {
+        (*duplicates_by_source)[(size_t)source].push_back(
+            candidate.ordinal);
+    }
+    if (decisions_by_source) {
+        MpiMarkdupDecisionShared decision = {};
+        decision.ordinal = candidate.ordinal;
+        decision.duplicate = 1;
+        (*decisions_by_source)[(size_t)source].push_back(decision);
+    }
+    return 0;
+}
+
+static int MdPushDuplicateStream(
+        const MpiMarkdupCandidateShared &candidate, int comm_size,
+        std::vector<std::vector<uint64_t> > *duplicates_by_source) {
+    return MdPushDuplicateStream(
+        candidate, comm_size, duplicates_by_source, nullptr);
+}
+
+static bool MdIsDecisionCandidate(
+        const MpiMarkdupCandidateShared &candidate) {
+    return !candidate.key.single || !candidate.paired_marker;
+}
+
+static int MdPushKeepDecision(
+        const MpiMarkdupCandidateShared &candidate, int comm_size,
+        std::vector<std::vector<MpiMarkdupDecisionShared> >
+            *decisions_by_source) {
+    if (!decisions_by_source || !MdIsDecisionCandidate(candidate)) {
+        return 0;
+    }
+    const int source = candidate.source_rank;
+    if (source < 0 || source >= comm_size) return -1;
+    MpiMarkdupDecisionShared decision = {};
+    decision.ordinal = candidate.ordinal;
+    decision.duplicate = 0;
+    (*decisions_by_source)[(size_t)source].push_back(decision);
+    return 0;
+}
+
+static int MdEmitOptimisticDecision(
+        const MpiMarkdupCandidateShared &candidate, int comm_size,
+        int local_rank, int action,
+        MpiMarkdupLocalDecisionFn apply_local, void *local_opaque,
+        std::vector<std::vector<MpiMarkdupDecisionShared> >
+            *remote_decisions_by_source) {
+    if (!MdIsDecisionCandidate(candidate)) return 0;
+    const int source = candidate.source_rank;
+    if (source < 0 || source >= comm_size || !apply_local ||
+        !remote_decisions_by_source) {
+        return -1;
+    }
+    if (source == local_rank) {
+        return apply_local(local_opaque, candidate.ordinal, action);
+    }
+    if (action == RB_MARKDUP_DECISION_PENDING) {
+        // A remotely owned candidate is made pending by its source rank
+        // before candidate exchange, so no reverse notification is needed.
+        return 0;
+    }
+    MpiMarkdupDecisionShared decision = {};
+    decision.ordinal = candidate.ordinal;
+    decision.duplicate =
+        action == RB_MARKDUP_DECISION_DUPLICATE ? 1 : 0;
+    (*remote_decisions_by_source)[(size_t)source].push_back(decision);
     return 0;
 }
 
@@ -252,12 +334,15 @@ struct MpiMarkdupStreamingWindow {
     std::vector<size_t> single_slots;
     std::vector<size_t> marker_indices;
     std::vector<size_t> marker_carry_indices;
+    uint64_t marker_filter[kMdMarkerFilterWords];
 
     MpiMarkdupStreamingWindow()
         : comm_size(1), max_read_length(300),
           first_ref(0), first_coord(0),
           last_ref(0), last_coord(0),
-          peak_working_bytes(0) {}
+          peak_working_bytes(0) {
+        memset(marker_filter, 0, sizeof(marker_filter));
+    }
 };
 
 namespace {
@@ -334,18 +419,66 @@ void MpiMarkdupStreamingWindowDestroy(
     delete window;
 }
 
-int MpiMarkdupStreamingWindowProcess(
+static int MdStreamingWindowProcessImpl(
         MpiMarkdupStreamingWindow *window,
         const std::vector<MpiMarkdupCandidateShared> &owner_candidates,
         const std::vector<unsigned char> &owner_qnames,
         int progress_tid, int progress_pos,
         std::vector<std::vector<uint64_t> > *duplicates_by_source,
+        std::vector<std::vector<MpiMarkdupDecisionShared> >
+            *decisions_by_source,
+        int optimistic_local_rank,
+        MpiMarkdupLocalDecisionFn apply_local,
+        void *local_opaque,
+        bool optimistic,
         MpiMarkdupStats *stats) {
-    if (!window || !duplicates_by_source || !stats) return -1;
-    if (duplicates_by_source->size() != (size_t)window->comm_size) {
+    if (!window || (!duplicates_by_source && !decisions_by_source) ||
+        !stats) {
+        return -1;
+    }
+    if (duplicates_by_source &&
+        duplicates_by_source->size() != (size_t)window->comm_size) {
         duplicates_by_source->assign(
             (size_t)window->comm_size, std::vector<uint64_t>());
     }
+    if (decisions_by_source &&
+        decisions_by_source->size() != (size_t)window->comm_size) {
+        decisions_by_source->assign(
+            (size_t)window->comm_size,
+            std::vector<MpiMarkdupDecisionShared>());
+    }
+    const bool emit_decisions = decisions_by_source != nullptr;
+    const bool track_all_winners = emit_decisions && !optimistic;
+    auto emit_duplicate = [&](const MpiMarkdupCandidateShared &candidate)
+        -> int {
+        return optimistic
+            ? MdEmitOptimisticDecision(
+                  candidate, window->comm_size, optimistic_local_rank,
+                  RB_MARKDUP_DECISION_DUPLICATE, apply_local,
+                  local_opaque, decisions_by_source)
+            : MdPushDuplicateStream(
+                  candidate, window->comm_size, duplicates_by_source,
+                  decisions_by_source);
+    };
+    auto emit_keep = [&](const MpiMarkdupCandidateShared &candidate)
+        -> int {
+        return optimistic
+            ? MdEmitOptimisticDecision(
+                  candidate, window->comm_size, optimistic_local_rank,
+                  RB_MARKDUP_DECISION_KEEP, apply_local,
+                  local_opaque, decisions_by_source)
+            : MdPushKeepDecision(
+                  candidate, window->comm_size, decisions_by_source);
+    };
+    auto mark_pending = [&](const MpiMarkdupCandidateShared &candidate)
+        -> int {
+        return optimistic
+            ? MdEmitOptimisticDecision(
+                  candidate, window->comm_size, optimistic_local_rank,
+                  RB_MARKDUP_DECISION_PENDING, apply_local,
+                  local_opaque, decisions_by_source)
+            : 0;
+    };
     const double group_t0 = GetTime();
     const size_t carry_count = window->carry.size();
     const size_t total = carry_count + owner_candidates.size();
@@ -388,10 +521,16 @@ int MpiMarkdupStreamingWindowProcess(
 
     size_t pair_expected = 0;
     size_t single_expected = 0;
+    memset(window->marker_filter, 0, sizeof(window->marker_filter));
     for (size_t i = 0; i < total; ++i) {
         const MpiMarkdupCandidateShared &candidate = candidate_at(i);
         if (!candidate.key.single) pair_expected++;
-        else if (!candidate.paired_marker) single_expected++;
+        else if (!candidate.paired_marker) {
+            single_expected++;
+            const size_t bit = MdMarkerFilterIndex(candidate.key);
+            window->marker_filter[bit >> 6] |=
+                (uint64_t)1 << (bit & 63);
+        }
     }
     if (window->pair_best.Prepare(
             pair_expected, &stats->t_flat_alloc,
@@ -422,9 +561,11 @@ int MpiMarkdupStreamingWindowProcess(
             }
             // Only winners close enough to cross a batch/rank boundary need
             // a second visit during carry construction.
-            if (inserted && MdWindowKeepKey(
-                    window, candidate.key,
-                    progress_tid, progress_pos)) {
+            if (inserted && (i < carry_count || track_all_winners ||
+                    (optimistic &&
+                     candidate.source_rank != optimistic_local_rank) ||
+                    MdWindowKeepKey(window, candidate.key,
+                                    progress_tid, progress_pos))) {
                 window->pair_slots.push_back(slot);
             }
             if (inserted) continue;
@@ -432,15 +573,18 @@ int MpiMarkdupStreamingWindowProcess(
             const MpiMarkdupCandidateShared &best =
                 candidate_at(old_best);
             if (pair_better(i, old_best)) {
-                if (MdPushDuplicateStream(best, window->comm_size,
-                                          duplicates_by_source) != 0) {
+                if (emit_duplicate(best) != 0) {
                     status = -1;
                     break;
                 }
                 window->pair_best.best[slot] = i;
-            } else if (MdPushDuplicateStream(
-                           candidate, window->comm_size,
-                           duplicates_by_source) != 0) {
+                if (optimistic &&
+                    candidate.source_rank != optimistic_local_rank &&
+                    !MdWindowKeepKey(window, candidate.key,
+                                     progress_tid, progress_pos)) {
+                    window->pair_slots.push_back(slot);
+                }
+            } else if (emit_duplicate(candidate) != 0) {
                 status = -1;
                 break;
             }
@@ -448,7 +592,11 @@ int MpiMarkdupStreamingWindowProcess(
             continue;
         }
         if (candidate.paired_marker) {
-            window->marker_indices.push_back(i);
+            const size_t bit = MdMarkerFilterIndex(candidate.key);
+            if (window->marker_filter[bit >> 6] &
+                    ((uint64_t)1 << (bit & 63))) {
+                window->marker_indices.push_back(i);
+            }
             if (MdWindowKeepKey(window, candidate.key,
                                 progress_tid, progress_pos)) {
                 window->marker_carry_indices.push_back(i);
@@ -461,9 +609,11 @@ int MpiMarkdupStreamingWindowProcess(
             status = -1;
             break;
         }
-        if (inserted && MdWindowKeepKey(
-                window, candidate.key,
-                progress_tid, progress_pos)) {
+        if (inserted && (i < carry_count || track_all_winners ||
+                (optimistic &&
+                 candidate.source_rank != optimistic_local_rank) ||
+                MdWindowKeepKey(window, candidate.key,
+                                progress_tid, progress_pos))) {
             window->single_slots.push_back(slot);
         }
         if (inserted) continue;
@@ -472,15 +622,18 @@ int MpiMarkdupStreamingWindowProcess(
         if (candidate.score > best.score ||
             (candidate.score == best.score &&
              candidate.global_order < best.global_order)) {
-            if (MdPushDuplicateStream(best, window->comm_size,
-                                      duplicates_by_source) != 0) {
+            if (emit_duplicate(best) != 0) {
                 status = -1;
                 break;
             }
             window->single_best.best[slot] = i;
-        } else if (MdPushDuplicateStream(
-                       candidate, window->comm_size,
-                       duplicates_by_source) != 0) {
+            if (optimistic &&
+                candidate.source_rank != optimistic_local_rank &&
+                !MdWindowKeepKey(window, candidate.key,
+                                 progress_tid, progress_pos)) {
+                window->single_slots.push_back(slot);
+            }
+        } else if (emit_duplicate(candidate) != 0) {
             status = -1;
             break;
         }
@@ -498,8 +651,9 @@ int MpiMarkdupStreamingWindowProcess(
         const MpiMarkdupCandidateShared &input = candidate_at(index);
         if (!MdWindowKeepKey(window, input.key,
                              progress_tid, progress_pos)) {
-            return 0;
+            return emit_keep(input);
         }
+        if (mark_pending(input) != 0) return -1;
         MpiMarkdupCandidateShared candidate = input;
         if (!candidate.key.single) {
             const std::vector<unsigned char> &qnames = qnames_at(index);
@@ -533,9 +687,7 @@ int MpiMarkdupStreamingWindowProcess(
             window->single_best.best[single_slot] != SIZE_MAX) {
             const MpiMarkdupCandidateShared &candidate =
                 candidate_at(window->single_best.best[single_slot]);
-            if (MdPushDuplicateStream(
-                    candidate, window->comm_size,
-                    duplicates_by_source) != 0) {
+            if (emit_duplicate(candidate) != 0) {
                 return -1;
             }
             window->single_best.best[single_slot] = SIZE_MAX;
@@ -563,7 +715,8 @@ int MpiMarkdupStreamingWindowProcess(
         window->pair_slots.capacity() * sizeof(size_t) +
         window->single_slots.capacity() * sizeof(size_t) +
         window->marker_indices.capacity() * sizeof(size_t) +
-        window->marker_carry_indices.capacity() * sizeof(size_t);
+        window->marker_carry_indices.capacity() * sizeof(size_t) +
+        sizeof(window->marker_filter);
     const size_t pair_bytes = MdFlatTableBytes(window->pair_best);
     const size_t single_bytes = MdFlatTableBytes(window->single_best);
     if (pair_bytes == SIZE_MAX || single_bytes == SIZE_MAX ||
@@ -581,6 +734,97 @@ int MpiMarkdupStreamingWindowProcess(
     stats->t_flat_finalize += finalize_dt;
     stats->t_group_scan += finalize_dt;
     stats->t_group += GetTime() - group_t0;
+    return 0;
+}
+
+int MpiMarkdupStreamingWindowProcess(
+        MpiMarkdupStreamingWindow *window,
+        const std::vector<MpiMarkdupCandidateShared> &owner_candidates,
+        const std::vector<unsigned char> &owner_qnames,
+        int progress_tid, int progress_pos,
+        std::vector<std::vector<uint64_t> > *duplicates_by_source,
+        MpiMarkdupStats *stats) {
+    return MdStreamingWindowProcessImpl(
+        window, owner_candidates, owner_qnames,
+        progress_tid, progress_pos, duplicates_by_source,
+        nullptr, -1, nullptr, nullptr, false, stats);
+}
+
+int MpiMarkdupStreamingWindowProcessDecisions(
+        MpiMarkdupStreamingWindow *window,
+        const std::vector<MpiMarkdupCandidateShared> &owner_candidates,
+        const std::vector<unsigned char> &owner_qnames,
+        int progress_tid, int progress_pos,
+        std::vector<std::vector<MpiMarkdupDecisionShared> >
+            *decisions_by_source,
+        MpiMarkdupStats *stats) {
+    return MdStreamingWindowProcessImpl(
+        window, owner_candidates, owner_qnames,
+        progress_tid, progress_pos, nullptr,
+        decisions_by_source, -1, nullptr, nullptr, false, stats);
+}
+
+int MpiMarkdupStreamingWindowProcessOptimistic(
+        MpiMarkdupStreamingWindow *window,
+        const std::vector<MpiMarkdupCandidateShared> &owner_candidates,
+        const std::vector<unsigned char> &owner_qnames,
+        int progress_tid, int progress_pos, int local_rank,
+        MpiMarkdupLocalDecisionFn apply_local, void *local_opaque,
+        std::vector<std::vector<MpiMarkdupDecisionShared> >
+            *remote_decisions_by_source,
+        MpiMarkdupStats *stats) {
+    return MdStreamingWindowProcessImpl(
+        window, owner_candidates, owner_qnames,
+        progress_tid, progress_pos, nullptr,
+        remote_decisions_by_source, local_rank, apply_local,
+        local_opaque, true, stats);
+}
+
+int MpiMarkdupStreamingWindowFinalizeDecisions(
+        MpiMarkdupStreamingWindow *window,
+        std::vector<std::vector<MpiMarkdupDecisionShared> >
+            *decisions_by_source) {
+    if (!window || !decisions_by_source) return -1;
+    if (decisions_by_source->size() != (size_t)window->comm_size) {
+        decisions_by_source->assign(
+            (size_t)window->comm_size,
+            std::vector<MpiMarkdupDecisionShared>());
+    }
+    for (size_t i = 0; i < window->carry.size(); ++i) {
+        if (MdPushKeepDecision(window->carry[i], window->comm_size,
+                               decisions_by_source) != 0) {
+            return -1;
+        }
+    }
+    window->carry.clear();
+    window->carry_qnames.clear();
+    window->next_carry.clear();
+    window->next_qnames.clear();
+    return 0;
+}
+
+int MpiMarkdupStreamingWindowFinalizeOptimistic(
+        MpiMarkdupStreamingWindow *window, int local_rank,
+        MpiMarkdupLocalDecisionFn apply_local, void *local_opaque,
+        std::vector<std::vector<MpiMarkdupDecisionShared> >
+            *remote_decisions_by_source) {
+    if (!window || !apply_local || !remote_decisions_by_source ||
+        remote_decisions_by_source->size() !=
+            (size_t)window->comm_size) {
+        return -1;
+    }
+    for (size_t i = 0; i < window->carry.size(); ++i) {
+        if (MdEmitOptimisticDecision(
+                window->carry[i], window->comm_size, local_rank,
+                RB_MARKDUP_DECISION_KEEP, apply_local, local_opaque,
+                remote_decisions_by_source) != 0) {
+            return -1;
+        }
+    }
+    window->carry.clear();
+    window->carry_qnames.clear();
+    window->next_carry.clear();
+    window->next_qnames.clear();
     return 0;
 }
 

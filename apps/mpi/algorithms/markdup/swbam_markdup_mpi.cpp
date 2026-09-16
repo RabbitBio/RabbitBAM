@@ -7,9 +7,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <new>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #ifdef PLATFORM_SUNWAY
@@ -59,6 +63,12 @@ namespace {
 const int kMarkdupNB = 64;
 const int kMarkdupTagCount = 8;
 const int kMarkdupExchangeChunk = INT_MAX / 2;
+
+enum MdOnePassRecordState {
+    kMdOnePassKeep = 0,
+    kMdOnePassUnknown = 1,
+    kMdOnePassDuplicate = 2
+};
 
 const unsigned char kMarkdupBgzfEofBlock[28] = {
     0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00,
@@ -111,6 +121,15 @@ struct MdCandidateWorkspace {
     size_t qname_stride;
 };
 
+struct MdExtractBatchView {
+    MdBlockSet *uncompressed;
+    Bam2BamPara *decomp;
+    int n_blocks;
+    uint64_t ordinal_base;
+    uint64_t ordinal_end;
+    size_t fixed_workspace_bytes;
+};
+
 struct MdMarkdupCandidateBufferDeleter {
     void operator()(MpiMarkdupCandidateShared *p) const {
         if (p) aligned_free_custom((unsigned char *)p);
@@ -147,6 +166,42 @@ struct MdRemoteCandidateRef {
     size_t index;
     int owner;
 };
+
+struct MdBoundaryCandidateId {
+    uint64_t global_order;
+    uint8_t kind;
+
+    bool operator==(const MdBoundaryCandidateId &other) const {
+        return global_order == other.global_order && kind == other.kind;
+    }
+};
+
+struct MdBoundaryCandidateIdHash {
+    size_t operator()(const MdBoundaryCandidateId &id) const {
+        uint64_t value = id.global_order ^
+            ((uint64_t)id.kind * 0x9e3779b97f4a7c15ull);
+        value ^= value >> 30;
+        value *= 0xbf58476d1ce4e5b9ull;
+        value ^= value >> 27;
+        value *= 0x94d049bb133111ebull;
+        value ^= value >> 31;
+        return (size_t)value;
+    }
+};
+
+struct MdOnePassBoundaryPlan {
+    int enabled;
+    std::vector<MdCoordBoundary> boundaries;
+    std::unordered_set<MdBoundaryCandidateId,
+                       MdBoundaryCandidateIdHash> candidates;
+    std::unordered_map<uint64_t, uint8_t> decisions;
+
+    MdOnePassBoundaryPlan() : enabled(0) {}
+};
+
+typedef int (*MdRemoteCandidateObserver)(
+    void *opaque, const MpiMarkdupCandidateShared &candidate,
+    int owner);
 
 struct MdBucketRange {
     uint64_t code;
@@ -480,7 +535,8 @@ typedef int (*MdCandidateBatchConsumer)(
     std::vector<MpiMarkdupCandidateShared> *candidates,
     std::vector<unsigned char> *qnames,
     int progress_tid, int progress_pos,
-    uint64_t records_so_far);
+    uint64_t records_so_far,
+    MdExtractBatchView *batch);
 
 static int MdExtractCandidatesPass(
         MdInputPass &source, long long global_block_begin,
@@ -803,10 +859,17 @@ static int MdExtractCandidatesPass(
 
     auto consume_slot = [&](MdExtractSlot *slot) -> int {
         if (!batch_consumer) return 0;
+        MdExtractBatchView batch = {};
+        batch.uncompressed = &slot->uncompressed;
+        batch.decomp = slot->decomp;
+        batch.n_blocks = slot->n_blocks;
+        batch.ordinal_base = slot->ordinal_base;
+        batch.ordinal_end = slot->ordinal_end;
+        batch.fixed_workspace_bytes = fixed_workspace;
         if (batch_consumer(batch_context, local_candidates,
                            local_qnames, slot->progress_tid,
-                           slot->progress_pos,
-                           slot->ordinal_end) != 0) {
+                           slot->progress_pos, slot->ordinal_end,
+                           &batch) != 0) {
             return -1;
         }
         local_candidates->clear();
@@ -825,7 +888,8 @@ static int MdExtractCandidatesPass(
         *local_records = 0;
         while (batch_consumer && processed_batches < target_batches) {
             if (batch_consumer(batch_context, local_candidates,
-                               local_qnames, -1, -1, 0) != 0) {
+                               local_qnames, -1, -1, 0,
+                               nullptr) != 0) {
                 free_slots();
                 return -1;
             }
@@ -878,7 +942,7 @@ static int MdExtractCandidatesPass(
     while (batch_consumer && processed_batches < target_batches) {
         if (batch_consumer(batch_context, local_candidates,
                            local_qnames, previous_tid,
-                           previous_pos, ordinal) != 0) {
+                           previous_pos, ordinal, nullptr) != 0) {
             free_slots();
             return -1;
         }
@@ -1515,6 +1579,32 @@ static int MdCoordinateOwnerByFirst(
         int fallback_rank) {
     // First-coordinate cuts assign every key to one stable rank without
     // needing a full-file pass to discover each rank's final coordinate.
+    // Almost every candidate belongs to its source rank. Check that interval
+    // directly before falling back to the full boundary walk.
+    if (fallback_rank >= 0 &&
+        fallback_rank < (int)boundaries.size()) {
+        const MdCoordBoundary &local =
+            boundaries[(size_t)fallback_rank];
+        if (local.has_records &&
+            MdCompareCoord(key.this_ref, key.this_coord,
+                           local.first_ref, local.first_coord) >= 0) {
+            int next_rank = -1;
+            for (size_t r = (size_t)fallback_rank + 1;
+                 r < boundaries.size(); ++r) {
+                if (boundaries[r].has_records) {
+                    next_rank = (int)r;
+                    break;
+                }
+            }
+            if (next_rank < 0 ||
+                MdCompareCoord(
+                    key.this_ref, key.this_coord,
+                    boundaries[(size_t)next_rank].first_ref,
+                    boundaries[(size_t)next_rank].first_coord) < 0) {
+                return fallback_rank;
+            }
+        }
+    }
     int owner = -1;
     for (size_t r = 0; r < boundaries.size(); ++r) {
         const MdCoordBoundary &b = boundaries[r];
@@ -1567,7 +1657,9 @@ static int MdExchangeCandidatesByCoordinate(
         std::vector<unsigned char> *owner_qnames,
         MpiMarkdupStats *stats,
         const std::vector<MdCoordBoundary> *fixed_boundaries = nullptr,
-        int owner_by_first = 0) {
+        int owner_by_first = 0,
+        MdRemoteCandidateObserver remote_observer = nullptr,
+        void *remote_observer_opaque = nullptr) {
     double exchange_total_t0 = GetTime();
     std::vector<MpiMarkdupCandidateShared> &local_candidates =
         *local_candidates_in;
@@ -1626,6 +1718,12 @@ static int MdExchangeCandidatesByCoordinate(
                 self_qname_count += (size_t)candidate.qname_len;
             }
             continue;
+        }
+        if (remote_observer &&
+            remote_observer(remote_observer_opaque,
+                            candidate, owner) != 0) {
+            local_ok = 0;
+            break;
         }
         MdRemoteCandidateRef ref;
         ref.index = i;
@@ -1906,6 +2004,422 @@ static int MdExchangeCandidatesByCoordinate(
     stats->t_candidate_exchange += GetTime() - exchange_total_t0;
     stats->owner_candidates = (long long)owner_candidates->size();
     stats->qname_bytes = (long long)owner_qnames->size();
+    return 0;
+}
+
+static uint8_t MdBoundaryCandidateKind(
+        const MpiMarkdupCandidateShared &candidate) {
+    if (!candidate.key.single) return 0;
+    return candidate.paired_marker ? 2 : 1;
+}
+
+static MdBoundaryCandidateId MdMakeBoundaryCandidateId(
+        const MpiMarkdupCandidateShared &candidate) {
+    MdBoundaryCandidateId id;
+    id.global_order = candidate.global_order;
+    id.kind = MdBoundaryCandidateKind(candidate);
+    return id;
+}
+
+static bool MdBoundaryDecisionCandidate(
+        const MpiMarkdupCandidateShared &candidate) {
+    return !candidate.key.single || !candidate.paired_marker;
+}
+
+static bool MdCoordinateNearBoundary(
+        const MpiMarkdupKeyShared &key,
+        const std::vector<MdCoordBoundary> &boundaries,
+        int64_t max_read_length) {
+    int seen_nonempty = 0;
+    for (size_t r = 0; r < boundaries.size(); ++r) {
+        const MdCoordBoundary &boundary = boundaries[r];
+        if (!boundary.has_records) continue;
+        if (!seen_nonempty) {
+            seen_nonempty = 1;
+            continue;
+        }
+        if (key.this_ref != boundary.first_ref) continue;
+        const int64_t low = boundary.first_coord <
+                INT64_MIN + max_read_length
+            ? INT64_MIN : boundary.first_coord - max_read_length;
+        const int64_t high = boundary.first_coord >
+                INT64_MAX - max_read_length
+            ? INT64_MAX : boundary.first_coord + max_read_length;
+        if (key.this_coord >= low && key.this_coord <= high) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int MdRouteBoundaryDuplicateOrders(
+        std::vector<std::vector<uint64_t> > *duplicates_by_source,
+        int rank, int comm_size, MdOnePassBoundaryPlan *plan,
+        MpiMarkdupStats *stats) {
+    if (!duplicates_by_source || !plan || !stats ||
+        duplicates_by_source->size() != (size_t)comm_size) {
+        return -1;
+    }
+    std::vector<unsigned long long> send_counts((size_t)comm_size, 0);
+    std::vector<unsigned long long> recv_counts((size_t)comm_size, 0);
+    for (int r = 0; r < comm_size; ++r) {
+        std::vector<uint64_t> &values =
+            (*duplicates_by_source)[(size_t)r];
+        std::sort(values.begin(), values.end());
+        values.erase(std::unique(values.begin(), values.end()),
+                     values.end());
+        send_counts[(size_t)r] =
+            (unsigned long long)values.size();
+    }
+    MPI_Alltoall(send_counts.data(), 1, MPI_UNSIGNED_LONG_LONG,
+                 recv_counts.data(), 1, MPI_UNSIGNED_LONG_LONG,
+                 MPI_COMM_WORLD);
+
+    int local_ok = 1;
+    for (int step = 0; step < comm_size; ++step) {
+        const int dest = (rank + step) % comm_size;
+        const int src = (rank - step + comm_size) % comm_size;
+        const unsigned long long send_count =
+            send_counts[(size_t)dest];
+        const unsigned long long recv_count =
+            recv_counts[(size_t)src];
+        if (recv_count >
+            (unsigned long long)(SIZE_MAX / sizeof(uint64_t))) {
+            local_ok = 0;
+        }
+        if (!MdAllRanksOk(local_ok)) return -1;
+
+        std::vector<uint64_t> received;
+        if (step == 0) {
+            received = (*duplicates_by_source)[(size_t)rank];
+        } else {
+            try {
+                received.resize((size_t)recv_count);
+            } catch (...) {
+                local_ok = 0;
+            }
+            if (!MdAllRanksOk(local_ok)) return -1;
+            if (MdSendrecvBytes(
+                    send_count
+                        ? (*duplicates_by_source)[(size_t)dest].data()
+                        : nullptr,
+                    send_count * sizeof(uint64_t), dest,
+                    recv_count ? received.data() : nullptr,
+                    recv_count * sizeof(uint64_t), src, 4141) != 0) {
+                return -1;
+            }
+            stats->mpi_result_bytes +=
+                (long long)(send_count * sizeof(uint64_t));
+        }
+        for (size_t i = 0; i < received.size(); ++i) {
+            std::unordered_map<uint64_t, uint8_t>::iterator found =
+                plan->decisions.find(received[i]);
+            if (found == plan->decisions.end()) {
+                fprintf(stderr,
+                        "[rank %d] ERROR: boundary duplicate order=%llu "
+                        "was not selected by the source rank.\n",
+                        rank, (unsigned long long)received[i]);
+                local_ok = 0;
+                continue;
+            }
+            found->second = (uint8_t)kMdOnePassDuplicate;
+        }
+    }
+    return MdAllRanksOk(local_ok) ? 0 : -1;
+}
+
+static int MdAppendBoundaryCandidates(
+        const std::vector<MpiMarkdupCandidateShared> &input_candidates,
+        const std::vector<unsigned char> &input_qnames,
+        const std::vector<MdCoordBoundary> &boundaries,
+        int max_read_length, MdOnePassBoundaryPlan *plan,
+        std::vector<MpiMarkdupCandidateShared> *selected_candidates,
+        std::vector<unsigned char> *selected_qnames) {
+    for (size_t i = 0; i < input_candidates.size(); ++i) {
+        const MpiMarkdupCandidateShared &input = input_candidates[i];
+        if (!MdCoordinateNearBoundary(
+                input.key, boundaries, max_read_length)) {
+            continue;
+        }
+        const MdBoundaryCandidateId id =
+            MdMakeBoundaryCandidateId(input);
+        if (!plan->candidates.insert(id).second) continue;
+
+        MpiMarkdupCandidateShared candidate = input;
+        if (!candidate.key.single) {
+            const size_t qname_offset =
+                (size_t)candidate.qname_offset;
+            const size_t qname_len = (size_t)candidate.qname_len;
+            if (qname_offset > input_qnames.size() ||
+                qname_len > input_qnames.size() - qname_offset) {
+                return -1;
+            }
+            candidate.qname_offset =
+                (uint64_t)selected_qnames->size();
+            selected_qnames->insert(
+                selected_qnames->end(),
+                input_qnames.data() + qname_offset,
+                input_qnames.data() + qname_offset + qname_len);
+        }
+        // Boundary duplicate routing uses a globally unique record id.
+        candidate.ordinal = candidate.global_order;
+        selected_candidates->push_back(candidate);
+        if (MdBoundaryDecisionCandidate(candidate)) {
+            plan->decisions[candidate.global_order] =
+                (uint8_t)kMdOnePassKeep;
+        }
+    }
+    return 0;
+}
+
+struct MdBoundaryProbeContext {
+    size_t first_end;
+    size_t last_begin;
+    int first_last_tid;
+    int first_last_pos;
+    int last_first_tid;
+    int last_first_pos;
+
+    MdBoundaryProbeContext()
+        : first_end(0), last_begin(0), first_last_tid(-1),
+          first_last_pos(-1), last_first_tid(-1),
+          last_first_pos(-1) {}
+};
+
+static int MdCaptureBoundaryProbe(
+        void *opaque,
+        std::vector<MpiMarkdupCandidateShared> *,
+        std::vector<unsigned char> *, int, int, uint64_t,
+        MdExtractBatchView *batch) {
+    MdBoundaryProbeContext *probe =
+        (MdBoundaryProbeContext *)opaque;
+    if (!probe || !batch || !batch->decomp || batch->n_blocks <= 0) {
+        return -1;
+    }
+    size_t first_end = std::min(
+        probe->first_end, (size_t)batch->n_blocks - 1);
+    for (size_t i = first_end + 1; i > 0; --i) {
+        Bam2BamPara &para = batch->decomp[i - 1];
+        if (para.n_total_records <= 0 || !para.output_records) continue;
+        bam1_t *record = para.output_records[para.n_total_records - 1];
+        if (!record) return -1;
+        probe->first_last_tid = record->core.tid;
+        probe->first_last_pos = record->core.pos;
+        break;
+    }
+    for (size_t i = probe->last_begin;
+         i < (size_t)batch->n_blocks; ++i) {
+        Bam2BamPara &para = batch->decomp[i];
+        if (para.n_total_records <= 0 || !para.output_records) continue;
+        bam1_t *record = para.output_records[0];
+        if (!record) return -1;
+        probe->last_first_tid = record->core.tid;
+        probe->last_first_pos = record->core.pos;
+        break;
+    }
+    return 0;
+}
+
+static int MdBuildOnePassBoundaryPlan(
+        const swbam::BamInputBackend &backend,
+        const swbam::BgzfBlockSpan *spans, size_t span_count,
+        long long global_block_begin, int rank, int comm_size,
+        int include_fails, int max_read_length, size_t memory_limit,
+        MdOnePassBoundaryPlan *plan, MpiMarkdupStats *stats) {
+    if (!plan || !stats || max_read_length <= 0 ||
+        (span_count > 0 && !spans)) {
+        return -1;
+    }
+    const double boundary_t0 = GetTime();
+    plan->enabled = 0;
+    plan->boundaries.clear();
+    plan->candidates.clear();
+    plan->decisions.clear();
+
+    // Empty ranks are uncommon and complicate a fixed one-batch collective
+    // probe. Keep the existing conservative window for that layout.
+    const int local_nonempty = span_count > 0 ? 1 : 0;
+    int all_nonempty = 0;
+    MPI_Allreduce(&local_nonempty, &all_nonempty, 1, MPI_INT, MPI_MIN,
+                  MPI_COMM_WORLD);
+    if (!all_nonempty) {
+        stats->t_boundary_check += GetTime() - boundary_t0;
+        return 0;
+    }
+
+    const size_t side_blocks = std::min(
+        span_count, (size_t)kMarkdupNB / 2);
+    const size_t last_actual_begin = span_count - side_blocks;
+    std::vector<swbam::BgzfBlockSpan> probe_spans;
+    std::vector<size_t> probe_indices;
+    if (last_actual_begin <= side_blocks) {
+        probe_spans.assign(spans, spans + span_count);
+        probe_indices.resize(span_count);
+        for (size_t i = 0; i < span_count; ++i) probe_indices[i] = i;
+    } else {
+        probe_spans.reserve(side_blocks * 2);
+        probe_indices.reserve(side_blocks * 2);
+        for (size_t i = 0; i < side_blocks; ++i) {
+            probe_spans.push_back(spans[i]);
+            probe_indices.push_back(i);
+        }
+        for (size_t i = last_actual_begin; i < span_count; ++i) {
+            probe_spans.push_back(spans[i]);
+            probe_indices.push_back(i);
+        }
+    }
+    size_t last_probe_begin = 0;
+    while (last_probe_begin < probe_indices.size() &&
+           probe_indices[last_probe_begin] < last_actual_begin) {
+        ++last_probe_begin;
+    }
+    if (last_probe_begin >= probe_indices.size()) return -1;
+
+    std::vector<MpiMarkdupCandidateShared> probe_candidates;
+    std::vector<unsigned char> probe_qnames;
+    uint64_t ignored_records = 0;
+    int first_has = 0;
+    int first_tid = -1;
+    int first_pos = -1;
+    int last_tid = -1;
+    int last_pos = -1;
+    MpiMarkdupStats probe_stats = {};
+    MdBoundaryProbeContext probe;
+    probe.first_end = side_blocks - 1;
+    probe.last_begin = last_probe_begin;
+
+    MdInputPass probe_source(
+        &backend, probe_spans.data(), probe_spans.size());
+    int local_ok = MdExtractCandidatesPass(
+        probe_source, global_block_begin, rank, include_fails,
+        memory_limit, &probe_candidates, &probe_qnames,
+        &ignored_records, &first_has, &first_tid, &first_pos,
+        &last_tid, &last_pos, &probe_stats,
+        MdCaptureBoundaryProbe, &probe) == 0;
+    if (!MdAllRanksOk(local_ok)) return -1;
+
+    for (size_t i = 0; i < probe_candidates.size(); ++i) {
+        MpiMarkdupCandidateShared &candidate = probe_candidates[i];
+        const uint64_t fake_block = candidate.global_order >> 32;
+        if (fake_block < (uint64_t)global_block_begin) {
+            local_ok = 0;
+            break;
+        }
+        const uint64_t probe_index64 =
+            fake_block - (uint64_t)global_block_begin;
+        if (probe_index64 >= probe_indices.size()) {
+            local_ok = 0;
+            break;
+        }
+        const uint64_t record_index = candidate.global_order &
+            0xffffffffull;
+        candidate.global_order =
+            ((uint64_t)global_block_begin +
+             (uint64_t)probe_indices[(size_t)probe_index64]) << 32 |
+            record_index;
+    }
+    if (!MdAllRanksOk(local_ok)) return -1;
+    if (MdBuildFirstCoordBoundaries(
+            first_has, first_tid, first_pos, comm_size,
+            &plan->boundaries) != 0) {
+        return -1;
+    }
+
+    int previous_rank = -1;
+    int next_rank = -1;
+    for (int r = rank - 1; r >= 0; --r) {
+        if (plan->boundaries[(size_t)r].has_records) {
+            previous_rank = r;
+            break;
+        }
+    }
+    for (int r = rank + 1; r < comm_size; ++r) {
+        if (plan->boundaries[(size_t)r].has_records) {
+            next_rank = r;
+            break;
+        }
+    }
+
+    if (!first_has || probe.first_last_tid < 0 ||
+        probe.last_first_tid < 0) {
+        local_ok = 0;
+    }
+    if (local_ok && previous_rank >= 0) {
+        const MdCoordBoundary &cut =
+            plan->boundaries[(size_t)rank];
+        const int32_t halo_ref = probe.first_last_tid + 1;
+        const int64_t halo_coord = (int64_t)probe.first_last_pos + 1;
+        const int64_t needed = cut.first_coord >
+                INT64_MAX - max_read_length
+            ? INT64_MAX : cut.first_coord + max_read_length;
+        local_ok = MdCompareCoord(halo_ref, halo_coord,
+                                  cut.first_ref, needed) >= 0;
+    }
+    if (local_ok && next_rank >= 0) {
+        const MdCoordBoundary &cut =
+            plan->boundaries[(size_t)next_rank];
+        const int32_t halo_ref = probe.last_first_tid + 1;
+        const int64_t halo_coord = (int64_t)probe.last_first_pos + 1;
+        const int64_t needed = cut.first_coord <
+                INT64_MIN + max_read_length
+            ? INT64_MIN : cut.first_coord - max_read_length;
+        local_ok = MdCompareCoord(halo_ref, halo_coord,
+                                  cut.first_ref, needed) <= 0;
+    }
+    int coverage_ok = 0;
+    MPI_Allreduce(&local_ok, &coverage_ok, 1, MPI_INT, MPI_MIN,
+                  MPI_COMM_WORLD);
+    if (!coverage_ok) {
+        plan->boundaries.clear();
+        stats->t_boundary_check += GetTime() - boundary_t0;
+        if (rank == 0) {
+            printf("MPI BAM markdup boundary halo=fallback blocks=%zu\n",
+                   probe_spans.size());
+        }
+        return 0;
+    }
+
+    std::vector<MpiMarkdupCandidateShared> selected_candidates;
+    std::vector<unsigned char> selected_qnames;
+    local_ok = MdAppendBoundaryCandidates(
+        probe_candidates, probe_qnames, plan->boundaries,
+        max_read_length, plan, &selected_candidates,
+        &selected_qnames) == 0;
+    if (!MdAllRanksOk(local_ok)) return -1;
+
+    std::vector<MpiMarkdupCandidateShared> owner_candidates;
+    std::vector<unsigned char> owner_qnames;
+    MpiMarkdupStats boundary_stats = {};
+    if (MdExchangeCandidatesByCoordinate(
+            &selected_candidates, &selected_qnames,
+            first_has, first_tid, first_pos, last_tid, last_pos,
+            rank, comm_size, memory_limit,
+            &owner_candidates, &owner_qnames, &boundary_stats,
+            &plan->boundaries, 1) != 0) {
+        return -1;
+    }
+    std::vector<std::vector<uint64_t> > duplicates_by_source;
+    if (MpiMarkdupFindDuplicatesStreamingHash(
+            &owner_candidates, owner_qnames, comm_size,
+            &duplicates_by_source, &boundary_stats) != 0 ||
+        MdRouteBoundaryDuplicateOrders(
+            &duplicates_by_source, rank, comm_size, plan,
+            &boundary_stats) != 0) {
+        return -1;
+    }
+
+    stats->pair_duplicates += boundary_stats.pair_duplicates;
+    stats->single_duplicates += boundary_stats.single_duplicates;
+    stats->owner_candidates += boundary_stats.owner_candidates;
+    stats->qname_bytes += boundary_stats.qname_bytes;
+    stats->mpi_candidate_bytes += boundary_stats.mpi_candidate_bytes;
+    stats->mpi_result_bytes += boundary_stats.mpi_result_bytes;
+    plan->enabled = 1;
+    stats->t_boundary_check += GetTime() - boundary_t0;
+    if (rank == 0) {
+        printf("MPI BAM markdup boundary halo=enabled blocks=%zu\n",
+               probe_spans.size());
+    }
     return 0;
 }
 
@@ -2653,7 +3167,9 @@ static int MdConsumeStreamingBatch(
         std::vector<MpiMarkdupCandidateShared> *local_candidates,
         std::vector<unsigned char> *local_qnames,
         int progress_tid, int progress_pos,
-        uint64_t records_so_far) {
+        uint64_t records_so_far,
+        MdExtractBatchView *batch) {
+    (void)batch;
     MdStreamingBatchContext *context =
         (MdStreamingBatchContext *)opaque;
     if (!context || !context->window || !context->bitmap ||
@@ -4136,6 +4652,1143 @@ static int MdFindDuplicatesStreamingBatches(
         duplicate_bitmap, stats);
 }
 
+struct MdOnePassBlockInfo {
+    uint64_t ordinal_base;
+    int n_records;
+    int unresolved;
+};
+
+struct MdOnePassPendingBatch {
+    MdBlockSet blocks;
+    std::vector<MdOnePassBlockInfo> infos;
+    std::vector<uint8_t> states;
+    uint64_t ordinal_base;
+    uint64_t ordinal_end;
+    int n_blocks;
+    int next_block;
+
+    MdOnePassPendingBatch()
+        : ordinal_base(0), ordinal_end(0), n_blocks(0), next_block(0) {
+        memset(&blocks, 0, sizeof(blocks));
+    }
+
+    ~MdOnePassPendingBatch() {
+        MdFreeBlockSet(&blocks);
+    }
+
+    MdOnePassPendingBatch(MdOnePassPendingBatch &&other)
+        : blocks(other.blocks), infos(std::move(other.infos)),
+          states(std::move(other.states)),
+          ordinal_base(other.ordinal_base), ordinal_end(other.ordinal_end),
+          n_blocks(other.n_blocks), next_block(other.next_block) {
+        memset(&other.blocks, 0, sizeof(other.blocks));
+        other.n_blocks = 0;
+        other.next_block = 0;
+    }
+
+    MdOnePassPendingBatch &operator=(MdOnePassPendingBatch &&other) {
+        if (this != &other) {
+            MdFreeBlockSet(&blocks);
+            blocks = other.blocks;
+            infos = std::move(other.infos);
+            states = std::move(other.states);
+            ordinal_base = other.ordinal_base;
+            ordinal_end = other.ordinal_end;
+            n_blocks = other.n_blocks;
+            next_block = other.next_block;
+            memset(&other.blocks, 0, sizeof(other.blocks));
+            other.n_blocks = 0;
+            other.next_block = 0;
+        }
+        return *this;
+    }
+
+private:
+    MdOnePassPendingBatch(const MdOnePassPendingBatch &);
+    MdOnePassPendingBatch &operator=(const MdOnePassPendingBatch &);
+};
+
+struct MdOnePassReadyBlock {
+    MdOnePassPendingBatch *batch;
+    int block_index;
+};
+
+struct MdOnePassContext {
+    int rank;
+    int comm_size;
+    int max_read_length;
+    size_t memory_limit;
+    size_t extract_workspace_bytes;
+    int *range_has_records;
+    int *range_first_tid;
+    int *range_first_pos;
+    swbam::RankBodySink *sink;
+    MpiMarkdupStats *stats;
+    const MdOnePassBoundaryPlan *boundary_plan;
+    MpiMarkdupStreamingWindow *window;
+    std::vector<MdCoordBoundary> boundaries;
+    std::vector<MpiMarkdupCandidateShared> owner_candidates;
+    std::vector<unsigned char> owner_qnames;
+    std::vector<std::vector<MpiMarkdupDecisionShared> > decisions_by_source;
+    std::deque<MdOnePassPendingBatch> pending;
+    std::vector<MdBlockSet> free_block_sets;
+    MdBlockSet fallback_payload;
+    MdBlockSet compressed_output;
+    MpiSortRawCompressPara compress_paras[kMarkdupNB];
+    std::vector<MdOnePassReadyBlock> prepared_inputs;
+    int prepared_outputs;
+    int compression_running;
+    int compress_level;
+    long long captured_blocks;
+    long long retired_blocks;
+    uint64_t captured_records;
+    uint64_t retired_records;
+    long long launched_output_blocks;
+    long long written_output_blocks;
+
+    MdOnePassContext()
+        : rank(0), comm_size(1), max_read_length(300), memory_limit(0),
+          extract_workspace_bytes(0),
+          range_has_records(nullptr), range_first_tid(nullptr),
+          range_first_pos(nullptr), sink(nullptr), stats(nullptr),
+          boundary_plan(nullptr), window(nullptr), prepared_outputs(0),
+          compression_running(0), captured_blocks(0), retired_blocks(0),
+          captured_records(0), retired_records(0),
+          launched_output_blocks(0), written_output_blocks(0) {
+        memset(&fallback_payload, 0, sizeof(fallback_payload));
+        memset(&compressed_output, 0, sizeof(compressed_output));
+        memset(compress_paras, 0, sizeof(compress_paras));
+        compress_level = 1;
+    }
+};
+
+static void MdOnePassCleanup(MdOnePassContext *context) {
+    if (!context) return;
+    if (context->compression_running) {
+        athread_join();
+        context->compression_running = 0;
+    }
+    if (context->window) {
+        MpiMarkdupStreamingWindowDestroy(context->window);
+        context->window = nullptr;
+    }
+    context->pending.clear();
+    for (size_t i = 0; i < context->free_block_sets.size(); ++i) {
+        MdFreeBlockSet(&context->free_block_sets[i]);
+    }
+    context->free_block_sets.clear();
+    MdFreeBlockSet(&context->fallback_payload);
+    MdFreeBlockSet(&context->compressed_output);
+}
+
+static void MdOnePassRecycleBlockSet(MdOnePassContext *context,
+                                     MdBlockSet *blocks) {
+    if (!context || !blocks || !blocks->blocks) return;
+    if (context->free_block_sets.size() < 2) {
+        try {
+            context->free_block_sets.push_back(*blocks);
+            memset(blocks, 0, sizeof(*blocks));
+            return;
+        } catch (...) {
+        }
+    }
+    MdFreeBlockSet(blocks);
+}
+
+static int MdOnePassAcquireBlockSet(MdOnePassContext *context,
+                                    MdBlockSet *blocks) {
+    memset(blocks, 0, sizeof(*blocks));
+    if (!context->free_block_sets.empty()) {
+        *blocks = context->free_block_sets.back();
+        context->free_block_sets.pop_back();
+        return 0;
+    }
+    return MdAllocateBlockSet(blocks, kMarkdupNB);
+}
+
+static int MdOnePassFindRecord(
+        MdOnePassContext *context, uint64_t ordinal,
+        MdOnePassPendingBatch **batch_out,
+        MdOnePassBlockInfo **info_out, uint8_t **state_out) {
+    for (std::deque<MdOnePassPendingBatch>::iterator it =
+             context->pending.begin();
+         it != context->pending.end(); ++it) {
+        if (ordinal < it->ordinal_base || ordinal >= it->ordinal_end) {
+            continue;
+        }
+        const size_t state_index = (size_t)(ordinal - it->ordinal_base);
+        for (int b = 0; b < it->n_blocks; ++b) {
+            MdOnePassBlockInfo &info = it->infos[(size_t)b];
+            if (ordinal >= info.ordinal_base &&
+                ordinal < info.ordinal_base +
+                    (uint64_t)info.n_records) {
+                *batch_out = &*it;
+                *info_out = &info;
+                *state_out = &it->states[state_index];
+                return 0;
+            }
+        }
+        return -1;
+    }
+    return -1;
+}
+
+static int MdOnePassMarkUnknown(MdOnePassContext *context,
+                                uint64_t ordinal) {
+    MdOnePassPendingBatch *batch = nullptr;
+    MdOnePassBlockInfo *info = nullptr;
+    uint8_t *state = nullptr;
+    if (MdOnePassFindRecord(context, ordinal, &batch, &info,
+                            &state) != 0) {
+        fprintf(stderr,
+                "[rank %d] ERROR: one-pass cannot find remote-owned "
+                "ordinal=%llu pending_batches=%zu.\n",
+                context->rank, (unsigned long long)ordinal,
+                context->pending.size());
+        return -1;
+    }
+    (void)batch;
+    if (*state == kMdOnePassKeep) {
+        *state = kMdOnePassUnknown;
+        info->unresolved++;
+        return 0;
+    }
+    return *state == kMdOnePassUnknown ? 0 : -1;
+}
+
+static int MdOnePassObserveRemoteCandidate(
+        void *opaque,
+        const MpiMarkdupCandidateShared &candidate,
+        int owner) {
+    MdOnePassContext *context = (MdOnePassContext *)opaque;
+    if (!context || owner < 0 || owner >= context->comm_size) return -1;
+    if (candidate.key.single && candidate.paired_marker) return 0;
+    if (MdOnePassMarkUnknown(context, candidate.ordinal) == 0) return 0;
+    fprintf(stderr,
+            "[rank %d] ERROR: one-pass cannot pend remote candidate "
+            "ordinal=%llu owner=%d.\n",
+            context->rank, (unsigned long long)candidate.ordinal,
+            owner);
+    return -1;
+}
+
+static int MdOnePassApplyDecision(
+        MdOnePassContext *context,
+        const MpiMarkdupDecisionShared &decision) {
+    MdOnePassPendingBatch *batch = nullptr;
+    MdOnePassBlockInfo *info = nullptr;
+    uint8_t *state = nullptr;
+    if (MdOnePassFindRecord(context, decision.ordinal, &batch, &info,
+                            &state) != 0) {
+        fprintf(stderr,
+                "[rank %d] ERROR: one-pass remote decision cannot find "
+                "ordinal=%llu duplicate=%u pending_batches=%zu.\n",
+                context->rank,
+                (unsigned long long)decision.ordinal,
+                (unsigned)decision.duplicate,
+                context->pending.size());
+        return -1;
+    }
+    (void)batch;
+    const uint8_t final_state = decision.duplicate
+        ? kMdOnePassDuplicate : kMdOnePassKeep;
+    if (*state == kMdOnePassUnknown) {
+        *state = final_state;
+        info->unresolved--;
+        return info->unresolved >= 0 ? 0 : -1;
+    }
+    if (*state == final_state) return 0;
+    fprintf(stderr,
+            "[rank %d] ERROR: one-pass conflicting remote decision "
+            "ordinal=%llu duplicate=%u state=%u.\n",
+            context->rank, (unsigned long long)decision.ordinal,
+            (unsigned)decision.duplicate, (unsigned)*state);
+    return -1;
+}
+
+static int MdOnePassApplyLocalAction(
+        void *opaque, uint64_t ordinal, int action) {
+    MdOnePassContext *context = (MdOnePassContext *)opaque;
+    if (!context) return -1;
+    MdOnePassPendingBatch *batch = nullptr;
+    MdOnePassBlockInfo *info = nullptr;
+    uint8_t *state = nullptr;
+    if (MdOnePassFindRecord(context, ordinal, &batch, &info,
+                            &state) != 0) {
+        fprintf(stderr,
+                "[rank %d] ERROR: one-pass local action cannot find "
+                "ordinal=%llu action=%d pending_batches=%zu.\n",
+                context->rank, (unsigned long long)ordinal, action,
+                context->pending.size());
+        return -1;
+    }
+    (void)batch;
+    if (action == RB_MARKDUP_DECISION_PENDING) {
+        if (*state == kMdOnePassKeep) {
+            *state = kMdOnePassUnknown;
+            info->unresolved++;
+            return 0;
+        }
+        if (*state == kMdOnePassUnknown) return 0;
+        fprintf(stderr,
+                "[rank %d] ERROR: one-pass cannot pend ordinal=%llu "
+                "state=%u.\n", context->rank,
+                (unsigned long long)ordinal, (unsigned)*state);
+        return -1;
+    }
+    const uint8_t final_state =
+        action == RB_MARKDUP_DECISION_DUPLICATE
+            ? kMdOnePassDuplicate : kMdOnePassKeep;
+    if (*state == kMdOnePassUnknown) {
+        *state = final_state;
+        info->unresolved--;
+        return info->unresolved >= 0 ? 0 : -1;
+    }
+    if (action == RB_MARKDUP_DECISION_DUPLICATE &&
+        *state == kMdOnePassKeep) {
+        *state = kMdOnePassDuplicate;
+        return 0;
+    }
+    if (*state == final_state) return 0;
+    fprintf(stderr,
+            "[rank %d] ERROR: one-pass conflicting local action "
+            "ordinal=%llu action=%d state=%u.\n",
+            context->rank, (unsigned long long)ordinal, action,
+            (unsigned)*state);
+    return -1;
+}
+
+static int MdOnePassCaptureBatch(
+        MdOnePassContext *context, MdExtractBatchView *view,
+        const std::vector<MpiMarkdupCandidateShared> &candidates) {
+    if (!view || view->n_blocks <= 0) return 0;
+    if (!view->uncompressed || !view->uncompressed->blocks ||
+        !view->decomp || view->ordinal_end < view->ordinal_base) {
+        return -1;
+    }
+    context->extract_workspace_bytes = view->fixed_workspace_bytes;
+
+    MdBlockSet replacement = {};
+    if (MdOnePassAcquireBlockSet(context, &replacement) != 0) {
+        return -1;
+    }
+    MdBlockSet retained = *view->uncompressed;
+    *view->uncompressed = replacement;
+
+    try {
+        context->pending.emplace_back();
+    } catch (...) {
+        MdFreeBlockSet(view->uncompressed);
+        *view->uncompressed = retained;
+        return -1;
+    }
+    MdOnePassPendingBatch &batch = context->pending.back();
+    batch.blocks = retained;
+    batch.ordinal_base = view->ordinal_base;
+    batch.ordinal_end = view->ordinal_end;
+    batch.n_blocks = view->n_blocks;
+    batch.next_block = 0;
+    try {
+        batch.infos.resize((size_t)view->n_blocks);
+        batch.states.assign(
+            (size_t)(view->ordinal_end - view->ordinal_base),
+            (uint8_t)kMdOnePassKeep);
+    } catch (...) {
+        context->pending.pop_back();
+        return -1;
+    }
+
+    uint64_t ordinal = view->ordinal_base;
+    for (int b = 0; b < view->n_blocks; ++b) {
+        MdOnePassBlockInfo &info = batch.infos[(size_t)b];
+        info.ordinal_base = ordinal;
+        info.n_records = view->decomp[b].n_total_records;
+        info.unresolved = 0;
+        ordinal += (uint64_t)info.n_records;
+    }
+    if (ordinal != view->ordinal_end) return -1;
+    context->captured_blocks += view->n_blocks;
+    context->captured_records += view->ordinal_end - view->ordinal_base;
+
+    if (context->boundary_plan && context->boundary_plan->enabled) {
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            const MpiMarkdupCandidateShared &candidate = candidates[i];
+            if (!MdBoundaryDecisionCandidate(candidate)) {
+                continue;
+            }
+            const MdBoundaryCandidateId id =
+                MdMakeBoundaryCandidateId(candidate);
+            if (context->boundary_plan->candidates.find(id) ==
+                context->boundary_plan->candidates.end()) {
+                continue;
+            }
+            std::unordered_map<uint64_t, uint8_t>::const_iterator decision =
+                context->boundary_plan->decisions.find(
+                    candidate.global_order);
+            if (decision == context->boundary_plan->decisions.end() ||
+                candidate.ordinal < batch.ordinal_base ||
+                candidate.ordinal >= batch.ordinal_end) {
+                return -1;
+            }
+            batch.states[(size_t)(candidate.ordinal -
+                                  batch.ordinal_base)] =
+                decision->second;
+        }
+    }
+
+    return 0;
+}
+
+static int MdOnePassPatchBlock(
+        MdOnePassPendingBatch *batch, int block_index,
+        MpiMarkdupStats *stats) {
+    if (!batch || block_index < 0 || block_index >= batch->n_blocks) {
+        return -1;
+    }
+    MdOnePassBlockInfo &info = batch->infos[(size_t)block_index];
+    if (info.unresolved != 0) return -1;
+    bam_block *block = batch->blocks.blocks + block_index;
+    size_t pos = 0;
+    for (int r = 0; r < info.n_records; ++r) {
+        if (pos + 36u > block->length) return -1;
+        unsigned char *raw = block->data + pos;
+        const uint32_t block_len = MdLoadLe32(raw);
+        const uint64_t raw_len = (uint64_t)block_len + 4u;
+        if (block_len < 32 || raw_len > block->length - pos) {
+            return -1;
+        }
+        const size_t state_index = (size_t)(
+            info.ordinal_base + (uint64_t)r - batch->ordinal_base);
+        const uint8_t state = batch->states[state_index];
+        if (state == kMdOnePassUnknown) return -1;
+        if (state == kMdOnePassDuplicate) {
+            uint32_t flag_nc = MdLoadLe32(raw + 16);
+            flag_nc |= (uint32_t)BAM_FDUP << 16;
+            memcpy(raw + 16, &flag_nc, sizeof(flag_nc));
+            stats->marked_records++;
+        }
+        pos += (size_t)raw_len;
+    }
+    if (pos != block->length) return -1;
+    block->pos = block->length;
+    return 0;
+}
+
+static int MdOnePassPendingBytes(MdOnePassContext *context,
+                                 size_t *bytes_out) {
+    size_t total = 0;
+    for (std::deque<MdOnePassPendingBatch>::const_iterator it =
+             context->pending.begin();
+         it != context->pending.end(); ++it) {
+        const size_t block_bytes =
+            (size_t)it->blocks.n *
+            (sizeof(bam_block) + BGZF_MAX_BLOCK_SIZE);
+        const size_t info_bytes =
+            it->infos.capacity() * sizeof(MdOnePassBlockInfo);
+        const size_t state_bytes = it->states.capacity();
+        if (block_bytes > SIZE_MAX - total ||
+            info_bytes > SIZE_MAX - total - block_bytes ||
+            state_bytes > SIZE_MAX - total - block_bytes - info_bytes) {
+            return -1;
+        }
+        total += block_bytes + info_bytes + state_bytes;
+    }
+    const size_t pool_block_bytes =
+        (sizeof(bam_block) + BGZF_MAX_BLOCK_SIZE) * kMarkdupNB;
+    if (context->free_block_sets.size() >
+            (SIZE_MAX - total) / pool_block_bytes) {
+        return -1;
+    }
+    total += context->free_block_sets.size() * pool_block_bytes;
+    *bytes_out = total;
+    return 0;
+}
+
+// A legal BGZF block may inflate to 64 KiB, while the CPE compressor accepts
+// at most BGZF_BLOCK_SIZE bytes. Repack only that uncommon case, preserving
+// record boundaries and the original record order.
+static int MdOnePassPrepareOversizedBlock(
+        MdOnePassContext *context, bam_block *source, int n_records,
+        int *output_count) {
+    if (!context || !source || !output_count || n_records <= 0 ||
+        *output_count < 0 || *output_count > kMarkdupNB - 2) {
+        return -1;
+    }
+    int active = *output_count;
+    MdResetPayloadBlock(context->fallback_payload.blocks + active, active);
+    size_t pos = 0;
+    for (int r = 0; r < n_records; ++r) {
+        if (pos + 36u > source->length) return -1;
+        const unsigned char *raw = source->data + pos;
+        const uint32_t block_len = MdLoadLe32(raw);
+        const uint64_t raw_len64 = (uint64_t)block_len + 4u;
+        if (block_len < 32 || raw_len64 > BGZF_BLOCK_SIZE ||
+            raw_len64 > (uint64_t)source->length - pos) {
+            return -1;
+        }
+        int append_status = MdAppendRawPayload(
+            context->fallback_payload.blocks + active, raw,
+            (uint32_t)raw_len64);
+        if (append_status == 1) {
+            MdSetupRawCompress(
+                context->compress_paras + active, active,
+                context->fallback_payload.blocks + active,
+                context->compressed_output.blocks + active,
+                context->compress_level);
+            ++active;
+            if (active >= kMarkdupNB) return -1;
+            MdResetPayloadBlock(
+                context->fallback_payload.blocks + active, active);
+            append_status = MdAppendRawPayload(
+                context->fallback_payload.blocks + active, raw,
+                (uint32_t)raw_len64);
+        }
+        if (append_status != 0) return -1;
+        pos += (size_t)raw_len64;
+    }
+    if (pos != source->length ||
+        context->fallback_payload.blocks[active].pos <= 0) {
+        return -1;
+    }
+    MdSetupRawCompress(
+        context->compress_paras + active, active,
+        context->fallback_payload.blocks + active,
+        context->compressed_output.blocks + active,
+        context->compress_level);
+    *output_count = active + 1;
+    return 0;
+}
+
+static int MdOnePassPrepareOutput(MdOnePassContext *context) {
+    if (context->prepared_outputs != 0 ||
+        !context->prepared_inputs.empty()) {
+        return -1;
+    }
+    int output_count = 0;
+    double patch_t0 = GetTime();
+    auto commit_prepared = [&]() -> int {
+        for (int i = output_count; i < kMarkdupNB; ++i) {
+            MdInitEmptyRawCompress(context->compress_paras + i, i);
+        }
+        context->prepared_outputs = output_count;
+        context->stats->t_pack += GetTime() - patch_t0;
+        return 0;
+    };
+    for (std::deque<MdOnePassPendingBatch>::iterator it =
+             context->pending.begin();
+         it != context->pending.end() && output_count < kMarkdupNB;
+         ++it) {
+        for (int b = it->next_block;
+             b < it->n_blocks && output_count < kMarkdupNB; ++b) {
+            MdOnePassBlockInfo &info = it->infos[(size_t)b];
+            if (info.unresolved != 0) {
+                return commit_prepared();
+            }
+            bam_block *source = it->blocks.blocks + b;
+            if (source->length == 0 && info.n_records == 0) {
+                MdOnePassReadyBlock ready = {&*it, b};
+                context->prepared_inputs.push_back(ready);
+                continue;
+            }
+            if (source->length > BGZF_BLOCK_SIZE &&
+                output_count > kMarkdupNB - 2) {
+                return commit_prepared();
+            }
+            if (MdOnePassPatchBlock(&*it, b, context->stats) != 0) {
+                context->stats->t_pack += GetTime() - patch_t0;
+                return -1;
+            }
+            if (source->length > BGZF_BLOCK_SIZE) {
+                if (MdOnePassPrepareOversizedBlock(
+                        context, source, info.n_records,
+                        &output_count) != 0) {
+                    fprintf(stderr,
+                            "[rank %d] ERROR: one-pass markdup cannot "
+                            "repack decoded BGZF payload=%u.\n",
+                            context->rank, source->length);
+                    context->stats->t_pack += GetTime() - patch_t0;
+                    return -1;
+                }
+            } else {
+                MdSetupRawCompress(
+                    context->compress_paras + output_count,
+                    output_count, source,
+                    context->compressed_output.blocks + output_count,
+                    context->compress_level);
+                output_count++;
+            }
+            MdOnePassReadyBlock ready = {&*it, b};
+            context->prepared_inputs.push_back(ready);
+        }
+    }
+    return commit_prepared();
+}
+
+static int MdOnePassLaunchOutput(MdOnePassContext *context) {
+    if (context->compression_running || context->prepared_outputs == 0) {
+        return 0;
+    }
+    const double launch_t0 = GetTime();
+    __real_athread_spawn((void *)slave_mpi_sort_compress_payload,
+                         context->compress_paras, 1);
+    context->stats->t_cpe_launch += GetTime() - launch_t0;
+    context->compression_running = 1;
+    context->launched_output_blocks += context->prepared_outputs;
+    return 0;
+}
+
+static int MdOnePassFinishOutput(MdOnePassContext *context) {
+    if (!context->compression_running && context->prepared_outputs > 0 &&
+        MdOnePassLaunchOutput(context) != 0) {
+        return -1;
+    }
+    const bool had_compression = context->compression_running != 0;
+    if (context->compression_running) {
+        const double compress_t0 = GetTime();
+        const double sync_t0 = GetTime();
+        athread_join();
+        context->stats->t_cpe_sync += GetTime() - sync_t0;
+        context->stats->t_compress += GetTime() - compress_t0;
+        context->compression_running = 0;
+        const double write_t0 = GetTime();
+        for (int i = 0; i < context->prepared_outputs; ++i) {
+            if (context->compress_paras[i].status != 0 ||
+                swbam::AppendBgzfBlock(
+                    context->sink,
+                    context->compressed_output.blocks + i) != 0) {
+                return -1;
+            }
+            context->stats->bgzf_blocks++;
+            context->written_output_blocks++;
+        }
+        context->stats->t_write += GetTime() - write_t0;
+    }
+
+    for (size_t i = 0; i < context->prepared_inputs.size(); ++i) {
+        if (context->pending.empty()) return -1;
+        MdOnePassPendingBatch &front = context->pending.front();
+        const MdOnePassReadyBlock &ready = context->prepared_inputs[i];
+        if (ready.batch != &front || ready.block_index != front.next_block) {
+            return -1;
+        }
+        if (!had_compression &&
+            front.infos[(size_t)ready.block_index].n_records != 0) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: retiring a non-empty one-pass "
+                    "block without a compression launch: block=%d "
+                    "records=%d raw=%u prepared_inputs=%zu "
+                    "prepared_outputs=%d pending=%zu.\n",
+                    context->rank, ready.block_index,
+                    front.infos[(size_t)ready.block_index].n_records,
+                    front.blocks.blocks[ready.block_index].length,
+                    context->prepared_inputs.size(),
+                    context->prepared_outputs,
+                    context->pending.size());
+            return -1;
+        }
+        context->retired_blocks++;
+        context->retired_records +=
+            (uint64_t)front.infos[(size_t)ready.block_index].n_records;
+        front.next_block++;
+        if (front.next_block == front.n_blocks) {
+            MdBlockSet recycled = front.blocks;
+            memset(&front.blocks, 0, sizeof(front.blocks));
+            context->pending.pop_front();
+            MdOnePassRecycleBlockSet(context, &recycled);
+        }
+    }
+    context->prepared_inputs.clear();
+    context->prepared_outputs = 0;
+    return 0;
+}
+
+static int MdOnePassRouteDecisions(MdOnePassContext *context) {
+    const double exchange_t0 = GetTime();
+    std::vector<unsigned long long> send_counts(
+        (size_t)context->comm_size, 0);
+    std::vector<unsigned long long> recv_counts(
+        (size_t)context->comm_size, 0);
+
+    int local_ok = 1;
+    for (int dest = 0; dest < context->comm_size; ++dest) {
+        std::vector<MpiMarkdupDecisionShared> &values =
+            context->decisions_by_source[(size_t)dest];
+        std::sort(values.begin(), values.end(),
+                  [](const MpiMarkdupDecisionShared &a,
+                     const MpiMarkdupDecisionShared &b) {
+                      if (a.ordinal != b.ordinal) {
+                          return a.ordinal < b.ordinal;
+                      }
+                      return a.duplicate > b.duplicate;
+                  });
+        size_t write = 0;
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (write > 0 &&
+                values[write - 1].ordinal == values[i].ordinal) {
+                values[write - 1].duplicate =
+                    values[write - 1].duplicate || values[i].duplicate;
+            } else {
+                values[write++] = values[i];
+            }
+        }
+        values.resize(write);
+        if (dest == context->rank) {
+            for (size_t i = 0; i < values.size(); ++i) {
+                if (MdOnePassApplyDecision(context, values[i]) != 0) {
+                    local_ok = 0;
+                    break;
+                }
+            }
+        } else {
+            send_counts[(size_t)dest] =
+                (unsigned long long)values.size();
+        }
+        if (!local_ok) break;
+    }
+
+    if (!MdAllRanksOk(local_ok)) return -1;
+
+    MPI_Alltoall(send_counts.data(), 1, MPI_UNSIGNED_LONG_LONG,
+                 recv_counts.data(), 1, MPI_UNSIGNED_LONG_LONG,
+                 MPI_COMM_WORLD);
+    for (int step = 1; step < context->comm_size; ++step) {
+        const int dest = (context->rank + step) % context->comm_size;
+        const int src = (context->rank - step + context->comm_size) %
+                        context->comm_size;
+        const unsigned long long send_count = send_counts[(size_t)dest];
+        const unsigned long long recv_count = recv_counts[(size_t)src];
+        if (send_count > ULLONG_MAX /
+                sizeof(MpiMarkdupDecisionShared) ||
+            recv_count > (unsigned long long)(SIZE_MAX /
+                sizeof(MpiMarkdupDecisionShared))) {
+            return -1;
+        }
+        std::vector<MpiMarkdupDecisionShared> received;
+        try {
+            received.resize((size_t)recv_count);
+        } catch (...) {
+            local_ok = 0;
+        }
+        if (!MdAllRanksOk(local_ok)) return -1;
+        const unsigned long long send_bytes =
+            send_count * sizeof(MpiMarkdupDecisionShared);
+        const unsigned long long recv_bytes =
+            recv_count * sizeof(MpiMarkdupDecisionShared);
+        if (MdSendrecvBytes(
+                send_count ? context->decisions_by_source[(size_t)dest].data()
+                           : nullptr,
+                send_bytes, dest,
+                recv_count ? received.data() : nullptr,
+                recv_bytes, src, 4131) != 0) {
+            return -1;
+        }
+        context->stats->mpi_result_bytes += (long long)send_bytes;
+        for (size_t i = 0; i < received.size(); ++i) {
+            if (MdOnePassApplyDecision(context, received[i]) != 0) {
+                local_ok = 0;
+                break;
+            }
+        }
+        if (!MdAllRanksOk(local_ok)) return -1;
+    }
+    for (size_t i = 0; i < context->decisions_by_source.size(); ++i) {
+        context->decisions_by_source[i].clear();
+    }
+    context->stats->t_result_exchange += GetTime() - exchange_t0;
+    return 0;
+}
+
+static int MdOnePassInitWindow(MdOnePassContext *context) {
+    if (context->window) return 0;
+    if (!context->range_has_records || !context->range_first_tid ||
+        !context->range_first_pos) {
+        return -1;
+    }
+    const bool have_boundary_plan =
+        context->boundary_plan && context->boundary_plan->enabled;
+    if (have_boundary_plan) {
+        context->boundaries = context->boundary_plan->boundaries;
+    } else if (MdBuildFirstCoordBoundaries(
+                   *context->range_has_records,
+                   *context->range_first_tid,
+                   *context->range_first_pos,
+                   context->comm_size, &context->boundaries) != 0) {
+        return -1;
+    }
+    int window_last_tid = -1;
+    int window_last_pos = -1;
+    if (!have_boundary_plan) {
+        for (int r = context->rank + 1; r < context->comm_size; ++r) {
+            const MdCoordBoundary &next = context->boundaries[(size_t)r];
+            if (!next.has_records) continue;
+            window_last_tid = next.first_ref - 1;
+            window_last_pos = (int)(next.first_coord - 1);
+            break;
+        }
+    }
+    context->window = MpiMarkdupStreamingWindowCreate(
+        context->comm_size, context->max_read_length,
+        have_boundary_plan ? -1 : *context->range_first_tid,
+        have_boundary_plan ? -1 : *context->range_first_pos,
+        window_last_tid, window_last_pos);
+    return context->window ? 0 : -1;
+}
+
+static int MdConsumeOnePassBatch(
+        void *opaque,
+        std::vector<MpiMarkdupCandidateShared> *local_candidates,
+        std::vector<unsigned char> *local_qnames,
+        int progress_tid, int progress_pos,
+        uint64_t records_so_far,
+        MdExtractBatchView *batch) {
+    (void)records_so_far;
+    MdOnePassContext *context = (MdOnePassContext *)opaque;
+    if (!context || !context->stats || !context->sink) return -1;
+
+    if (MdOnePassLaunchOutput(context) != 0) return -1;
+    int local_ok = MdOnePassInitWindow(context) == 0;
+    if (!MdAllRanksOk(local_ok)) {
+        MdOnePassFinishOutput(context);
+        return -1;
+    }
+    double buffer_t0 = GetTime();
+    local_ok = MdOnePassCaptureBatch(
+        context, batch, *local_candidates) == 0;
+    context->stats->t_stream_buffer += GetTime() - buffer_t0;
+    if (!MdAllRanksOk(local_ok)) {
+        MdOnePassFinishOutput(context);
+        return -1;
+    }
+
+    if (context->boundary_plan && context->boundary_plan->enabled) {
+        size_t write = 0;
+        for (size_t i = 0; i < local_candidates->size(); ++i) {
+            const MpiMarkdupCandidateShared &candidate =
+                (*local_candidates)[i];
+            const bool precomputed =
+                context->boundary_plan->candidates.find(
+                    MdMakeBoundaryCandidateId(candidate)) !=
+                context->boundary_plan->candidates.end();
+            if (!precomputed) {
+                if (write != i) {
+                    (*local_candidates)[write] = candidate;
+                }
+                ++write;
+            }
+        }
+        local_candidates->resize(write);
+    }
+
+    const long long previous_owner_candidates =
+        context->stats->owner_candidates;
+    const long long previous_qname_bytes = context->stats->qname_bytes;
+    if (MdExchangeCandidatesByCoordinate(
+            local_candidates, local_qnames,
+            *context->range_has_records,
+            *context->range_first_tid,
+            *context->range_first_pos,
+            -1, -1, context->rank, context->comm_size,
+            context->memory_limit,
+            &context->owner_candidates, &context->owner_qnames,
+            context->stats, &context->boundaries, 1,
+            MdOnePassObserveRemoteCandidate, context) != 0) {
+        MdOnePassFinishOutput(context);
+        return -1;
+    }
+    context->stats->owner_candidates += previous_owner_candidates;
+    context->stats->qname_bytes += previous_qname_bytes;
+
+    local_ok = MpiMarkdupStreamingWindowProcessOptimistic(
+        context->window, context->owner_candidates,
+        context->owner_qnames, progress_tid, progress_pos, context->rank,
+        MdOnePassApplyLocalAction, context,
+        &context->decisions_by_source, context->stats) == 0;
+    if (!local_ok) {
+        fprintf(stderr,
+                "[rank %d] ERROR: one-pass optimistic window failed "
+                "at progress=%d:%d.\n",
+                context->rank, progress_tid, progress_pos);
+    }
+    if (!MdAllRanksOk(local_ok)) {
+        MdOnePassFinishOutput(context);
+        return -1;
+    }
+    if (MdOnePassRouteDecisions(context) != 0) {
+        MdOnePassFinishOutput(context);
+        return -1;
+    }
+    context->owner_candidates.clear();
+    context->owner_qnames.clear();
+
+    if (MdOnePassFinishOutput(context) != 0) return -1;
+    if (MdOnePassPrepareOutput(context) != 0) return -1;
+
+    const double memcheck_t0 = GetTime();
+    size_t pending_bytes = 0;
+    const size_t window_bytes =
+        MpiMarkdupStreamingWindowMemory(context->window);
+    const size_t output_workspace_bytes =
+        (size_t)2 * kMarkdupNB *
+        (sizeof(bam_block) + BGZF_MAX_BLOCK_SIZE);
+    size_t boundary_plan_bytes = 0;
+    if (context->boundary_plan && context->boundary_plan->enabled) {
+        const MdOnePassBoundaryPlan &plan = *context->boundary_plan;
+        boundary_plan_bytes =
+            plan.candidates.bucket_count() * sizeof(void *) +
+            plan.decisions.bucket_count() * sizeof(void *) +
+            plan.candidates.size() *
+                (sizeof(MdBoundaryCandidateId) + 2 * sizeof(void *)) +
+            plan.decisions.size() *
+                (sizeof(std::pair<const uint64_t, uint8_t>) +
+                 2 * sizeof(void *)) +
+            plan.boundaries.capacity() * sizeof(MdCoordBoundary);
+    }
+    local_ok = MdOnePassPendingBytes(context, &pending_bytes) == 0 &&
+        window_bytes != SIZE_MAX &&
+        context->extract_workspace_bytes <=
+            SIZE_MAX - output_workspace_bytes &&
+        pending_bytes <= SIZE_MAX - output_workspace_bytes -
+            context->extract_workspace_bytes &&
+        window_bytes <= SIZE_MAX - output_workspace_bytes -
+            context->extract_workspace_bytes - pending_bytes &&
+        boundary_plan_bytes <= SIZE_MAX - output_workspace_bytes -
+            context->extract_workspace_bytes - pending_bytes -
+            window_bytes;
+    if (local_ok) {
+        const size_t active_bytes = output_workspace_bytes +
+            context->extract_workspace_bytes + pending_bytes +
+            window_bytes + boundary_plan_bytes;
+        if ((long long)pending_bytes >
+            context->stats->stream_pending_peak_bytes) {
+            context->stats->stream_pending_peak_bytes =
+                pending_bytes > (size_t)LLONG_MAX
+                    ? LLONG_MAX : (long long)pending_bytes;
+        }
+        local_ok = MdCheckMemory(
+            active_bytes, context->memory_limit, context->stats,
+            context->rank, "one-pass decoded block window") == 0;
+    }
+    context->stats->t_extract_memcheck += GetTime() - memcheck_t0;
+    return MdAllRanksOk(local_ok) ? 0 : -1;
+}
+
+static int MdDrainOnePassOutput(MdOnePassContext *context) {
+    while (!context->pending.empty() ||
+           context->prepared_outputs > 0 ||
+           !context->prepared_inputs.empty()) {
+        if (context->prepared_outputs == 0 &&
+            context->prepared_inputs.empty() &&
+            MdOnePassPrepareOutput(context) != 0) {
+            return -1;
+        }
+        if (context->prepared_outputs == 0 &&
+            !context->prepared_inputs.empty()) {
+            if (MdOnePassFinishOutput(context) != 0) return -1;
+            continue;
+        }
+        if (context->prepared_outputs == 0) {
+            size_t unknown = 0;
+            uint64_t first_unknown = UINT64_MAX;
+            for (std::deque<MdOnePassPendingBatch>::const_iterator it =
+                     context->pending.begin();
+                 it != context->pending.end(); ++it) {
+                for (size_t i = 0; i < it->states.size(); ++i) {
+                    if (it->states[i] == kMdOnePassUnknown) {
+                        unknown++;
+                        if (first_unknown == UINT64_MAX) {
+                            first_unknown = it->ordinal_base + i;
+                        }
+                    }
+                }
+            }
+            fprintf(stderr,
+                    "[rank %d] ERROR: one-pass output blocked by %zu "
+                    "unresolved records; first_ordinal=%llu "
+                    "pending_batches=%zu.\n",
+                    context->rank, unknown,
+                    (unsigned long long)first_unknown,
+                    context->pending.size());
+            return -1;
+        }
+        if (MdOnePassLaunchOutput(context) != 0 ||
+            MdOnePassFinishOutput(context) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int MdMarkdupOnePassToSink(
+        MdInputPass &source, long long global_block_begin,
+        long long local_block_count, int rank, int comm_size,
+        int include_fails, int max_read_length, size_t memory_limit,
+        int compress_level, swbam::RankBodySink *sink,
+        const MdOnePassBoundaryPlan *boundary_plan,
+        uint64_t *local_records,
+        int *range_has_records,
+        int *range_first_tid, int *range_first_pos,
+        int *range_last_tid, int *range_last_pos,
+        MpiMarkdupStats *stats) {
+    if (!sink || (compress_level != 0 && compress_level != 1 &&
+                  compress_level != 6)) {
+        return -1;
+    }
+    MdOnePassContext context;
+    context.rank = rank;
+    context.comm_size = comm_size;
+    context.max_read_length = max_read_length;
+    context.memory_limit = memory_limit;
+    context.range_has_records = range_has_records;
+    context.range_first_tid = range_first_tid;
+    context.range_first_pos = range_first_pos;
+    context.sink = sink;
+    context.stats = stats;
+    context.boundary_plan = boundary_plan;
+    context.compress_level = compress_level;
+    context.decisions_by_source.resize((size_t)comm_size);
+    if (MdAllocateBlockSet(&context.fallback_payload, kMarkdupNB) != 0 ||
+        MdAllocateBlockSet(&context.compressed_output, kMarkdupNB) != 0) {
+        MdOnePassCleanup(&context);
+        return -1;
+    }
+    for (int i = 0; i < kMarkdupNB; ++i) {
+        MdInitEmptyRawCompress(context.compress_paras + i, i);
+    }
+
+    long long max_local_blocks = 0;
+    MPI_Allreduce(&local_block_count, &max_local_blocks, 1,
+                  MPI_LONG_LONG, MPI_MAX, MPI_COMM_WORLD);
+    const long long target_batches = max_local_blocks > 0
+        ? (max_local_blocks + kMarkdupNB - 1) / kMarkdupNB : 0;
+    std::vector<MpiMarkdupCandidateShared> local_candidates;
+    std::vector<unsigned char> local_qnames;
+    source.Reset();
+    const int extract_status = MdExtractCandidatesPass(
+        source, global_block_begin, rank, include_fails,
+        memory_limit, &local_candidates, &local_qnames,
+        local_records, range_has_records,
+        range_first_tid, range_first_pos,
+        range_last_tid, range_last_pos, stats,
+        MdConsumeOnePassBatch, &context, target_batches);
+    int local_ok = extract_status == 0;
+    if (!MdAllRanksOkTimed(local_ok, stats)) {
+        MdOnePassCleanup(&context);
+        return -1;
+    }
+
+    double boundary_t0 = GetTime();
+    if (MdValidateRankBoundaries(
+            *range_has_records, *range_first_tid, *range_first_pos,
+            *range_last_tid, *range_last_pos,
+            rank, comm_size) != 0) {
+        local_ok = 0;
+    }
+    stats->t_boundary_check += GetTime() - boundary_t0;
+    if (!MdAllRanksOkTimed(local_ok, stats)) {
+        MdOnePassCleanup(&context);
+        return -1;
+    }
+
+    if (context.prepared_outputs > 0 &&
+        MdOnePassLaunchOutput(&context) != 0) {
+        local_ok = 0;
+    }
+    const double finalize_t0 = GetTime();
+    if (local_ok && context.window &&
+        MpiMarkdupStreamingWindowFinalizeOptimistic(
+            context.window, context.rank,
+            MdOnePassApplyLocalAction, &context,
+            &context.decisions_by_source) != 0) {
+        local_ok = 0;
+    }
+    stats->t_stream_finalize += GetTime() - finalize_t0;
+    if (!MdAllRanksOk(local_ok)) {
+        MdOnePassFinishOutput(&context);
+        MdOnePassCleanup(&context);
+        return -1;
+    }
+    if (context.window && MdOnePassRouteDecisions(&context) != 0) {
+        local_ok = 0;
+    }
+    if (MdOnePassFinishOutput(&context) != 0) local_ok = 0;
+    if (local_ok && MdDrainOnePassOutput(&context) != 0) {
+        local_ok = 0;
+    }
+    if (!MdAllRanksOkTimed(local_ok, stats)) {
+        MdOnePassCleanup(&context);
+        return -1;
+    }
+    if (!context.pending.empty()) local_ok = 0;
+    if (context.captured_blocks != context.retired_blocks ||
+        context.captured_records != context.retired_records ||
+        context.captured_records != *local_records) {
+        fprintf(stderr,
+                "[rank %d] ERROR: one-pass output conservation failed "
+                "blocks=%lld/%lld records=%llu/%llu input=%llu.\n",
+                rank, context.retired_blocks, context.captured_blocks,
+                (unsigned long long)context.retired_records,
+                (unsigned long long)context.captured_records,
+                (unsigned long long)*local_records);
+        local_ok = 0;
+    }
+    if (context.launched_output_blocks !=
+            context.written_output_blocks) {
+        fprintf(stderr,
+                "[rank %d] ERROR: one-pass compressed output "
+                "conservation failed blocks=%lld/%lld.\n",
+                rank, context.written_output_blocks,
+                context.launched_output_blocks);
+        local_ok = 0;
+    }
+    if (!MdAllRanksOkTimed(local_ok, stats)) {
+        MdOnePassCleanup(&context);
+        return -1;
+    }
+    MdOnePassCleanup(&context);
+    return 0;
+}
+
+static int MdMarkdupOnePassToSink(
+        MemReader &reader, long long global_block_begin,
+        long long local_block_count, int rank, int comm_size,
+        int include_fails, int max_read_length, size_t memory_limit,
+        int compress_level, swbam::RankBodySink *sink,
+        const MdOnePassBoundaryPlan *boundary_plan,
+        uint64_t *local_records,
+        int *range_has_records,
+        int *range_first_tid, int *range_first_pos,
+        int *range_last_tid, int *range_last_pos,
+        MpiMarkdupStats *stats) {
+    MdInputPass source(&reader);
+    return MdMarkdupOnePassToSink(
+        source, global_block_begin, local_block_count,
+        rank, comm_size, include_fails, max_read_length,
+        memory_limit, compress_level, sink, boundary_plan, local_records,
+        range_has_records, range_first_tid, range_first_pos,
+        range_last_tid, range_last_pos, stats);
+}
+
+static int MdMarkdupOnePassToSink(
+        const swbam::BamInputBackend &backend,
+        const swbam::BgzfBlockSpan *spans, size_t span_count,
+        long long global_block_begin, int rank, int comm_size,
+        int include_fails, int max_read_length, size_t memory_limit,
+        int compress_level, swbam::RankBodySink *sink,
+        const MdOnePassBoundaryPlan *boundary_plan,
+        uint64_t *local_records,
+        int *range_has_records,
+        int *range_first_tid, int *range_first_pos,
+        int *range_last_tid, int *range_last_pos,
+        MpiMarkdupStats *stats) {
+    MdInputPass source(&backend, spans, span_count);
+    return MdMarkdupOnePassToSink(
+        source, global_block_begin, (long long)span_count,
+        rank, comm_size, include_fails, max_read_length,
+        memory_limit, compress_level, sink, boundary_plan, local_records,
+        range_has_records, range_first_tid, range_first_pos,
+        range_last_tid, range_last_pos, stats);
+}
+
 struct MdOutputMemory {
     char *data;
     size_t size;
@@ -4427,6 +6080,8 @@ static double MdAccountedFusedTime(const MpiMarkdupStats &stats) {
            stats.t_owner_cleanup +
            stats.t_result_exchange +
            stats.t_result_cleanup +
+           stats.t_stream_buffer +
+           stats.t_stream_finalize +
            stats.t_rewrite_decomp +
            stats.t_rewrite +
            stats.t_pack +
@@ -4470,7 +6125,7 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
         "pair_duplicates=%lld single_duplicates=%lld "
         "marked=%lld cleared=%lld removed=%lld "
         "mpi_candidate_bytes=%lld result_bytes=%lld "
-        "bgzf=%lld tracked_peak=%lld\n",
+        "bgzf=%lld tracked_peak=%lld stream_pending_peak=%lld\n",
         rank, stats.input_blocks, stats.group_count,
         stats.total_records, stats.examined_records,
         stats.excluded_records, stats.pair_candidates,
@@ -4479,7 +6134,8 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
         stats.single_duplicates, stats.marked_records,
         stats.cleared_records, stats.removed_records,
         stats.mpi_candidate_bytes, stats.mpi_result_bytes,
-        stats.bgzf_blocks, stats.tracked_peak_bytes);
+        stats.bgzf_blocks, stats.tracked_peak_bytes,
+        stats.stream_pending_peak_bytes);
     if (used < 0) used = 0;
     if (used >= kLineBytes) used = kLineBytes - 1;
     snprintf(
@@ -4491,6 +6147,7 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
         "candidate_exchange=%.6f boundary=%.6f "
         "group_sort=%.6f group_scan=%.6f group=%.6f "
         "flat_init=%.6f flat_probe=%.6f result=%.6f "
+        "stream_buffer=%.6f stream_finalize=%.6f "
         "rewrite_decomp=%.6f "
         "rewrite=%.6f pack=%.6f compress=%.6f "
         "read=%.6f write=%.6f rank_sync=%.6f "
@@ -4506,6 +6163,7 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
         stats.t_group_scan, stats.t_group,
         stats.t_flat_init, stats.t_flat_probe,
         stats.t_result_exchange,
+        stats.t_stream_buffer, stats.t_stream_finalize,
         stats.t_rewrite_decomp, stats.t_rewrite, stats.t_pack,
         stats.t_compress, stats.t_read, stats.t_write,
         stats.t_rank_sync, stats.t_cpe_sync, accounted,
@@ -4525,8 +6183,12 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
     long long peak_max = 0;
     MPI_Reduce(&peak, &peak_max, 1, MPI_LONG_LONG,
                MPI_MAX, 0, MPI_COMM_WORLD);
+    long long pending_peak = stats.stream_pending_peak_bytes;
+    long long pending_peak_max = 0;
+    MPI_Reduce(&pending_peak, &pending_peak_max, 1, MPI_LONG_LONG,
+               MPI_MAX, 0, MPI_COMM_WORLD);
 
-    const int time_count = 26;
+    const int time_count = 28;
     double local_times[time_count] = {
         stats.t_candidate_decomp,
         stats.t_candidate_extract,
@@ -4543,6 +6205,8 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
         stats.t_flat_init,
         stats.t_flat_probe,
         stats.t_result_exchange,
+        stats.t_stream_buffer,
+        stats.t_stream_finalize,
         stats.t_rewrite_decomp,
         stats.t_rewrite,
         stats.t_pack,
@@ -4576,8 +6240,8 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
                "cleared=%lld removed=%lld\n",
                sums[8], sums[9], sums[10], sums[11], sums[12]);
         printf("  mpi candidate_bytes=%lld result_bytes=%lld "
-               "tracked_peak_max=%lld\n",
-               sums[14], sums[15], peak_max);
+               "tracked_peak_max=%lld stream_pending_peak_max=%lld\n",
+               sums[14], sums[15], peak_max, pending_peak_max);
         printf("  timing_sum candidate_decomp=%.3f "
                "candidate_extract=%.3f extract_status=%.3f "
                "extract_merge=%.3f extract_memcheck=%.3f "
@@ -4585,6 +6249,7 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
                "candidate_exchange=%.3f boundary=%.3f "
                "group_sort=%.3f group_scan=%.3f group=%.3f "
                "flat_init=%.3f flat_probe=%.3f result=%.3f "
+               "stream_buffer=%.3f stream_finalize=%.3f "
                "rewrite_decomp=%.3f "
                "rewrite=%.3f pack=%.3f compress=%.3f "
                "read=%.3f write=%.3f rank_sync=%.3f "
@@ -4598,7 +6263,8 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
                time_sums[15], time_sums[16], time_sums[17],
                time_sums[18], time_sums[19], time_sums[20],
                time_sums[21], time_sums[22], time_sums[23],
-               time_sums[24], time_sums[25]);
+               time_sums[24], time_sums[25], time_sums[26],
+               time_sums[27]);
         printf("  timing_max candidate_decomp=%.3f "
                "candidate_extract=%.3f extract_status=%.3f "
                "extract_merge=%.3f extract_memcheck=%.3f "
@@ -4606,6 +6272,7 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
                "candidate_exchange=%.3f boundary=%.3f "
                "group_sort=%.3f group_scan=%.3f group=%.3f "
                "flat_init=%.3f flat_probe=%.3f result=%.3f "
+               "stream_buffer=%.3f stream_finalize=%.3f "
                "rewrite_decomp=%.3f "
                "rewrite=%.3f pack=%.3f compress=%.3f "
                "read=%.3f write=%.3f rank_sync=%.3f "
@@ -4619,7 +6286,8 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
                time_max[15], time_max[16], time_max[17],
                time_max[18], time_max[19], time_max[20],
                time_max[21], time_max[22], time_max[23],
-               time_max[24], time_max[25]);
+               time_max[24], time_max[25], time_max[26],
+               time_max[27]);
         fflush(stdout);
     }
 }
@@ -5207,6 +6875,10 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
     double stage43_cost = 0.0;
     double body_total_t0 = 0.0;
     const int use_streaming = cmd_info->markdup_streaming_ ? 1 : 0;
+    const int use_one_pass = use_streaming &&
+        !cmd_info->markdup_remove_dups_ &&
+        !cmd_info->markdup_clear_ &&
+        !MdEnvFlagEnabled("RABBITBAM_MARKDUP_TWO_PASS");
 
     std::vector<MpiMarkdupCandidateShared> local_candidates;
     std::vector<unsigned char> local_qnames;
@@ -5415,12 +7087,51 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
     // 4.3 核心：提取候选、交换、找 duplicate、重写 BAM
     {
         if (rank == 0 && use_streaming) {
-            printf("MPI BAM markdup algorithm=coordinate-stream "
-                   "max_read_length=%d\n",
+            printf("MPI BAM markdup algorithm=%s max_read_length=%d\n",
+                   use_one_pass
+                       ? "coordinate-stream-one-pass"
+                       : "coordinate-stream-two-pass",
                    cmd_info->markdup_max_read_length_);
         }
         double fused_t0 = GetTime();
-        if (use_streaming) {
+        if (use_one_pass) {
+            MdOnePassBoundaryPlan boundary_plan;
+            if (MdBuildOnePassBoundaryPlan(
+                    *input_backend, input_plan.rank_spans(),
+                    input_plan.rank_block_count(), local_block_begin,
+                    rank, comm_size,
+                    cmd_info->markdup_include_fails_,
+                    cmd_info->markdup_max_read_length_, memory_limit,
+                    &boundary_plan, &stats) != 0) {
+                local_ok = 0;
+            }
+            if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
+            const int stream_ret = memory_input
+                ? MdMarkdupOnePassToSink(
+                    reader, local_block_begin,
+                    local_block_end - local_block_begin,
+                    rank, comm_size,
+                    cmd_info->markdup_include_fails_,
+                    cmd_info->markdup_max_read_length_, memory_limit,
+                    cmd_info->compress_level_, body_sink,
+                    &boundary_plan,
+                    &local_records, &range_has_records,
+                    &range_first_tid, &range_first_pos,
+                    &range_last_tid, &range_last_pos, &stats)
+                : MdMarkdupOnePassToSink(
+                    *input_backend, input_plan.rank_spans(),
+                    input_plan.rank_block_count(), local_block_begin,
+                    rank, comm_size,
+                    cmd_info->markdup_include_fails_,
+                    cmd_info->markdup_max_read_length_, memory_limit,
+                    cmd_info->compress_level_, body_sink,
+                    &boundary_plan,
+                    &local_records, &range_has_records,
+                    &range_first_tid, &range_first_pos,
+                    &range_last_tid, &range_last_pos, &stats);
+            if (stream_ret != 0) local_ok = 0;
+            if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
+        } else if (use_streaming) {
             const char *force_hash_owner =
                 getenv("RABBITBAM_MARKDUP_HASH_OWNER");
             if (force_hash_owner && force_hash_owner[0] == '1' &&
@@ -5656,7 +7367,8 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
         }
         }
 
-        // 6. MdRewriteOutput：重写本 rank 的 BAM body
+        // 6. 两遍路径重写本 rank 的 BAM body；单遍路径已经写出。
+        if (!use_one_pass) {
         const int remove_dups = cmd_info->markdup_remove_dups_;
         const int legacy_remove_path =
             MdEnvFlagEnabled("RABBITBAM_MARKDUP_LEGACY_REMOVE");
@@ -5739,6 +7451,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
             stats.t_pack += filter_stats.t_pack;
             stats.t_compress += filter_stats.t_compress;
             stats.t_write += filter_stats.t_write;
+        }
         }
         stats.t_fused_total = GetTime() - fused_t0;
         stage43_cost = MdReduceMax(stats.t_fused_total);
