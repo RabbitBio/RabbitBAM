@@ -1,6 +1,8 @@
 #ifndef SWBAM_SWBAM_H
 #define SWBAM_SWBAM_H
 
+#include "swbam/bam1.h"
+#include "swbam/bam1_writer.h"
 #include "swbam/cpe_pipeline.h"
 #include "swbam/cpe_write_pipeline.h"
 #include "swbam/generic_compress.h"

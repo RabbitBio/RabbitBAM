@@ -146,6 +146,8 @@ if(PLATFORM_SUNWAY)
         lib/cpe/swbam_cpe_write_pipeline.cpp
         lib/cpe/swbam_generic_compress.cpp
         lib/cpe/swbam_generic_decode.cpp
+        lib/bam/swbam_bam1.cpp
+        lib/bam/swbam_bam1_writer.cpp
         lib/bam/swbam_raw_bam.cpp
         lib/bam/swbam_raw_bam_filter.cpp
         lib/bam/swbam_raw_bam_writer.cpp
@@ -309,10 +311,18 @@ if(PLATFORM_SUNWAY)
             examples/sdk_record_count.cpp)
         add_executable(swbam-sdk-filter-bam
             examples/sdk_filter_bam.cpp)
+        add_executable(swbam-sdk-bam1-stats
+            examples/sdk_bam1_stats.cpp)
+        add_executable(swbam-sdk-bam1-filter
+            examples/sdk_bam1_filter.cpp)
         target_compile_options(swbam-sdk-record-count PRIVATE ${HOST_FLAGS})
         target_compile_options(swbam-sdk-filter-bam PRIVATE ${HOST_FLAGS})
+        target_compile_options(swbam-sdk-bam1-stats PRIVATE ${HOST_FLAGS})
+        target_compile_options(swbam-sdk-bam1-filter PRIVATE ${HOST_FLAGS})
         target_link_libraries(swbam-sdk-record-count PRIVATE swbam::swbam)
         target_link_libraries(swbam-sdk-filter-bam PRIVATE swbam::swbam)
+        target_link_libraries(swbam-sdk-bam1-stats PRIVATE swbam::swbam)
+        target_link_libraries(swbam-sdk-bam1-filter PRIVATE swbam::swbam)
     endif()
     
     # Main executable with host code and slave objects

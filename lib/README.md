@@ -8,12 +8,12 @@ sort/collate/markdup 的完整算法语义。
 - `io/`：`swbam_io`，输入输出和 rank body 存储。
 - `mpi/`：`swbam_mpi_runtime`，MPI backend、分区和分布式输出。
 - `cpe/`：`swbam_cpe_runtime` 的 MPE 侧流水线和通用算子包装。
-- `bam/`：`swbam_cpe_runtime` 中的 Raw BAM adapter、filter 和 writer。
+- `bam/`：`swbam_cpe_runtime` 中的 Raw/`bam1_t` adapter、filter 和 writer。
 
 ## 设计边界
 
 ```text
-backend -> BGZF batch -> CPE pipeline -> raw/operator -> output backend
+backend -> BGZF batch -> CPE pipeline -> raw/bam1/operator -> output backend
 ```
 
 库的扩展调用发生在 batch 或 consumer 层。性能敏感命令可以保留专用融合 kernel，

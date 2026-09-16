@@ -102,7 +102,8 @@ decode+parse+count 融合 CPE kernel 没有拆开，因此不会增加中间数�
 
 - 通用路径：`RunGenericDecodePipeline` 通过 `DecodedBgzfConsumer` 输出解压后的
   BGZF batch；`RunGenericRawBamPipeline` 进一步生成零拷贝 `RawBamRecordView`
-  batch，供简单工具、库使用者和功能原型消费。
+  batch，供简单工具、库使用者和功能原型消费；`RunGenericBam1Pipeline` 再在
+  MPE 上批量物化库管理的 `bam1_t`，供需要标准 HTSlib accessor 的应用消费。
 - 融合路径：内置性能敏感命令继续使用 decode+flagstat、decode+stats、
   decode+filter、decode+collate-extract 等专用融合算子。
 
@@ -117,6 +118,34 @@ decode+parse+count 融合 CPE kernel 没有拆开，因此不会增加中间数�
 `RawBamRecordView` 直接指向 decoded batch 中包含 4 字节 `block_size` 的原始编码，
 不构造 `bam1_t`，也不复制 record payload。view 只在 consumer 回调期间有效。当前
 与项目其他路径一致，要求单条 BAM record 不跨 BGZF block。
+
+`bam1_t` 通用路径复用上述 Raw batch，而不是新增另一套读取和解压流水线。adapter
+规范化 QNAME padding、CIGAR 和 aux 布局，并维护只随历史最大 batch 增长的对象池；
+consumer 回调结束后记录会被后续 batch 复用，跨回调保存必须调用 `bam_dup1()`。
+这条路径以一次 payload 物化换取与 HTSlib 生态的直接兼容，Raw 路径仍用于简单字段
+扫描，融合 CPE kernel 仍用于内置性能热点。
+
+通用写端提供与之对称的 `Bam1Writer`：
+
+```text
+bam1_t batch
+  -> MPE batch serialize
+  -> RawBamRecordView batch
+  -> RawBamWriter
+  -> CPE BGZF compress
+  -> BamOutputBackend
+```
+
+serializer 两遍处理每个 batch：第一遍校验 QNAME/data/CIGAR 并统计总长度，第二遍
+在复用 arena 中连续编码，随后整批调用一次 `RawBamWriter::ConsumeRaw()`。它会移除
+HTSlib 在内存中为 QNAME 添加的 padding，按 little-endian BAM 格式写 mandatory
+fields，并由坐标和 CIGAR 重算 bin。当前写端明确拒绝跨 BGZF payload 的超大记录和
+`n_cigar > 65535` 的长 CIGAR；这些边界不会影响原 Raw 路径和专用应用热路径。
+
+在 WES_0.25G（2,668,351 records）的单 rank memory smoke 中，`bam1_t` 示例得到
+mapped=2,663,701、MAPQ>=30=2,481,669、NM sum=878,007，分别与 Raw 统计、过滤
+基线和 `stats --basic` 一致。该次 `timing_materialize` 为 1.484 s，作为通用对象
+路径的首个性能基线，不与零拷贝 Raw 或融合 kernel 混作同一性能结果。
 
 ## `flagstat` 实例
 
@@ -205,6 +234,11 @@ helper；这些 helper 需要在构造更多边界样例后再决定是否并入
 `CpeWritePipeline` 压缩并追加到 `BamOutputBackend`。writer 还负责序列化标准 BAM
 header、让 body 从独立 BGZF block 开始并追加标准 EOF block，因此输出是可重新打开
 的完整 BAM，而不是只有 body 的内部片段。
+
+`Bam1Writer` 构建在 `RawBamWriter` 之上，为 HTSlib 对象提供完整 BAM 写出能力。
+它不复制或持有调用者的 `bam1_t` 生命周期，只在 batch 回调期间序列化；因此同一个
+实例既能直接作为 `RunGenericBam1Pipeline` 的 consumer，也能接收用户自行创建或
+修改后的记录。
 
 `MemoryBamInput::OpenMemoryCopy()` 可把完整内存 BAM 重新作为下一阶段输入，形成
 `memory input -> generic decode/raw view -> memory writer -> memory input` 闭环。当前
@@ -383,6 +417,8 @@ run/segment；`--rank-body-temp-dir` 只管理最终压缩 body 的 spool。两�
 - `RawBamWriter`、标准 BAM header/EOF 序列化、`MemoryBamOutput` 与
   `PosixBamOutput`；完整内存
   BAM 可以通过 `OpenMemoryCopy()` 再次进入读流水线。
+- `Bam1RecordConsumer`、批量 `bam1_t` 物化 adapter 与 `Bam1Writer`，形成兼容
+  HTSlib accessor 的通用对象级读写闭环。
 - `RawBamFilterConsumer` 通用二进制过滤算子，以及独立的 BAM2BAM CPE 融合
   filter/passthrough operator。
 - BAM2BAM 命令的 `memory|posix|mpiio|auto` 输入选择；memory 继续使用
