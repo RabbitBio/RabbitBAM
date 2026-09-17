@@ -227,20 +227,20 @@ int MaterializeRecord(const RawBamRecordView &view, bam1_t *output,
     return 0;
 }
 
-class Bam1BatchAdapter : public RawBamRecordConsumer {
+class Bam1BatchPostProcessorAdapter : public RawBamBatchPostProcessor {
 public:
-    Bam1BatchAdapter(Bam1RecordConsumer *consumer,
-                     GenericBam1Metrics *metrics)
-        : consumer_(consumer), metrics_(metrics) {}
+    Bam1BatchPostProcessorAdapter(Bam1BatchPostProcessor *post_processor,
+                     ComposableBam1Metrics *metrics)
+        : post_processor_(post_processor), metrics_(metrics) {}
 
-    ~Bam1BatchAdapter() {
+    ~Bam1BatchPostProcessorAdapter() {
         for (size_t i = 0; i < pool_.size(); ++i) {
             bam_destroy1(pool_[i]);
         }
     }
 
-    int ConsumeRaw(const RawBamRecordView *records, size_t count) {
-        if (!consumer_ || (!records && count != 0)) return -1;
+    int PostProcessRawBatch(const RawBamRecordView *records, size_t count) {
+        if (!post_processor_ || (!records && count != 0)) return -1;
         if (EnsurePool(count) != 0) return -1;
 
         long long encoded_bytes = 0;
@@ -257,12 +257,12 @@ public:
         }
         const double materialize = GetTime() - materialize_t0;
 
-        const double consume_t0 = GetTime();
-        if (consumer_->ConsumeBam1(
+        const double post_process_t0 = GetTime();
+        if (post_processor_->PostProcessBam1Batch(
                 count == 0 ? nullptr : batch_.data(), count) != 0) {
             return -1;
         }
-        const double consume = GetTime() - consume_t0;
+        const double post_process = GetTime() - post_process_t0;
 
         if (metrics_) {
             metrics_->records += (long long)count;
@@ -272,7 +272,7 @@ public:
                 metrics_->peak_batch_records = count;
             }
             metrics_->materialize += materialize;
-            metrics_->consume += consume;
+            metrics_->post_process += post_process;
         }
         return 0;
     }
@@ -297,8 +297,8 @@ private:
         return 0;
     }
 
-    Bam1RecordConsumer *consumer_;
-    GenericBam1Metrics *metrics_;
+    Bam1BatchPostProcessor *post_processor_;
+    ComposableBam1Metrics *metrics_;
     std::vector<bam1_t *> pool_;
     std::vector<const bam1_t *> batch_;
     std::vector<unsigned char> resize_scratch_;
@@ -306,24 +306,24 @@ private:
 
 } // namespace
 
-GenericBam1Metrics::GenericBam1Metrics()
+ComposableBam1Metrics::ComposableBam1Metrics()
     : records(0), encoded_bytes(0), data_bytes(0),
-      peak_batch_records(0), materialize(0.0), consume(0.0) {}
+      peak_batch_records(0), materialize(0.0), post_process(0.0) {}
 
-int RunGenericBam1Pipeline(
+int RunComposableBam1Pipeline(
         const BamInputBackend &input,
         const BgzfBlockSpan *spans,
         size_t span_count,
-        Bam1RecordConsumer *consumer,
+        Bam1BatchPostProcessor *post_processor,
         CpeReadPipelineTiming *timing,
-        GenericDecodeMetrics *decode_metrics,
-        GenericBam1Metrics *bam1_metrics,
+        ComposableDecodeMetrics *decode_metrics,
+        ComposableBam1Metrics *bam1_metrics,
         const CpeReadPipelineOptions &options) {
-    if (!consumer) return -1;
-    if (bam1_metrics) *bam1_metrics = GenericBam1Metrics();
-    Bam1BatchAdapter adapter(consumer, bam1_metrics);
-    GenericRawBamMetrics raw_metrics;
-    return RunGenericRawBamPipeline(
+    if (!post_processor) return -1;
+    if (bam1_metrics) *bam1_metrics = ComposableBam1Metrics();
+    Bam1BatchPostProcessorAdapter adapter(post_processor, bam1_metrics);
+    ComposableRawBamMetrics raw_metrics;
+    return RunComposableRawBamPipeline(
         input, spans, span_count, &adapter,
         timing, decode_metrics, &raw_metrics, options);
 }

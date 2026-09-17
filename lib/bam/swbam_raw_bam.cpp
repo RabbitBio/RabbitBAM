@@ -7,16 +7,16 @@ namespace swbam {
 namespace cpe {
 namespace {
 
-class RawBamBatchAdapter : public DecodedBgzfConsumer {
+class RawBamBatchPostProcessorAdapter : public DecodedBgzfBatchPostProcessor {
 public:
-    RawBamBatchAdapter(RawBamRecordConsumer *consumer,
-                       GenericRawBamMetrics *metrics)
-        : consumer_(consumer), metrics_(metrics) {
+    RawBamBatchPostProcessorAdapter(RawBamBatchPostProcessor *post_processor,
+                       ComposableRawBamMetrics *metrics)
+        : post_processor_(post_processor), metrics_(metrics) {
         records_.reserve(64 * 1024);
     }
 
-    int ConsumeDecoded(const bam_block *blocks, size_t count) {
-        if (!consumer_ || (!blocks && count != 0)) return -1;
+    int PostProcessDecodedBatch(const bam_block *blocks, size_t count) {
+        if (!post_processor_ || (!blocks && count != 0)) return -1;
         records_.clear();
 
         long long encoded_bytes = 0;
@@ -48,7 +48,7 @@ public:
             }
         }
 
-        if (consumer_->ConsumeRaw(
+        if (post_processor_->PostProcessRawBatch(
                 records_.empty() ? nullptr : records_.data(),
                 records_.size()) != 0) {
             return -1;
@@ -61,26 +61,26 @@ public:
     }
 
 private:
-    RawBamRecordConsumer *consumer_;
-    GenericRawBamMetrics *metrics_;
+    RawBamBatchPostProcessor *post_processor_;
+    ComposableRawBamMetrics *metrics_;
     std::vector<RawBamRecordView> records_;
 };
 
 } // namespace
 
-int RunGenericRawBamPipeline(
+int RunComposableRawBamPipeline(
         const BamInputBackend &input,
         const BgzfBlockSpan *spans,
         size_t span_count,
-        RawBamRecordConsumer *consumer,
+        RawBamBatchPostProcessor *post_processor,
         CpeReadPipelineTiming *timing,
-        GenericDecodeMetrics *decode_metrics,
-        GenericRawBamMetrics *raw_metrics,
+        ComposableDecodeMetrics *decode_metrics,
+        ComposableRawBamMetrics *raw_metrics,
         const CpeReadPipelineOptions &options) {
-    if (!consumer) return -1;
-    if (raw_metrics) *raw_metrics = GenericRawBamMetrics();
-    RawBamBatchAdapter adapter(consumer, raw_metrics);
-    return RunGenericDecodePipeline(
+    if (!post_processor) return -1;
+    if (raw_metrics) *raw_metrics = ComposableRawBamMetrics();
+    RawBamBatchPostProcessorAdapter adapter(post_processor, raw_metrics);
+    return RunComposableDecodePipeline(
         input, spans, span_count, &adapter,
         timing, decode_metrics, options);
 }

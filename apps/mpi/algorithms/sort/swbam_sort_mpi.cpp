@@ -350,14 +350,14 @@ void MpiSortPrintRankStats(int rank, int comm_size,
                            const MpiSortStats &stats,
                            size_t body_size) {
     const double core_stage = stats.sort_mode == 1
-        ? stats.t_fused_total
+        ? stats.t_optimized_total
         : stats.t_setup + stats.t_extract_read_unhidden +
           stats.t_extract + stats.t_extract_prepare +
           stats.t_extract_merge + stats.t_local_sort + stats.t_sample +
           stats.t_partition + stats.t_exchange + stats.t_offset_fix +
           stats.t_final_sort + stats.t_compress +
           stats.t_status_check + stats.t_cleanup;
-    const double unaccounted = stats.t_fused_total - core_stage;
+    const double unaccounted = stats.t_optimized_total - core_stage;
     const long long bucket_total_raw =
         stats.bucket_self_raw_bytes + stats.bucket_remote_raw_bytes;
     const double bucket_self_raw_ratio =
@@ -374,7 +374,7 @@ void MpiSortPrintRankStats(int rank, int comm_size,
              "[rank %d] external_memory temp_write_bytes=%lld temp_read_bytes=%lld resident_records=%lld resident_raw=%lld tracked_peak=%lld limit_arena=%lld merge_fan_in=%lld consolidation_passes=%lld\n"
              "[rank %d] extract_detail alloc=%.3f inflate=%.3f crc=%.3f parse=%.3f other=%.3f\n"
              "[rank %d] compress_detail pack=%.3f alloc=%.3f deflate=%.3f footer=%.3f other=%.3f\n"
-             "[rank %d] fused_total=%.6f actual_wall_including_probe=%.6f core_stage=%.6f\n",
+             "[rank %d] optimized_total=%.6f actual_wall_including_probe=%.6f core_stage=%.6f\n",
              rank, mode, stats.input_blocks, stats.local_records, stats.received_records,
              stats.sample_records, stats.bgzf_blocks, body_size,
              rank, stats.t_extract, stats.t_local_sort, stats.t_sample,
@@ -403,7 +403,7 @@ void MpiSortPrintRankStats(int rank, int comm_size,
              stats.t_extract_parse, stats.t_extract_other,
              rank, stats.t_compress_pack, stats.t_compress_alloc, stats.t_compress_deflate,
              stats.t_compress_footer, stats.t_compress_other,
-             rank, stats.t_fused_total, stats.t_fused_actual, core_stage);
+             rank, stats.t_optimized_total, stats.t_optimized_actual, core_stage);
 
     const int kLineBytes = 12288;
     std::vector<char> gathered;
@@ -461,7 +461,7 @@ int MpiSortMemoryToMemory(CmdInfo *cmd_info,
     double body_total_t0 = 0.0;
     double stage41_cost_max = 0.0;
     double stage42_cost_max = 0.0;
-    double fused_cost_max = 0.0;
+    double optimized_cost_max = 0.0;
     double stage44_cost_max = 0.0;
     double stage45_header_cost_max = 0.0;
     double stage46_cost_max = 0.0;
@@ -621,23 +621,23 @@ int MpiSortMemoryToMemory(CmdInfo *cmd_info,
         }
         if (!MpiSortAllRanksOk(local_ok)) goto cleanup;
 
-        double fused_t0 = GetTime();
-        int fused_ret =
-            FusedBamSortMPI(reader, mem_writer,
+        double optimized_t0 = GetTime();
+        int optimized_ret =
+            OptimizedBamSortMPI(reader, mem_writer,
                             local_block_begin, rank,
                             comm_size, cmd_info->compress_level_,
                             memory_limit, &stats);
-        if (fused_ret != 0) local_ok = 0;
+        if (optimized_ret != 0) local_ok = 0;
         int global_ok = MpiSortAllRanksOk(local_ok);
-        stats.t_fused_actual = GetTime() - fused_t0;
-        fused_cost_max =
-            MpiSortReduceMaxCost(stats.t_fused_actual);
+        stats.t_optimized_actual = GetTime() - optimized_t0;
+        optimized_cost_max =
+            MpiSortReduceMaxCost(stats.t_optimized_actual);
         if (rank == 0 && global_ok) {
-            printf("Complete the 4.3 FusedBamSortMPI cost %lf\n",
-                   fused_cost_max);
-            printf("FusedBamSortMPI reported cost model=measured-memory-mode\n");
-            printf("FusedBamSortMPI actual wall %lf\n",
-                   fused_cost_max);
+            printf("Complete the 4.3 OptimizedBamSortMPI cost %lf\n",
+                   optimized_cost_max);
+            printf("OptimizedBamSortMPI reported cost model=measured-memory-mode\n");
+            printf("OptimizedBamSortMPI actual wall %lf\n",
+                   optimized_cost_max);
         }
         if (!global_ok) goto cleanup;
 
@@ -763,7 +763,7 @@ int MpiSortMemoryToMemory(CmdInfo *cmd_info,
                    stage46_cost_max);
             printf("Complete the total (4.1~4.6) cost %lf-----\n",
                    stage41_cost_max + stage42_cost_max +
-                   fused_cost_max + stage44_cost_max +
+                   optimized_cost_max + stage44_cost_max +
                    stage45_header_cost_max + stage46_cost_max);
         }
         if (simulated_write_guard == (unsigned long long)-1 &&
@@ -810,7 +810,7 @@ int MpiSortMemoryToMemory(CmdInfo *cmd_info,
 
     if (core_cost) {
         *core_cost = stage41_cost_max + stage42_cost_max +
-                     fused_cost_max + stage44_cost_max +
+                     optimized_cost_max + stage44_cost_max +
                      stage45_header_cost_max + stage46_cost_max;
     }
     exit_code = 0;
@@ -1055,60 +1055,60 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
             printf("MPI BAM sort mode policy: no -m => memory; otherwise all ranks use external when max(3 * rank_input_bytes + 256MiB) exceeds -m\n");
         }
 
-        double fused_t0 = GetTime();
-        int fused_ret = 0;
+        double optimized_t0 = GetTime();
+        int optimized_ret = 0;
         if (memory_input) {
-            fused_ret = use_external
-                ? FusedBamExternalSortMPI(
+            optimized_ret = use_external
+                ? OptimizedBamExternalSortMPI(
                       reader, rank_body_sink, local_block_begin,
                       rank, comm_size, cmd_info->compress_level_,
                       memory_limit, sort_temp_prefix.c_str(), &stats)
-                : FusedBamSortMPI(
+                : OptimizedBamSortMPI(
                       reader, rank_body_sink, local_block_begin,
                       rank, comm_size, cmd_info->compress_level_,
                       memory_limit, &stats);
         } else {
-            fused_ret = use_external
-                ? FusedBamExternalSortMPI(
+            optimized_ret = use_external
+                ? OptimizedBamExternalSortMPI(
                       *input_backend, input_plan.rank_spans(),
                       input_plan.rank_block_count(), rank_body_sink,
                       local_block_begin, rank, comm_size,
                       cmd_info->compress_level_, memory_limit,
                       sort_temp_prefix.c_str(), &stats)
-                : FusedBamSortMPI(
+                : OptimizedBamSortMPI(
                       *input_backend, input_plan.rank_spans(),
                       input_plan.rank_block_count(), rank_body_sink,
                       local_block_begin, rank, comm_size,
                       cmd_info->compress_level_, memory_limit, &stats);
         }
-        if (fused_ret != 0) {
-            fprintf(stderr, "[rank %d] ERROR: MPI BAM sort fused body failed.\n", rank);
+        if (optimized_ret != 0) {
+            fprintf(stderr, "[rank %d] ERROR: MPI BAM sort optimized body failed.\n", rank);
             local_ok = 0;
         }
         int global_ok = MpiSortAllRanksOk(local_ok);
-        double fused_actual_cost_with_probe = GetTime() - fused_t0;
+        double optimized_actual_cost_with_probe = GetTime() - optimized_t0;
         if (!use_external) {
-            stats.t_fused_actual = fused_actual_cost_with_probe;
+            stats.t_optimized_actual = optimized_actual_cost_with_probe;
         }
-        double fused_actual_cost = fused_actual_cost_with_probe -
+        double optimized_actual_cost = optimized_actual_cost_with_probe -
             (use_external ? stats.t_mpi_simulated : 0.0);
-        if (fused_actual_cost < 0.0) fused_actual_cost = 0.0;
-        double fused_cost = use_external
-            ? stats.t_fused_total
-            : fused_actual_cost;
-        double fused_cost_max = MpiSortReduceMaxCost(fused_cost);
-        double fused_actual_cost_max = MpiSortReduceMaxCost(fused_actual_cost);
-        double fused_probe_cost_max = MpiSortReduceMaxCost(
+        if (optimized_actual_cost < 0.0) optimized_actual_cost = 0.0;
+        double optimized_cost = use_external
+            ? stats.t_optimized_total
+            : optimized_actual_cost;
+        double optimized_cost_max = MpiSortReduceMaxCost(optimized_cost);
+        double optimized_actual_cost_max = MpiSortReduceMaxCost(optimized_actual_cost);
+        double optimized_probe_cost_max = MpiSortReduceMaxCost(
             use_external ? stats.t_mpi_simulated : 0.0);
         if (rank == 0 && global_ok) {
-            printf("Complete the 4.3 FusedBamSortMPI cost %lf\n", fused_cost_max);
-            printf("FusedBamSortMPI reported cost model=%s\n",
+            printf("Complete the 4.3 OptimizedBamSortMPI cost %lf\n", optimized_cost_max);
+            printf("OptimizedBamSortMPI reported cost model=%s\n",
                    use_external ? "simulated-high-speed-temp-io"
                                 : "measured-memory-mode");
-            printf("FusedBamSortMPI actual wall %lf\n", fused_actual_cost_max);
+            printf("OptimizedBamSortMPI actual wall %lf\n", optimized_actual_cost_max);
             if (use_external) {
-                printf("FusedBamSortMPI timing probe overhead %lf\n",
-                       fused_probe_cost_max);
+                printf("OptimizedBamSortMPI timing probe overhead %lf\n",
+                       optimized_probe_cost_max);
             }
         }
         if (!global_ok) goto cleanup;
@@ -1300,12 +1300,12 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
         (void)body_cost;
         if (rank == 0 && global_ok) {
             double body_counted_cost = stage41_cost_max + stage42_cost_max +
-                                       fused_cost_max + stage44_cost_max +
+                                       optimized_cost_max + stage44_cost_max +
                                        stage45_header_cost_max + stage46_cost_max;
             printf("Complete the total (4.1~4.6) cost %lf-----\n", body_counted_cost);
             double body_actual_counted_cost =
                 stage41_cost_max + stage42_cost_max +
-                fused_actual_cost_max + stage44_cost_max +
+                optimized_actual_cost_max + stage44_cost_max +
                 stage45_header_cost_max + stage46_cost_max;
             printf("total actual wall (4.1~4.6) %lf-----\n",
                    body_actual_counted_cost);
@@ -1358,7 +1358,7 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
             stats.t_write,
             stats.t_status_check,
             stats.t_cleanup,
-            stats.t_fused_total,
+            stats.t_optimized_total,
             stats.t_temp_write_sim,
             stats.t_temp_read_sim,
             stats.t_run_sort,
@@ -1368,7 +1368,7 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
             stats.t_merge_unhidden,
             stats.t_temp_write_actual,
             stats.t_temp_read_actual,
-            stats.t_fused_actual,
+            stats.t_optimized_actual,
             stats.t_mpi_simulated,
             stats.t_merge_simulated,
             stats.t_compress_simulated,
@@ -1385,7 +1385,7 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
         MpiSortPrintRankStats(rank, comm_size, stats,
                               (size_t)rank_body_sink.size());
         if (rank == 0) {
-            printf("FusedBamSortMPI finished. mode=%s ranks=%d in_blocks=%lld local_records=%lld received_records=%lld samples=%lld bgzf_blocks=%lld body_bytes=%lld\n",
+            printf("OptimizedBamSortMPI finished. mode=%s ranks=%d in_blocks=%lld local_records=%lld received_records=%lld samples=%lld bgzf_blocks=%lld body_bytes=%lld\n",
                    stats.sort_mode == 1 ? "external" : "memory",
                    comm_size, global_long_stats[0], global_long_stats[1],
                    global_long_stats[2], global_long_stats[3], global_long_stats[4],
@@ -1435,7 +1435,7 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
                   global_double_stats[11] + global_double_stats[13] +
                   global_double_stats[14] + global_double_stats[15] +
                   global_double_stats[17] + global_double_stats[18];
-            printf("  fused_total_sum=%.3f  core_stage_sum=%.3f  unaccounted_sum=%.3f\n",
+            printf("  optimized_total_sum=%.3f  core_stage_sum=%.3f  unaccounted_sum=%.3f\n",
                    global_double_stats[19], core_stage_sum,
                    global_double_stats[19] - core_stage_sum);
         }

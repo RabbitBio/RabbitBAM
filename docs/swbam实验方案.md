@@ -152,17 +152,19 @@ descriptor 和规范化 payload offset，最后才评估由 CPE 直接填充数�
 
 | 对照 | 唯一变化 | 预期说明 |
 |---|---|---|
-| overlap off | 串行执行 read、CPE kernel、consume | 双缓冲前基线 |
+| overlap off | 串行执行 read、CPE kernel、post_process | 双缓冲前基线 |
 | overlap on | MPE 读取下一批与 CPE 处理当前批重叠 | 证明异构流水收益 |
 
-建议在 Raw read、Raw read-write 各测一次，并记录 read、kernel、consume、等待和总时间。
+建议在 Raw read、Raw read-write 各测一次，并记录 read、kernel、post_process、等待和总时间。
 
-### A2：Programmable Batch Path 与 Fusion-Optimized Path
+### A2：Composable path 与 Optimized path
 
-当前代码中的 generic/fused 在论文中建议改称：
+当前代码中的 composable/optimized 在论文中建议改称：
 
-- **Programmable Batch Path**：输出 Raw view 或 `bam1_t` batch，由 MPE 后处理；
-- **Fusion-Optimized Path**：CPE 内融合 decode、parse 和具体 operator。
+- **Composable path**：输出 Raw view 或 `bam1_t` batch，由 MPE batch post-processor
+  继续处理；
+- **Optimized path**：使用 fused CPE kernel 在从核内融合 decode、parse 和具体
+  operator。
 
 选择同一项业务，例如 `MAPQ >= 30` 过滤并写出 BAM，比较两条路径。两边必须输出
 相同记录集合，不能用“只解压”对比“完整过滤”。该实验回答可编程接口付出了多少

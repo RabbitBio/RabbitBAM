@@ -12,7 +12,7 @@ extern "C" {
     void slave_cgs_compressfunc();
 }
 
-int FusedBamToBamCGS(MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter) {
+int OptimizedBamToBamCGS(MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter) {
     if (CheckCgsResources() != 0) return -1;
 
     double t0 = GetTime();
@@ -240,7 +240,7 @@ int FusedBamToBamCGS(MemReader &reader, MemWriter &mem_writer, const BamFilterOp
     if (flush_pending() != 0) return -1;
 
     double keep_ratio = total_records > 0 ? (double)kept_records / (double)total_records : 1.0;
-    printf("FusedBamToBamCGS finished. in_blocks=%lld groups=%lld total_records=%lld kept_records=%lld dropped_records=%lld bgzf_blocks=%lld cost=%.3f s\n",
+    printf("OptimizedBamToBamCGS finished. in_blocks=%lld groups=%lld total_records=%lld kept_records=%lld dropped_records=%lld bgzf_blocks=%lld cost=%.3f s\n",
            input_block_count, group_count, total_records, kept_records, dropped_records, bgzf_blocks, GetTime() - t0);
     printf("  decomp_filter_slave=%.3f  pack=%.3f  compress_slave=%.3f  read=%.3f  write=%.3f\n",
            t_decomp_filter, t_pack, t_compress, t_read, t_write);

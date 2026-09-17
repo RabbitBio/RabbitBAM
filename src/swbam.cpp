@@ -106,7 +106,7 @@ void SetBoundsError(BoundsCheckError *err,
     err->core_id = core_id;
 }
 
-void SetGenericBoundsError(BoundsCheckError *err,
+void SetCommonBoundsError(BoundsCheckError *err,
                            const char *pipeline,
                            const char *stage,
                            long long actual_value,
@@ -139,7 +139,7 @@ void SetBoundsErrorFromCheckedPara(BoundsCheckError *err,
                                    const CheckedPara &para,
                                    int core_id) {
     if (para.limit_id == BOUNDS_LIMIT_NONE) {
-        SetGenericBoundsError(err, pipeline, stage, para.status, para.block_id, -1,
+        SetCommonBoundsError(err, pipeline, stage, para.status, para.block_id, -1,
                               para.record_index, core_id);
         return;
     }
@@ -153,7 +153,7 @@ void SetBoundsErrorFromCheckedBam2BamPara(BoundsCheckError *err,
                                           const CheckedBam2BamPara &para,
                                           int core_id) {
     if (para.limit_id == BOUNDS_LIMIT_NONE) {
-        SetGenericBoundsError(err, pipeline, stage, para.status, para.block_id, -1,
+        SetCommonBoundsError(err, pipeline, stage, para.status, para.block_id, -1,
                               para.record_index, core_id);
         return;
     }
@@ -558,8 +558,8 @@ void SwBam::ProducerSwBamTask(BGZF *fp, BamRead *read) {
 
 }
 
-void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
-    printf("ConsumerSwBamTask started\n");
+void SwBam::PostProcessSwBamTask(BamRead *read, BamComplete *complete) {
+    printf("PostProcessSwBamTask started\n");
     double t0 = GetTime();
  
     while (true) {
@@ -624,11 +624,11 @@ void SwBam::ConsumerSwBamTask(BamRead *read, BamComplete *complete) {
 
     complete->markComplete(); // 标记全部处理完成
 
-    printf("ConsumerSwBamTask finished , cost %lf!\n", GetTime() - t0); 
+    printf("PostProcessSwBamTask finished , cost %lf!\n", GetTime() - t0);
 }
 
-// FusedBamToSam: 单线程融合 Producer + Consumer + Writer
-void SwBam::FusedBamToSam(BamRead *read, BamComplete *complete,
+// OptimizedBamToSam: 单线程融合 Producer + MPE Post-Processing + Writer
+void SwBam::OptimizedBamToSam(BamRead *read, BamComplete *complete,
                            sam_hdr_t *h, MemReader &reader, MemWriter &mem_writer) {
     double t1 = GetTime();
     double t_decomp = 0, t_format = 0 , t_read = 0 , t_write = 0, t_collect = 0;
@@ -765,7 +765,7 @@ void SwBam::FusedBamToSam(BamRead *read, BamComplete *complete,
     delete fmt_prev;
 
     // printf("  max_bams_per_block=%d  max_data_size=%d  max_line_size=%d\n", max_bams_per_block, max_data_size, max_line_size);
-    printf("FusedBamToSam finished. blocks=%lld groups=%lld records=%lld cost=%.3f s\n",
+    printf("OptimizedBamToSam finished. blocks=%lld groups=%lld records=%lld cost=%.3f s\n",
            block_count, group_count, total_records, GetTime() - t1);
     printf("  decomp_slave=%.3f  format_slave=%.3f  collect=%.3f  read=%.3f  write=%.3f \n",
            t_decomp, t_format, t_collect, t_read, t_write);
@@ -780,7 +780,7 @@ int FormatSamRecordsChecked(const sam_hdr_t *h,
                             BoundsCheckError *bounds_error) {
     kstring_t line = {0, MAX_SAM_LINE_SIZE + 1, (char *)malloc(MAX_SAM_LINE_SIZE + 1)};
     if (!line.s) {
-        SetGenericBoundsError(bounds_error, "bam2sam", "sam_format_alloc", errno, -1, -1, -1, -1);
+        SetCommonBoundsError(bounds_error, "bam2sam", "sam_format_alloc", errno, -1, -1, -1, -1);
         return -1;
     }
 
@@ -803,7 +803,7 @@ int FormatSamRecordsChecked(const sam_hdr_t *h,
         for (int idx = start; idx < end; ++idx) {
             int line_len = sam_format1(h, records[idx], &line);
             if (line_len < 0) {
-                SetGenericBoundsError(bounds_error, "bam2sam", "sam_format", line_len, -1, -1, idx, cid);
+                SetCommonBoundsError(bounds_error, "bam2sam", "sam_format", line_len, -1, -1, idx, cid);
                 free(line.s);
                 return -1;
             }
@@ -834,7 +834,7 @@ int FormatSamRecordsChecked(const sam_hdr_t *h,
 
 } // namespace
 
-int SwBam::FusedBamToSamChecked(BamRead *read, BamComplete *complete,
+int SwBam::OptimizedBamToSamChecked(BamRead *read, BamComplete *complete,
                                 sam_hdr_t *h, MemReader &reader, MemWriter &mem_writer,
                                 BoundsCheckError *bounds_error) {
     double t0 = GetTime();
@@ -929,18 +929,18 @@ int SwBam::FusedBamToSamChecked(BamRead *read, BamComplete *complete,
         group_count++;
     }
 
-    printf("FusedBamToSamChecked finished. blocks=%lld groups=%lld records=%lld cost=%.3f s\n",
+    printf("OptimizedBamToSamChecked finished. blocks=%lld groups=%lld records=%lld cost=%.3f s\n",
            block_count, group_count, total_records, GetTime() - t0);
     return 0;
 }
 
-// FusedBamToBam: 单线程融合 Producer + Consumer + Writer
-void SwBam::FusedBamToBam(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
+// OptimizedBamToBam: 单线程融合 Producer + MPE Post-Processing + Writer
+void SwBam::OptimizedBamToBam(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
                           MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter) {
-    FusedBamToBamOptimized(read, complete, write_complete, reader, mem_writer, filter);
+    OptimizedBamToBamCore(read, complete, write_complete, reader, mem_writer, filter);
 }
 
-void SwBam::FusedBamToBamOptimized(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
+void SwBam::OptimizedBamToBamCore(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
                                    MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter) {
     double t0 = GetTime();
     double t_decomp_filter = 0, t_pack = 0, t_compress = 0, t_read = 0, t_write = 0;
@@ -1149,7 +1149,7 @@ void SwBam::FusedBamToBamOptimized(BamRead *read, BamComplete *complete, BamWrit
     }
 
     double keep_ratio = total_records > 0 ? (double)kept_records / (double)total_records : 1.0;
-    printf("FusedBamToBam finished. in_blocks=%lld groups=%lld total_records=%lld kept_records=%lld dropped_records=%lld bgzf_blocks=%lld cost=%.3f s\n",
+    printf("OptimizedBamToBam finished. in_blocks=%lld groups=%lld total_records=%lld kept_records=%lld dropped_records=%lld bgzf_blocks=%lld cost=%.3f s\n",
            input_blocks, group_count, total_records, kept_records, dropped_records, bgzf_blocks, GetTime() - t0);
     printf("  decomp_filter_slave=%.3f  pack=%.3f  compress_slave=%.3f  read=%.3f  write=%.3f\n",
            t_decomp_filter, t_pack, t_compress, t_read, t_write);
@@ -1157,7 +1157,7 @@ void SwBam::FusedBamToBamOptimized(BamRead *read, BamComplete *complete, BamWrit
            pack_records, bgzf_blocks, keep_ratio, no_filter ? "passthrough" : "filtered");
 }
 
-int SwBam::FusedBamToBamChecked(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
+int SwBam::OptimizedBamToBamChecked(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
                                 MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter,
                                 BoundsCheckError *bounds_error) {
     double t0 = GetTime();
@@ -1168,7 +1168,7 @@ int SwBam::FusedBamToBamChecked(BamRead *read, BamComplete *complete, BamWriteCo
         paras[b].output_records = complete->getResultBuf(b).data();
         paras[b].bam_lens = (uint32_t *)aligned_alloc_custom(64, MAX_RECORDS_PER_BLOCK * sizeof(uint32_t));
         if (!paras[b].bam_lens) {
-            SetGenericBoundsError(bounds_error, "bam2bam", "alloc_bam_lens", errno, -1, -1, -1, b);
+            SetCommonBoundsError(bounds_error, "bam2bam", "alloc_bam_lens", errno, -1, -1, -1, b);
             for (int j = 0; j < b; ++j) {
                 if (paras[j].bam_lens) aligned_free_custom((unsigned char*)paras[j].bam_lens);
             }
@@ -1262,7 +1262,7 @@ int SwBam::FusedBamToBamChecked(BamRead *read, BamComplete *complete, BamWriteCo
 
         for (int k = 0; k < NB; ++k) {
             if (!group[k].empty() && comp_active[k].status != 0) {
-                SetGenericBoundsError(bounds_error, "bam2bam", "compress", comp_active[k].status,
+                SetCommonBoundsError(bounds_error, "bam2bam", "compress", comp_active[k].status,
                                       k, -1, -1, k);
                 release_pending_outputs(comp_active);
                 return -1;
@@ -1395,7 +1395,7 @@ int SwBam::FusedBamToBamChecked(BamRead *read, BamComplete *complete, BamWriteCo
         }
     }
 
-    printf("FusedBamToBamChecked finished. in_blocks=%lld groups=%lld total_records=%lld kept_records=%lld dropped_records=%lld bgzf_blocks=%lld cost=%.3f s\n",
+    printf("OptimizedBamToBamChecked finished. in_blocks=%lld groups=%lld total_records=%lld kept_records=%lld dropped_records=%lld bgzf_blocks=%lld cost=%.3f s\n",
            input_blocks, group_count, total_records, kept_records, dropped_records, bgzf_blocks, GetTime() - t0);
     return 0;
 }
@@ -1714,8 +1714,8 @@ void SwBam:: ProducerSwBamTask2(samFile *fp, BamWrite *write, sam_hdr_t *h){
 
 }
 
-void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
-    printf("ConsumerSwBamTask2 started\n");
+void SwBam:: PostProcessSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
+    printf("PostProcessSwBamTask2 started\n");
     double t0 = GetTime();
 
     while (true) {
@@ -1777,11 +1777,11 @@ void SwBam:: ConsumerSwBamTask2 (BamWrite *write, BamWriteComplete *complete){
     }
 
     complete->markComplete(); 
-    printf("ConsumerSwBamTask2 finished , cost %lf!\n", GetTime() - t0); 
+    printf("PostProcessSwBamTask2 finished , cost %lf!\n", GetTime() - t0);
 }
 
-// FusedSamToBam: 单线程融合 Producer + Consumer + Writer
-void SwBam::FusedSamToBam(BamWrite *write, BamWriteComplete *complete,
+// OptimizedSamToBam: 单线程融合 Producer + MPE Post-Processing + Writer
+void SwBam::OptimizedSamToBam(BamWrite *write, BamWriteComplete *complete,
                           sam_hdr_t *h, MemReader reader, MemWriter &mem_writer) {
     double t0 , t1 = GetTime();
     double t_copy_count = 0, t_parse = 0, t_compress = 0, t_pack = 0 , t_write = 0;
@@ -1984,13 +1984,13 @@ void SwBam::FusedSamToBam(BamWrite *write, BamWriteComplete *complete,
     destroy_sam_parse_batch(&batch);
 
     // printf("max_bams_per_chunk=%d, max_data_size=%d\n",max_bams_per_chunk , max_data_size);
-    printf("FusedSamToBam finished. bam1_t=%d, blocks=%d, groups=%d, bgzf=%lld, cost %lf\n",
+    printf("OptimizedSamToBam finished. bam1_t=%d, blocks=%d, groups=%d, bgzf=%lld, cost %lf\n",
            bam1_t_nums, block_nums, group_nums, bgzf_nums, GetTime() - t1);
     printf("  copy_count_slave=%lf  parse_slave=%lf  pack(+compress)=%lf  compress_slave=%lf  write=%lf\n",
            t_copy_count, t_parse, t_pack, t_compress, t_write);
 }
 
-int SwBam::FusedSamToBamChecked(BamWriteComplete *complete, sam_hdr_t *h,
+int SwBam::OptimizedSamToBamChecked(BamWriteComplete *complete, sam_hdr_t *h,
                                 MemReader reader, MemWriter &mem_writer, BoundsCheckError *bounds_error) {
     double t1 = GetTime();
 
@@ -2087,7 +2087,7 @@ int SwBam::FusedSamToBamChecked(BamWriteComplete *complete, sam_hdr_t *h,
 
         for (int k = 0; k < 64; ++k) {
             if (!cur_group[k].empty() && comp_active[k].status != 0) {
-                SetGenericBoundsError(bounds_error, "sam2bam", "compress", comp_active[k].status,
+                SetCommonBoundsError(bounds_error, "sam2bam", "compress", comp_active[k].status,
                                       k, -1, -1, k);
                 release_outputs(comp_active);
                 return -1;
@@ -2193,7 +2193,7 @@ int SwBam::FusedSamToBamChecked(BamWriteComplete *complete, sam_hdr_t *h,
                 kstring_t ks = {line_len, line_len + 1, line_buf.data()};
                 bam1_t *b = bam_init1();
                 if (!b) {
-                    SetGenericBoundsError(bounds_error, "sam2bam", "sam_parse_alloc", errno,
+                    SetCommonBoundsError(bounds_error, "sam2bam", "sam_parse_alloc", errno,
                                           -1, chunk_id, record_index, -1);
                     cleanup_state();
                     return -1;
@@ -2201,7 +2201,7 @@ int SwBam::FusedSamToBamChecked(BamWriteComplete *complete, sam_hdr_t *h,
                 int ret = sam_parse1(&ks, h, b);
                 if (ret < 0) {
                     bam_destroy1(b);
-                    SetGenericBoundsError(bounds_error, "sam2bam", "sam_parse", ret,
+                    SetCommonBoundsError(bounds_error, "sam2bam", "sam_parse", ret,
                                           -1, chunk_id, record_index, -1);
                     cleanup_state();
                     return -1;
@@ -2266,7 +2266,7 @@ int SwBam::FusedSamToBamChecked(BamWriteComplete *complete, sam_hdr_t *h,
     }
     flush_pending();
 
-    printf("FusedSamToBamChecked finished. bam1_t=%lld, blocks=%lld, groups=%lld, bgzf=%lld, cost=%lf\n",
+    printf("OptimizedSamToBamChecked finished. bam1_t=%lld, blocks=%lld, groups=%lld, bgzf=%lld, cost=%lf\n",
            bam1_t_nums, block_nums, group_nums, bgzf_nums, GetTime() - t1);
     return 0;
 }
@@ -2385,7 +2385,7 @@ int SwBam::ProcessSwBam() {
     //     }
     //     if (cross_ret > 0) {
     //         fprintf(stderr,
-    //                 "ERROR: input BAM contains %lld cross-block records; BAM -> BAM fused fast-path is disabled for this file.\n",
+    //                 "ERROR: input BAM contains %lld cross-block records; BAM -> BAM optimized fast-path is disabled for this file.\n",
     //                 cross_stats.cross_block_records);
     //         goto cleanup;
     //     }
@@ -2530,12 +2530,12 @@ int SwBam::ProcessSwBam() {
                         printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
                         if (cmd_info_->validate_bounds_) {
                             printf("Enable CHECKED BAM2SAM mode (--validate-bounds)!!!\n");
-                            if (FusedBamToSamChecked(read, complete, hdr, reader, mem_writer, &bounds_error) != 0) {
+                            if (OptimizedBamToSamChecked(read, complete, hdr, reader, mem_writer, &bounds_error) != 0) {
                                 PrintBoundsError(bounds_error);
                                 goto cleanup;
                             }
                         } else {
-                            FusedBamToSam(read, complete, hdr, reader, mem_writer);
+                            OptimizedBamToSam(read, complete, hdr, reader, mem_writer);
                         }
                     }
                     #elif defined(USE_MEMORY)
@@ -2547,7 +2547,7 @@ int SwBam::ProcessSwBam() {
                         printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
 
                         thread producer(bind(&SwBam::ProducerSwBamTask_memory, this, sin->fp.bgzf, read, bam_mem, bam_size));
-                        thread consumer(bind(&SwBam::ConsumerSwBamTask, this, read, complete));
+                        thread post_processor(bind(&SwBam::PostProcessSwBamTask, this, read, complete));
 
                         t0 = GetTime();
                         SamFormatBatch batch;
@@ -2581,7 +2581,7 @@ int SwBam::ProcessSwBam() {
 
                         destroy_sam_format_batch_buffers(&batch);
                         producer.join();
-                        consumer.join();
+                        post_processor.join();
                         printf("Complete main thread writing to sam cost %lf\n", GetTime() - t0);
                         printf("The total bam1_t nums is %lld\n", num);
                     }
@@ -2593,7 +2593,7 @@ int SwBam::ProcessSwBam() {
                         printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
 
                         thread producer(bind(&SwBam::ProducerSwBamTask, this, sin->fp.bgzf, read));
-                        thread consumer(bind(&SwBam::ConsumerSwBamTask, this, read, complete));
+                        thread post_processor(bind(&SwBam::PostProcessSwBamTask, this, read, complete));
 
                         t0 = GetTime();
                         SamFormatBatch batch;
@@ -2628,7 +2628,7 @@ int SwBam::ProcessSwBam() {
 
                         destroy_sam_format_batch_buffers(&batch);
                         producer.join();
-                        consumer.join();
+                        post_processor.join();
                         printf("Complete main thread writing to sam cost %lf\n", GetTime() - t0);
                         printf("The total bam1_t nums is %lld\n", num);
                     }
@@ -2644,18 +2644,18 @@ int SwBam::ProcessSwBam() {
                         printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
                         if (cmd_info_->validate_bounds_) {
                             printf("Enable CHECKED BAM2BAM mode (--validate-bounds)!!!\n");
-                            if (FusedBamToBamChecked(read, complete, writeComplete, reader, mem_writer,
+                            if (OptimizedBamToBamChecked(read, complete, writeComplete, reader, mem_writer,
                                                      bam_filter, &bounds_error) != 0) {
                                 PrintBoundsError(bounds_error);
                                 goto cleanup;
                             }
                         } else {
-                            FusedBamToBam(read, complete, writeComplete, reader, mem_writer, bam_filter);
+                            OptimizedBamToBam(read, complete, writeComplete, reader, mem_writer, bam_filter);
                         }
                     }
                     #else
                     {
-                        fprintf(stderr, "BAM -> BAM is only supported in fused memory mode in this version.\n");
+                        fprintf(stderr, "BAM -> BAM is only supported in optimized memory mode in this version.\n");
                         goto cleanup;
                     }
                     #endif
@@ -2677,13 +2677,13 @@ int SwBam::ProcessSwBam() {
                     printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
                     if (cmd_info_->validate_bounds_) {
                         printf("Enable CHECKED SAM2BAM mode (--validate-bounds)!!!\n");
-                        if (FusedSamToBamChecked(writeComplete, hdr, reader, mem_writer, &bounds_error) != 0) {
+                        if (OptimizedSamToBamChecked(writeComplete, hdr, reader, mem_writer, &bounds_error) != 0) {
                             PrintBoundsError(bounds_error);
                             goto cleanup;
                         }
                     } else {
                         write = new BamWrite(FUSED_SAM2BAM_BAM_POOL_SIZE, 1);
-                        FusedSamToBam(write, writeComplete, hdr, reader, mem_writer);
+                        OptimizedSamToBam(write, writeComplete, hdr, reader, mem_writer);
                     }
                 }
                 #elif defined(USE_MEMORY)
@@ -2695,7 +2695,7 @@ int SwBam::ProcessSwBam() {
                     printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
                     
                     thread producer2(bind(&SwBam::ProducerSwBamTask2_parallel_memory_OP, this, write, hdr, reader));
-                    thread consumer2(bind(&SwBam::ConsumerSwBamTask2, this, write , writeComplete));
+                    thread post_processor2(bind(&SwBam::PostProcessSwBamTask2, this, write , writeComplete));
 
                     t0 = GetTime();
                     long long num2 = 0;
@@ -2709,7 +2709,7 @@ int SwBam::ProcessSwBam() {
                     }
 
                     producer2.join();
-                    consumer2.join();
+                    post_processor2.join();
                     printf("The actual time of reading sam cost %lf\n", t_sam2bam_read);
                     printf("The actual time of sam parsing cost %lf\n", t_sam_parse);
                     printf("The actual time of for loops in producer cost %lf\n", t_sam2bam_for);
@@ -2727,7 +2727,7 @@ int SwBam::ProcessSwBam() {
                     printf("Complete the queue initialization cost %lf\n", GetTime() - t0);
                     
                     thread producer2(bind(&SwBam::ProducerSwBamTask2_parallel, this, sin, write, hdr));
-                    thread consumer2(bind(&SwBam::ConsumerSwBamTask2, this, write, writeComplete));
+                    thread post_processor2(bind(&SwBam::PostProcessSwBamTask2, this, write, writeComplete));
                     t0 = GetTime();
                     long long num2 = 0;
                     bam_block* comp_block;
@@ -2741,7 +2741,7 @@ int SwBam::ProcessSwBam() {
                     }
 
                     producer2.join();
-                    consumer2.join();
+                    post_processor2.join();
                     printf("Complete main thread writing to bam cost %lf\n", GetTime() - t0);
                     printf("The total BGZF nums is %lld\n", num2);
                 }

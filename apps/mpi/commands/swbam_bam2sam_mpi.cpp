@@ -269,7 +269,7 @@ void MpiAccumulateDecompDetail(const Bam2BamPara *paras,
 
 } // namespace
 
-static int FusedBamToSamCoreMPI(
+static int OptimizedBamToSamCoreMPI(
                      MemReader *reader,
                      const swbam::BamInputBackend *backend,
                      const swbam::BgzfBlockSpan *spans,
@@ -281,7 +281,7 @@ static int FusedBamToSamCoreMPI(
     const size_t block_arena_stride = MPI_BAM_BLOCK_ARENA_SIZE;
     MpiBamToSamStats local_stats = {};
     if (!stats) stats = &local_stats;
-    double fused_t0 = GetTime();
+    double optimized_t0 = GetTime();
 
     double alloc_t0 = GetTime();
     Bam2BamPara paras[NB];
@@ -318,7 +318,7 @@ static int FusedBamToSamCoreMPI(
         MpiFreeBamToSamBlockSet(&un_blocks);
         MpiFreeBamToSamRecordSet(&record_set);
         stats->t_alloc_init += GetTime() - alloc_t0;
-        stats->t_fused_total += GetTime() - fused_t0;
+        stats->t_optimized_total += GetTime() - optimized_t0;
         return -1;
     }
     stats->t_alloc_init += GetTime() - alloc_t0;
@@ -503,43 +503,43 @@ cleanup:
         MpiFreeBamToSamRecordSet(&record_set);
         stats->t_free_workspace += GetTime() - free_t0;
     }
-    stats->t_fused_total += GetTime() - fused_t0;
+    stats->t_optimized_total += GetTime() - optimized_t0;
     return ret_code;
 }
 
-int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
+int OptimizedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
                      sam_hdr_t *hdr,
                      MpiBamToSamStats *stats) {
     swbam::MemoryRankBodySink body_sink(&mem_writer);
-    return FusedBamToSamCoreMPI(
+    return OptimizedBamToSamCoreMPI(
         &reader, nullptr, nullptr, 0, &body_sink, hdr, stats);
 }
 
-int FusedBamToSamMPI(MemReader &reader,
+int OptimizedBamToSamMPI(MemReader &reader,
                      swbam::RankBodySink &body_sink,
                      sam_hdr_t *hdr,
                      MpiBamToSamStats *stats) {
-    return FusedBamToSamCoreMPI(
+    return OptimizedBamToSamCoreMPI(
         &reader, nullptr, nullptr, 0, &body_sink, hdr, stats);
 }
 
-int FusedBamToSamMPI(const swbam::BamInputBackend &input,
+int OptimizedBamToSamMPI(const swbam::BamInputBackend &input,
                      const swbam::BgzfBlockSpan *spans,
                      size_t span_count,
                      MemWriter &mem_writer,
                      sam_hdr_t *hdr,
                      MpiBamToSamStats *stats) {
     swbam::MemoryRankBodySink body_sink(&mem_writer);
-    return FusedBamToSamCoreMPI(
+    return OptimizedBamToSamCoreMPI(
         nullptr, &input, spans, span_count, &body_sink, hdr, stats);
 }
 
-int FusedBamToSamMPI(const swbam::BamInputBackend &input,
+int OptimizedBamToSamMPI(const swbam::BamInputBackend &input,
                      const swbam::BgzfBlockSpan *spans,
                      size_t span_count,
                      swbam::RankBodySink &body_sink,
                      sam_hdr_t *hdr,
                      MpiBamToSamStats *stats) {
-    return FusedBamToSamCoreMPI(
+    return OptimizedBamToSamCoreMPI(
         nullptr, &input, spans, span_count, &body_sink, hdr, stats);
 }

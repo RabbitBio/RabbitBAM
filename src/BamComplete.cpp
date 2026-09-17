@@ -51,7 +51,7 @@ BamComplete::BamComplete(int queue_size)
     con_queueSizeLim = queue_size + 5;
     con_bg = 1;
     con_ed = 0;
-    consumer_queue_ = new bam1_t*[con_queueSizeLim];
+    post_process_queue_ = new bam1_t*[con_queueSizeLim];
 
     complete_flag = false;
 }
@@ -75,9 +75,9 @@ BamComplete::~BamComplete() {
         producer_queue_ = nullptr;
     }
 
-    if (consumer_queue_) {
-        delete[] consumer_queue_;
-        consumer_queue_ = nullptr;
+    if (post_process_queue_) {
+        delete[] post_process_queue_;
+        post_process_queue_ = nullptr;
     }
 }
 
@@ -124,7 +124,7 @@ void BamComplete::backBam1_tBatch(bam1_t** src, int n) {
 
 void BamComplete::inputBam1_t(bam1_t*& bam1) {
     //先+1再放入
-    consumer_queue_[(con_ed + 1) % con_queueSizeLim] = bam1;
+    post_process_queue_[(con_ed + 1) % con_queueSizeLim] = bam1;
     con_ed = (con_ed + 1) % con_queueSizeLim;
 }
 
@@ -136,7 +136,7 @@ bam1_t* BamComplete::getBam1_t() {
     }
     //先取再+1
     int num = con_bg;
-    bam1_t* bam1 = consumer_queue_[con_bg];
+    bam1_t* bam1 = post_process_queue_[con_bg];
     con_bg = (con_bg + 1) % con_queueSizeLim;
     return bam1;
 }

@@ -72,8 +72,8 @@ void ResetPackWorkspace(CgsPackWorkspace *workspace);
 int SealCurrentPackBlock(CgsPackWorkspace *workspace);
 int AppendRecordToPackWorkspace(CgsPackWorkspace *workspace, bam1_t *record, uint32_t bam_len);
 
-int FusedBamToBamCGS(MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter);
-int FusedBamToSamCGS(MemReader &reader, MemWriter &mem_writer, sam_hdr_t *hdr);
-int FusedSamToBamCGS(MemReader reader, MemWriter &mem_writer, sam_hdr_t *hdr);
+int OptimizedBamToBamCGS(MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter);
+int OptimizedBamToSamCGS(MemReader &reader, MemWriter &mem_writer, sam_hdr_t *hdr);
+int OptimizedSamToBamCGS(MemReader reader, MemWriter &mem_writer, sam_hdr_t *hdr);
 
 #endif

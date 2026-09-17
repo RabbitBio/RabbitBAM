@@ -34,7 +34,7 @@ MPE/CPE 架构。
 | 应用计算 | 读取记录后在 CPU 上执行命令逻辑 | CPE 可融合 decode、parse、filter/count/extract/rewrite | 避免 decoded 数据回到 MPE 后再次扫描 |
 | 全局算法 | 单机内存、线程和临时文件 | MPI sample/owner/bin 分区及 rank 间交换 | 分散排序、聚类和去重工作集 |
 | 输出 | HTSlib 顺序写和 BGZF 线程压缩 | CPE 压缩、rank body sink、MPI-IO 分布式布局 | 压缩并行化并避免 rank0 汇总瓶颈 |
-| 扩展接口 | HTSlib 是成熟通用格式库 | generic 与 fused 两条路径共存 | 同时保留易开发性和高性能 |
+| 扩展接口 | HTSlib 是成熟通用格式库 | composable 与 optimized 两条路径共存 | 同时保留易开发性和高性能 |
 
 ## 4. 公共库级核心优化
 
@@ -91,17 +91,17 @@ slots，减少中间 scratch buffer。
 对应代码：`lib/cpe/swbam_cpe_pipeline.cpp`、
 `lib/cpe/swbam_cpe_write_pipeline.cpp`。
 
-### 4.4 Generic 与 fused 双执行路径
+### 4.4 Composable path 与 Optimized path
 
 SWBAM 没有强迫所有应用使用同一种抽象：
 
-- **Generic 路径**：CPE 解压后，`RawBamRecordView` 直接指向 decoded batch 中的原始
+- **Composable 路径**：CPE 解压后，`RawBamRecordView` 直接指向 decoded batch 中的原始
   BAM record，不构造 `bam1_t`，适合 SDK 示例、简单扫描和过滤。
-- **Fused 路径**：专用 CPE kernel 在一次启动中完成
+- **Optimized 路径**：专用 CPE kernel 在一次启动中完成
   `BGZF decode + BAM parse + application operator`，只回传计数、key、plan 或 bitmap
   等紧凑结果。
 
-Generic 路径强调易扩展；fused 路径强调性能。二者共享 backend、block batch、codec、
+Composable 路径强调易扩展；optimized 路径强调性能。二者共享 backend、block batch、codec、
 调度和错误处理，因此专用优化不会迫使每个命令重新实现整套 I/O。
 
 这是相对通用 `sam_read1() -> bam1_t -> application loop` 最重要的数据通路区别之一。
@@ -146,7 +146,7 @@ collate 的 raw arena 优化曾将 `raw_resize` 从约 2.732 s/rank 降到约 0.
 
 公共库只统一 backend、batch runtime 和输出布局。sort 的 bucket exchange、collate
 的 QNAME merge、markdup 的 owner 判重等状态仍留在应用层；专用 CPE kernel 也没有
-被 generic consumer 替换。已有重构 A/B 结果中：
+被 composable batch post-processor 替换。已有重构 A/B 结果中：
 
 - flagstat：`0.052073 s -> 0.051994 s`，约快 0.15%；
 - stats --basic：`0.098962 s -> 0.099174 s`，约回退 0.21%。
@@ -167,8 +167,8 @@ SAMtools `view` 通常通过 HTSlib 解码为 `bam1_t`，在主 CPU 上判断条
 4. MPE 使用连续 flat pack，CPE 复用 compressor 并行压缩。
 5. 输入读取可与当前 CPE 解压重叠，输出可使用 memory/spool/MPI-IO。
 
-通用 SDK 中还有 `RawBamFilterConsumer + RawBamWriter`，但论文应用性能应使用上述
-专用融合路径，不应把 SDK 示例性能当作生产命令上限。
+Composable SDK 中还有 `RawBamFilterBatchPostProcessor + RawBamWriter`，但论文应用
+性能应使用上述 Optimized path，不应把 SDK 示例性能当作生产命令上限。
 
 ### 5.2 BAM -> SAM
 
@@ -373,13 +373,13 @@ splitter/bin/coordinate owner 等分布式算法，而不只是并行压缩。
 
 如果每个命令分别实现扫描、block buffer、CPE launch/join、错误处理和分布式输出，
 代码会重复且难以增加 backend。库把这些公共机制放在 batch 边界；新工具可以使用
-generic raw view 快速实现，热点明确后再替换为 fused operator。
+composable raw view 快速实现，热点明确后再替换为 optimized operator。
 
-### Generic 路径比专用路径慢，库还有意义吗？
+### Composable 路径比专用路径慢，库还有意义吗？
 
-有。Generic 路径的目标是开发效率和可复用性，专用融合路径承担最终性能。二者共享
-同一 I/O/runtime，不要求在易用性与性能之间二选一。正式实验应同时报告 generic、
-fused 和 SAMtools，展示融合的收益及库抽象开销。
+有。Composable path 的目标是开发效率和可复用性，Optimized path 承担最终性能。二者共享
+同一 I/O/runtime，不要求在易用性与性能之间二选一。正式实验应同时报告 composable、
+optimized 和 SAMtools，展示融合的收益及库抽象开销。
 
 ### 当前最快的几个关键优化是什么？
 
@@ -400,7 +400,7 @@ fused 和 SAMtools，展示融合的收益及库抽象开销。
 - 相同节点、相同核资源、相同压缩级别下的 SAMtools 与 SWBAM wall time。
 - `/dev/shm` 或已预热页缓存上的内存驻留对比，以及真实高速存储对比。
 - `np=1/2/4/6` 扩展性和 MPE-only/CPE-enabled 对比。
-- overlap on/off、generic/fused、memory/posix/mpiio 的消融实验。
+- overlap on/off、composable/optimized、memory/posix/mpiio 的消融实验。
 - 峰值内存、MPI 通信字节、sort/collate 临时空间。
 - 至少三个数据规模和多种压缩率/记录长度数据集。
 - 所有对比的共同功能选项与正确性 fingerprint。

@@ -19,13 +19,13 @@ struct RawBamWriterMetrics {
     double pack;
     double source;
     double kernel;
-    double consume;
+    double post_process;
     double total;
 
     RawBamWriterMetrics();
 };
 
-class RawBamWriter : public RawBamRecordConsumer {
+class RawBamWriter : public RawBamBatchPostProcessor {
 public:
     RawBamWriter();
     ~RawBamWriter();
@@ -37,7 +37,7 @@ public:
                       const sam_hdr_t *header,
                       int compression_level,
                       size_t chunk_blocks = 256);
-    int ConsumeRaw(const RawBamRecordView *records, size_t count);
+    int PostProcessRawBatch(const RawBamRecordView *records, size_t count);
     int Finish(bool append_bgzf_eof = true);
     const RawBamWriterMetrics &metrics() const;
 

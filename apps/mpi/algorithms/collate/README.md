@@ -19,7 +19,7 @@
 ## 阅读建议
 
 先看 `ProcessCollateMPI()` 如何选择 memory/external，再分别追踪
-`FusedBamMemoryCollateMPI` 和 `FusedBamExternalCollateMPI`。最后再看 exchange 与
+`OptimizedBamMemoryCollateMPI` 和 `OptimizedBamExternalCollateMPI`。最后再看 exchange 与
 loser tree，避免同时展开两套模式。
 
 验证重点是 record multiset、QNAME continuity 和 read1/read2 顺序，不要求输出与

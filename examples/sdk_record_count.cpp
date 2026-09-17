@@ -25,11 +25,11 @@ uint32_t ReadLe32(const unsigned char *data) {
            ((uint32_t)data[3] << 24);
 }
 
-class CountConsumer : public swbam::cpe::RawBamRecordConsumer {
+class CountBatchPostProcessor : public swbam::cpe::RawBamBatchPostProcessor {
 public:
-    CountConsumer() : records_(0), mapped_(0), duplicates_(0) {}
+    CountBatchPostProcessor() : records_(0), mapped_(0), duplicates_(0) {}
 
-    int ConsumeRaw(const swbam::cpe::RawBamRecordView *records,
+    int PostProcessRawBatch(const swbam::cpe::RawBamRecordView *records,
                    size_t count) {
         for (size_t i = 0; i < count; ++i) {
             if (!records[i].encoded || records[i].encoded_size < 20) {
@@ -76,10 +76,10 @@ int main(int argc, char **argv) {
             : static_cast<swbam::BamInputBackend *>(
                   new swbam::PosixBamInput()));
     std::vector<swbam::BgzfBlockSpan> spans;
-    CountConsumer consumer;
+    CountBatchPostProcessor post_processor;
     swbam::cpe::CpeReadPipelineTiming timing;
-    swbam::cpe::GenericDecodeMetrics decode_metrics;
-    swbam::cpe::GenericRawBamMetrics raw_metrics;
+    swbam::cpe::ComposableDecodeMetrics decode_metrics;
+    swbam::cpe::ComposableRawBamMetrics raw_metrics;
     double open_seconds = 0.0;
     double scan_seconds = 0.0;
     double phase_t0 = 0.0;
@@ -99,15 +99,15 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     scan_seconds = NowSeconds() - phase_t0;
-    if (swbam::cpe::RunGenericRawBamPipeline(
+    if (swbam::cpe::RunComposableRawBamPipeline(
             *input, spans.empty() ? nullptr : spans.data(), spans.size(),
-            &consumer, &timing, &decode_metrics, &raw_metrics) != 0) {
-        fprintf(stderr, "Generic raw BAM pipeline failed\n");
+            &post_processor, &timing, &decode_metrics, &raw_metrics) != 0) {
+        fprintf(stderr, "Composable raw BAM pipeline failed\n");
         goto cleanup;
     }
-    printf("records %lld\n", consumer.records());
-    printf("mapped %lld\n", consumer.mapped());
-    printf("duplicates %lld\n", consumer.duplicates());
+    printf("records %lld\n", post_processor.records());
+    printf("mapped %lld\n", post_processor.mapped());
+    printf("duplicates %lld\n", post_processor.duplicates());
     printf("bgzf_blocks %zu\n", spans.size());
     printf("decoded_bytes %lld\n", decode_metrics.decoded_bytes);
     printf("io_backend %s\n", memory_io ? "memory" : "posix");
@@ -116,7 +116,7 @@ int main(int argc, char **argv) {
     printf("timing_core %.6f\n", timing.total);
     printf("timing_read %.6f\n", timing.read);
     printf("timing_cpe %.6f\n", timing.kernel);
-    printf("timing_consume %.6f\n", timing.consume);
+    printf("timing_post_process %.6f\n", timing.post_process);
     exit_code = 0;
 
 cleanup:

@@ -20,17 +20,17 @@ struct RawBamFilterMetrics {
     RawBamFilterMetrics();
 };
 
-class RawBamFilterConsumer : public RawBamRecordConsumer {
+class RawBamFilterBatchPostProcessor : public RawBamBatchPostProcessor {
 public:
-    RawBamFilterConsumer(const BamFilterOptions &filter,
-                         RawBamRecordConsumer *downstream);
+    RawBamFilterBatchPostProcessor(const BamFilterOptions &filter,
+                         RawBamBatchPostProcessor *downstream);
 
-    int ConsumeRaw(const RawBamRecordView *records, size_t count);
+    int PostProcessRawBatch(const RawBamRecordView *records, size_t count);
     const RawBamFilterMetrics &metrics() const { return metrics_; }
 
 private:
     BamFilterOptions filter_;
-    RawBamRecordConsumer *downstream_;
+    RawBamBatchPostProcessor *downstream_;
     bool noop_;
     RawBamFilterMetrics metrics_;
     std::vector<RawBamRecordView> kept_;

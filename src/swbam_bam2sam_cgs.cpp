@@ -46,7 +46,7 @@ void ResetSamFormatBatchCGS(CgsSamFormatBatch *batch, int n_records) {
 
 } // namespace
 
-int FusedBamToSamCGS(MemReader &reader, MemWriter &mem_writer, sam_hdr_t *hdr) {
+int OptimizedBamToSamCGS(MemReader &reader, MemWriter &mem_writer, sam_hdr_t *hdr) {
     if (CheckCgsResources() != 0) return -1;
 
     double t0 = GetTime();
@@ -231,7 +231,7 @@ int FusedBamToSamCGS(MemReader &reader, MemWriter &mem_writer, sam_hdr_t *hdr) {
 
     if (flush_pending_write() != 0) return -1;
 
-    printf("FusedBamToSamCGS finished. blocks=%lld groups=%lld records=%lld format_tiles=%lld cost=%.3f s\n",
+    printf("OptimizedBamToSamCGS finished. blocks=%lld groups=%lld records=%lld format_tiles=%lld cost=%.3f s\n",
            input_blocks_count, group_count, total_records, format_tiles, GetTime() - t0);
     printf("  decomp_slave=%.3f  format_slave=%.3f  collect=%.3f  read=%.3f  write=%.3f\n",
            t_decomp, t_format, t_collect, t_read, t_write);

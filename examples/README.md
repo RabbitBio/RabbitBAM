@@ -17,8 +17,8 @@ cmake --build build_sunway_sduhpc \
 
 ## record count
 
-`sdk_record_count.cpp` 展示 `PosixBamInput + RunGenericRawBamPipeline +
-RawBamRecordConsumer`，统计 records、mapped 和 duplicate 数量：
+`sdk_record_count.cpp` 展示 `PosixBamInput + RunComposableRawBamPipeline +
+RawBamBatchPostProcessor`，统计 records、mapped 和 duplicate 数量：
 
 ```bash
 ./swbam-sdk-record-count input.bam
@@ -32,7 +32,7 @@ RawBamRecordConsumer`，统计 records、mapped 和 duplicate 数量：
 
 ## bam1_t stats
 
-`sdk_bam1_stats.cpp` 展示 `RunGenericBam1Pipeline + Bam1RecordConsumer`。记录由
+`sdk_bam1_stats.cpp` 展示 `RunComposableBam1Pipeline + Bam1BatchPostProcessor`。记录由
 SDK 按 batch 物化为标准 `bam1_t`，示例通过 HTSlib accessor 访问 mandatory fields、
 QNAME/CIGAR/SEQ/QUAL 和 `NM` aux tag：
 
@@ -42,13 +42,15 @@ QNAME/CIGAR/SEQ/QUAL 和 `NM` aux tag：
 ```
 
 输出中的 `timing_materialize` 是 Raw record 转换为 `bam1_t` 的额外成本；它与
-`timing_bam1_consume` 分开，便于比较易用路径和零拷贝 Raw 路径。consumer 不能保存
+`timing_bam1_post_process` 分开，便于比较易用路径和零拷贝 Raw 路径。batch
+post-processor 不能保存
 回调中的记录指针，确需保存时使用 `bam_dup1()`。
 
 ## bam1_t filter + writer
 
-`sdk_bam1_filter.cpp` 展示完整的 HTSlib 对象路径：通用读流水线批量物化
-`bam1_t`，consumer 通过 `record->core.qual` 过滤，再由 `Bam1Writer` 批量编码并
+`sdk_bam1_filter.cpp` 展示完整的 HTSlib 对象路径：Composable read pipeline 批量物化
+`bam1_t`，batch post-processor 通过 `record->core.qual` 过滤，再由 `Bam1Writer`
+批量编码并
 复用 `RawBamWriter + CPE BGZF compress` 写出 BAM：
 
 ```bash
@@ -62,7 +64,7 @@ Raw filter 路径更轻。
 
 ## filter BAM
 
-`sdk_filter_bam.cpp` 展示 `RawBamFilterConsumer + RawBamWriter +
+`sdk_filter_bam.cpp` 展示 `RawBamFilterBatchPostProcessor + RawBamWriter +
 PosixBamOutput`，保留 MAPQ 不低于阈值的记录：
 
 ```bash
@@ -81,11 +83,11 @@ Sunway CPE object 需要直接交给 hybrid linker，不能先封装进普通主
 
 ## 示例与生产命令的区别
 
-- 示例使用通用 `RawBamRecordConsumer`，代码短，适合开发新统计和简单过滤。
-- 需要直接调用 HTSlib record accessor 时，使用 `Bam1RecordConsumer`；它比 Raw
+- 示例使用 Composable `RawBamBatchPostProcessor`，代码短，适合开发新统计和简单过滤。
+- 需要直接调用 HTSlib record accessor 时，使用 `Bam1BatchPostProcessor`；它比 Raw
   路径易用，但需要物化并复制 record payload。
 - `RabbitBAM-MPI` 的热点命令可使用专用融合 kernel，以减少中间记录和主从核搬运。
 - 示例仍需显式管理 `athread_init()`/`athread_halt()`；当前 SDK 尚未提供运行时 RAII。
-- `RawBamRecordView` 只在当前 consumer 回调期间有效，不能跨 batch 保存指针。
-- `Bam1RecordConsumer` 收到的 `bam1_t` 同样是 batch-local；需要保留时调用
+- `RawBamRecordView` 只在当前 batch post-processor 回调期间有效，不能跨 batch 保存指针。
+- `Bam1BatchPostProcessor` 收到的 `bam1_t` 同样是 batch-local；需要保留时调用
   `bam_dup1()`，并由调用者负责 `bam_destroy1()`。

@@ -95,7 +95,7 @@ int main(int argc, char **argv) {
     stats->add_flag("--verbose", cmd_info.verbose_, "Enable verbose logging")->default_val(false);
 
     CLI::App *io_check = app.add_subcommand(
-        "io-check", "Validate the generic MPI BGZF decode pipeline");
+        "io-check", "Validate the composable MPI BGZF decode pipeline");
     io_check->add_option("-i,--inFile", cmd_info.in_file_name_,
                          "input bam name")->required()->check(CLI::ExistingFile);
 

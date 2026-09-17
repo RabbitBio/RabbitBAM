@@ -12,16 +12,16 @@ namespace cpe {
 
 CpeWritePipelineTiming::CpeWritePipelineTiming()
     : input_blocks(0), output_blocks(0), output_bytes(0),
-      batch_count(0), source(0.0), kernel(0.0), consume(0.0),
+      batch_count(0), source(0.0), kernel(0.0), post_process(0.0),
       total(0.0) {}
 
 int RunCpeWritePipeline(
         UncompressedBgzfSource *source,
-        CompressedBgzfConsumer *consumer,
+        CompressedBgzfBatchPostProcessor *post_processor,
         CpeWriteBatchOperator *op,
         CpeWritePipelineTiming *timing,
         const CpeWritePipelineOptions &options) {
-    if (!source || !consumer || !op || op->batch_capacity() == 0) return -1;
+    if (!source || !post_processor || !op || op->batch_capacity() == 0) return -1;
 
     CpeWritePipelineTiming local;
     const double total_t0 = GetTime();
@@ -66,10 +66,10 @@ int RunCpeWritePipeline(
         }
 
         if (previous_output && !options.overlap_output) {
-            const double consume_t0 = GetTime();
-            if (consumer->ConsumeCompressed(
+            const double post_process_t0 = GetTime();
+            if (post_processor->PostProcessCompressedBatch(
                     previous_output, previous_count) != 0) goto cleanup;
-            local.consume += GetTime() - consume_t0;
+            local.post_process += GetTime() - post_process_t0;
             previous_output = nullptr;
             previous_count = 0;
         }
@@ -81,12 +81,12 @@ int RunCpeWritePipeline(
         goto cleanup;
 #endif
 
-        int overlap_consume_ret = 0;
+        int overlap_post_process_ret = 0;
         if (previous_output && options.overlap_output) {
-            const double consume_t0 = GetTime();
-            overlap_consume_ret = consumer->ConsumeCompressed(
+            const double post_process_t0 = GetTime();
+            overlap_post_process_ret = post_processor->PostProcessCompressedBatch(
                 previous_output, previous_count);
-            local.consume += GetTime() - consume_t0;
+            local.post_process += GetTime() - post_process_t0;
         }
 #ifdef PLATFORM_SUNWAY
         athread_join();
@@ -94,7 +94,7 @@ int RunCpeWritePipeline(
         const double kernel_wall = GetTime() - kernel_t0;
         local.kernel += kernel_wall;
         op->ObserveKernel(kernel_wall, active_blocks);
-        if (overlap_consume_ret != 0 || op->Validate(active_blocks) != 0) {
+        if (overlap_post_process_ret != 0 || op->Validate(active_blocks) != 0) {
             goto cleanup;
         }
 
@@ -115,10 +115,10 @@ int RunCpeWritePipeline(
     }
 
     if (previous_output) {
-        const double consume_t0 = GetTime();
-        if (consumer->ConsumeCompressed(
+        const double post_process_t0 = GetTime();
+        if (post_processor->PostProcessCompressedBatch(
                 previous_output, previous_count) != 0) goto cleanup;
-        local.consume += GetTime() - consume_t0;
+        local.post_process += GetTime() - post_process_t0;
     }
     if (op->Finish() != 0) goto cleanup;
     ret = 0;

@@ -1,7 +1,7 @@
 #ifndef SWBAM_RAW_BAM_H
 #define SWBAM_RAW_BAM_H
 
-#include "swbam/generic_decode.h"
+#include "swbam/composable_decode.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -17,30 +17,31 @@ struct RawBamRecordView {
     uint32_t block_index;
 };
 
-struct GenericRawBamMetrics {
+struct ComposableRawBamMetrics {
     long long records;
     long long encoded_bytes;
 
-    GenericRawBamMetrics() : records(0), encoded_bytes(0) {}
+    ComposableRawBamMetrics() : records(0), encoded_bytes(0) {}
 };
 
-class RawBamRecordConsumer {
+// MPE-side post-processing extension point for zero-copy raw BAM views.
+class RawBamBatchPostProcessor {
 public:
-    virtual ~RawBamRecordConsumer() {}
+    virtual ~RawBamBatchPostProcessor() {}
 
     // Views point into the decoded batch and remain valid only during this call.
-    virtual int ConsumeRaw(const RawBamRecordView *records,
-                           size_t count) = 0;
+    virtual int PostProcessRawBatch(const RawBamRecordView *records,
+                                    size_t count) = 0;
 };
 
-int RunGenericRawBamPipeline(
+int RunComposableRawBamPipeline(
     const BamInputBackend &input,
     const BgzfBlockSpan *spans,
     size_t span_count,
-    RawBamRecordConsumer *consumer,
+    RawBamBatchPostProcessor *post_processor,
     CpeReadPipelineTiming *timing,
-    GenericDecodeMetrics *decode_metrics,
-    GenericRawBamMetrics *raw_metrics,
+    ComposableDecodeMetrics *decode_metrics,
+    ComposableRawBamMetrics *raw_metrics,
     const CpeReadPipelineOptions &options = CpeReadPipelineOptions());
 
 } // namespace cpe

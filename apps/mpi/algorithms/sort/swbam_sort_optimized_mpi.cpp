@@ -3562,7 +3562,7 @@ int MpiSortStrictMergeCompress(
 } // namespace
 
 
-static int FusedBamSortMPIImpl(
+static int OptimizedBamSortMPIImpl(
         MemReader *reader,
         const swbam::BamInputBackend *input,
         const swbam::BgzfBlockSpan *spans,
@@ -3575,7 +3575,7 @@ static int FusedBamSortMPIImpl(
         int compress_level,
         size_t memory_limit,
         MpiSortStats *stats) {
-    double fused_t0 = GetTime();
+    double optimized_t0 = GetTime();
     double setup_t0 = GetTime();
     //1. 参数准备
     std::vector<MpiSortRecordMeta> local_records;
@@ -3720,12 +3720,12 @@ static int FusedBamSortMPIImpl(
                                         body_sink, compress_level, stats) != 0) {
         return -1;
     }
-    stats->t_fused_total += GetTime() - fused_t0;
+    stats->t_optimized_total += GetTime() - optimized_t0;
     (void)global_sample_count;
     return 0;
 }
 
-int FusedBamSortMPI(MemReader &reader,
+int OptimizedBamSortMPI(MemReader &reader,
                     swbam::RankBodySink &body_sink,
                     long long global_block_begin,
                     int rank,
@@ -3733,13 +3733,13 @@ int FusedBamSortMPI(MemReader &reader,
                     int compress_level,
                     size_t memory_limit,
                     MpiSortStats *stats) {
-    return FusedBamSortMPIImpl(
+    return OptimizedBamSortMPIImpl(
         &reader, nullptr, nullptr, 0, reader.size,
         body_sink, global_block_begin, rank, comm_size,
         compress_level, memory_limit, stats);
 }
 
-int FusedBamSortMPI(const swbam::BamInputBackend &input,
+int OptimizedBamSortMPI(const swbam::BamInputBackend &input,
                     const swbam::BgzfBlockSpan *spans,
                     size_t span_count,
                     swbam::RankBodySink &body_sink,
@@ -3754,13 +3754,13 @@ int FusedBamSortMPI(const swbam::BamInputBackend &input,
         if (spans[i].compressed_size > SIZE_MAX - compressed_size) return -1;
         compressed_size += spans[i].compressed_size;
     }
-    return FusedBamSortMPIImpl(
+    return OptimizedBamSortMPIImpl(
         nullptr, &input, spans, span_count, compressed_size,
         body_sink, global_block_begin, rank, comm_size,
         compress_level, memory_limit, stats);
 }
 
-static int FusedBamExternalSortMPIImpl(
+static int OptimizedBamExternalSortMPIImpl(
         MemReader *reader,
         const swbam::BamInputBackend *input,
         const swbam::BgzfBlockSpan *spans,
@@ -3773,7 +3773,7 @@ static int FusedBamExternalSortMPIImpl(
         size_t memory_limit,
         const char *temp_prefix,
         MpiSortStats *stats) {
-    double fused_t0 = GetTime();
+    double optimized_t0 = GetTime();
     stats->sort_mode = 1;
     MpiSortMemoryTracker tracker(memory_limit);
     MpiSortStrictTempStore temp_store;
@@ -3970,7 +3970,7 @@ static int FusedBamExternalSortMPIImpl(
     if (control_acquired) tracker.release(kSortStrictControlReserve);
     stats->t_cleanup += GetTime() - cleanup_t0;
     stats->tracked_peak_bytes = (long long)tracker.peak;
-    stats->t_fused_actual = GetTime() - fused_t0;
+    stats->t_optimized_actual = GetTime() - optimized_t0;
     double non_merge_read_sim =
         stats->t_temp_read_sim -
         stats->t_merge_temp_read_sim -
@@ -3985,7 +3985,7 @@ static int FusedBamExternalSortMPIImpl(
     const double final_pipeline_sim =
         std::max(stats->t_merge_simulated,
                  stats->t_compress_simulated);
-    stats->t_fused_total =
+    stats->t_optimized_total =
         stats->t_setup +
         stats->t_extract_read_unhidden +
         stats->t_extract +
@@ -4005,7 +4005,7 @@ static int FusedBamExternalSortMPIImpl(
     return ret;
 }
 
-int FusedBamExternalSortMPI(MemReader &reader,
+int OptimizedBamExternalSortMPI(MemReader &reader,
                             swbam::RankBodySink &body_sink,
                             long long global_block_begin,
                             int rank,
@@ -4014,13 +4014,13 @@ int FusedBamExternalSortMPI(MemReader &reader,
                             size_t memory_limit,
                             const char *temp_prefix,
                             MpiSortStats *stats) {
-    return FusedBamExternalSortMPIImpl(
+    return OptimizedBamExternalSortMPIImpl(
         &reader, nullptr, nullptr, 0, body_sink,
         global_block_begin, rank, comm_size, compress_level,
         memory_limit, temp_prefix, stats);
 }
 
-int FusedBamExternalSortMPI(const swbam::BamInputBackend &input,
+int OptimizedBamExternalSortMPI(const swbam::BamInputBackend &input,
                             const swbam::BgzfBlockSpan *spans,
                             size_t span_count,
                             swbam::RankBodySink &body_sink,
@@ -4031,13 +4031,13 @@ int FusedBamExternalSortMPI(const swbam::BamInputBackend &input,
                             size_t memory_limit,
                             const char *temp_prefix,
                             MpiSortStats *stats) {
-    return FusedBamExternalSortMPIImpl(
+    return OptimizedBamExternalSortMPIImpl(
         nullptr, &input, spans, span_count, body_sink,
         global_block_begin, rank, comm_size, compress_level,
         memory_limit, temp_prefix, stats);
 }
 
-int FusedBamSortMPI(MemReader &reader,
+int OptimizedBamSortMPI(MemReader &reader,
                     MemWriter &mem_writer,
                     long long global_block_begin,
                     int rank,
@@ -4046,12 +4046,12 @@ int FusedBamSortMPI(MemReader &reader,
                     size_t memory_limit,
                     MpiSortStats *stats) {
     swbam::MemoryRankBodySink body_sink(&mem_writer);
-    return FusedBamSortMPI(
+    return OptimizedBamSortMPI(
         reader, body_sink, global_block_begin, rank, comm_size,
         compress_level, memory_limit, stats);
 }
 
-int FusedBamExternalSortMPI(MemReader &reader,
+int OptimizedBamExternalSortMPI(MemReader &reader,
                             MemWriter &mem_writer,
                             long long global_block_begin,
                             int rank,
@@ -4061,7 +4061,7 @@ int FusedBamExternalSortMPI(MemReader &reader,
                             const char *temp_prefix,
                             MpiSortStats *stats) {
     swbam::MemoryRankBodySink body_sink(&mem_writer);
-    return FusedBamExternalSortMPI(
+    return OptimizedBamExternalSortMPI(
         reader, body_sink, global_block_begin, rank, comm_size,
         compress_level, memory_limit, temp_prefix, stats);
 }

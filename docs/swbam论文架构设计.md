@@ -6,7 +6,7 @@
 它不是最终论文，也不把尚未充分验证的能力写成确定结论。当前最适合的论文定位是：
 
 > 面向神威异构众核平台，设计一个以 BGZF 批次为扩展边界的分布式 BAM 处理库，
-> 在统一数据通路上同时支持易扩展的通用算子和高性能专用融合算子，并通过统计、
+> 在统一数据通路上同时支持易扩展的 Composable path 和高性能 Optimized path，并通过统计、
 > 转换、全局重排和有状态去重等多类应用验证其通用性与性能。
 
 建议暂用题目：
@@ -49,13 +49,13 @@ MPI 数据交换。若每个命令分别实现输入、缓冲、CPE 调度和输
 核心设计
   backend-neutral 数据平面
   + batch 级 MPE/CPE 双缓冲运行时
-  + generic/fused 双执行路径
+  + composable/optimized 双执行路径
           ↓
 算法实例
   统计、转换、sort、collate、fixmate、streaming markdup
           ↓
 实验结论
-  库化开销很小，融合路径更快，复杂应用获得加速并降低部分内存开销
+  库化开销很小，Optimized path 更快，复杂应用获得加速并降低部分内存开销
 ```
 
 ### 3.2 一句话主张
@@ -159,25 +159,25 @@ MPE       read batch 1         read batch 2         read batch 3
 - 双缓冲分配和轮换；
 - CPE kernel launch/join；
 - CPE 处理当前批时由 MPE 读取下一批；
-- 参数准备、状态校验、结果消费和计时；
+- 参数准备、状态校验、MPE 侧 batch post-processing 和计时；
 - BGZF codec、CRC、parser 与每个 CPE 的 compressor/decompressor cache。
 
 扩展接口 `CpeBatchOperator` 每批调用一次，而不是每条记录调用一次。
 
-#### 通用路径
+#### Composable path
 
 ```text
 BGZF batch
   → CPE 通用解压
   → MPE 扫描 record 边界
   → 零拷贝 RawBamRecordView
-  → 用户 consumer
+  → 用户 batch post-processor
 ```
 
 适用于快速开发记录计数、简单过滤和 SDK 新功能。`RawBamRecordView` 指向 decoded
 batch 内存，不构造 `bam1_t`，也不复制 payload。
 
-#### 专用融合路径
+#### Optimized path
 
 ```text
 BGZF batch
@@ -192,26 +192,26 @@ stats 同样在 CPE 上完成 SN、insert size、orientation 和局部有序性�
 
 #### 设计价值
 
-这不是两套互不相关的实现：通用路径与融合路径共享 backend、batch、双缓冲、codec、
+这不是两套互不相关的实现：Composable path 与 Optimized path 共享 backend、batch、双缓冲、codec、
 parser、生命周期和错误处理，只替换 batch operator。它形成了明确的性能演进路线：
 
-1. 先用 generic path 快速构建正确功能；
-2. profiling 后只为热点实现 fused operator；
+1. 先用 Composable path 快速构建正确功能；
+2. profiling 后只为热点实现 optimized operator；
 3. 不修改输入、输出和 MPI runtime。
 
 #### 论文中建议这样表述
 
-> SWBAM provides a dual-path execution model. A generic zero-copy record-view path improves
-> programmability, while fused CPE operators combine decompression, parsing, and domain
+> SWBAM provides a dual-path execution model. A composable zero-copy record-view path improves
+> programmability, while optimized CPE operators combine decompression, parsing, and domain
 > computation for performance-critical tools. Both paths share the same batch runtime, and
 > dispatch occurs only once per batch.
 
 #### 支撑证据
 
-- 通用 BGZF 解压约 `0.0448s`，聚合解压吞吐约 `17.60 GB/s`。
-- 通用 raw record 扫描约 `0.1255s`，约 `21.27 M records/s`。
+- Composable BGZF 解压约 `0.0448s`，聚合解压吞吐约 `17.60 GB/s`。
+- Composable raw record 扫描约 `0.1255s`，约 `21.27 M records/s`。
 - 库化后的融合 flagstat/stats 未出现结构性性能回退。
-- 尚需正式补做 overlap on/off、generic/fused 同工作量消融实验。
+- 尚需正式补做 overlap on/off、composable/optimized 同工作量消融实验。
 
 ### 4.3 创新三：在公共数据平面上实现全局重排和有状态 BAM 算法
 
@@ -305,7 +305,7 @@ CPE extract QNAME/hash/meta
 │ flagstat stats filter convert                │
 │ sort collate fixmate markdup                 │
 └─────────────────────┬────────────────────────┘
-                      │ generic / fused operator
+                      │ composable / optimized operator
 ┌──────────── Heterogeneous Runtime ───────────┐
 │ CPE read pipeline │ CPE write pipeline       │
 │ double buffering  │ codec/parser/cache       │
@@ -321,7 +321,7 @@ CPE extract QNAME/hash/meta
 └──────────────────────────────────────────────┘
 ```
 
-图中应特别画出两条竖向路径：generic path 和 fused path。不要把全部类名放进去，
+图中应特别画出两条竖向路径：Composable path 和 Optimized path。不要把全部类名放进去，
 图注再给出类名映射。
 
 ### 图 2：MPE/CPE 双缓冲时间线
@@ -335,21 +335,21 @@ CPE extract QNAME/hash/meta
 
 这张图对应 overlap 消融实验，不能只画图而不测数据。
 
-### 图 3：generic 与 fused 数据流对比
+### 图 3：composable 与 optimized 数据流对比
 
-左侧 generic：
+左侧 composable：
 
 ```text
-decode → decoded batch → record views → MPE consumer
+decode → decoded batch → record views → MPE batch post-processor
 ```
 
-右侧 fused：
+右侧 optimized：
 
 ```text
 decode + parse + operator on CPE → compact result → MPE reduction
 ```
 
-箭头宽度可表示主存流量，突出 fused path 避免大规模 decoded payload 二次搬运。
+箭头宽度可表示主存流量，突出 Optimized path 避免大规模 decoded payload 二次搬运。
 若没有硬件计数器，图中不要标具体带宽节省百分比，只描述数据路径。
 
 ### 图 4：collate 分布式数据重排
@@ -374,7 +374,7 @@ candidate。旁边画 flat hash 与 duplicate bitmap。该图应回答：
 
 1. 各应用 SWBAM 与 SAMtools 时间柱状图，并在柱顶标加速比；
 2. `np=1/2/4/6` 吞吐量或 strong scaling 折线图；
-3. generic/fused、overlap、库化前后消融柱状图；
+3. composable/optimized、overlap、库化前后消融柱状图；
 4. 默认/stream markdup 的时间与峰值内存双轴图。
 
 完整去重流程可使用一张 stacked bar，分别显示 collate、fixmate、sort、markdup。
@@ -411,7 +411,7 @@ Introduction 中不要放过多命令实现细节，也不要把“实现了很�
 1. 总体分层和 BGZF batch 边界；
 2. 输入 backend 与 MPI block plan；
 3. MPE/CPE 双缓冲 read/write pipeline；
-4. generic/fused 双路径；
+4. composable/optimized 双路径；
 5. RankBodySink 与 DistributedBamOutput；
 6. 错误传播、资源生命周期和内存策略。
 
@@ -446,7 +446,7 @@ flagstat/stats/filter/转换可合并成“线性算子实例”一节，用于�
 
 - RQ1：公共数据平面的吞吐与扩展性如何？
 - RQ2：batch 抽象是否引入额外开销？
-- RQ3：generic/fused 与 overlap 分别贡献多少？
+- RQ3：composable/optimized 与 overlap 分别贡献多少？
 - RQ4：复杂应用相对 SAMtools 能获得多少加速？
 - RQ5：streaming 和 external 模式能否控制内存及临时空间？
 - RQ6：四阶段完整去重流程的总体收益如何？
@@ -481,7 +481,7 @@ flagstat/stats/filter/转换可合并成“线性算子实例”一节，用于�
 | 实验 | 自变量 | 指标 | 目的 |
 |---|---|---|---|
 | BGZF decode | ranks、batch size | GB/s、blocks/s | 测公共读流水上限 |
-| Raw BAM scan | ranks、batch size | records/s | 测 generic record view 成本 |
+| Raw BAM scan | ranks、batch size | records/s | 测 composable record view 成本 |
 | BGZF encode | level、ranks | GB/s、压缩率 | 测公共写流水上限 |
 | Read-write roundtrip | backend、ranks | records/s、wall time | 测完整库数据通路 |
 | Input backend | memory/POSIX/MPI-IO | core、I/O、wall | 区分计算与存储瓶颈 |
@@ -495,13 +495,13 @@ flagstat/stats/filter/转换可合并成“线性算子实例”一节，用于�
 |---|---|---|
 | 重构前 vs 重构后 | kernel、数据、节点 | 公共库抽象 |
 | overlap off vs on | operator、batch、backend | MPE/CPE overlap |
-| generic vs fused | 过滤/统计语义、输入输出 | operator 路径 |
+| composable vs optimized | 过滤/统计语义、输入输出 | operator 路径 |
 | vector/raw arena | collate 算法 | 初始化和数据布局 |
 | full remote vs sparse remote | markdup 语义 | candidate pack |
 | node hash vs flat hash | key、结果 | hash 结构 |
 
-generic/fused 必须做同工作量对比。例如都实现相同的 MAPQ 过滤并生成同一 BAM，不能
-把“只解压”的 generic 与“完整 flagstat”的 fused 时间直接相除。
+composable/optimized 必须做同工作量对比。例如都实现相同的 MAPQ 过滤并生成同一 BAM，不能
+把“只解压”的 composable 与“完整 flagstat”的 optimized 时间直接相除。
 
 ### 7.3 Application Case Studies
 
@@ -588,7 +588,7 @@ collate → fixmate -m → sort → markdup
 - 应用范围受单节点/每 rank 可用内存限制；
 - 阶段耦合后错误定位困难；
 - 当前核心时间与四个独立阶段求和接近，深度融合收益不明显；
-- 会分散论文对公共库、generic/fused 和 streaming markdup 的叙述。
+- 会分散论文对公共库、composable/optimized 和 streaming markdup 的叙述。
 
 ### 推荐处理
 
@@ -608,7 +608,7 @@ pipeline 升级为核心创新。
 | 主张 | 必须提供的机制证据 | 必须提供的实验 |
 |---|---|---|
 | 库抽象开销很低 | batch 级接口、不进入 record 热路径 | 重构前后 A/B |
-| generic/fused 兼顾易用与性能 | 两条路径共享 runtime 的代码结构 | 同语义 generic/fused |
+| composable/optimized 兼顾易用与性能 | 两条路径共享 runtime 的代码结构 | 同语义 composable/optimized |
 | MPE/CPE overlap 有效 | 双缓冲时间线和计时点 | overlap on/off |
 | 支持复杂分布式算法 | sort/collate/fixmate/markdup 映射 | 应用性能与扩展性 |
 | markdup 内存有界 | sliding window、bitmap、spans 多遍读取 | 内存随规模曲线 |
@@ -625,7 +625,7 @@ pipeline 升级为核心创新。
 1. **问题与目标**：为什么神威上的 BAM 处理不能只靠并行 BGZF 解压。
 2. **总体架构图**：四层架构和 BGZF batch 边界。
 3. **创新一**：backend、MPI plan、sink、distributed output。
-4. **创新二**：generic/fused 双路径与 MPE/CPE overlap。
+4. **创新二**：composable/optimized 双路径与 MPE/CPE overlap。
 5. **创新三**：collate 和 streaming markdup 两个算法案例。
 6. **已有结果**：应用初步加速比、markdup 内存下降、库化开销。
 7. **正确性与限制**：已验证内容、block-aligned 假设、慢盘问题。
@@ -635,7 +635,7 @@ pipeline 升级为核心创新。
 
 > 我不是只实现了若干 BAM 命令，而是抽象出了一套面向神威的 BAM 批处理库。它以
 > BGZF batch 为边界统一内存、POSIX、MPI-IO 输入，MPI block 分区，CPE 双缓冲和
-> 分布式输出；对新功能提供零拷贝 record-view 通用路径，对热点功能保留解压、解析、
+> 分布式输出；对新功能提供零拷贝 record-view Composable path，对热点功能保留解压、解析、
 > 计算融合的 CPE 路径。sort、collate、fixmate 和 streaming markdup 证明这套架构
 > 不只适用于简单统计，还能承载全局重排与跨批状态。现有初步结果显示多个应用相对
 > SAMtools 获得加速，库化开销低于约 0.3%，streaming markdup 还将 workspace 降低
@@ -653,7 +653,7 @@ pipeline 升级为核心创新。
 ### 第二优先级：补最关键证据
 
 - overlap on/off；
-- generic/fused 同语义 A/B；
+- composable/optimized 同语义 A/B；
 - `np=1/2/4/6` 扩展性；
 - 至少 3 个规模的数据集；
 - memory 与真实高速 POSIX/MPI-IO；

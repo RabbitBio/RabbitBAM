@@ -470,13 +470,13 @@ int ProcessSwBamCGS(CmdInfo *cmd_info) {
         if (bam_to_bam) {
             printf("Enable CGS BAM2BAM mode (1 MPE + %d CPEs)!!!\n", CGS_NB);
             if (filter_requested) printf("Enable CGS BAM filtering options.\n");
-            if (FusedBamToBamCGS(reader, mem_writer, bam_filter) != 0) goto cleanup;
+            if (OptimizedBamToBamCGS(reader, mem_writer, bam_filter) != 0) goto cleanup;
         } else if (bam_to_sam) {
             printf("Enable CGS BAM2SAM mode (1 MPE + %d CPEs)!!!\n", CGS_NB);
-            if (FusedBamToSamCGS(reader, mem_writer, hdr) != 0) goto cleanup;
+            if (OptimizedBamToSamCGS(reader, mem_writer, hdr) != 0) goto cleanup;
         } else {
             printf("Enable CGS SAM2BAM mode (1 MPE + %d CPEs)!!!\n", CGS_NB);
-            if (FusedSamToBamCGS(reader, mem_writer, hdr) != 0) goto cleanup;
+            if (OptimizedSamToBamCGS(reader, mem_writer, hdr) != 0) goto cleanup;
         }
         ran_body = true;
         exit_code = 0;

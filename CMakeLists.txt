@@ -109,7 +109,7 @@ set(SWBAM_MPI_APP_FILES
     apps/mpi/commands/swbam_sam2bam_mpi.cpp
     apps/mpi/commands/swbam_stats_mpi.cpp
     apps/mpi/algorithms/sort/swbam_sort_mpi.cpp
-    apps/mpi/algorithms/sort/swbam_sort_fused_mpi.cpp
+    apps/mpi/algorithms/sort/swbam_sort_optimized_mpi.cpp
     apps/mpi/algorithms/collate/swbam_collate_mpi.cpp
     apps/mpi/algorithms/markdup/swbam_markdup_mpi.cpp
     apps/mpi/algorithms/markdup/swbam_markdup_stream_mpi.cpp
@@ -145,8 +145,8 @@ if(PLATFORM_SUNWAY)
     add_library(swbam_cpe_runtime STATIC
         lib/cpe/swbam_cpe_pipeline.cpp
         lib/cpe/swbam_cpe_write_pipeline.cpp
-        lib/cpe/swbam_generic_compress.cpp
-        lib/cpe/swbam_generic_decode.cpp
+        lib/cpe/swbam_composable_compress.cpp
+        lib/cpe/swbam_composable_decode.cpp
         lib/bam/swbam_bam1.cpp
         lib/bam/swbam_bam1_writer.cpp
         lib/bam/swbam_raw_bam.cpp

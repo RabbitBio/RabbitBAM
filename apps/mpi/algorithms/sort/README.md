@@ -6,7 +6,7 @@
 
 - `swbam_sort_mpi.cpp`：命令级编排、输入 backend、内存策略、header 和分布式输出；
   入口为 `ProcessSortMPI()`，pipeline 还会使用 memory-to-memory helper。
-- `swbam_sort_fused_mpi.cpp`：排序核心，包括 CPE 元数据提取、local sort、采样选取
+- `swbam_sort_optimized_mpi.cpp`：排序核心，包括 CPE 元数据提取、local sort、采样选取
   splitter、MPI bucket exchange、k-way merge、压缩，以及外排 run/segment。
 - 对应从核实现：`slave/algorithms/sort_mpi.cpp`。
 

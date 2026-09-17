@@ -159,7 +159,7 @@ public:
         return status;
     }
 
-    int Consume(const bam1_t *const *records, size_t count) {
+    int PostProcessBatch(const bam1_t *const *records, size_t count) {
         if (!initialized || finished || (!records && count != 0) ||
             count > UINT32_MAX) {
             return -1;
@@ -208,7 +208,7 @@ public:
             offset += encoded_sizes[i];
         }
         const double encode = GetTime() - encode_t0;
-        if (raw_writer.ConsumeRaw(
+        if (raw_writer.PostProcessRawBatch(
                 count == 0 ? nullptr : views.data(), count) != 0) {
             return -1;
         }
@@ -248,9 +248,9 @@ int Bam1Writer::InitializeBam(BamOutputBackend *output,
         output, compression_level, chunk_blocks, header);
 }
 
-int Bam1Writer::ConsumeBam1(
+int Bam1Writer::PostProcessBam1Batch(
         const bam1_t *const *records, size_t count) {
-    return impl_->Consume(records, count);
+    return impl_->PostProcessBatch(records, count);
 }
 
 int Bam1Writer::Finish(bool append_bgzf_eof) {

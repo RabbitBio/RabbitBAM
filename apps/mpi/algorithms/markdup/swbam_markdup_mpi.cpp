@@ -530,7 +530,7 @@ static const char *MdExtractErrorText(int status) {
     }
 }
 
-typedef int (*MdCandidateBatchConsumer)(
+typedef int (*MdCandidateBatchPostProcessor)(
     void *context,
     std::vector<MpiMarkdupCandidateShared> *candidates,
     std::vector<unsigned char> *qnames,
@@ -548,7 +548,7 @@ static int MdExtractCandidatesPass(
         int *range_first_tid, int *range_first_pos,
         int *range_last_tid, int *range_last_pos,
         MpiMarkdupStats *stats,
-        MdCandidateBatchConsumer batch_consumer = nullptr,
+        MdCandidateBatchPostProcessor batch_post_processor = nullptr,
         void *batch_context = nullptr,
         long long target_batches = 0) {
 
@@ -798,7 +798,7 @@ static int MdExtractCandidatesPass(
                 previous_pos = slot->extract[b].last_pos;
                 *range_last_tid = slot->extract[b].last_tid;
                 *range_last_pos = slot->extract[b].last_pos;
-                if (batch_consumer) {
+                if (batch_post_processor) {
                     batch_last_tid = slot->extract[b].last_tid;
                     batch_last_pos = slot->extract[b].last_pos;
                 }
@@ -857,8 +857,8 @@ static int MdExtractCandidatesPass(
         return 0;
     };
 
-    auto consume_slot = [&](MdExtractSlot *slot) -> int {
-        if (!batch_consumer) return 0;
+    auto post_process_slot = [&](MdExtractSlot *slot) -> int {
+        if (!batch_post_processor) return 0;
         MdExtractBatchView batch = {};
         batch.uncompressed = &slot->uncompressed;
         batch.decomp = slot->decomp;
@@ -866,7 +866,7 @@ static int MdExtractCandidatesPass(
         batch.ordinal_base = slot->ordinal_base;
         batch.ordinal_end = slot->ordinal_end;
         batch.fixed_workspace_bytes = fixed_workspace;
-        if (batch_consumer(batch_context, local_candidates,
+        if (batch_post_processor(batch_context, local_candidates,
                            local_qnames, slot->progress_tid,
                            slot->progress_pos, slot->ordinal_end,
                            &batch) != 0) {
@@ -886,8 +886,8 @@ static int MdExtractCandidatesPass(
     }
     if (slots[current].n_blocks == 0) {
         *local_records = 0;
-        while (batch_consumer && processed_batches < target_batches) {
-            if (batch_consumer(batch_context, local_candidates,
+        while (batch_post_processor && processed_batches < target_batches) {
+            if (batch_post_processor(batch_context, local_candidates,
                                local_qnames, -1, -1, 0,
                                nullptr) != 0) {
                 free_slots();
@@ -922,12 +922,12 @@ static int MdExtractCandidatesPass(
         if (have_next) {
             decomp_status = join_decomp(slots + next);
         }
-        int consume_status = 0;
+        int post_process_status = 0;
         if (process_status == 0 && decomp_status == 0) {
-            consume_status = consume_slot(slots + current);
+            post_process_status = post_process_slot(slots + current);
         }
         if (process_status != 0 || decomp_status != 0 ||
-            consume_status != 0) {
+            post_process_status != 0) {
             free_slots();
             return -1;
         }
@@ -939,8 +939,8 @@ static int MdExtractCandidatesPass(
         std::swap(current, next);
     }
 
-    while (batch_consumer && processed_batches < target_batches) {
-        if (batch_consumer(batch_context, local_candidates,
+    while (batch_post_processor && processed_batches < target_batches) {
+        if (batch_post_processor(batch_context, local_candidates,
                            local_qnames, previous_tid,
                            previous_pos, ordinal, nullptr) != 0) {
             free_slots();
@@ -963,7 +963,7 @@ static int MdExtractCandidates(
         int *range_first_tid, int *range_first_pos,
         int *range_last_tid, int *range_last_pos,
         MpiMarkdupStats *stats,
-        MdCandidateBatchConsumer batch_consumer = nullptr,
+        MdCandidateBatchPostProcessor batch_post_processor = nullptr,
         void *batch_context = nullptr,
         long long target_batches = 0) {
     MdInputPass source(&reader);
@@ -973,7 +973,7 @@ static int MdExtractCandidates(
         local_records, range_has_records,
         range_first_tid, range_first_pos,
         range_last_tid, range_last_pos, stats,
-        batch_consumer, batch_context, target_batches);
+        batch_post_processor, batch_context, target_batches);
 }
 
 static int MdScanRankFirstCoordinate(
@@ -3162,7 +3162,7 @@ struct MdStreamingBatchContext {
     MpiMarkdupStats *stats;
 };
 
-static int MdConsumeStreamingBatch(
+static int MdPostProcessStreamingBatch(
         void *opaque,
         std::vector<MpiMarkdupCandidateShared> *local_candidates,
         std::vector<unsigned char> *local_qnames,
@@ -4150,7 +4150,8 @@ static int MdRewriteOutputPass(
         }
 
         // 普通 -r 默认走已验证的 raw payload 删除路径；需要测试
-        // host-filter 融合路径时设置 RABBITBAM_MARKDUP_FUSED_REMOVE=1。
+        // Optimized path 内部的 fused host-filter 实现时设置
+        // RABBITBAM_MARKDUP_FUSED_REMOVE=1。
         if (remove_dups && !clear_old && !fused_remove_path) {
             int active_payload_blocks = 0;
             uint64_t next_ordinal = ordinal;
@@ -4570,7 +4571,7 @@ static int MdFindDuplicatesStreamingBatchesPass(
         local_records, range_has_records,
         range_first_tid, range_first_pos,
         range_last_tid, range_last_pos, stats,
-        MdConsumeStreamingBatch, &context, target_batches);
+        MdPostProcessStreamingBatch, &context, target_batches);
     MpiMarkdupStreamingWindowDestroy(window);
     context.window = nullptr;
     local_ok = extract_status == 0;
@@ -5434,7 +5435,7 @@ static int MdOnePassInitWindow(MdOnePassContext *context) {
     return context->window ? 0 : -1;
 }
 
-static int MdConsumeOnePassBatch(
+static int MdPostProcessOnePassBatch(
         void *opaque,
         std::vector<MpiMarkdupCandidateShared> *local_candidates,
         std::vector<unsigned char> *local_qnames,
@@ -5669,7 +5670,7 @@ static int MdMarkdupOnePassToSink(
         local_records, range_has_records,
         range_first_tid, range_first_pos,
         range_last_tid, range_last_pos, stats,
-        MdConsumeOnePassBatch, &context, target_batches);
+        MdPostProcessOnePassBatch, &context, target_batches);
     int local_ok = extract_status == 0;
     if (!MdAllRanksOkTimed(local_ok, stats)) {
         MdOnePassCleanup(&context);
@@ -6066,7 +6067,7 @@ static int MdWriteOutputMpiio(
     return MdAllRanksOk(local_ok) ? 0 : -1;
 }
 
-static double MdAccountedFusedTime(const MpiMarkdupStats &stats) {
+static double MdAccountedOptimizedTime(const MpiMarkdupStats &stats) {
     return stats.t_candidate_decomp +
            stats.t_candidate_extract +
            stats.t_extract_status +
@@ -6110,8 +6111,8 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
         stats.mpi_candidate_bytes,
         stats.mpi_result_bytes
     };
-    const double accounted = MdAccountedFusedTime(stats);
-    const double unaccounted = stats.t_fused_total - accounted;
+    const double accounted = MdAccountedOptimizedTime(stats);
+    const double unaccounted = stats.t_optimized_total - accounted;
 
     const int kLineBytes = 8192;
     char local_lines[kLineBytes];
@@ -6152,7 +6153,7 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
         "rewrite=%.6f pack=%.6f compress=%.6f "
         "read=%.6f write=%.6f rank_sync=%.6f "
         "cpe_sync=%.6f accounted=%.6f "
-        "unaccounted=%.6f fused=%.6f\n",
+        "unaccounted=%.6f optimized=%.6f\n",
         rank, stats.t_candidate_decomp,
         stats.t_candidate_extract, stats.t_extract_status,
         stats.t_extract_merge, stats.t_extract_memcheck,
@@ -6167,7 +6168,7 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
         stats.t_rewrite_decomp, stats.t_rewrite, stats.t_pack,
         stats.t_compress, stats.t_read, stats.t_write,
         stats.t_rank_sync, stats.t_cpe_sync, accounted,
-        unaccounted, stats.t_fused_total);
+        unaccounted, stats.t_optimized_total);
     std::vector<char> gathered_lines;
     if (rank == 0) {
         gathered_lines.resize((size_t)comm_size * kLineBytes);
@@ -6217,7 +6218,7 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
         stats.t_cpe_sync,
         accounted,
         unaccounted,
-        stats.t_fused_total
+        stats.t_optimized_total
     };
     double time_sums[time_count] = {};
     double time_max[time_count] = {};
@@ -6230,7 +6231,7 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
             fputs(gathered_lines.data() + (size_t)r * kLineBytes,
                   stdout);
         }
-        printf("FusedMarkdupMPI finished. ranks=%d blocks=%lld "
+        printf("OptimizedMarkdupMPI finished. ranks=%d blocks=%lld "
                "records=%lld examined=%lld excluded=%lld\n",
                comm_size, sums[0], sums[2], sums[3], sums[4]);
         printf("  candidates pair=%lld single=%lld owner=%lld "
@@ -6254,7 +6255,7 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
                "rewrite=%.3f pack=%.3f compress=%.3f "
                "read=%.3f write=%.3f rank_sync=%.3f "
                "cpe_sync=%.3f accounted=%.3f "
-               "unaccounted=%.3f fused=%.3f\n",
+               "unaccounted=%.3f optimized=%.3f\n",
                time_sums[0], time_sums[1], time_sums[2],
                time_sums[3], time_sums[4], time_sums[5],
                time_sums[6], time_sums[7], time_sums[8],
@@ -6277,7 +6278,7 @@ static void MdPrintStats(const MpiMarkdupStats &stats,
                "rewrite=%.3f pack=%.3f compress=%.3f "
                "read=%.3f write=%.3f rank_sync=%.3f "
                "cpe_sync=%.3f accounted=%.3f "
-               "unaccounted=%.3f fused=%.3f\n",
+               "unaccounted=%.3f optimized=%.3f\n",
                time_max[0], time_max[1], time_max[2],
                time_max[3], time_max[4], time_max[5],
                time_max[6], time_max[7], time_max[8],
@@ -6480,7 +6481,7 @@ int MpiMarkdupMemoryToMemory(CmdInfo *cmd_info,
                    "max_read_length=%d\n",
                    cmd_info->markdup_max_read_length_);
         }
-        double fused_t0 = GetTime();
+        double optimized_t0 = GetTime();
         if (use_streaming) {
             if (MdFindDuplicatesStreamingBatches(
                     reader, local_block_begin,
@@ -6694,10 +6695,10 @@ int MpiMarkdupMemoryToMemory(CmdInfo *cmd_info,
         }
         if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
 
-        stats.t_fused_total = GetTime() - fused_t0;
-        stage43_cost = MdReduceMax(stats.t_fused_total);
+        stats.t_optimized_total = GetTime() - optimized_t0;
+        stage43_cost = MdReduceMax(stats.t_optimized_total);
         if (rank == 0) {
-            printf("Complete the 4.3 FusedMarkdupMPI cost %lf\n",
+            printf("Complete the 4.3 OptimizedMarkdupMPI cost %lf\n",
                    stage43_cost);
         }
     }
@@ -7094,7 +7095,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                        : "coordinate-stream-two-pass",
                    cmd_info->markdup_max_read_length_);
         }
-        double fused_t0 = GetTime();
+        double optimized_t0 = GetTime();
         if (use_one_pass) {
             MdOnePassBoundaryPlan boundary_plan;
             if (MdBuildOnePassBoundaryPlan(
@@ -7404,7 +7405,8 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
         if (!MdAllRanksOkTimed(local_ok, &stats)) goto cleanup;
 
         // 兼容回退路径：设置 RABBITBAM_MARKDUP_LEGACY_REMOVE=1 时，
-        // -c -r 仍使用两段式稳定实现，便于和融合路径对照。
+        // -c -r 仍使用两段式稳定实现，便于和 Optimized path 内部的
+        // fused remove 实现对照。
         if (remove_dups && !fused_remove_dups) {
             MemWriter *writer = rank_body_sink.memory_writer();
             MemReader filter_reader = {};
@@ -7435,7 +7437,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                 if (filtered_writer.data) free(filtered_writer.data);
                 goto cleanup;
             }
-            if (FusedBamToBamMPI(filter_reader, filtered_writer,
+            if (OptimizedBamToBamMPI(filter_reader, filtered_writer,
                                  filter, cmd_info->compress_level_,
                                  &filter_stats) != 0) {
                 local_ok = 0;
@@ -7454,10 +7456,10 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
             stats.t_write += filter_stats.t_write;
         }
         }
-        stats.t_fused_total = GetTime() - fused_t0;
-        stage43_cost = MdReduceMax(stats.t_fused_total);
+        stats.t_optimized_total = GetTime() - optimized_t0;
+        stage43_cost = MdReduceMax(stats.t_optimized_total);
         if (rank == 0) {
-            printf("Complete the 4.3 FusedMarkdupMPI cost %lf\n",
+            printf("Complete the 4.3 OptimizedMarkdupMPI cost %lf\n",
                    stage43_cost);
         }
     }

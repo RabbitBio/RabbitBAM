@@ -454,7 +454,7 @@ void MpiPrintRankStats(int rank, int comm_size, const MpiBamToBamStats &stats, s
              "[rank %d] decomp_filter_slave=%.3f  pack=%.3f  compress_stage=%.3f  read=%.3f  write=%.3f  mpi_write=%.3f\n"
              "[rank %d] decomp_detail alloc=%.3f  inflate=%.3f  crc=%.3f  parse_filter=%.3f  other=%.3f\n"
              "[rank %d] compress_detail serialize=%.3f  alloc=%.3f  deflate=%.3f  footer=%.3f  other=%.3f\n"
-             "[rank %d] fused_total=%.6f  core_stage=%.6f\n",
+             "[rank %d] optimized_total=%.6f  core_stage=%.6f\n",
              rank, stats.input_blocks, stats.group_count, stats.total_records,
              stats.kept_records, stats.dropped_records, stats.bgzf_blocks, body_size, keep_ratio,
              rank, stats.t_decomp_filter, stats.t_pack, stats.t_compress,
@@ -463,7 +463,7 @@ void MpiPrintRankStats(int rank, int comm_size, const MpiBamToBamStats &stats, s
              stats.t_decomp_crc, stats.t_decomp_parse, stats.t_decomp_other,
              rank, stats.t_compress_serialize, stats.t_compress_alloc,
              stats.t_compress_deflate, stats.t_compress_footer, stats.t_compress_other,
-             rank, stats.t_fused_total, core_stage);
+             rank, stats.t_optimized_total, core_stage);
     MpiPrintRankBufferedLines(rank, comm_size, local_lines);
 }
 
@@ -476,14 +476,14 @@ void MpiPrintRankBamToSamStats(int rank, int comm_size,
              "[rank %d] blocks=%lld groups=%lld records=%lld format_tiles=%lld body=%zu\n"
              "[rank %d] decomp_slave=%.3f  format_slave=%.3f  collect=%.3f  read=%.3f  write=%.3f  gather=%.3f\n"
              "[rank %d] decomp_detail alloc=%.3f  inflate=%.3f  crc=%.3f  parse=%.3f  other=%.3f\n"
-             "[rank %d] fused_total=%.6f  core_stage=%.6f  alloc_init=%.6f  free_workspace=%.6f\n",
+             "[rank %d] optimized_total=%.6f  core_stage=%.6f  alloc_init=%.6f  free_workspace=%.6f\n",
              rank, stats.input_blocks, stats.group_count, stats.total_records,
              stats.format_tiles, body_size,
              rank, stats.t_decomp, stats.t_format, stats.t_collect,
              stats.t_read, stats.t_write, stats.t_gather,
              rank, stats.t_decomp_alloc, stats.t_decomp_inflate,
              stats.t_decomp_crc, stats.t_decomp_parse, stats.t_decomp_other,
-             rank, stats.t_fused_total, core_stage,
+             rank, stats.t_optimized_total, core_stage,
              stats.t_alloc_init, stats.t_free_workspace);
     MpiPrintRankBufferedLines(rank, comm_size, local_lines);
 }
@@ -496,14 +496,14 @@ void MpiPrintRankSamToBamStats(int rank, int comm_size,
     // double measured_extra = stats.t_split + stats.t_alloc_init + stats.t_setup_reset +
     //                         stats.t_compress_setup + stats.t_status_check +
     //                         stats.t_free_workspace;
-    // double residual = stats.t_fused_total - core_stage - measured_extra;
+    // double residual = stats.t_optimized_total - core_stage - measured_extra;
     snprintf(local_lines, sizeof(local_lines),
              "[rank %d] chunks=%lld chunk_groups=%lld records=%lld compress_groups=%lld bgzf=%lld body=%zu\n"
              "[rank %d] parse_fast=%lld  parse_fallback=%lld\n"
              "[rank %d] split=%.3f  copy_count_slave=%.3f  parse_slave=%.3f  pack=%.3f  compress_slave=%.3f  write=%.3f  gather=%.3f\n"
              "[rank %d] parse_detail core=%.3f  aux=%.3f  cg=%.3f  fallback=%.3f  other=%.3f\n"
              "[rank %d] compress_detail serialize=%.3f  alloc=%.3f  deflate=%.3f  footer=%.3f  other=%.3f\n"
-             "[rank %d] fused_total=%.6f  core_stage=%.6f\n",
+             "[rank %d] optimized_total=%.6f  core_stage=%.6f\n",
              rank, stats.input_chunks, stats.chunk_groups, stats.total_records,
              stats.compress_groups, stats.bgzf_blocks, body_size,
              rank, stats.parse_fast_records, stats.parse_fallback_records,
@@ -513,7 +513,7 @@ void MpiPrintRankSamToBamStats(int rank, int comm_size,
              stats.t_parse_cg, stats.t_parse_fallback, stats.t_parse_other,
              rank, stats.t_compress_serialize, stats.t_compress_alloc,
              stats.t_compress_deflate, stats.t_compress_footer, stats.t_compress_other,
-             rank, stats.t_fused_total, core_stage);
+             rank, stats.t_optimized_total, core_stage);
     MpiPrintRankBufferedLines(rank, comm_size, local_lines);
 }
 
@@ -1195,50 +1195,50 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         }
         if (!stage42_ok) goto cleanup;
 
-        //4.3 核心处理：FusedBamToBamMPI / FusedBamToSamMPI / FusedSamToBamMPI
-        const char *fused_name = sam_to_bam ? "FusedSamToBamMPI" :
-                                 (bam_to_sam ? "FusedBamToSamMPI" : "FusedBamToBamMPI");
-        double FusedBamToBamMPI_t0 = GetTime();
+        //4.3 核心处理：OptimizedBamToBamMPI / OptimizedBamToSamMPI / OptimizedSamToBamMPI
+        const char *optimized_name = sam_to_bam ? "OptimizedSamToBamMPI" :
+                                 (bam_to_sam ? "OptimizedBamToSamMPI" : "OptimizedBamToBamMPI");
+        double OptimizedBamToBamMPI_t0 = GetTime();
         if (bam_to_sam) {
             int ret = backend_bam_input && !input_file_mem
-                ? FusedBamToSamMPI(
+                ? OptimizedBamToSamMPI(
                       *backend_input, backend_plan.rank_spans(),
                       backend_plan.rank_block_count(), body_sink,
                       hdr, &sam_stats)
-                : FusedBamToSamMPI(
+                : OptimizedBamToSamMPI(
                       reader, body_sink, hdr, &sam_stats);
             if (ret != 0) {
-                fprintf(stderr, "[rank %d] ERROR: MPI bam2sam fused 1CG body failed.\n", rank);
+                fprintf(stderr, "[rank %d] ERROR: MPI bam2sam optimized 1CG body failed.\n", rank);
                 local_ok = 0;
             }
         } else if (sam_to_bam) {
-            if (FusedSamToBamMPI(
+            if (OptimizedSamToBamMPI(
                     reader, body_sink, hdr,
                     cmd_info->compress_level_,
                     &sam2bam_stats) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: MPI sam2bam fused 1CG body failed.\n", rank);
+                fprintf(stderr, "[rank %d] ERROR: MPI sam2bam optimized 1CG body failed.\n", rank);
                 local_ok = 0;
             }
         } else {
             int ret = backend_bam_input && !input_file_mem
-                ? FusedBamToBamMPI(
+                ? OptimizedBamToBamMPI(
                       *backend_input, backend_plan.rank_spans(),
                       backend_plan.rank_block_count(), body_sink,
                       filter, cmd_info->compress_level_, &stats)
-                : FusedBamToBamMPI(
+                : OptimizedBamToBamMPI(
                       reader, body_sink, filter,
                       cmd_info->compress_level_, &stats);
             if (ret != 0) {
-                fprintf(stderr, "[rank %d] ERROR: MPI bam2bam fused 1CG body failed.\n", rank);
+                fprintf(stderr, "[rank %d] ERROR: MPI bam2bam optimized 1CG body failed.\n", rank);
                 local_ok = 0;
             }
         }
 
         int global_ok = MpiAllRanksOk(local_ok);
-        double FusedBamToBamMPI_cost = GetTime() - FusedBamToBamMPI_t0;
-        double FusedBamToBamMPI_cost_max = MpiReduceMaxCost(FusedBamToBamMPI_cost);
+        double OptimizedBamToBamMPI_cost = GetTime() - OptimizedBamToBamMPI_t0;
+        double OptimizedBamToBamMPI_cost_max = MpiReduceMaxCost(OptimizedBamToBamMPI_cost);
         if (rank == 0 && global_ok) {
-            printf("Complete the 4.3 %s cost %lf\n", fused_name, FusedBamToBamMPI_cost_max);
+            printf("Complete the 4.3 %s cost %lf\n", optimized_name, OptimizedBamToBamMPI_cost_max);
         }
 
         if (!global_ok) goto cleanup;
@@ -1441,7 +1441,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         double body_cost_max = MpiReduceMaxCost(body_cost);
         if (rank == 0 && global_ok) {
             double body_counted_cost = stage41_cost_max + stage42_cost_max +
-                                       FusedBamToBamMPI_cost_max + stage44_cost_max +
+                                       OptimizedBamToBamMPI_cost_max + stage44_cost_max +
                                        stage45_header_cost_max + stage46_cost_max;
             t_total += body_counted_cost;
             // printf("Complete the counted body cost %lf\n", body_counted_cost);
@@ -1473,7 +1473,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 sam_stats.t_read,
                 sam_stats.t_write,
                 sam_stats.t_gather,
-                sam_stats.t_fused_total,
+                sam_stats.t_optimized_total,
                 sam_stats.t_decomp + sam_stats.t_collect + sam_stats.t_format,
                 sam_stats.t_alloc_init,
                 sam_stats.t_free_workspace
@@ -1484,7 +1484,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             MpiPrintRankBamToSamStats(
                 rank, comm_size, sam_stats, (size_t)body_sink.size());
             if (rank == 0) {
-                printf("FusedBamToSamMPI finished. ranks=%d in_blocks=%lld groups=%lld total_records=%lld format_tiles=%lld body_bytes=%lld\n",
+                printf("OptimizedBamToSamMPI finished. ranks=%d in_blocks=%lld groups=%lld total_records=%lld format_tiles=%lld body_bytes=%lld\n",
                        comm_size, global_long_stats[0], global_long_stats[1],
                        global_long_stats[2], global_long_stats[3], total_body_size);
                 printf("  decomp_slave_sum=%.3f  format_slave_sum=%.3f  collect_sum=%.3f  read_sum=%.3f  write_sum=%.3f  gather_sum=%.3f\n",
@@ -1493,7 +1493,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 printf("  decomp_detail_sum alloc=%.3f  inflate=%.3f  crc=%.3f  parse=%.3f  other=%.3f\n",
                        global_double_stats[1], global_double_stats[2], global_double_stats[3],
                        global_double_stats[4], global_double_stats[5]);
-                printf("  fused_total_sum=%.3f  core_stage_sum=%.3f  alloc_init_sum=%.3f  free_workspace_sum=%.3f\n",
+                printf("  optimized_total_sum=%.3f  core_stage_sum=%.3f  alloc_init_sum=%.3f  free_workspace_sum=%.3f\n",
                        global_double_stats[11], global_double_stats[12],
                        global_double_stats[13], global_double_stats[14]);
             }
@@ -1527,7 +1527,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 sam2bam_stats.t_compress_other,
                 sam2bam_stats.t_write,
                 sam2bam_stats.t_gather,
-                sam2bam_stats.t_fused_total,
+                sam2bam_stats.t_optimized_total,
                 sam2bam_stats.t_setup_reset,
                 sam2bam_stats.t_compress_setup,
                 sam2bam_stats.t_status_check,
@@ -1540,7 +1540,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             MpiPrintRankSamToBamStats(
                 rank, comm_size, sam2bam_stats, (size_t)body_sink.size());
             if (rank == 0) {
-                printf("FusedSamToBamMPI finished. ranks=%d chunks=%lld chunk_groups=%lld total_records=%lld compress_groups=%lld bgzf_blocks=%lld body_bytes=%lld\n",
+                printf("OptimizedSamToBamMPI finished. ranks=%d chunks=%lld chunk_groups=%lld total_records=%lld compress_groups=%lld bgzf_blocks=%lld body_bytes=%lld\n",
                        comm_size, global_long_stats[0], global_long_stats[1],
                        global_long_stats[2], global_long_stats[3], global_long_stats[4],
                        total_body_size);
@@ -1556,7 +1556,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 printf("  compress_detail_sum serialize=%.3f  alloc=%.3f  deflate=%.3f  footer=%.3f  other=%.3f\n",
                        global_double_stats[10], global_double_stats[11], global_double_stats[12],
                        global_double_stats[13], global_double_stats[14]);
-                printf("  fused_total_sum=%.3f  core_stage_sum=%.3f  setup_reset_sum=%.3f  compress_setup_sum=%.3f  status_check_sum=%.3f  alloc_free_sum=%.3f\n",
+                printf("  optimized_total_sum=%.3f  core_stage_sum=%.3f  setup_reset_sum=%.3f  compress_setup_sum=%.3f  status_check_sum=%.3f  alloc_free_sum=%.3f\n",
                        global_double_stats[17],
                        global_double_stats[1] + global_double_stats[2] +
                        global_double_stats[8] + global_double_stats[9],
@@ -1596,7 +1596,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             double global_double_stats[16] = {};
             MPI_Reduce(local_double_stats, global_double_stats, 16, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
             double local_detail_stats[3] = {
-                stats.t_fused_total,
+                stats.t_optimized_total,
                 stats.t_decomp_filter + stats.t_pack + stats.t_compress,
                 stats.t_prepare_decomp,
             };
@@ -1609,7 +1609,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 double keep_ratio = global_long_stats[2] > 0
                                     ? (double)global_long_stats[3] / (double)global_long_stats[2]
                                     : 1.0;
-                printf("FusedBamToBamMPI finished. ranks=%d in_blocks=%lld groups=%lld total_records=%lld kept_records=%lld dropped_records=%lld bgzf_blocks=%lld body_bytes=%lld\n",
+                printf("OptimizedBamToBamMPI finished. ranks=%d in_blocks=%lld groups=%lld total_records=%lld kept_records=%lld dropped_records=%lld bgzf_blocks=%lld body_bytes=%lld\n",
                        comm_size, global_long_stats[0], global_long_stats[1], global_long_stats[2],
                        global_long_stats[3], global_long_stats[4], global_long_stats[5],
                        total_body_size);
@@ -1622,7 +1622,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 printf("  compress_detail_sum serialize=%.3f  alloc=%.3f  deflate=%.3f  footer=%.3f  other=%.3f\n",
                        global_double_stats[8], global_double_stats[9], global_double_stats[10],
                        global_double_stats[11], global_double_stats[12]);
-                printf("  fused_total_sum=%.3f  core_stage_sum=%.3f  prepare_decomp_sum=%.3f\n",
+                printf("  optimized_total_sum=%.3f  core_stage_sum=%.3f  prepare_decomp_sum=%.3f\n",
                        global_detail_stats[0], global_detail_stats[1], global_detail_stats[2]);
                 printf("  pack_records=%lld  keep_ratio=%.6f  filter_mode=%s\n",
                        global_long_stats[6], keep_ratio, bam_filter_is_noop(filter) ? "passthrough" : "filtered");

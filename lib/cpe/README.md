@@ -7,15 +7,15 @@
 
 - `swbam_cpe_pipeline.cpp`：两套 compressed/decoded batch，重叠 MPE 读取下一批与
   CPE 处理当前批。
-- `swbam_generic_decode.cpp`：把通用 BGZF decode kernel 包装成
+- `swbam_composable_decode.cpp`：把 BGZF decode kernel 包装成 Composable
   `CpeBatchOperator`。
 - `swbam_cpe_write_pipeline.cpp`：两套 uncompressed/compressed batch，重叠 CPE
-  压缩与 MPE 输出消费。
-- `swbam_generic_compress.cpp`：通用 BGZF compress operator。
+  压缩与 MPE 输出 batch post-processing。
+- `swbam_composable_compress.cpp`：Composable BGZF compress operator。
 
 ## 扩展方式
 
-简单工具使用 `RunGenericDecodePipeline` 或 `RunGenericRawBamPipeline`。需要融合
+简单工具使用 `RunComposableDecodePipeline` 或 `RunComposableRawBamPipeline`。需要融合
 decode+parse+业务逻辑时，实现 `CpeBatchOperator`，提供参数准备、kernel entry、
 状态校验和 MPE 归并即可。
 

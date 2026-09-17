@@ -13,7 +13,7 @@ namespace cpe {
 
 CpeReadPipelineTiming::CpeReadPipelineTiming()
     : input_blocks(0), batch_count(0), total_records(0),
-      read(0.0), kernel(0.0), consume(0.0), total(0.0) {}
+      read(0.0), kernel(0.0), post_process(0.0), total(0.0) {}
 
 int RunCpeReadPipeline(const BamInputBackend &input,
                        const BgzfBlockSpan *spans,
@@ -111,10 +111,10 @@ int RunCpeReadPipeline(const BamInputBackend &input,
 
         if (op->Validate(active_blocks) != 0) goto cleanup;
 
-        const double consume_t0 = GetTime();
+        const double post_process_t0 = GetTime();
         long long batch_records = 0;
-        if (op->Consume(active_blocks, &batch_records) != 0) goto cleanup;
-        local_timing.consume += GetTime() - consume_t0;
+        if (op->PostProcessBatch(active_blocks, &batch_records) != 0) goto cleanup;
+        local_timing.post_process += GetTime() - post_process_t0;
         local_timing.total_records += batch_records;
 
         std::swap(current_compressed, next_compressed);
@@ -123,9 +123,9 @@ int RunCpeReadPipeline(const BamInputBackend &input,
     }
 
     {
-        const double consume_t0 = GetTime();
+        const double post_process_t0 = GetTime();
         if (op->Finish() != 0) goto cleanup;
-        local_timing.consume += GetTime() - consume_t0;
+        local_timing.post_process += GetTime() - post_process_t0;
     }
     ret = 0;
 

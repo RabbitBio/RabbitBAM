@@ -79,7 +79,7 @@ int SplitSamChunksCGS(MemReader &reader, CgsSamParseBatch *batch, int *active_ch
 
 } // namespace
 
-int FusedSamToBamCGS(MemReader reader, MemWriter &mem_writer, sam_hdr_t *hdr) {
+int OptimizedSamToBamCGS(MemReader reader, MemWriter &mem_writer, sam_hdr_t *hdr) {
     if (CheckCgsResources() != 0) return -1;
 
     double t0 = GetTime();
@@ -298,7 +298,7 @@ int FusedSamToBamCGS(MemReader reader, MemWriter &mem_writer, sam_hdr_t *hdr) {
 
     if (flush_pending() != 0) return -1;
 
-    printf("FusedSamToBamCGS finished. bam1_t=%lld, groups=%lld, chunk_groups=%lld, bgzf=%lld, cost %.6f\n",
+    printf("OptimizedSamToBamCGS finished. bam1_t=%lld, groups=%lld, chunk_groups=%lld, bgzf=%lld, cost %.6f\n",
            bam1_t_nums, group_nums, chunk_groups, bgzf_nums, GetTime() - t0);
     printf("  copy_count_slave=%lf  parse_slave=%lf  pack=%lf  compress_slave=%lf  write=%lf\n",
            t_copy_count, t_parse, t_pack, t_compress, t_write);

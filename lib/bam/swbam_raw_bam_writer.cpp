@@ -1,5 +1,5 @@
 #include "swbam/raw_bam_writer.h"
-#include "swbam/generic_compress.h"
+#include "swbam/composable_compress.h"
 
 #include <algorithm>
 #include <cstring>
@@ -93,12 +93,12 @@ private:
     size_t position_;
 };
 
-class BackendOutputConsumer : public CompressedBgzfConsumer {
+class BackendOutputBatchPostProcessor : public CompressedBgzfBatchPostProcessor {
 public:
-    explicit BackendOutputConsumer(BamOutputBackend *output)
+    explicit BackendOutputBatchPostProcessor(BamOutputBackend *output)
         : output_(output) {}
 
-    int ConsumeCompressed(const bam_block *blocks, size_t count) {
+    int PostProcessCompressedBatch(const bam_block *blocks, size_t count) {
         return WriteBgzfBlocks(output_, blocks, count);
     }
 
@@ -111,7 +111,7 @@ private:
 RawBamWriterMetrics::RawBamWriterMetrics()
     : records(0), raw_bytes(0), header_raw_bytes(0), header_blocks(0),
       packed_blocks(0), compressed_bytes(0),
-      pack(0.0), source(0.0), kernel(0.0), consume(0.0), total(0.0) {}
+      pack(0.0), source(0.0), kernel(0.0), post_process(0.0), total(0.0) {}
 
 class RawBamWriter::Impl {
 public:
@@ -198,19 +198,19 @@ public:
     int Flush() {
         if (finalized_blocks == 0) return 0;
         PackedChunkSource source(&packed, finalized_blocks);
-        BackendOutputConsumer consumer(output);
+        BackendOutputBatchPostProcessor post_processor(output);
         CpeWritePipelineTiming timing;
-        GenericCompressMetrics compress_metrics;
+        ComposableCompressMetrics compress_metrics;
         const uint64_t output_before = output->bytes_written();
         const double flush_t0 = GetTime();
-        if (RunGenericCompressPipeline(
-                &source, &consumer, compression_level,
+        if (RunComposableCompressPipeline(
+                &source, &post_processor, compression_level,
                 &timing, &compress_metrics) != 0) {
             return -1;
         }
         metrics.source += timing.source;
         metrics.kernel += timing.kernel;
-        metrics.consume += timing.consume;
+        metrics.post_process += timing.post_process;
         metrics.total += GetTime() - flush_t0;
         metrics.compressed_bytes +=
             (long long)(output->bytes_written() - output_before);
@@ -218,7 +218,7 @@ public:
         return 0;
     }
 
-    int Consume(const RawBamRecordView *records, size_t count) {
+    int PostProcessBatch(const RawBamRecordView *records, size_t count) {
         if (!initialized || finished || (!records && count != 0)) return -1;
         double pack_t0 = GetTime();
         for (size_t i = 0; i < count; ++i) {
@@ -295,9 +295,9 @@ int RawBamWriter::InitializeBam(
         output, header, compression_level, chunk_blocks);
 }
 
-int RawBamWriter::ConsumeRaw(
+int RawBamWriter::PostProcessRawBatch(
         const RawBamRecordView *records, size_t count) {
-    return impl_->Consume(records, count);
+    return impl_->PostProcessBatch(records, count);
 }
 
 int RawBamWriter::Finish(bool append_bgzf_eof) {

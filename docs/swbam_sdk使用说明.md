@@ -93,27 +93,28 @@ examples/               独立于命令内部类型的 SDK 示例
 
 ### 4.2 通用 CPE 流水线
 
-定义在 `swbam/cpe_pipeline.h`、`generic_decode.h`、
-`cpe_write_pipeline.h` 和 `generic_compress.h`：
+定义在 `swbam/cpe_pipeline.h`、`composable_decode.h`、
+`cpe_write_pipeline.h` 和 `composable_compress.h`：
 
 - `RunCpeReadPipeline`：读取下一批与 CPE 处理当前批重叠。
 - `CpeBatchOperator`：批级专用算子扩展点，不在逐记录热路径增加虚调用。
-- `RunGenericDecodePipeline`：BGZF 解压后把 decoded block batch 交给 consumer。
-- `RunCpeWritePipeline`：未压缩 block 生产、CPE 压缩和输出消费流水。
-- `RunGenericCompressPipeline`：通用 BGZF 压缩实现。
-- 对应 timing/metrics 结构用于拆分 read、kernel、consume、inflate、CRC、deflate 等时间。
+- `RunComposableDecodePipeline`：BGZF 解压后把 decoded block batch 交给 batch post-processor。
+- `RunCpeWritePipeline`：未压缩 block 生产、CPE 压缩和 MPE 输出 batch
+  post-processing 流水。
+- `RunComposableCompressPipeline`：Composable BGZF 压缩实现。
+- 对应 timing/metrics 结构用于拆分 read、kernel、post_process、inflate、CRC、deflate 等时间。
 
 ### 4.3 Raw BAM 记录接口
 
 定义在 `swbam/raw_bam.h`、`raw_bam_filter.h` 和 `raw_bam_writer.h`：
 
 - `RawBamRecordView`：指向 decoded batch 中原始 BAM record 的零拷贝只读视图。
-- `RawBamRecordConsumer`：应用实现的批量记录回调。
-- `RunGenericRawBamPipeline`：通用解压、记录边界解析和 consumer 调用。
-- `RawBamFilterConsumer`：读取 mandatory fields 并完成常用过滤。
+- `RawBamBatchPostProcessor`：应用实现的批量记录回调。
+- `RunComposableRawBamPipeline`：通用解压、记录边界解析和 batch post-processor 调用。
+- `RawBamFilterBatchPostProcessor`：读取 mandatory fields 并完成常用过滤。
 - `RawBamWriter`：将 Raw BAM records 重新分块、CPE 压缩并写入 output backend。
 
-`RawBamRecordView` 的内存只在当前 `ConsumeRaw()` 回调期间有效，不能保存指针供后续
+`RawBamRecordView` 的内存只在当前 `PostProcessRawBatch()` 回调期间有效，不能保存指针供后续
 batch 使用。当前实现还沿用项目的输入约束，即单条 BAM record 不跨 BGZF block。
 
 ### 4.4 MPI 运行时
@@ -136,13 +137,13 @@ batch 使用。当前实现还沿用项目的输入约束，即单条 BAM record
 ```text
 PosixBamInput::Open
   -> ScanBlocks
-  -> 自定义 RawBamRecordConsumer
-  -> RunGenericRawBamPipeline
+  -> 自定义 RawBamBatchPostProcessor
+  -> RunComposableRawBamPipeline
   -> Close
 ```
 
 `examples/sdk_record_count.cpp` 展示了完整实现。使用者只需要在
-`ConsumeRaw()` 中读取所需 BAM mandatory fields；公共库负责 BGZF 扫描、批读取、
+`PostProcessRawBatch()` 中读取所需 BAM mandatory fields；公共库负责 BGZF 扫描、批读取、
 CPE 解压、记录边界识别和双缓冲。
 
 ### 5.2 过滤并生成 BAM
@@ -151,15 +152,15 @@ CPE 解压、记录边界识别和双缓冲。
 
 ```text
 PosixBamInput
-  -> RunGenericRawBamPipeline
-  -> RawBamFilterConsumer
+  -> RunComposableRawBamPipeline
+  -> RawBamFilterBatchPostProcessor
   -> RawBamWriter
   -> PosixBamOutput
 ```
 
 对应代码见 `examples/sdk_filter_bam.cpp`。`RawBamWriter::InitializeBam()` 负责序列化
 header，`Finish()` 刷新最后一个 payload 并追加 BGZF EOF。业务代码主要负责设置
-`BamFilterOptions` 和选择 downstream consumer。
+`BamFilterOptions` 和选择 downstream batch post-processor。
 
 ### 5.3 链接方式
 
@@ -191,7 +192,7 @@ target_link_libraries(my_swbam_tool PRIVATE swbam::swbam)
 - 组合流程：`dedup-pipeline`。
 - 库微基准及完整性检查：`io-check`。
 
-这些命令并不都通过 `RawBamRecordConsumer` 实现。`flagstat`、`stats`、转换、sort、
+这些命令并不都通过 `RawBamBatchPostProcessor` 实现。`flagstat`、`stats`、转换、sort、
 collate、fixmate 和 markdup 保留了针对数据流融合的专用 CPE kernel，同时复用公共
 backend、BGZF batch、双缓冲调度、rank body sink 和分布式输出。这是通用性与性能
 并存的设计，而不是两套互不相关的实现。
@@ -231,8 +232,8 @@ SAMtools 对齐，但 CLI、API、格式和选项覆盖仍是一个面向神威�
 - 普通应用只链接一个目标 `swbam::swbam`，无需了解从核 object 的链接规则。
 - `swbam/swbam.h` 提供单一总入口。
 - 输入、输出、过滤、Raw BAM writer 可以组合，两个示例分别覆盖只读和读写工具。
-- backend 和算法解耦，同一 consumer 可以使用 memory 或 POSIX 输入。
-- 扩展发生在 batch/consumer 层，开发新统计或简单过滤无需复制 BGZF/CPE 调度代码。
+- backend 和算法解耦，同一 batch post-processor 可以使用 memory 或 POSIX 输入。
+- 扩展发生在 batch/batch post-processor 层，开发新统计或简单过滤无需复制 BGZF/CPE 调度代码。
 
 ### 当前使用门槛
 
@@ -251,7 +252,7 @@ SAMtools 对齐，但 CLI、API、格式和选项覆盖仍是一个面向神威�
 
 1. 增加 `install()`、目标 export 和 `SWBAMConfig.cmake`，支持
    `find_package(SWBAM CONFIG REQUIRED)`。
-2. 增加一个真正位于独立目录、只通过安装包编译的 consumer 示例，验证依赖没有
+2. 增加一个真正位于独立目录、只通过安装包编译的 batch post-processor 示例，验证依赖没有
    从源码树泄漏。
 3. 提供 `RuntimeGuard`/`MpiRuntimeGuard`，隐藏 `athread` 和 MPI 生命周期样板代码。
 4. 为 FLAG、MAPQ、坐标、QNAME 和 aux tag 增加只读 accessor，避免 SDK 用户手工按

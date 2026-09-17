@@ -18,7 +18,7 @@ struct Bam1WriterMetrics {
     Bam1WriterMetrics();
 };
 
-class Bam1Writer : public Bam1RecordConsumer {
+class Bam1Writer : public Bam1BatchPostProcessor {
 public:
     Bam1Writer();
     ~Bam1Writer();
@@ -30,7 +30,7 @@ public:
                       const sam_hdr_t *header,
                       int compression_level,
                       size_t chunk_blocks = 256);
-    int ConsumeBam1(const bam1_t *const *records, size_t count);
+    int PostProcessBam1Batch(const bam1_t *const *records, size_t count);
     int Finish(bool append_bgzf_eof = true);
 
     const Bam1WriterMetrics &metrics() const;

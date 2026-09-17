@@ -96,34 +96,44 @@ decode+parse+count 融合 CPE kernel 没有拆开，因此不会增加中间数�
 两个命令现已支持 `--io-backend memory|posix|mpiio|auto` 和
 `--io-memory-limit SIZE`；backend 只改变 batch 来源，不改变算子实现。
 
-## 通用路径与融合路径
+## Composable path 与 Optimized path
 
 两条路径需要同时保留：
 
-- 通用路径：`RunGenericDecodePipeline` 通过 `DecodedBgzfConsumer` 输出解压后的
-  BGZF batch；`RunGenericRawBamPipeline` 进一步生成零拷贝 `RawBamRecordView`
-  batch，供简单工具、库使用者和功能原型消费；`RunGenericBam1Pipeline` 再在
-  MPE 上批量物化库管理的 `bam1_t`，供需要标准 HTSlib accessor 的应用消费。
-- 融合路径：内置性能敏感命令继续使用 decode+flagstat、decode+stats、
-  decode+filter、decode+collate-extract 等专用融合算子。
+```text
+SWBAM
+|-- Composable path
+|   `-- CPE processing -> BatchPostProcessor -> subsequent processing/output
+`-- Optimized path
+    `-- performance-critical operations implemented with fused CPE kernels
+```
+
+- **Composable path**：`RunComposableDecodePipeline` 通过
+  `DecodedBgzfBatchPostProcessor` 输出解压后的
+  BGZF batch；`RunComposableRawBamPipeline` 进一步生成零拷贝 `RawBamRecordView`
+  batch，交由简单工具、库使用者和功能原型执行 MPE 侧 batch post-processing；
+  `RunComposableBam1Pipeline` 再在 MPE 上批量物化库管理的 `bam1_t`，交由需要
+  标准 HTSlib accessor 的应用继续处理。
+- **Optimized path**：内置性能敏感命令使用 fused CPE kernels，在从核内完成
+  decode+flagstat、decode+stats、decode+filter 或 decode+collate-extract。
 
 二者共用输入 backend、批缓冲、双缓冲调度、CPE 生命周期和错误处理，仅算子
 不同。markdup candidate ownership、collate QNAME exchange 等算法专用状态继续留在
 具体命令中，不进入 BAM I/O 核心库。
 
-当前提供 `RabbitBAM-MPI io-check -i input.bam` 作为通用路径实例：它不执行任何
+当前提供 `RabbitBAM-MPI io-check -i input.bam` 作为 Composable path 实例：它不执行任何
 业务统计，只校验全局 BGZF block 数、decoded block 状态、解压字节数、raw record
-边界和记录数，并打印 pipeline/kernel/consumer 计时。
+边界和记录数，并打印 pipeline/kernel/batch post-processor 计时。
 
 `RawBamRecordView` 直接指向 decoded batch 中包含 4 字节 `block_size` 的原始编码，
-不构造 `bam1_t`，也不复制 record payload。view 只在 consumer 回调期间有效。当前
+不构造 `bam1_t`，也不复制 record payload。view 只在 batch post-processor 回调期间有效。当前
 与项目其他路径一致，要求单条 BAM record 不跨 BGZF block。
 
-`bam1_t` 通用路径复用上述 Raw batch，而不是新增另一套读取和解压流水线。adapter
+`bam1_t` Composable path 复用上述 Raw batch，而不是新增另一套读取和解压流水线。adapter
 规范化 QNAME padding、CIGAR 和 aux 布局，并维护只随历史最大 batch 增长的对象池；
 物化时先保证池内目标记录容量，再直接写入其 `data`，避免通过临时 normalized
 payload 再调用 `bam_copy1()` 的二次复制。
-consumer 回调结束后记录会被后续 batch 复用，跨回调保存必须调用 `bam_dup1()`。
+batch post-processor 回调结束后记录会被后续 batch 复用，跨回调保存必须调用 `bam_dup1()`。
 这条路径以一次 payload 物化换取与 HTSlib 生态的直接兼容，Raw 路径仍用于简单字段
 扫描，融合 CPE kernel 仍用于内置性能热点。
 
@@ -139,7 +149,7 @@ bam1_t batch
 ```
 
 serializer 两遍处理每个 batch：第一遍校验 QNAME/data/CIGAR 并统计总长度，第二遍
-在复用 arena 中连续编码，随后整批调用一次 `RawBamWriter::ConsumeRaw()`。它会移除
+在复用 arena 中连续编码，随后整批调用一次 `RawBamWriter::PostProcessRawBatch()`。它会移除
 HTSlib 在内存中为 QNAME 添加的 padding，按 little-endian BAM 格式写 mandatory
 fields，并由坐标和 CIGAR 重算 bin。当前写端明确拒绝跨 BGZF payload 的超大记录和
 `n_cigar > 65535` 的长 CIGAR；这些边界不会影响原 Raw 路径和专用应用热路径。
@@ -158,7 +168,7 @@ mapped=2,663,701、MAPQ>=30=2,481,669、NM sum=878,007，分别与 Raw 统计、
    `MpiFlagstatCountPara[64]`。
 3. `kernel_entry` 返回现有 `slave_mpi_flagstat_count`。
 4. CPE 在一次 kernel 中完成 BGZF 解压、BAM record 解析和 flagstat 计数。
-5. `Validate` 检查每个 CPE 的状态，`Consume` 将 64 个计数 slice 合并到 rank
+5. `Validate` 检查每个 CPE 的状态，`PostProcessBatch` 将 64 个计数 slice 合并到 rank
    结果。
 
 命令本身不再维护读取、双缓冲和 launch/join 循环。
@@ -170,7 +180,7 @@ mapped=2,663,701、MAPQ>=30=2,481,669、NM sum=878,007，分别与 Raw 统计、
 
 1. CPE 融合执行 BGZF 解压、BAM 解析、SN 统计、insert-size/orientation 统计和
    block 内坐标有序性检查。
-2. `Consume` 合并 block sort state 和 record 数。
+2. `PostProcessBatch` 合并 block sort state 和 record 数。
 3. `Finish` 在全部 batch 完成后合并 64 个持续累积的统计 slice。
 
 这说明同一套 pipeline 可以承载不同参数结构、结果结构和融合 kernel。
@@ -207,7 +217,7 @@ helper；这些 helper 需要在构造更多边界样例后再决定是否并入
 1. `Initialize/Shutdown`：管理参数和结果 workspace。
 2. `Prepare`：绑定当前 compressed/decoded batch 与 CPE 参数。
 3. `kernel_entry/kernel_arguments`：指定每批启动的 CPE kernel。
-4. `Validate/Consume`：处理状态并归并结果。
+4. `Validate/PostProcessBatch`：处理状态并归并结果。
 5. `Finish`：执行可选的跨 batch 最终规约。
 
 命令只需把 rank-local spans 和算子交给 `RunCpeReadPipeline`，不再复制读取、
@@ -217,7 +227,7 @@ helper；这些 helper 需要在构造更多边界样例后再决定是否并入
 
 读流水线方向是：
 
-`compressed BGZF -> CPE decode/parse/operator -> MPE consume`
+`compressed BGZF -> CPE decode/parse/operator -> MPE batch post-processing`
 
 写流水线方向则是：
 
@@ -226,10 +236,10 @@ helper；这些 helper 需要在构造更多边界样例后再决定是否并入
 当前 `CpeWritePipeline` 已统一管理：
 
 - 两套未压缩输入 batch 和两套压缩输出 batch；
-- CPE compress 当前批与 MPE 消费上一批的重叠；
+- CPE compress 当前批与 MPE 后处理上一批的重叠；
 - BGZF block 大小、CRC、compression level、codec cache、错误处理和统一计时；
-- `UncompressedBgzfSource` 与 `CompressedBgzfConsumer` 两侧扩展接口；
-- `GenericCompressOperator` 通用 BGZF 压缩实例。
+- `UncompressedBgzfSource` 与 `CompressedBgzfBatchPostProcessor` 两侧扩展接口；
+- `ComposableCompressOperator` 通用 BGZF 压缩实例。
 
 `RawBamWriter` 已补齐通用 raw record 写路径：它将 `RawBamRecordView` 按记录
 边界装入 BGZF payload，以固定 256-block chunk 控制临时内存，再交给
@@ -239,11 +249,11 @@ header、让 body 从独立 BGZF block 开始并追加标准 EOF block，因此�
 
 `Bam1Writer` 构建在 `RawBamWriter` 之上，为 HTSlib 对象提供完整 BAM 写出能力。
 它不复制或持有调用者的 `bam1_t` 生命周期，只在 batch 回调期间序列化；因此同一个
-实例既能直接作为 `RunGenericBam1Pipeline` 的 consumer，也能接收用户自行创建或
+实例既能直接作为 `RunComposableBam1Pipeline` 的 batch post-processor，也能接收用户自行创建或
 修改后的记录。
 
 `MemoryBamInput::OpenMemoryCopy()` 可把完整内存 BAM 重新作为下一阶段输入，形成
-`memory input -> generic decode/raw view -> memory writer -> memory input` 闭环。当前
+`memory input -> composable decode/raw view -> memory writer -> memory input` 闭环。当前
 chunk source 到 write pipeline input 尚有一次 block copy；MPI-IO output backend
 尚未实现。sort、markdup 等命令仍可提供专用 rewrite+pack+compress 融合算子，
 避免为了通用接口强制落地中间 record batch。
@@ -256,13 +266,13 @@ chunk source 到 write pipeline input 尚有一次 block copy；MPI-IO output ba
 - `MemoryBamOutput`：默认模拟高速存储，支持 reserve、连续 append 和完整内存 BAM；
 - `PosixBamOutput`：真实顺序文件输出，为后续高速 SSD/并行文件系统保留直接路径。
 
-`RawBamWriter`、BGZF block consumer、BAM2BAM rank-local body append 和最终 memory
+`RawBamWriter`、BGZF block batch post-processor、BAM2BAM rank-local body append 和最终 memory
 dump 已经通过该接口。BAM2BAM 使用一个只包装既有 `MemWriter` 的 adapter，因此
 rank gather/layout 完全不变；实测 backend 化前后 `4.3` 只相差约 0.15%。
 
-## 通用过滤与专用过滤
+## Composable 过滤与 Optimized 过滤
 
-`RawBamFilterConsumer` 是由公共库构建的第一个通用 BAM 应用算子。它直接从 raw
+`RawBamFilterBatchPostProcessor` 是由公共库构建的第一个 Composable BAM 应用算子。它直接从 raw
 BAM mandatory fields 读取 `tid/MAPQ/FLAG/l_qseq`，不构造 `bam1_t`；通过的记录
 仍以 `RawBamRecordView` 交给下游，因此 aux、序列、质量值等 payload 不发生重建。
 它可连接 `RawBamWriter`，并按配置使用 memory 或 POSIX output backend。
@@ -270,8 +280,9 @@ BAM mandatory fields 读取 `tid/MAPQ/FLAG/l_qseq`，不构造 `bam1_t`；通过
 默认 BAM2BAM 命令没有因此降级。其
 `slave_mpi_decompress_filterfunc` 和 passthrough 入口作为专用融合算子保留在
 `swbam_cpe_operator_objects`，CPE 一次完成 decode+parse+filter，主机继续使用成熟的
-flat pack 与 record serialize+compress 路径。通用算子用于快速构建实例和功能验证，
-专用算子用于论文性能结果；二者共享 codec、parser、backend 和数据语义。
+flat pack 与 record serialize+compress 路径。Composable operator 用于快速构建实例和
+功能验证，Optimized operator 用于论文性能结果；二者共享 codec、parser、backend
+和数据语义。
 
 `io-check` 分两层验证写流水线：确定性合成 payload 用来检查 BSIZE、ISIZE、CRC
 和逐字节内容；真实 BAM 回环则重新序列化 header、打包全部 raw records、CPE 压缩
@@ -285,7 +296,7 @@ flat pack 与 record serialize+compress 路径。通用算子用于快速构建�
 `MpiBamInputPlan` 的全局 BGZF 索引与 rank 分区，但热路径有意保留两种实现：
 
 - memory backend 直接将该 rank 的连续 BGZF 窗口交给原
-  `FusedBamToBamMPI`，不新增逐 block 拷贝；
+  `OptimizedBamToBamMPI`，不新增逐 block 拷贝；
 - POSIX backend 在同一个融合核心内通过 `ReadBatch`/`preadv` 将每批 BGZF
   block 直接读入既有 CPE input slots，工作内存不随输入文件增长。
 - MPI-IO backend 使用派生 memory datatype 在一次 `MPI_File_read_at` 中将连续
@@ -358,12 +369,12 @@ spool/auto 要求显式提供 `--rank-body-temp-dir`，例如
 
 - BAM→BAM：使用 `BamInputBackend + MpiBamInputPlan`，保留专用 CPE
   decode/filter/compress 融合算子；
-- BAM→SAM：`FusedBamToSamMPI` 提供 `MemReader` 和
+- BAM→SAM：`OptimizedBamToSamMPI` 提供 `MemReader` 和
   `BamInputBackend + spans` 两个入口，memory 继续走原路径，POSIX/MPI-IO
   按 batch 读取，格式化 CPE kernel 不变；
 - SAM→BAM：memory 保留原完整内存模拟，显式 `posix/mpiio` 时使用
-  `SamInputBackend` 仅读本 rank 范围，然后交给原 CPE copy/count/parse/compress
-  融合路径。SAM 的 `auto` 保守选择 POSIX streaming，避免大文本在每 rank
+  `SamInputBackend` 仅读本 rank 范围，然后交给原 Optimized path 的 CPE
+  copy/count/parse/compress fused kernel。SAM 的 `auto` 保守选择 POSIX streaming，避免大文本在每 rank
   上完整复制；要求 memory 模拟时需显式使用默认 `memory`。
 
 三种转换的最终 memory gather 与 MPI-IO offset write 由同一布局逻辑处理。
@@ -412,16 +423,16 @@ run/segment；`--rank-body-temp-dir` 只管理最终压缩 body 的 spool。两�
 - 独立的 CPE BGZF codec/cache 和 raw BAM fast parser object target；
 - 独立的 CPE operator object target，以及 `flagstat`、`stats --basic` 两个融合
   算子实例。
-- `GenericDecodeOperator`、`DecodedBgzfConsumer` 和可运行的 `io-check` 通用解码
+- `ComposableDecodeOperator`、`DecodedBgzfBatchPostProcessor` 和可运行的 `io-check` 通用解码
   实例。
-- `RawBamRecordView`、`RawBamRecordConsumer` 和通用 raw BAM batch adapter。
-- `CpeWritePipeline`、`GenericCompressOperator` 和通用 source/consumer 接口。
+- `RawBamRecordView`、`RawBamBatchPostProcessor` 和通用 raw BAM batch adapter。
+- `CpeWritePipeline`、`ComposableCompressOperator` 和通用 source/batch post-processor 接口。
 - `RawBamWriter`、标准 BAM header/EOF 序列化、`MemoryBamOutput` 与
   `PosixBamOutput`；完整内存
   BAM 可以通过 `OpenMemoryCopy()` 再次进入读流水线。
-- `Bam1RecordConsumer`、批量 `bam1_t` 物化 adapter 与 `Bam1Writer`，形成兼容
+- `Bam1BatchPostProcessor`、批量 `bam1_t` 物化 adapter 与 `Bam1Writer`，形成兼容
   HTSlib accessor 的通用对象级读写闭环。
-- `RawBamFilterConsumer` 通用二进制过滤算子，以及独立的 BAM2BAM CPE 融合
+- `RawBamFilterBatchPostProcessor` 通用二进制过滤算子，以及独立的 BAM2BAM CPE 融合
   filter/passthrough operator。
 - BAM2BAM 命令的 `memory|posix|mpiio|auto` 输入选择；memory 继续使用
   连续窗口快速路径，POSIX/MPI-IO 使用有界 batch 读取。

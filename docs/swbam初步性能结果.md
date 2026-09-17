@@ -33,7 +33,7 @@
 | markdup workspace 峰值 | 333.12 MB | 106.63 MB | 降低约 68% |
 | collate 外排优化 | 1.550668 | 1.365146 | 1.136x，耗时下降约 12.0% |
 | overlap 关闭 -> 开启 |  |  | 待正式 A/B 测试 |
-| generic -> fused operator |  |  | 待同工作量 A/B 测试 |
+| composable -> optimized operator |  |  | 待同工作量 A/B 测试 |
 
 ## 应用性能
 

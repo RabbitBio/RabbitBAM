@@ -24,7 +24,7 @@ BamRead::BamRead(int blocks_size, int queue_size) {
     con_queueSizeLim = queue_size + 5; // 多留一些空间
     con_bg = 1;
     con_ed = 0;
-    consumer_queue_ = new std::vector<bam_block*>[con_queueSizeLim];
+    post_process_queue_ = new std::vector<bam_block*>[con_queueSizeLim];
 
     read_complete = false;
 }
@@ -47,11 +47,11 @@ BamRead:: ~BamRead() {
             readBlock = nullptr;
         }
 
-        // 释放 consumer_queue_
-        if (consumer_queue_) {
+        // 释放 post_process_queue_
+        if (post_process_queue_) {
             // 不需要手动清理 vector 内指针，假设外部会处理 bam_block 指针生命周期
-            delete[] consumer_queue_;
-            consumer_queue_ = nullptr;
+            delete[] post_process_queue_;
+            post_process_queue_ = nullptr;
         }
 }
 
@@ -76,7 +76,7 @@ void BamRead::backBlock(bam_block *block) {
 
 void BamRead::inputBlock64(std::vector<bam_block*>& group) {
     //先+1再放入
-    consumer_queue_[(con_ed + 1) % con_queueSizeLim] = std::move(group);
+    post_process_queue_[(con_ed + 1) % con_queueSizeLim] = std::move(group);
     con_ed = (con_ed + 1) % con_queueSizeLim;
 }
 
@@ -89,7 +89,7 @@ std::vector<bam_block*> BamRead::getBlock64() {
     //先取再+1
     int num = con_bg;
     con_bg = (con_bg + 1) % con_queueSizeLim;
-    return std::move(consumer_queue_[num]);
+    return std::move(post_process_queue_[num]);
 }
 
 bool BamRead::isComplete() const {

@@ -7,19 +7,20 @@
 
 - `swbam.h`：公共总入口。
 - `io.h`：BAM/SAM backend、BGZF batch、输出 backend 和 RankBodySink。
-- `raw_bam.h`：零拷贝 `RawBamRecordView`、consumer 和通用 raw pipeline。
-- `bam1.h`：批量 `bam1_t` consumer；在 MPE 上物化标准 HTSlib 记录，适合直接
+- `raw_bam.h`：零拷贝 `RawBamRecordView`、batch post-processor 和 Composable raw
+  pipeline。
+- `bam1.h`：批量 `bam1_t` batch post-processor；在 MPE 上物化标准 HTSlib 记录，适合直接
   使用 QNAME/CIGAR/SEQ/QUAL/AUX accessor 的应用。
-- `bam1_writer.h`：把标准 `bam1_t` 批量编码为 raw BAM record，并复用通用 BGZF
+- `bam1_writer.h`：把标准 `bam1_t` 批量编码为 raw BAM record，并复用 Composable BGZF
   writer/compression pipeline 写出完整 BAM。
-- `raw_bam_filter.h`：通用过滤 consumer。
+- `raw_bam_filter.h`：Composable 过滤 batch post-processor。
 - `raw_bam_writer.h`：Raw BAM pack、压缩和完整 BAM writer。
 - `mpi_runtime.h`：MPI input plan、MPI-IO 和分布式 BAM 输出。
 
 ## 流水线扩展接口
 
-- `cpe_pipeline.h`、`generic_decode.h`：CPE 读取、解压和批级 operator。
-- `cpe_write_pipeline.h`、`generic_compress.h`：CPE 压缩和输出流水。
+- `cpe_pipeline.h`、`composable_decode.h`：CPE 读取、解压和批级 operator。
+- `cpe_write_pipeline.h`、`composable_compress.h`：CPE 压缩和输出流水。
 
 ## 底层/高级接口
 

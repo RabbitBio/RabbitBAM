@@ -1,4 +1,4 @@
-#include "swbam/generic_decode.h"
+#include "swbam/composable_decode.h"
 #include "swbam/cpe_codec.h"
 
 #include <cstdio>
@@ -10,22 +10,22 @@ namespace swbam {
 namespace cpe {
 namespace {
 
-const size_t kGenericDecodeBatch = 64;
+const size_t kComposableDecodeBatch = 64;
 
-class GenericDecodeOperator : public CpeBatchOperator {
+class ComposableDecodeOperator : public CpeBatchOperator {
 public:
-    GenericDecodeOperator(DecodedBgzfConsumer *consumer,
-                          GenericDecodeMetrics *metrics)
-        : consumer_(consumer), metrics_(metrics), decoded_(nullptr) {
+    ComposableDecodeOperator(DecodedBgzfBatchPostProcessor *post_processor,
+                          ComposableDecodeMetrics *metrics)
+        : post_processor_(post_processor), metrics_(metrics), decoded_(nullptr) {
         memset(paras_, 0, sizeof(paras_));
     }
 
-    const char *name() const { return "generic-decode"; }
-    size_t batch_capacity() const { return kGenericDecodeBatch; }
+    const char *name() const { return "composable-decode"; }
+    size_t batch_capacity() const { return kComposableDecodeBatch; }
 
     int Initialize() {
-        if (!consumer_) return -1;
-        if (metrics_) *metrics_ = GenericDecodeMetrics();
+        if (!post_processor_) return -1;
+        if (metrics_) *metrics_ = ComposableDecodeMetrics();
         return 0;
     }
     void Shutdown() { decoded_ = nullptr; }
@@ -34,7 +34,7 @@ public:
                 BgzfBlockBatch *decoded,
                 size_t active_blocks) {
         decoded_ = decoded;
-        for (size_t i = 0; i < kGenericDecodeBatch; ++i) {
+        for (size_t i = 0; i < kComposableDecodeBatch; ++i) {
             SwbamCpeDecodePara &para = paras_[i];
             para.alloc_cycles = 0;
             para.inflate_cycles = 0;
@@ -89,7 +89,7 @@ public:
         for (size_t i = 0; i < active_blocks; ++i) {
             if (paras_[i].status != 0) {
                 fprintf(stderr,
-                        "ERROR: generic BGZF decode failed on block %zu with status %d.\n",
+                        "ERROR: composable BGZF decode failed on block %zu with status %d.\n",
                         i, paras_[i].status);
                 return -1;
             }
@@ -97,7 +97,7 @@ public:
         return 0;
     }
 
-    int Consume(size_t active_blocks, long long *records_processed) {
+    int PostProcessBatch(size_t active_blocks, long long *records_processed) {
         if (!decoded_) return -1;
         if (metrics_) {
             metrics_->decoded_blocks += (long long)active_blocks;
@@ -106,33 +106,33 @@ public:
             }
         }
         if (records_processed) *records_processed = 0;
-        return consumer_->ConsumeDecoded(decoded_->blocks(), active_blocks);
+        return post_processor_->PostProcessDecodedBatch(decoded_->blocks(), active_blocks);
     }
 
     int Finish() { return 0; }
 
 private:
-    DecodedBgzfConsumer *consumer_;
-    GenericDecodeMetrics *metrics_;
+    DecodedBgzfBatchPostProcessor *post_processor_;
+    ComposableDecodeMetrics *metrics_;
     BgzfBlockBatch *decoded_;
-    SwbamCpeDecodePara paras_[kGenericDecodeBatch];
+    SwbamCpeDecodePara paras_[kComposableDecodeBatch];
 };
 
 } // namespace
 
-GenericDecodeMetrics::GenericDecodeMetrics()
+ComposableDecodeMetrics::ComposableDecodeMetrics()
     : decoded_blocks(0), decoded_bytes(0), alloc(0.0),
       inflate(0.0), crc(0.0), other(0.0) {}
 
-int RunGenericDecodePipeline(
+int RunComposableDecodePipeline(
         const BamInputBackend &input,
         const BgzfBlockSpan *spans,
         size_t span_count,
-        DecodedBgzfConsumer *consumer,
+        DecodedBgzfBatchPostProcessor *post_processor,
         CpeReadPipelineTiming *timing,
-        GenericDecodeMetrics *metrics,
+        ComposableDecodeMetrics *metrics,
         const CpeReadPipelineOptions &options) {
-    GenericDecodeOperator op(consumer, metrics);
+    ComposableDecodeOperator op(post_processor, metrics);
     return RunCpeReadPipeline(
         input, spans, span_count, &op, timing, options);
 }

@@ -1,5 +1,5 @@
 #include "swbam_mpi.h"
-#include "swbam/generic_compress.h"
+#include "swbam/composable_compress.h"
 #include "swbam/io.h"
 #include "swbam/mpi_runtime.h"
 #include "swbam/raw_bam.h"
@@ -16,11 +16,11 @@
 
 namespace {
 
-class DecodeCheckConsumer : public swbam::cpe::RawBamRecordConsumer {
+class DecodeCheckBatchPostProcessor : public swbam::cpe::RawBamBatchPostProcessor {
 public:
-    DecodeCheckConsumer() : records_(0), encoded_bytes_(0) {}
+    DecodeCheckBatchPostProcessor() : records_(0), encoded_bytes_(0) {}
 
-    int ConsumeRaw(const swbam::cpe::RawBamRecordView *records,
+    int PostProcessRawBatch(const swbam::cpe::RawBamRecordView *records,
                    size_t count) {
         if (!records && count != 0) return -1;
         for (size_t i = 0; i < count; ++i) {
@@ -84,16 +84,16 @@ uint32_t ReadLe32(const unsigned char *data) {
            ((uint32_t)data[3] << 24);
 }
 
-class VerifyingBgzfConsumer : public swbam::cpe::CompressedBgzfConsumer {
+class VerifyingBgzfBatchPostProcessor : public swbam::cpe::CompressedBgzfBatchPostProcessor {
 public:
-    VerifyingBgzfConsumer()
+    VerifyingBgzfBatchPostProcessor()
         : decompressor_(libdeflate_alloc_decompressor()), blocks_(0),
           bytes_(0), scratch_(BGZF_MAX_BLOCK_SIZE) {}
-    ~VerifyingBgzfConsumer() {
+    ~VerifyingBgzfBatchPostProcessor() {
         if (decompressor_) libdeflate_free_decompressor(decompressor_);
     }
 
-    int ConsumeCompressed(const bam_block *blocks, size_t count) {
+    int PostProcessCompressedBatch(const bam_block *blocks, size_t count) {
         if (!decompressor_ || (!blocks && count != 0)) return -1;
         for (size_t i = 0; i < count; ++i) {
             const bam_block &block = blocks[i];
@@ -251,12 +251,12 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
     int local_ok = 1;
     swbam::MemoryBamInput input;
     swbam::mpi::MpiBamInputPlan plan;
-    DecodeCheckConsumer consumer;
+    DecodeCheckBatchPostProcessor post_processor;
     swbam::cpe::CpeReadPipelineTiming timing;
-    swbam::cpe::GenericDecodeMetrics metrics;
-    swbam::cpe::GenericRawBamMetrics raw_metrics;
+    swbam::cpe::ComposableDecodeMetrics metrics;
+    swbam::cpe::ComposableRawBamMetrics raw_metrics;
     swbam::cpe::CpeWritePipelineTiming write_timing;
-    swbam::cpe::GenericCompressMetrics compress_metrics;
+    swbam::cpe::ComposableCompressMetrics compress_metrics;
 
     if (!cmd_info || input.Load(cmd_info->in_file_name_) != 0 ||
         input.ParseHeader() != 0 || input.format() != bam) {
@@ -269,12 +269,12 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
     }
     if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
 
-    if (swbam::cpe::RunGenericRawBamPipeline(
+    if (swbam::cpe::RunComposableRawBamPipeline(
             input, plan.rank_spans(), plan.rank_block_count(),
-            &consumer, &timing, &metrics, &raw_metrics) != 0 ||
+            &post_processor, &timing, &metrics, &raw_metrics) != 0 ||
         metrics.decoded_blocks != (long long)plan.rank_block_count() ||
-        raw_metrics.records != consumer.records() ||
-        raw_metrics.encoded_bytes != consumer.encoded_bytes() ||
+        raw_metrics.records != post_processor.records() ||
+        raw_metrics.encoded_bytes != post_processor.encoded_bytes() ||
         raw_metrics.encoded_bytes != metrics.decoded_bytes) {
         local_ok = 0;
     }
@@ -283,22 +283,22 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
     {
         long long local_values[3] = {
             metrics.decoded_blocks, metrics.decoded_bytes,
-            consumer.records()
+            post_processor.records()
         };
         long long global_values[3] = {};
         MPI_Reduce(local_values, global_values, 3, MPI_LONG_LONG,
                    MPI_SUM, 0, MPI_COMM_WORLD);
         const double max_total = swbam::mpi::ReduceMaxCost(timing.total);
         const double max_kernel = swbam::mpi::ReduceMaxCost(timing.kernel);
-        const double max_consume = swbam::mpi::ReduceMaxCost(timing.consume);
+        const double max_post_process = swbam::mpi::ReduceMaxCost(timing.post_process);
         if (rank == 0) {
             const long long expected_blocks =
                 (long long)plan.blocks.size();
-            printf("SWBAM generic raw BAM check finished. ranks=%d blocks=%lld expected=%lld decoded_bytes=%lld records=%lld\n",
+            printf("SWBAM composable raw BAM check finished. ranks=%d blocks=%lld expected=%lld decoded_bytes=%lld records=%lld\n",
                    comm_size, global_values[0], expected_blocks,
                    global_values[1], global_values[2]);
-            printf("  pipeline_max=%.6f kernel_max=%.6f consume_max=%.6f\n",
-                   max_total, max_kernel, max_consume);
+            printf("  pipeline_max=%.6f kernel_max=%.6f post_process_max=%.6f\n",
+                   max_total, max_kernel, max_post_process);
             if (global_values[0] != expected_blocks) local_ok = 0;
         }
         MPI_Bcast(&local_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -308,10 +308,10 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
     {
         swbam::PosixBamInput posix_input;
         swbam::mpi::MpiBamInputPlan posix_plan;
-        DecodeCheckConsumer posix_consumer;
+        DecodeCheckBatchPostProcessor posix_post_processor;
         swbam::cpe::CpeReadPipelineTiming posix_timing;
-        swbam::cpe::GenericDecodeMetrics posix_decode_metrics;
-        swbam::cpe::GenericRawBamMetrics posix_raw_metrics;
+        swbam::cpe::ComposableDecodeMetrics posix_decode_metrics;
+        swbam::cpe::ComposableRawBamMetrics posix_raw_metrics;
 
         if (posix_input.Open(cmd_info->in_file_name_) != 0 ||
             posix_input.format() != bam ||
@@ -335,9 +335,9 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
         }
         if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
 
-        if (swbam::cpe::RunGenericRawBamPipeline(
+        if (swbam::cpe::RunComposableRawBamPipeline(
                 posix_input, posix_plan.rank_spans(),
-                posix_plan.rank_block_count(), &posix_consumer,
+                posix_plan.rank_block_count(), &posix_post_processor,
                 &posix_timing, &posix_decode_metrics,
                 &posix_raw_metrics) != 0 ||
             posix_decode_metrics.decoded_blocks !=
@@ -345,8 +345,8 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
             posix_decode_metrics.decoded_bytes != metrics.decoded_bytes ||
             posix_raw_metrics.records != raw_metrics.records ||
             posix_raw_metrics.encoded_bytes != raw_metrics.encoded_bytes ||
-            posix_consumer.records() != consumer.records() ||
-            posix_consumer.encoded_bytes() != consumer.encoded_bytes()) {
+            posix_post_processor.records() != post_processor.records() ||
+            posix_post_processor.encoded_bytes() != post_processor.encoded_bytes()) {
             local_ok = 0;
         }
         if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
@@ -374,10 +374,10 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
     {
         swbam::mpi::MpiIoBamInput mpiio_input;
         swbam::mpi::MpiBamInputPlan mpiio_plan;
-        DecodeCheckConsumer mpiio_consumer;
+        DecodeCheckBatchPostProcessor mpiio_post_processor;
         swbam::cpe::CpeReadPipelineTiming mpiio_timing;
-        swbam::cpe::GenericDecodeMetrics mpiio_decode_metrics;
-        swbam::cpe::GenericRawBamMetrics mpiio_raw_metrics;
+        swbam::cpe::ComposableDecodeMetrics mpiio_decode_metrics;
+        swbam::cpe::ComposableRawBamMetrics mpiio_raw_metrics;
 
         if (mpiio_input.Open(cmd_info->in_file_name_) != 0 ||
             mpiio_input.format() != bam ||
@@ -401,17 +401,17 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
         }
         if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
 
-        if (swbam::cpe::RunGenericRawBamPipeline(
+        if (swbam::cpe::RunComposableRawBamPipeline(
                 mpiio_input, mpiio_plan.rank_spans(),
-                mpiio_plan.rank_block_count(), &mpiio_consumer,
+                mpiio_plan.rank_block_count(), &mpiio_post_processor,
                 &mpiio_timing, &mpiio_decode_metrics,
                 &mpiio_raw_metrics) != 0 ||
             mpiio_decode_metrics.decoded_blocks != metrics.decoded_blocks ||
             mpiio_decode_metrics.decoded_bytes != metrics.decoded_bytes ||
             mpiio_raw_metrics.records != raw_metrics.records ||
             mpiio_raw_metrics.encoded_bytes != raw_metrics.encoded_bytes ||
-            mpiio_consumer.records() != consumer.records() ||
-            mpiio_consumer.encoded_bytes() != consumer.encoded_bytes()) {
+            mpiio_post_processor.records() != post_processor.records() ||
+            mpiio_post_processor.encoded_bytes() != post_processor.encoded_bytes()) {
             local_ok = 0;
         }
         if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
@@ -439,14 +439,14 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
     {
         const int synthetic_blocks = 128;
         SyntheticBgzfSource source(synthetic_blocks);
-        VerifyingBgzfConsumer write_consumer;
-        if (swbam::cpe::RunGenericCompressPipeline(
-                &source, &write_consumer, 1,
+        VerifyingBgzfBatchPostProcessor write_post_processor;
+        if (swbam::cpe::RunComposableCompressPipeline(
+                &source, &write_post_processor, 1,
                 &write_timing, &compress_metrics) != 0 ||
-            write_consumer.blocks() != synthetic_blocks ||
+            write_post_processor.blocks() != synthetic_blocks ||
             write_timing.input_blocks != synthetic_blocks ||
             write_timing.output_blocks != synthetic_blocks ||
-            write_timing.output_bytes != write_consumer.bytes()) {
+            write_timing.output_bytes != write_post_processor.bytes()) {
             local_ok = 0;
         }
         if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
@@ -456,9 +456,9 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
         const double compress_max =
             swbam::mpi::ReduceMaxCost(write_timing.kernel);
         const double output_max =
-            swbam::mpi::ReduceMaxCost(write_timing.consume);
+            swbam::mpi::ReduceMaxCost(write_timing.post_process);
         if (rank == 0) {
-            printf("SWBAM generic write check finished. blocks_per_rank=%d compression=1\n",
+            printf("SWBAM composable write check finished. blocks_per_rank=%d compression=1\n",
                    synthetic_blocks);
             printf("  pipeline_max=%.6f compress_max=%.6f output_verify_max=%.6f\n",
                    write_max, compress_max, output_max);
@@ -469,14 +469,14 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
         swbam::MemoryBamOutput roundtrip_output;
         swbam::cpe::RawBamMemoryWriter writer;
         swbam::cpe::CpeReadPipelineTiming roundtrip_read_timing;
-        swbam::cpe::GenericDecodeMetrics roundtrip_decode_metrics;
-        swbam::cpe::GenericRawBamMetrics roundtrip_raw_metrics;
+        swbam::cpe::ComposableDecodeMetrics roundtrip_decode_metrics;
+        swbam::cpe::ComposableRawBamMetrics roundtrip_raw_metrics;
         const size_t reserve_size = input.size() /
             (size_t)(comm_size > 0 ? comm_size : 1) + 1024 * 1024;
         if (roundtrip_output.Reserve(reserve_size) != 0 ||
             writer.InitializeBam(
                 &roundtrip_output, input.header(), 1, 256) != 0 ||
-            swbam::cpe::RunGenericRawBamPipeline(
+            swbam::cpe::RunComposableRawBamPipeline(
                 input, plan.rank_spans(), plan.rank_block_count(),
                 &writer, &roundtrip_read_timing,
                 &roundtrip_decode_metrics, &roundtrip_raw_metrics) != 0 ||
@@ -523,25 +523,25 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
 
         swbam::MemoryBamOutput filtered_output;
         swbam::cpe::RawBamMemoryWriter writer;
-        swbam::cpe::RawBamFilterConsumer filter_consumer(filter, &writer);
+        swbam::cpe::RawBamFilterBatchPostProcessor filter_post_processor(filter, &writer);
         swbam::cpe::CpeReadPipelineTiming filter_timing;
-        swbam::cpe::GenericDecodeMetrics filter_decode_metrics;
-        swbam::cpe::GenericRawBamMetrics filter_raw_metrics;
+        swbam::cpe::ComposableDecodeMetrics filter_decode_metrics;
+        swbam::cpe::ComposableRawBamMetrics filter_raw_metrics;
         const size_t reserve_size = input.size() /
             (size_t)(comm_size > 0 ? comm_size : 1) + 1024 * 1024;
         if (filtered_output.Reserve(reserve_size) != 0 ||
             writer.InitializeBam(
                 &filtered_output, input.header(), 1, 256) != 0 ||
-            swbam::cpe::RunGenericRawBamPipeline(
+            swbam::cpe::RunComposableRawBamPipeline(
                 input, plan.rank_spans(), plan.rank_block_count(),
-                &filter_consumer, &filter_timing,
+                &filter_post_processor, &filter_timing,
                 &filter_decode_metrics, &filter_raw_metrics) != 0 ||
             writer.Finish(true) != 0 ||
-            filter_consumer.metrics().total_records !=
+            filter_post_processor.metrics().total_records !=
                 filter_raw_metrics.records ||
-            filter_consumer.metrics().kept_records !=
+            filter_post_processor.metrics().kept_records !=
                 writer.metrics().records ||
-            filter_consumer.metrics().kept_bytes !=
+            filter_post_processor.metrics().kept_bytes !=
                 writer.metrics().raw_bytes ||
             VerifyMemoryBam(
                 filtered_output, input.header(),
@@ -552,20 +552,20 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
         if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
 
         long long local_filter[4] = {
-            filter_consumer.metrics().total_records,
-            filter_consumer.metrics().kept_records,
-            filter_consumer.metrics().dropped_records,
+            filter_post_processor.metrics().total_records,
+            filter_post_processor.metrics().kept_records,
+            filter_post_processor.metrics().dropped_records,
             (long long)filtered_output.size()
         };
         long long global_filter[4] = {};
         MPI_Reduce(local_filter, global_filter, 4, MPI_LONG_LONG,
                    MPI_SUM, 0, MPI_COMM_WORLD);
         const double filter_max = swbam::mpi::ReduceMaxCost(
-            filter_consumer.metrics().filter);
+            filter_post_processor.metrics().filter);
         const double pipeline_max =
             swbam::mpi::ReduceMaxCost(filter_timing.total);
         if (rank == 0) {
-            printf("SWBAM generic BAM filter check finished. min_mapq=30 total=%lld kept=%lld dropped=%lld output_bytes=%lld\n",
+            printf("SWBAM composable BAM filter check finished. min_mapq=30 total=%lld kept=%lld dropped=%lld output_bytes=%lld\n",
                    global_filter[0], global_filter[1],
                    global_filter[2], global_filter[3]);
             printf("  pipeline_max=%.6f filter_max=%.6f\n",

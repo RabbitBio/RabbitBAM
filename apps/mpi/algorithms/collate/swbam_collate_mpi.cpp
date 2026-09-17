@@ -1405,7 +1405,7 @@ static int CollateCompressStream(
     /*
      * A one-record lookahead is needed when the next record does not fit
      * in the current BGZF payload. Wrap the source once so fill() never
-     * consumes a record it cannot place.
+     * post_processs a record it cannot place.
      */
     const unsigned char *held_record = nullptr;
     uint32_t held_length = 0;
@@ -3428,7 +3428,7 @@ static int CollateMergeExternal(
     return ret;
 }
 
-static int FusedBamExternalCollateMPIImpl(
+static int OptimizedBamExternalCollateMPIImpl(
         MemReader *reader,
         const swbam::BamInputBackend *input,
         const swbam::BgzfBlockSpan *spans,
@@ -3587,32 +3587,32 @@ static int FusedBamExternalCollateMPIImpl(
 cleanup:
     stats->t_actual = GetTime() - wall_t0;
     // Real temp I/O is removed; CollateSimulateCopy runs outside the
-    // measured syscalls, so its memory-copy cost remains in t_fused.
-    stats->t_fused =
+    // measured syscalls, so its memory-copy cost remains in t_optimized.
+    stats->t_optimized =
         stats->t_actual -
         stats->t_temp_read_actual -
         stats->t_temp_write_actual;
-    if (stats->t_fused < 0.0) stats->t_fused = 0.0;
+    if (stats->t_optimized < 0.0) stats->t_optimized = 0.0;
     CollateCloseTemp(&store);
     if (arena.data) aligned_free_custom(arena.data);
     if (scratch) aligned_free_custom(scratch);
     return result;
 }
 
-static int FusedBamExternalCollateMPI(
+static int OptimizedBamExternalCollateMPI(
         MemReader &reader, swbam::RankBodySink &body_sink,
         long long global_block_begin,
         int rank, int comm_size, int bins,
         int compress_level, size_t memory_limit,
         const std::string &temp_prefix,
         MpiCollateStats *stats) {
-    return FusedBamExternalCollateMPIImpl(
+    return OptimizedBamExternalCollateMPIImpl(
         &reader, nullptr, nullptr, 0, reader.size, body_sink,
         global_block_begin, rank, comm_size, bins,
         compress_level, memory_limit, temp_prefix, stats);
 }
 
-static int FusedBamExternalCollateMPI(
+static int OptimizedBamExternalCollateMPI(
         const swbam::BamInputBackend &input,
         const swbam::BgzfBlockSpan *spans, size_t span_count,
         size_t compressed_input_size,
@@ -3622,14 +3622,14 @@ static int FusedBamExternalCollateMPI(
         int compress_level, size_t memory_limit,
         const std::string &temp_prefix,
         MpiCollateStats *stats) {
-    return FusedBamExternalCollateMPIImpl(
+    return OptimizedBamExternalCollateMPIImpl(
         nullptr, &input, spans, span_count,
         compressed_input_size, body_sink,
         global_block_begin, rank, comm_size, bins,
         compress_level, memory_limit, temp_prefix, stats);
 }
 
-static int FusedBamMemoryCollateMPIImpl(
+static int OptimizedBamMemoryCollateMPIImpl(
         MemReader *reader,
         const swbam::BamInputBackend *input,
         const swbam::BgzfBlockSpan *spans,
@@ -3732,23 +3732,23 @@ static int FusedBamMemoryCollateMPIImpl(
         return -1;
     }
     stats->t_actual = GetTime() - wall_t0;
-    stats->t_fused = stats->t_actual;
+    stats->t_optimized = stats->t_actual;
     return 0;
 }
 
-static int FusedBamMemoryCollateMPI(
+static int OptimizedBamMemoryCollateMPI(
         MemReader &reader, swbam::RankBodySink &body_sink,
         long long global_block_begin,
         int rank, int comm_size, int bins,
         int compress_level, size_t memory_limit,
         MpiCollateStats *stats) {
-    return FusedBamMemoryCollateMPIImpl(
+    return OptimizedBamMemoryCollateMPIImpl(
         &reader, nullptr, nullptr, 0, body_sink,
         global_block_begin, rank, comm_size, bins,
         compress_level, memory_limit, stats);
 }
 
-static int FusedBamMemoryCollateMPI(
+static int OptimizedBamMemoryCollateMPI(
         const swbam::BamInputBackend &input,
         const swbam::BgzfBlockSpan *spans, size_t span_count,
         swbam::RankBodySink &body_sink,
@@ -3756,25 +3756,25 @@ static int FusedBamMemoryCollateMPI(
         int rank, int comm_size, int bins,
         int compress_level, size_t memory_limit,
         MpiCollateStats *stats) {
-    return FusedBamMemoryCollateMPIImpl(
+    return OptimizedBamMemoryCollateMPIImpl(
         nullptr, &input, spans, span_count, body_sink,
         global_block_begin, rank, comm_size, bins,
         compress_level, memory_limit, stats);
 }
 
-static int FusedBamMemoryCollateMPI(
+static int OptimizedBamMemoryCollateMPI(
         MemReader &reader, MemWriter &writer,
         long long global_block_begin,
         int rank, int comm_size, int bins,
         int compress_level, size_t memory_limit,
         MpiCollateStats *stats) {
     swbam::MemoryRankBodySink body_sink(&writer);
-    return FusedBamMemoryCollateMPI(
+    return OptimizedBamMemoryCollateMPI(
         reader, body_sink, global_block_begin, rank, comm_size,
         bins, compress_level, memory_limit, stats);
 }
 
-static int FusedBamExternalCollateMPI(
+static int OptimizedBamExternalCollateMPI(
         MemReader &reader, MemWriter &writer,
         long long global_block_begin,
         int rank, int comm_size, int bins,
@@ -3782,7 +3782,7 @@ static int FusedBamExternalCollateMPI(
         const std::string &temp_prefix,
         MpiCollateStats *stats) {
     swbam::MemoryRankBodySink body_sink(&writer);
-    return FusedBamExternalCollateMPI(
+    return OptimizedBamExternalCollateMPI(
         reader, body_sink, global_block_begin, rank, comm_size,
         bins, compress_level, memory_limit, temp_prefix, stats);
 }
@@ -3806,7 +3806,7 @@ static void CollatePrintStats(
         stats.t_temp_write_sim +
         stats.t_temp_read_sim;
     const double unaccounted =
-        stats.t_fused - accounted;
+        stats.t_optimized - accounted;
     char local[8192] = {};
     snprintf(
         local, sizeof(local),
@@ -3816,7 +3816,7 @@ static void CollatePrintStats(
         "[rank %d] collate_time extract=%.3f sort=%.3f "
         "exchange=%.3f merge_wall=%.3f compress_pipeline=%.3f "
         "compress_fill=%.3f write=%.3f accounted=%.3f "
-        "unaccounted=%.3f fused=%.3f actual=%.3f\n"
+        "unaccounted=%.3f optimized=%.3f actual=%.3f\n"
         "[rank %d] collate_extract alloc=%.3f read=%.3f "
         "raw_resize=%.3f setup=%.3f cpe=%.3f status=%.3f "
         "merge=%.3f free=%.3f memory_track=%.3f\n"
@@ -3841,7 +3841,7 @@ static void CollatePrintStats(
         stats.t_exchange, stats.t_merge,
         stats.t_compress, stats.t_compress_fill,
         stats.t_write, accounted, unaccounted,
-        stats.t_fused,
+        stats.t_optimized,
         stats.t_actual,
         rank, stats.t_extract_alloc,
         stats.t_extract_read,
@@ -3932,7 +3932,7 @@ static void CollatePrintStats(
         stats.t_temp_read_actual,
         stats.t_temp_write_sim,
         stats.t_temp_read_sim,
-        stats.t_fused,
+        stats.t_optimized,
         stats.t_actual,
         accounted,
         unaccounted
@@ -3970,7 +3970,7 @@ static void CollatePrintStats(
                       (double)exchange_raw
                 : 0.0;
         printf(
-            "FusedBamCollateMPI finished. mode=%s ranks=%d "
+            "OptimizedBamCollateMPI finished. mode=%s ranks=%d "
             "blocks=%lld records=%lld received=%lld groups=%lld "
             "collisions=%lld bgzf_blocks=%lld\n",
             stats.mode ? "external" : "memory",
@@ -3982,7 +3982,7 @@ static void CollatePrintStats(
             "  timing_sum extract=%.3f sort=%.3f exchange=%.3f "
             "mpi=%.3f merge_wall=%.3f compress_pipeline=%.3f "
             "compress_fill=%.3f write=%.3f accounted=%.3f "
-            "unaccounted=%.3f fused=%.3f actual=%.3f\n",
+            "unaccounted=%.3f optimized=%.3f actual=%.3f\n",
             global_double[0], global_double[8],
             global_double[9], global_double[10],
             global_double[17], global_double[18],
@@ -4002,7 +4002,7 @@ static void CollatePrintStats(
             "  timing_max extract=%.3f sort=%.3f exchange=%.3f "
             "mpi=%.3f merge_wall=%.3f compress_pipeline=%.3f "
             "compress_fill=%.3f write=%.3f accounted=%.3f "
-            "unaccounted=%.3f fused=%.3f actual=%.3f\n",
+            "unaccounted=%.3f optimized=%.3f actual=%.3f\n",
             max_double[0], max_double[8],
             max_double[9], max_double[10],
             max_double[17], max_double[18],
@@ -4277,7 +4277,7 @@ int MpiCollateMemoryToMemory(CmdInfo *cmd_info,
         if (!CollateAllRanksOk(local_ok)) goto cleanup;
 
         double t0 = GetTime();
-        int ret = FusedBamMemoryCollateMPI(
+        int ret = OptimizedBamMemoryCollateMPI(
             reader, writer, local_begin,
             rank, comm_size, collate_bins,
             cmd_info->compress_level_,
@@ -4289,9 +4289,9 @@ int MpiCollateMemoryToMemory(CmdInfo *cmd_info,
         double actual_max =
             CollateReduceMax(stats.t_actual);
         if (rank == 0 && global_ok) {
-            printf("Complete the 4.3 FusedBamCollateMPI cost %lf\n",
+            printf("Complete the 4.3 OptimizedBamCollateMPI cost %lf\n",
                    stage43_cost);
-            printf("FusedBamCollateMPI actual wall %lf\n",
+            printf("OptimizedBamCollateMPI actual wall %lf\n",
                    actual_max);
         }
         if (!global_ok) goto cleanup;
@@ -4620,24 +4620,24 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
         int ret = 0;
         if (memory_input) {
             ret = use_external
-                ? FusedBamExternalCollateMPI(
+                ? OptimizedBamExternalCollateMPI(
                       reader, rank_body_sink, local_begin,
                       rank, comm_size, collate_bins,
                       cmd_info->compress_level_, memory_limit,
                       temp_prefix, &stats)
-                : FusedBamMemoryCollateMPI(
+                : OptimizedBamMemoryCollateMPI(
                       reader, rank_body_sink, local_begin,
                       rank, comm_size, collate_bins,
                       cmd_info->compress_level_, memory_limit, &stats);
         } else {
             ret = use_external
-                ? FusedBamExternalCollateMPI(
+                ? OptimizedBamExternalCollateMPI(
                       *input_backend, input_plan.rank_spans(),
                       input_plan.rank_block_count(), rank_input_size,
                       rank_body_sink, local_begin, rank, comm_size,
                       collate_bins, cmd_info->compress_level_,
                       memory_limit, temp_prefix, &stats)
-                : FusedBamMemoryCollateMPI(
+                : OptimizedBamMemoryCollateMPI(
                       *input_backend, input_plan.rank_spans(),
                       input_plan.rank_block_count(), rank_body_sink,
                       local_begin, rank, comm_size, collate_bins,
@@ -4648,7 +4648,7 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
             CollateAllRanksOk(local_ok);
         double modeled =
             use_external
-                ? stats.t_fused
+                ? stats.t_optimized
                 : GetTime() - t0;
         double modeled_max =
             CollateReduceMax(modeled);
@@ -4657,10 +4657,10 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
         stage43_cost = modeled_max;
         if (rank == 0 && global_ok) {
             printf(
-                "Complete the 4.3 FusedBamCollateMPI cost %lf\n",
+                "Complete the 4.3 OptimizedBamCollateMPI cost %lf\n",
                 modeled_max);
             printf(
-                "FusedBamCollateMPI actual wall %lf\n",
+                "OptimizedBamCollateMPI actual wall %lf\n",
                 actual_max);
         }
         if (!global_ok) goto cleanup;

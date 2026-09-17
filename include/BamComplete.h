@@ -50,7 +50,7 @@ private:
     bam1_t  *pq_flat_;
     uint8_t *pq_data_;
 
-    bam1_t** consumer_queue_;
+    bam1_t** post_process_queue_;
     int con_bg;
     int con_ed;
     int con_queueSizeLim;

@@ -22,7 +22,7 @@ public:
     void markComplete();
 
 private:
-    std::vector<bam_block*> *consumer_queue_; 
+    std::vector<bam_block*> *post_process_queue_;
     int con_bg;
     int con_ed;
     int con_queueSizeLim;

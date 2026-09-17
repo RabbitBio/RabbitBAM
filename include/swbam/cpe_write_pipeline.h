@@ -15,7 +15,7 @@ struct CpeWritePipelineTiming {
     long long batch_count;
     double source;
     double kernel;
-    double consume;
+    double post_process;
     double total;
 
     CpeWritePipelineTiming();
@@ -33,11 +33,12 @@ public:
     virtual int Fill(BgzfBlockBatch *batch, size_t *count) = 0;
 };
 
-class CompressedBgzfConsumer {
+// MPE-side post-processing extension point for a compressed output batch.
+class CompressedBgzfBatchPostProcessor {
 public:
-    virtual ~CompressedBgzfConsumer() {}
-    virtual int ConsumeCompressed(const bam_block *blocks,
-                                  size_t count) = 0;
+    virtual ~CompressedBgzfBatchPostProcessor() {}
+    virtual int PostProcessCompressedBatch(const bam_block *blocks,
+                                           size_t count) = 0;
 };
 
 class CpeWriteBatchOperator {
@@ -62,7 +63,7 @@ public:
 
 int RunCpeWritePipeline(
     UncompressedBgzfSource *source,
-    CompressedBgzfConsumer *consumer,
+    CompressedBgzfBatchPostProcessor *post_processor,
     CpeWriteBatchOperator *op,
     CpeWritePipelineTiming *timing,
     const CpeWritePipelineOptions &options = CpeWritePipelineOptions());

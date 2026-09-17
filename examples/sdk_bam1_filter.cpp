@@ -60,15 +60,15 @@ struct FilterMetrics {
     FilterMetrics() : total(0), kept(0), dropped(0), filter(0.0) {}
 };
 
-class MapqFilterConsumer : public swbam::cpe::Bam1RecordConsumer {
+class MapqFilterBatchPostProcessor : public swbam::cpe::Bam1BatchPostProcessor {
 public:
-    MapqFilterConsumer(int min_mapq,
-                       swbam::cpe::Bam1RecordConsumer *downstream)
+    MapqFilterBatchPostProcessor(int min_mapq,
+                       swbam::cpe::Bam1BatchPostProcessor *downstream)
         : min_mapq_(min_mapq), downstream_(downstream) {
         kept_.reserve(64 * 1024);
     }
 
-    int ConsumeBam1(const bam1_t *const *records, size_t count) {
+    int PostProcessBam1Batch(const bam1_t *const *records, size_t count) {
         if (!downstream_ || (!records && count != 0)) return -1;
         const double filter_t0 = NowSeconds();
         kept_.clear();
@@ -83,7 +83,7 @@ public:
         metrics_.dropped +=
             (long long)count - (long long)kept_.size();
         metrics_.filter += NowSeconds() - filter_t0;
-        return downstream_->ConsumeBam1(
+        return downstream_->PostProcessBam1Batch(
             kept_.empty() ? nullptr : kept_.data(), kept_.size());
     }
 
@@ -91,7 +91,7 @@ public:
 
 private:
     int min_mapq_;
-    swbam::cpe::Bam1RecordConsumer *downstream_;
+    swbam::cpe::Bam1BatchPostProcessor *downstream_;
     FilterMetrics metrics_;
     std::vector<const bam1_t *> kept_;
 };
@@ -131,10 +131,10 @@ int main(int argc, char **argv) {
         : static_cast<swbam::BamOutputBackend *>(&posix_output);
     std::vector<swbam::BgzfBlockSpan> spans;
     swbam::cpe::Bam1Writer writer;
-    MapqFilterConsumer filter(min_mapq, &writer);
+    MapqFilterBatchPostProcessor filter(min_mapq, &writer);
     swbam::cpe::CpeReadPipelineTiming timing;
-    swbam::cpe::GenericDecodeMetrics decode_metrics;
-    swbam::cpe::GenericBam1Metrics bam1_metrics;
+    swbam::cpe::ComposableDecodeMetrics decode_metrics;
+    swbam::cpe::ComposableBam1Metrics bam1_metrics;
     double open_seconds = 0.0;
     double scan_seconds = 0.0;
     double core_seconds = 0.0;
@@ -171,11 +171,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to initialize bam1_t writer\n");
         goto cleanup;
     }
-    if (swbam::cpe::RunGenericBam1Pipeline(
+    if (swbam::cpe::RunComposableBam1Pipeline(
             *input, spans.empty() ? nullptr : spans.data(), spans.size(),
             &filter, &timing, &decode_metrics, &bam1_metrics) != 0 ||
         writer.Finish() != 0 || (!memory_io && posix_output.Close() != 0)) {
-        fprintf(stderr, "Generic bam1_t filter pipeline failed\n");
+        fprintf(stderr, "Composable bam1_t filter pipeline failed\n");
         goto cleanup;
     }
     core_seconds = NowSeconds() - phase_t0;

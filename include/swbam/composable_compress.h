@@ -1,26 +1,26 @@
-#ifndef SWBAM_GENERIC_COMPRESS_H
-#define SWBAM_GENERIC_COMPRESS_H
+#ifndef SWBAM_COMPOSABLE_COMPRESS_H
+#define SWBAM_COMPOSABLE_COMPRESS_H
 
 #include "swbam/cpe_write_pipeline.h"
 
 namespace swbam {
 namespace cpe {
 
-struct GenericCompressMetrics {
+struct ComposableCompressMetrics {
     double alloc;
     double deflate;
     double footer;
     double other;
 
-    GenericCompressMetrics();
+    ComposableCompressMetrics();
 };
 
-int RunGenericCompressPipeline(
+int RunComposableCompressPipeline(
     UncompressedBgzfSource *source,
-    CompressedBgzfConsumer *consumer,
+    CompressedBgzfBatchPostProcessor *post_processor,
     int compression_level,
     CpeWritePipelineTiming *timing,
-    GenericCompressMetrics *metrics,
+    ComposableCompressMetrics *metrics,
     const CpeWritePipelineOptions &options = CpeWritePipelineOptions());
 
 } // namespace cpe

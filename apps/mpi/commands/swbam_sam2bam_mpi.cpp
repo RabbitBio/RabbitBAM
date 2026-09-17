@@ -473,7 +473,7 @@ int MpiBuildSamChunkPieces(MpiSamParseBatch *batch,
 
 } // namespace
 
-static int FusedSamToBamSinkMPI(
+static int OptimizedSamToBamSinkMPI(
                      MemReader &reader,
                      swbam::RankBodySink *body_sink,
                      sam_hdr_t *hdr, int compress_level,
@@ -481,7 +481,7 @@ static int FusedSamToBamSinkMPI(
     const int NB = 64;
     MpiSamToBamStats local_stats = {};
     if (!stats) stats = &local_stats;
-    double fused_t0 = GetTime();
+    double optimized_t0 = GetTime();
     const size_t sam_chunk_size = MpiChooseSamChunkSize(reader.size);
 
     // double alloc_t0 = GetTime();
@@ -531,7 +531,7 @@ static int FusedSamToBamSinkMPI(
         MpiFreeSamToBamRecordSet(&record_set);
         MpiFreePackWorkspace(&pack_workspace);
         // stats->t_alloc_init += GetTime() - alloc_t0;
-        stats->t_fused_total += GetTime() - fused_t0;
+        stats->t_optimized_total += GetTime() - optimized_t0;
         return -1;
     }
     batch->hdr = hdr;
@@ -857,24 +857,24 @@ cleanup:
         MpiFreePackWorkspace(&pack_workspace);
         // stats->t_free_workspace += GetTime() - free_t0;
     }
-    stats->t_fused_total += GetTime() - fused_t0;
+    stats->t_optimized_total += GetTime() - optimized_t0;
     return ret_code;
 }
 
-int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
+int OptimizedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      sam_hdr_t *hdr,
                      int compress_level,
                      MpiSamToBamStats *stats) {
     swbam::MemoryRankBodySink body_sink(&mem_writer);
-    return FusedSamToBamSinkMPI(
+    return OptimizedSamToBamSinkMPI(
         reader, &body_sink, hdr, compress_level, stats);
 }
 
-int FusedSamToBamMPI(MemReader &reader,
+int OptimizedSamToBamMPI(MemReader &reader,
                      swbam::RankBodySink &body_sink,
                      sam_hdr_t *hdr,
                      int compress_level,
                      MpiSamToBamStats *stats) {
-    return FusedSamToBamSinkMPI(
+    return OptimizedSamToBamSinkMPI(
         reader, &body_sink, hdr, compress_level, stats);
 }

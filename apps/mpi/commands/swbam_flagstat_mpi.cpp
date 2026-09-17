@@ -56,7 +56,7 @@ struct MpiFlagstatStats {
     double t_decomp_parse;
     double t_decomp_other;
     double t_count;
-    double t_fused_total;
+    double t_optimized_total;
 };
 
 BamFilterOptions MpiFlagstatNoFilter() {
@@ -222,7 +222,7 @@ void MpiFlagstatReduceStats(const MpiFlagstatStats &local_stats,
         local_stats.t_decomp_parse,
         local_stats.t_decomp_other,
         local_stats.t_count,
-        local_stats.t_fused_total
+        local_stats.t_optimized_total
     };
     double global_double[9] = {};
 
@@ -241,7 +241,7 @@ void MpiFlagstatReduceStats(const MpiFlagstatStats &local_stats,
         global_stats->t_decomp_parse = global_double[5];
         global_stats->t_decomp_other = global_double[6];
         global_stats->t_count = global_double[7];
-        global_stats->t_fused_total = global_double[8];
+        global_stats->t_optimized_total = global_double[8];
     }
 }
 
@@ -344,7 +344,7 @@ public:
         return 0;
     }
 
-    int Consume(size_t active_blocks, long long *records_processed) {
+    int PostProcessBatch(size_t active_blocks, long long *records_processed) {
         long long records = 0;
         for (size_t b = 0; b < active_blocks; ++b) {
             records += paras_[b].n_total_records;
@@ -364,7 +364,7 @@ private:
     unsigned char *scratch_data_;
 };
 
-int FusedFlagstatMPI(const swbam::BamInputBackend &input,
+int OptimizedFlagstatMPI(const swbam::BamInputBackend &input,
                      const swbam::BgzfBlockSpan *spans,
                      size_t span_count,
                      MpiFlagstatCounts *counts,
@@ -379,8 +379,8 @@ int FusedFlagstatMPI(const swbam::BamInputBackend &input,
         stats->total_records = timing.total_records;
         stats->t_read = timing.read;
         stats->t_decomp = timing.kernel;
-        stats->t_count = timing.consume;
-        stats->t_fused_total = timing.total;
+        stats->t_count = timing.post_process;
+        stats->t_optimized_total = timing.total;
     }
     return ret;
 }
@@ -472,7 +472,7 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
         }
 
         double stage43_t0 = GetTime();
-        if (FusedFlagstatMPI(*input, input_plan.rank_spans(),
+        if (OptimizedFlagstatMPI(*input, input_plan.rank_spans(),
                              input_plan.rank_block_count(),
                              &local_counts, &local_stats) != 0) {
             local_ok = 0;
@@ -481,7 +481,7 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
         int global_ok = swbam::mpi::AllRanksOk(local_ok);
         double stage43_cost_max = swbam::mpi::ReduceMaxCost(stage43_cost);
         if (rank == 0 && global_ok) {
-            printf("Complete the 4.3 FusedFlagstatMPI cost %lf\n", stage43_cost_max);
+            printf("Complete the 4.3 OptimizedFlagstatMPI cost %lf\n", stage43_cost_max);
         }
         if (!global_ok) goto cleanup;
 
@@ -493,16 +493,16 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
         double stage44_cost_max = swbam::mpi::ReduceMaxCost(stage44_cost);
         if (rank == 0) {
             MpiFlagstatPrintSamtoolsStyle(global_counts);
-            printf("FusedFlagstatMPI finished. ranks=%d in_blocks=%lld groups=%lld total_records=%lld\n",
+            printf("OptimizedFlagstatMPI finished. ranks=%d in_blocks=%lld groups=%lld total_records=%lld\n",
                    comm_size,
                    global_stats.input_blocks,
                    global_stats.group_count,
                    global_stats.total_records);
-            printf("  read_sum=%.3f  decomp_sum=%.3f  merge_sum=%.3f  fused_total_sum=%.3f\n",
+            printf("  read_sum=%.3f  decomp_sum=%.3f  merge_sum=%.3f  optimized_total_sum=%.3f\n",
                    global_stats.t_read,
                    global_stats.t_decomp,
                    global_stats.t_count,
-                   global_stats.t_fused_total);
+                   global_stats.t_optimized_total);
             printf("  decomp_detail_sum alloc=%.3f  inflate=%.3f  crc=%.3f  parse=%.3f  other=%.3f\n",
                    global_stats.t_decomp_alloc,
                    global_stats.t_decomp_inflate,

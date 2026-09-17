@@ -115,7 +115,7 @@ struct MpiStatsPerf {
     double t_decomp_parse;
     double t_decomp_other;
     double t_count;
-    double t_fused_total;
+    double t_optimized_total;
 };
 
 BamFilterOptions MpiStatsNoFilter() {
@@ -459,7 +459,7 @@ void MpiStatsReducePerf(const MpiStatsPerf &local_stats, MpiStatsPerf *global_st
         local_stats.t_decomp_parse,
         local_stats.t_decomp_other,
         local_stats.t_count,
-        local_stats.t_fused_total
+        local_stats.t_optimized_total
     };
     double global_double[9] = {};
 
@@ -478,7 +478,7 @@ void MpiStatsReducePerf(const MpiStatsPerf &local_stats, MpiStatsPerf *global_st
         global_stats->t_decomp_parse = global_double[5];
         global_stats->t_decomp_other = global_double[6];
         global_stats->t_count = global_double[7];
-        global_stats->t_fused_total = global_double[8];
+        global_stats->t_optimized_total = global_double[8];
     }
 }
 
@@ -813,7 +813,7 @@ public:
         return 0;
     }
 
-    int Consume(size_t active_blocks, long long *records_processed) {
+    int PostProcessBatch(size_t active_blocks, long long *records_processed) {
         long long records = 0;
         for (size_t b = 0; b < active_blocks; ++b) {
             records += paras_[b].n_total_records;
@@ -840,7 +840,7 @@ private:
     unsigned char *scratch_data_;
 };
 
-int FusedStatsMPI(const swbam::BamInputBackend &input,
+int OptimizedStatsMPI(const swbam::BamInputBackend &input,
                   const swbam::BgzfBlockSpan *spans,
                   size_t span_count,
                   MpiBasicStatsCounts *counts,
@@ -858,8 +858,8 @@ int FusedStatsMPI(const swbam::BamInputBackend &input,
         perf->total_records = timing.total_records;
         perf->t_read = timing.read;
         perf->t_decomp = timing.kernel;
-        perf->t_count = timing.consume;
-        perf->t_fused_total = timing.total;
+        perf->t_count = timing.post_process;
+        perf->t_optimized_total = timing.total;
     }
     return ret;
 }
@@ -953,7 +953,7 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
 
         double stage43_t0 = GetTime();
         const int collect_diag = cmd_info->verbose_ ? 1 : 0;
-        if (FusedStatsMPI(*input, input_plan.rank_spans(),
+        if (OptimizedStatsMPI(*input, input_plan.rank_spans(),
                           input_plan.rank_block_count(),
                           &local_counts, &local_sort, &local_perf,
                           collect_diag) != 0) {
@@ -963,7 +963,7 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
         int global_ok = swbam::mpi::AllRanksOk(local_ok);
         double stage43_cost_max = swbam::mpi::ReduceMaxCost(stage43_cost);
         if (rank == 0 && global_ok) {
-            printf("Complete the 4.3 FusedStatsMPI cost %lf\n", stage43_cost_max);
+            printf("Complete the 4.3 OptimizedStatsMPI cost %lf\n", stage43_cost_max);
         }
         if (!global_ok) goto cleanup;
 
@@ -1015,16 +1015,16 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
             int is_sorted = MpiStatsIsSortedGlobal(comm_size, global_sort_values);
             MpiStatsPrintBasic(global_counts, is_sorted);
             if (cmd_info->verbose_) MpiStatsPrintOrientationDiag(global_counts);
-            printf("FusedStatsMPI finished. ranks=%d in_blocks=%lld groups=%lld total_records=%lld\n",
+            printf("OptimizedStatsMPI finished. ranks=%d in_blocks=%lld groups=%lld total_records=%lld\n",
                    comm_size,
                    global_perf.input_blocks,
                    global_perf.group_count,
                    global_perf.total_records);
-            printf("  read_sum=%.3f  decomp_sum=%.3f  merge_sum=%.3f  fused_total_sum=%.3f\n",
+            printf("  read_sum=%.3f  decomp_sum=%.3f  merge_sum=%.3f  optimized_total_sum=%.3f\n",
                    global_perf.t_read,
                    global_perf.t_decomp,
                    global_perf.t_count,
-                   global_perf.t_fused_total);
+                   global_perf.t_optimized_total);
             printf("  decomp_detail_sum alloc=%.3f  inflate=%.3f  crc=%.3f  parse=%.3f  other=%.3f\n",
                    global_perf.t_decomp_alloc,
                    global_perf.t_decomp_inflate,

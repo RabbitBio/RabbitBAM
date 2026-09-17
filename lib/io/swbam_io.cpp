@@ -86,16 +86,16 @@ int ReadVectorAt(int fd, uint64_t offset,
         }
         if (result == 0) return -1;
         done += (uint64_t)result;
-        size_t consumed = (size_t)result;
-        while (first < count && consumed >= vectors[first].iov_len) {
-            consumed -= vectors[first].iov_len;
+        size_t processed = (size_t)result;
+        while (first < count && processed >= vectors[first].iov_len) {
+            processed -= vectors[first].iov_len;
             first++;
         }
-        if (consumed > 0 && first < count) {
+        if (processed > 0 && first < count) {
             vectors[first].iov_base =
                 static_cast<unsigned char *>(vectors[first].iov_base) +
-                consumed;
-            vectors[first].iov_len -= consumed;
+                processed;
+            vectors[first].iov_len -= processed;
         }
     }
     return 0;

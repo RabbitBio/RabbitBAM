@@ -88,10 +88,10 @@ int main(int argc, char **argv) {
         : static_cast<swbam::BamOutputBackend *>(&posix_output);
     std::vector<swbam::BgzfBlockSpan> spans;
     swbam::cpe::RawBamWriter writer;
-    swbam::cpe::RawBamFilterConsumer filter(options, &writer);
+    swbam::cpe::RawBamFilterBatchPostProcessor filter(options, &writer);
     swbam::cpe::CpeReadPipelineTiming timing;
-    swbam::cpe::GenericDecodeMetrics decode_metrics;
-    swbam::cpe::GenericRawBamMetrics raw_metrics;
+    swbam::cpe::ComposableDecodeMetrics decode_metrics;
+    swbam::cpe::ComposableRawBamMetrics raw_metrics;
     double open_seconds = 0.0;
     double scan_seconds = 0.0;
     double core_seconds = 0.0;
@@ -128,11 +128,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to initialize BAM output: %s\n", argv[2]);
         goto cleanup;
     }
-    if (swbam::cpe::RunGenericRawBamPipeline(
+    if (swbam::cpe::RunComposableRawBamPipeline(
             *input, spans.empty() ? nullptr : spans.data(), spans.size(),
             &filter, &timing, &decode_metrics, &raw_metrics) != 0 ||
         writer.Finish() != 0 || (!memory_io && posix_output.Close() != 0)) {
-        fprintf(stderr, "Generic BAM filter pipeline failed\n");
+        fprintf(stderr, "Composable BAM filter pipeline failed\n");
         goto cleanup;
     }
     core_seconds = NowSeconds() - phase_t0;

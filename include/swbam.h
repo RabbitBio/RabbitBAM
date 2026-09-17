@@ -44,27 +44,27 @@ public:
     int ProcessSwBam();
 
 private:
-    void ConsumerSwBamTask(BamRead *read, BamComplete *complete);
+    void PostProcessSwBamTask(BamRead *read, BamComplete *complete);
     void ProducerSwBamTask(BGZF *fp, BamRead *read);
     void ProducerSwBamTask_memory(BGZF *fp, BamRead *read , char *bam_mem, size_t bam_size);
-    void FusedBamToSam(BamRead *read, BamComplete *complete, sam_hdr_t *h, MemReader &reader, MemWriter &mem_writer);
-    int FusedBamToSamChecked(BamRead *read, BamComplete *complete, sam_hdr_t *h,
+    void OptimizedBamToSam(BamRead *read, BamComplete *complete, sam_hdr_t *h, MemReader &reader, MemWriter &mem_writer);
+    int OptimizedBamToSamChecked(BamRead *read, BamComplete *complete, sam_hdr_t *h,
                              MemReader &reader, MemWriter &mem_writer, BoundsCheckError *bounds_error);
-    void FusedBamToBam(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
+    void OptimizedBamToBam(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
                        MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter);
-    void FusedBamToBamOptimized(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
+    void OptimizedBamToBamCore(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
                                 MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter);
-    int FusedBamToBamChecked(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
+    int OptimizedBamToBamChecked(BamRead *read, BamComplete *complete, BamWriteComplete *write_complete,
                              MemReader &reader, MemWriter &mem_writer, const BamFilterOptions &filter,
                              BoundsCheckError *bounds_error);
     int writeBam1_tToSam(samFile *fp, const sam_hdr_t *h, const bam1_t *b);
 
-    void ConsumerSwBamTask2(BamWrite *write, BamWriteComplete *complete);
+    void PostProcessSwBamTask2(BamWrite *write, BamWriteComplete *complete);
     void ProducerSwBamTask2(samFile *fp, BamWrite *write, sam_hdr_t *h);
     void ProducerSwBamTask2_parallel(samFile *fp, BamWrite *write, sam_hdr_t *h);
     void ProducerSwBamTask2_parallel_memory_OP( BamWrite *write, sam_hdr_t *h , MemReader reader);
-    void FusedSamToBam(BamWrite *write, BamWriteComplete *complete,sam_hdr_t *h, MemReader reader, MemWriter &mem_writer);
-    int FusedSamToBamChecked(BamWriteComplete *complete, sam_hdr_t *h,
+    void OptimizedSamToBam(BamWrite *write, BamWriteComplete *complete,sam_hdr_t *h, MemReader reader, MemWriter &mem_writer);
+    int OptimizedSamToBamChecked(BamWriteComplete *complete, sam_hdr_t *h,
                              MemReader reader, MemWriter &mem_writer, BoundsCheckError *bounds_error);
     int writeBlockTobam(BGZF *fp, bam_block *block);
 

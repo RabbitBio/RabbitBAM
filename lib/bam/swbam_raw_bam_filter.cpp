@@ -53,15 +53,15 @@ RawBamFilterMetrics::RawBamFilterMetrics()
     : total_records(0), kept_records(0), dropped_records(0),
       total_bytes(0), kept_bytes(0), dropped_bytes(0), filter(0.0) {}
 
-RawBamFilterConsumer::RawBamFilterConsumer(
+RawBamFilterBatchPostProcessor::RawBamFilterBatchPostProcessor(
         const BamFilterOptions &filter,
-        RawBamRecordConsumer *downstream)
+        RawBamBatchPostProcessor *downstream)
     : filter_(filter), downstream_(downstream),
       noop_(bam_filter_is_noop(filter)) {
     kept_.reserve(64 * 1024);
 }
 
-int RawBamFilterConsumer::ConsumeRaw(
+int RawBamFilterBatchPostProcessor::PostProcessRawBatch(
         const RawBamRecordView *records, size_t count) {
     if (!downstream_ || (!records && count != 0)) return -1;
     const double filter_t0 = GetTime();
@@ -81,7 +81,7 @@ int RawBamFilterConsumer::ConsumeRaw(
         metrics_.total_bytes += total_bytes;
         metrics_.kept_bytes += total_bytes;
         metrics_.filter += GetTime() - filter_t0;
-        return downstream_->ConsumeRaw(records, count);
+        return downstream_->PostProcessRawBatch(records, count);
     }
 
     kept_.clear();
@@ -102,7 +102,7 @@ int RawBamFilterConsumer::ConsumeRaw(
     metrics_.dropped_bytes += total_bytes - kept_bytes;
     metrics_.filter += GetTime() - filter_t0;
 
-    return downstream_->ConsumeRaw(
+    return downstream_->PostProcessRawBatch(
         kept_.empty() ? nullptr : kept_.data(), kept_.size());
 }
 

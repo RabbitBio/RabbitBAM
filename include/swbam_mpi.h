@@ -41,7 +41,7 @@ struct MpiBamToBamStats {
     double t_read;
     double t_write;
     double t_mpi_write;
-    double t_fused_total;
+    double t_optimized_total;
     double t_alloc_init;
     double t_initial_read;
     double t_prepare_decomp;
@@ -69,7 +69,7 @@ struct MpiBamToSamStats {
     double t_read;
     double t_write;
     double t_gather;
-    double t_fused_total;
+    double t_optimized_total;
     double t_alloc_init;
     double t_free_workspace;
 };
@@ -99,7 +99,7 @@ struct MpiSamToBamStats {
     double t_compress_other;
     double t_write;
     double t_gather;
-    double t_fused_total;
+    double t_optimized_total;
     double t_alloc_init;
     double t_setup_reset;
     double t_compress_setup;
@@ -175,8 +175,8 @@ struct MpiSortStats {
     double t_write;
     double t_status_check;
     double t_cleanup;
-    double t_fused_total;
-    double t_fused_actual;
+    double t_optimized_total;
+    double t_optimized_actual;
     double t_cpe_calibration_wall;
 };
 
@@ -228,7 +228,7 @@ struct MpiCollateStats {
     double t_temp_write_actual;
     double t_temp_read_sim;
     double t_temp_write_sim;
-    double t_fused;
+    double t_optimized;
     double t_actual;
 };
 
@@ -287,7 +287,7 @@ struct MpiMarkdupStats {
     double t_cpe_sync;
     double t_stream_buffer;
     double t_stream_finalize;
-    double t_fused_total;
+    double t_optimized_total;
 };
 
 struct MpiFixmateStats {
@@ -320,7 +320,7 @@ struct MpiFixmateStats {
     double t_write;
     double t_rank_sync;
     double t_workspace_free;
-    double t_fused_total;
+    double t_optimized_total;
 };
 
 int ProcessSwBamMPI(CmdInfo *cmd_info);
@@ -430,65 +430,65 @@ int MpiCommonReadBamHeaderFromMemory(const char *data, size_t size,
                                      sam_hdr_t **header,
                                      long long *body_start);
 
-int FusedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
+int OptimizedBamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      const BamFilterOptions &filter,
                      int compress_level,
                      MpiBamToBamStats *stats);
-int FusedBamToBamMPI(MemReader &reader,
+int OptimizedBamToBamMPI(MemReader &reader,
                      swbam::RankBodySink &body_sink,
                      const BamFilterOptions &filter,
                      int compress_level,
                      MpiBamToBamStats *stats);
-int FusedBamToBamMPI(const swbam::BamInputBackend &input,
+int OptimizedBamToBamMPI(const swbam::BamInputBackend &input,
                      const swbam::BgzfBlockSpan *spans,
                      size_t span_count,
                      MemWriter &mem_writer,
                      const BamFilterOptions &filter,
                      int compress_level,
                      MpiBamToBamStats *stats);
-int FusedBamToBamMPI(const swbam::BamInputBackend &input,
+int OptimizedBamToBamMPI(const swbam::BamInputBackend &input,
                      const swbam::BgzfBlockSpan *spans,
                      size_t span_count,
                      swbam::RankBodySink &body_sink,
                      const BamFilterOptions &filter,
                      int compress_level,
                      MpiBamToBamStats *stats);
-int FusedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
+int OptimizedBamToSamMPI(MemReader &reader, MemWriter &mem_writer,
                      sam_hdr_t *hdr,
                      MpiBamToSamStats *stats);
-int FusedBamToSamMPI(MemReader &reader,
+int OptimizedBamToSamMPI(MemReader &reader,
                      swbam::RankBodySink &body_sink,
                      sam_hdr_t *hdr,
                      MpiBamToSamStats *stats);
-int FusedBamToSamMPI(const swbam::BamInputBackend &input,
+int OptimizedBamToSamMPI(const swbam::BamInputBackend &input,
                      const swbam::BgzfBlockSpan *spans,
                      size_t span_count,
                      MemWriter &mem_writer,
                      sam_hdr_t *hdr,
                      MpiBamToSamStats *stats);
-int FusedBamToSamMPI(const swbam::BamInputBackend &input,
+int OptimizedBamToSamMPI(const swbam::BamInputBackend &input,
                      const swbam::BgzfBlockSpan *spans,
                      size_t span_count,
                      swbam::RankBodySink &body_sink,
                      sam_hdr_t *hdr,
                      MpiBamToSamStats *stats);
-int FusedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
+int OptimizedSamToBamMPI(MemReader &reader, MemWriter &mem_writer,
                      sam_hdr_t *hdr,
                      int compress_level,
                      MpiSamToBamStats *stats);
-int FusedSamToBamMPI(MemReader &reader,
+int OptimizedSamToBamMPI(MemReader &reader,
                      swbam::RankBodySink &body_sink,
                      sam_hdr_t *hdr,
                      int compress_level,
                      MpiSamToBamStats *stats);
-int FusedBamSortMPI(MemReader &reader, MemWriter &mem_writer,
+int OptimizedBamSortMPI(MemReader &reader, MemWriter &mem_writer,
                     long long global_block_begin,
                     int rank,
                     int comm_size,
                     int compress_level,
                     size_t memory_limit,
                     MpiSortStats *stats);
-int FusedBamSortMPI(MemReader &reader,
+int OptimizedBamSortMPI(MemReader &reader,
                     swbam::RankBodySink &body_sink,
                     long long global_block_begin,
                     int rank,
@@ -496,7 +496,7 @@ int FusedBamSortMPI(MemReader &reader,
                     int compress_level,
                     size_t memory_limit,
                     MpiSortStats *stats);
-int FusedBamSortMPI(const swbam::BamInputBackend &input,
+int OptimizedBamSortMPI(const swbam::BamInputBackend &input,
                     const swbam::BgzfBlockSpan *spans,
                     size_t span_count,
                     swbam::RankBodySink &body_sink,
@@ -506,7 +506,7 @@ int FusedBamSortMPI(const swbam::BamInputBackend &input,
                     int compress_level,
                     size_t memory_limit,
                     MpiSortStats *stats);
-int FusedBamExternalSortMPI(MemReader &reader, MemWriter &mem_writer,
+int OptimizedBamExternalSortMPI(MemReader &reader, MemWriter &mem_writer,
                             long long global_block_begin,
                             int rank,
                             int comm_size,
@@ -514,7 +514,7 @@ int FusedBamExternalSortMPI(MemReader &reader, MemWriter &mem_writer,
                             size_t memory_limit,
                             const char *temp_prefix,
                             MpiSortStats *stats);
-int FusedBamExternalSortMPI(MemReader &reader,
+int OptimizedBamExternalSortMPI(MemReader &reader,
                             swbam::RankBodySink &body_sink,
                             long long global_block_begin,
                             int rank,
@@ -523,7 +523,7 @@ int FusedBamExternalSortMPI(MemReader &reader,
                             size_t memory_limit,
                             const char *temp_prefix,
                             MpiSortStats *stats);
-int FusedBamExternalSortMPI(const swbam::BamInputBackend &input,
+int OptimizedBamExternalSortMPI(const swbam::BamInputBackend &input,
                             const swbam::BgzfBlockSpan *spans,
                             size_t span_count,
                             swbam::RankBodySink &body_sink,

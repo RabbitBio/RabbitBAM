@@ -18,13 +18,13 @@ double NowSeconds() {
         Clock::now().time_since_epoch()).count();
 }
 
-class Bam1StatsConsumer : public swbam::cpe::Bam1RecordConsumer {
+class Bam1StatsBatchPostProcessor : public swbam::cpe::Bam1BatchPostProcessor {
 public:
-    Bam1StatsConsumer()
+    Bam1StatsBatchPostProcessor()
         : records_(0), mapped_(0), duplicates_(0), mapq_ge_30_(0),
           nm_records_(0), nm_sum_(0) {}
 
-    int ConsumeBam1(const bam1_t *const *records, size_t count) {
+    int PostProcessBam1Batch(const bam1_t *const *records, size_t count) {
         if (!records && count != 0) return -1;
         for (size_t i = 0; i < count; ++i) {
             const bam1_t *record = records[i];
@@ -91,10 +91,10 @@ int main(int argc, char **argv) {
             : static_cast<swbam::BamInputBackend *>(
                   new swbam::PosixBamInput()));
     std::vector<swbam::BgzfBlockSpan> spans;
-    Bam1StatsConsumer consumer;
+    Bam1StatsBatchPostProcessor post_processor;
     swbam::cpe::CpeReadPipelineTiming timing;
-    swbam::cpe::GenericDecodeMetrics decode_metrics;
-    swbam::cpe::GenericBam1Metrics bam1_metrics;
+    swbam::cpe::ComposableDecodeMetrics decode_metrics;
+    swbam::cpe::ComposableBam1Metrics bam1_metrics;
     double open_seconds = 0.0;
     double scan_seconds = 0.0;
     double phase_t0 = 0.0;
@@ -114,19 +114,19 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     scan_seconds = NowSeconds() - phase_t0;
-    if (swbam::cpe::RunGenericBam1Pipeline(
+    if (swbam::cpe::RunComposableBam1Pipeline(
             *input, spans.empty() ? nullptr : spans.data(), spans.size(),
-            &consumer, &timing, &decode_metrics, &bam1_metrics) != 0) {
-        fprintf(stderr, "Generic bam1_t pipeline failed\n");
+            &post_processor, &timing, &decode_metrics, &bam1_metrics) != 0) {
+        fprintf(stderr, "Composable bam1_t pipeline failed\n");
         goto cleanup;
     }
 
-    printf("records %lld\n", consumer.records());
-    printf("mapped %lld\n", consumer.mapped());
-    printf("duplicates %lld\n", consumer.duplicates());
-    printf("mapq_ge_30 %lld\n", consumer.mapq_ge_30());
-    printf("nm_records %lld\n", consumer.nm_records());
-    printf("nm_sum %lld\n", consumer.nm_sum());
+    printf("records %lld\n", post_processor.records());
+    printf("mapped %lld\n", post_processor.mapped());
+    printf("duplicates %lld\n", post_processor.duplicates());
+    printf("mapq_ge_30 %lld\n", post_processor.mapq_ge_30());
+    printf("nm_records %lld\n", post_processor.nm_records());
+    printf("nm_sum %lld\n", post_processor.nm_sum());
     printf("bgzf_blocks %zu\n", spans.size());
     printf("decoded_bytes %lld\n", decode_metrics.decoded_bytes);
     printf("encoded_record_bytes %lld\n", bam1_metrics.encoded_bytes);
@@ -138,9 +138,9 @@ int main(int argc, char **argv) {
     printf("timing_core %.6f\n", timing.total);
     printf("timing_read %.6f\n", timing.read);
     printf("timing_cpe %.6f\n", timing.kernel);
-    printf("timing_pipeline_consume %.6f\n", timing.consume);
+    printf("timing_pipeline_post_process %.6f\n", timing.post_process);
     printf("timing_materialize %.6f\n", bam1_metrics.materialize);
-    printf("timing_bam1_consume %.6f\n", bam1_metrics.consume);
+    printf("timing_bam1_post_process %.6f\n", bam1_metrics.post_process);
     exit_code = 0;
 
 cleanup:

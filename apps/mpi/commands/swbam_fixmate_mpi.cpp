@@ -1460,7 +1460,7 @@ static int FmGatherOutput(
     return FmAllRanksOk(local_ok) ? 0 : -1;
 }
 
-static double FmAccountedFusedTime(const MpiFixmateStats &stats) {
+static double FmAccountedOptimizedTime(const MpiFixmateStats &stats) {
     return stats.t_read +
            stats.t_decompress +
            stats.t_record_collect +
@@ -1496,8 +1496,8 @@ static void FmPrintStats(
         stats.ms_updates,
         stats.bgzf_blocks
     };
-    const double accounted = FmAccountedFusedTime(stats);
-    const double unaccounted = stats.t_fused_total - accounted;
+    const double accounted = FmAccountedOptimizedTime(stats);
+    const double unaccounted = stats.t_optimized_total - accounted;
 
     const int kLineBytes = 8192;
     char local_lines[kLineBytes];
@@ -1525,7 +1525,7 @@ static void FmPrintStats(
         "output_index=%.6f boundary=%.6f rewrite=%.6f "
         "pack=%.6f compress_setup=%.6f compress=%.6f "
         "write=%.6f rank_sync=%.6f workspace_free=%.6f "
-        "accounted=%.6f unaccounted=%.6f fused=%.6f\n",
+        "accounted=%.6f unaccounted=%.6f optimized=%.6f\n",
         rank, stats.t_read, stats.t_decompress,
         stats.t_record_collect, stats.t_group_scan,
         stats.t_process_setup, stats.t_process_alloc,
@@ -1534,7 +1534,7 @@ static void FmPrintStats(
         stats.t_pack, stats.t_compress_setup,
         stats.t_compress, stats.t_write,
         stats.t_rank_sync, stats.t_workspace_free,
-        accounted, unaccounted, stats.t_fused_total);
+        accounted, unaccounted, stats.t_optimized_total);
 
     std::vector<char> gathered_lines;
     if (rank == 0) {
@@ -1567,7 +1567,7 @@ static void FmPrintStats(
         stats.t_workspace_free,
         accounted,
         unaccounted,
-        stats.t_fused_total
+        stats.t_optimized_total
     };
     double time_sums[time_count] = {};
     double time_max[time_count] = {};
@@ -1580,7 +1580,7 @@ static void FmPrintStats(
             fputs(gathered_lines.data() + (size_t)r * kLineBytes,
                   stdout);
         }
-        printf("FusedFixmateMPI finished. ranks=%d blocks=%lld "
+        printf("OptimizedFixmateMPI finished. ranks=%d blocks=%lld "
                "records=%lld groups=%lld paired=%lld singleton=%lld\n",
                comm_size, sums[0], sums[2], sums[1],
                sums[3], sums[4]);
@@ -1597,7 +1597,7 @@ static void FmPrintStats(
                "rewrite=%.3f pack=%.3f compress_setup=%.3f "
                "compress=%.3f write=%.3f rank_sync=%.3f "
                "workspace_free=%.3f accounted=%.3f "
-               "unaccounted=%.3f fused=%.3f\n",
+               "unaccounted=%.3f optimized=%.3f\n",
                time_sums[0], time_sums[1], time_sums[2],
                time_sums[3], time_sums[4], time_sums[5],
                time_sums[6], time_sums[7], time_sums[8],
@@ -1612,7 +1612,7 @@ static void FmPrintStats(
                "rewrite=%.3f pack=%.3f compress_setup=%.3f "
                "compress=%.3f write=%.3f rank_sync=%.3f "
                "workspace_free=%.3f accounted=%.3f "
-               "unaccounted=%.3f fused=%.3f\n",
+               "unaccounted=%.3f optimized=%.3f\n",
                time_max[0], time_max[1], time_max[2],
                time_max[3], time_max[4], time_max[5],
                time_max[6], time_max[7], time_max[8],
@@ -1796,7 +1796,7 @@ int MpiFixmateMemoryToMemory(CmdInfo *cmd_info,
     if (!FmAllRanksOk(local_ok)) goto cleanup;
 
     {
-        double fused_t0 = GetTime();
+        double optimized_t0 = GetTime();
         if (FmStreamLocalGroups(
                 reader, cmd_info->compress_level_,
                 &middle_sink, &leading, &trailing,
@@ -1841,10 +1841,10 @@ int MpiFixmateMemoryToMemory(CmdInfo *cmd_info,
             local_ok = 0;
         }
         if (!FmAllRanksOkTimed(local_ok, &stats)) goto cleanup;
-        stats.t_fused_total = GetTime() - fused_t0;
-        stage43_cost = FmReduceMax(stats.t_fused_total);
+        stats.t_optimized_total = GetTime() - optimized_t0;
+        stage43_cost = FmReduceMax(stats.t_optimized_total);
         if (rank == 0 && local_ok) {
-            printf("Complete the 4.3 FusedFixmateMPI cost %lf\n",
+            printf("Complete the 4.3 OptimizedFixmateMPI cost %lf\n",
                    stage43_cost);
         }
     }
@@ -2098,7 +2098,7 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
     最后只由 group 的负责 rank 处理边界 group，
     并把 prefix/middle/suffix 按顺序拼成当前 rank 输出。*/
     {
-        double fused_t0 = GetTime();
+        double optimized_t0 = GetTime();
         // 1. FmStreamLocalGroups：先处理本 rank 内部完整 group
         const int stream_ret = memory_input
             ? FmStreamLocalGroups(
@@ -2157,10 +2157,10 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
             local_ok = 0;
         }
         if (!FmAllRanksOkTimed(local_ok, &stats)) goto cleanup;
-        stats.t_fused_total = GetTime() - fused_t0;
-        stage43_cost = FmReduceMax(stats.t_fused_total);
+        stats.t_optimized_total = GetTime() - optimized_t0;
+        stage43_cost = FmReduceMax(stats.t_optimized_total);
         if (rank == 0 && local_ok) {
-            printf("Complete the 4.3 FusedFixmateMPI cost %lf\n",
+            printf("Complete the 4.3 OptimizedFixmateMPI cost %lf\n",
                    stage43_cost);
         }
     }

@@ -14,7 +14,7 @@ struct CpeReadPipelineTiming {
     long long total_records;
     double read;
     double kernel;
-    double consume;
+    double post_process;
     double total;
 
     CpeReadPipelineTiming();
@@ -45,8 +45,8 @@ public:
     virtual void ObserveKernel(double wall_seconds,
                                size_t active_blocks) = 0;
     virtual int Validate(size_t active_blocks) const = 0;
-    virtual int Consume(size_t active_blocks,
-                        long long *records_processed) = 0;
+    virtual int PostProcessBatch(size_t active_blocks,
+                            long long *records_processed) = 0;
     virtual int Finish() = 0;
 };
 
