@@ -354,20 +354,52 @@ if(PLATFORM_SUNWAY)
     )
     target_compile_definitions(crc32_bench_slave_objects PRIVATE PLATFORM_SUNWAY)
     add_executable(RabbitBAM-CRC32-Bench
-        bench/bench_crc32.cpp
+        tools/bench_crc32.cpp
         $<TARGET_OBJECTS:crc32_bench_slave_objects>
     )
     target_compile_options(RabbitBAM-CRC32-Bench PRIVATE ${HOST_FLAGS})
     target_include_directories(RabbitBAM-CRC32-Bench PRIVATE ${CMAKE_SOURCE_DIR}/include)
     target_link_directories(RabbitBAM-CRC32-Bench PRIVATE /usr/sw/lib)
     target_compile_definitions(RabbitBAM-CRC32-Bench PRIVATE PLATFORM_SUNWAY)
+
+    add_executable(swbam-mpi-memory-probe
+        tools/mpi_memory_capacity_probe.cpp)
+    add_executable(swbam-mpi-memcpy-probe
+        tools/mpi_memcpy_probe.cpp)
+    foreach(tool_target
+            swbam-mpi-memory-probe
+            swbam-mpi-memcpy-probe)
+        target_compile_options(${tool_target} PRIVATE ${HOST_FLAGS})
+        target_compile_definitions(${tool_target} PRIVATE PLATFORM_SUNWAY)
+        target_link_libraries(${tool_target} PRIVATE swbam::swbam)
+    endforeach()
+
+    add_library(cgs_memory_probe_slave_object OBJECT
+        tools/slave_cgs_memory_probe.cpp)
+    target_compile_options(cgs_memory_probe_slave_object PRIVATE
+        ${SLAVE_FLAGS})
+    target_include_directories(cgs_memory_probe_slave_object PRIVATE
+        ${CMAKE_SOURCE_DIR}/tools)
+    target_compile_definitions(cgs_memory_probe_slave_object PRIVATE
+        PLATFORM_SUNWAY)
+    add_executable(swbam-cgs-memory-probe
+        tools/cgs_memory_probe.cpp
+        $<TARGET_OBJECTS:cgs_memory_probe_slave_object>)
+    target_compile_options(swbam-cgs-memory-probe PRIVATE ${HOST_FLAGS})
+    target_include_directories(swbam-cgs-memory-probe PRIVATE
+        ${CMAKE_SOURCE_DIR}/tools)
+    target_compile_definitions(swbam-cgs-memory-probe PRIVATE
+        PLATFORM_SUNWAY)
+    target_link_libraries(swbam-cgs-memory-probe PRIVATE
+        pthread rt m dl)
+    target_link_options(swbam-cgs-memory-probe PRIVATE -mhybrid)
 else()
     # For x86, only compile src files
     add_executable(${PROJECT_NAME} ${SINGLE_SRC_FILES})
 endif()
 
 add_executable(markdup_verify_fast
-    bench/markdup_verify_fast.cpp
+    tools/markdup_verify_fast.cpp
 )
 if(PLATFORM_SUNWAY)
     target_compile_options(markdup_verify_fast PRIVATE ${HOST_FLAGS})
