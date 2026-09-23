@@ -96,32 +96,33 @@ decode+parse+count 融合 CPE kernel 没有拆开，因此不会增加中间数�
 两个命令现已支持 `--io-backend memory|posix|mpiio|auto` 和
 `--io-memory-limit SIZE`；backend 只改变 batch 来源，不改变算子实现。
 
-## Composable path 与 Optimized path
+## 统一流水线与两类 operator
 
-两条路径需要同时保留：
+当前架构不再把 Composable/Optimized 描述成两套彼此独立的顶层系统。所有功能
+共享 backend、类型化 batch、双缓冲 runtime 和 output sink，差别只在 operator
+如何处理一批数据：
 
 ```text
-SWBAM
-|-- Composable path
-|   `-- CPE processing -> BatchPostProcessor -> subsequent processing/output
-`-- Optimized path
-    `-- performance-critical operations implemented with fused CPE kernels
+SWBAM batch runtime
+|-- record-view adapter: decode -> RawBamRecordView/bam1_t -> MPE post-processing
+`-- fused CPE operator: decode + parse + business logic in one kernel
 ```
 
-- **Composable path**：`RunComposableDecodePipeline` 通过
+- **Record-view adapter**：现有兼容 API `RunComposableDecodePipeline` 通过
   `DecodedBgzfBatchPostProcessor` 输出解压后的
   BGZF batch；`RunComposableRawBamPipeline` 进一步生成零拷贝 `RawBamRecordView`
   batch，交由简单工具、库使用者和功能原型执行 MPE 侧 batch post-processing；
   `RunComposableBam1Pipeline` 再在 MPE 上批量物化库管理的 `bam1_t`，交由需要
   标准 HTSlib accessor 的应用继续处理。
-- **Optimized path**：内置性能敏感命令使用 fused CPE kernels，在从核内完成
+- **Fused CPE operator**：内置性能敏感命令在从核内完成
   decode+flagstat、decode+stats、decode+filter 或 decode+collate-extract。
 
-二者共用输入 backend、批缓冲、双缓冲调度、CPE 生命周期和错误处理，仅算子
-不同。markdup candidate ownership、collate QNAME exchange 等算法专用状态继续留在
-具体命令中，不进入 BAM I/O 核心库。
+两类 operator 可以同时存在于同一个库中。前者强调扩展性和 HTSlib 兼容，后者
+强调避免中间数据移动；生产应用优先组合已有融合 operator，而不需要另选一套
+runtime。详细数据契约见 `swbam流水线数据契约与整体架构.md`。markdup candidate
+ownership、collate QNAME exchange 等算法专用状态继续留在具体命令中。
 
-当前提供 `RabbitBAM-MPI io-check -i input.bam` 作为 Composable path 实例：它不执行任何
+当前提供 `RabbitBAM-MPI io-check -i input.bam` 作为 record-view 实例：它不执行任何
 业务统计，只校验全局 BGZF block 数、decoded block 状态、解压字节数、raw record
 边界和记录数，并打印 pipeline/kernel/batch post-processor 计时。
 
@@ -129,7 +130,7 @@ SWBAM
 不构造 `bam1_t`，也不复制 record payload。view 只在 batch post-processor 回调期间有效。当前
 与项目其他路径一致，要求单条 BAM record 不跨 BGZF block。
 
-`bam1_t` Composable path 复用上述 Raw batch，而不是新增另一套读取和解压流水线。adapter
+`bam1_t` adapter 复用上述 Raw batch，而不是新增另一套读取和解压流水线。adapter
 规范化 QNAME padding、CIGAR 和 aux 布局，并维护只随历史最大 batch 增长的对象池；
 物化时先保证池内目标记录容量，再直接写入其 `data`，避免通过临时 normalized
 payload 再调用 `bam_copy1()` 的二次复制。
@@ -161,7 +162,7 @@ mapped=2,663,701、MAPQ>=30=2,481,669、NM sum=878,007，分别与 Raw 统计、
 
 ## `flagstat` 实例
 
-`FlagstatCpeOperator` 实现 `CpeBatchOperator`：
+公共库中的 `swbam::operators::FlagstatOperator` 实现 `CpeBatchOperator`：
 
 1. `Initialize` 分配每个 CPE 的 scratch 和计数 slice。
 2. `Prepare` 将当前 compressed/decoded block、scratch 和 slice 绑定到
@@ -171,11 +172,12 @@ mapped=2,663,701、MAPQ>=30=2,481,669、NM sum=878,007，分别与 Raw 统计、
 5. `Validate` 检查每个 CPE 的状态，`PostProcessBatch` 将 64 个计数 slice 合并到 rank
    结果。
 
-命令本身不再维护读取、双缓冲和 launch/join 循环。
+`RunFlagstatPipeline` 将该算子接入公共 read runtime。命令本身只保留 MPI input
+plan、跨 rank 归约与结果打印，不再维护读取、双缓冲和 launch/join 循环。
 
 ## `stats --basic` 实例
 
-`StatsBasicCpeOperator` 使用同一个 runtime，但提供
+公共库中的 `swbam::operators::StatsBasicOperator` 使用同一个 runtime，并提供
 `slave_mpi_stats_basic_count` 及其参数：
 
 1. CPE 融合执行 BGZF 解压、BAM 解析、SN 统计、insert-size/orientation 统计和
@@ -183,6 +185,8 @@ mapped=2,663,701、MAPQ>=30=2,481,669、NM sum=878,007，分别与 Raw 统计、
 2. `PostProcessBatch` 合并 block sort state 和 record 数。
 3. `Finish` 在全部 batch 完成后合并 64 个持续累积的统计 slice。
 
+`RunStatsBasicPipeline` 返回 rank-local counts、sort state 和 metrics。command
+只负责 MPI 直方图/最大值归约、rank 边界有序性判断以及 SN/verbose 文本输出。
 这说明同一套 pipeline 可以承载不同参数结构、结果结构和融合 kernel。
 
 ## 从核公共层与专用 kernel

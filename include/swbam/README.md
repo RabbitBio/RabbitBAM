@@ -16,6 +16,8 @@
 - `raw_bam_filter.h`：Composable 过滤 batch post-processor。
 - `raw_bam_writer.h`：Raw BAM pack、压缩和完整 BAM writer。
 - `mpi_runtime.h`：MPI input plan、MPI-IO 和分布式 BAM 输出。
+- `operators/flagstat.h`：可复用的融合 flagstat operator、rank-local 结果与计时。
+- `operators/stats_basic.h`：可复用的融合 basic stats operator、直方图、排序边界与计时。
 
 ## 流水线扩展接口
 

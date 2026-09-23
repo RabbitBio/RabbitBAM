@@ -1,156 +1,17 @@
 #include "swbam_mpi.h"
-#include "swbam/cpe_pipeline.h"
 #include "swbam/io.h"
 #include "swbam/mpi_runtime.h"
+#include "swbam/operators/flagstat.h"
 
-#include <climits>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <stdint.h>
-#include <vector>
 
 #include <mpi.h>
 
-extern "C" {
-    void slave_mpi_flagstat_count();
-}
-
 namespace {
 
-const int kFlagstatNB = 64;
-
-enum FlagstatCounterId {
-    FLAGSTAT_TOTAL = 0,
-    FLAGSTAT_PRIMARY,
-    FLAGSTAT_SECONDARY,
-    FLAGSTAT_SUPPLEMENTARY,
-    FLAGSTAT_DUPLICATES,
-    FLAGSTAT_PRIMARY_DUPLICATES,
-    FLAGSTAT_MAPPED,
-    FLAGSTAT_PRIMARY_MAPPED,
-    FLAGSTAT_PAIRED,
-    FLAGSTAT_READ1,
-    FLAGSTAT_READ2,
-    FLAGSTAT_PROPERLY_PAIRED,
-    FLAGSTAT_PAIR_MAPPED,
-    FLAGSTAT_SINGLETONS,
-    FLAGSTAT_DIFF_CHR,
-    FLAGSTAT_DIFF_CHR_MAPQ5,
-    FLAGSTAT_COUNTER_COUNT
-};
-
-struct MpiFlagstatCounts {
-    long long values[FLAGSTAT_COUNTER_COUNT][2];
-};
-
-struct MpiFlagstatStats {
-    long long input_blocks;
-    long long group_count;
-    long long total_records;
-    double t_read;
-    double t_decomp;
-    double t_decomp_alloc;
-    double t_decomp_inflate;
-    double t_decomp_crc;
-    double t_decomp_parse;
-    double t_decomp_other;
-    double t_count;
-    double t_optimized_total;
-};
-
-BamFilterOptions MpiFlagstatNoFilter() {
-    BamFilterOptions filter;
-    filter.min_mapq = -1;
-    filter.max_mapq = -1;
-    filter.require_flag = 0;
-    filter.exclude_flag = 0;
-    filter.ref_tid = -2;
-    filter.min_read_len = -1;
-    filter.max_read_len = -1;
-    return filter;
-}
-
-void MpiFlagstatAccumulateDecompDetail(const MpiFlagstatCountPara *paras,
-                                       int active_blocks,
-                                       double decomp_wall,
-                                       MpiFlagstatStats *stats) {
-    if (!stats || active_blocks <= 0 || decomp_wall <= 0.0) return;
-
-    const MpiFlagstatCountPara *critical = nullptr;
-    uint64_t critical_total = 0;
-    for (int b = 0; b < active_blocks; ++b) {
-        if (paras[b].decomp_total_cycles >= critical_total) {
-            critical_total = paras[b].decomp_total_cycles;
-            critical = &paras[b];
-        }
-    }
-    if (!critical || critical_total == 0) {
-        stats->t_decomp_other += decomp_wall;
-        return;
-    }
-
-    const double scale = decomp_wall / (double)critical_total;
-    const double alloc_time = scale * (double)critical->decomp_alloc_cycles;
-    const double inflate_time = scale * (double)critical->decomp_inflate_cycles;
-    const double crc_time = scale * (double)critical->decomp_crc_cycles;
-    const double parse_time = scale * (double)critical->decomp_parse_cycles;
-    double other_time = decomp_wall - alloc_time - inflate_time - crc_time - parse_time;
-    if (other_time < 0.0) other_time = 0.0;
-
-    stats->t_decomp_alloc += alloc_time;
-    stats->t_decomp_inflate += inflate_time;
-    stats->t_decomp_crc += crc_time;
-    stats->t_decomp_parse += parse_time;
-    stats->t_decomp_other += other_time;
-}
-
-void MpiFlagstatAddRecord(const bam1_t *record, MpiFlagstatCounts *counts) {
-    const uint16_t flag = record->core.flag;
-    const int bucket = (flag & BAM_FQCFAIL) ? 1 : 0;
-    const bool is_secondary = (flag & BAM_FSECONDARY) != 0;
-    const bool is_supplementary = (flag & BAM_FSUPPLEMENTARY) != 0;
-    const bool is_primary = !is_secondary && !is_supplementary;
-    const bool is_paired = (flag & BAM_FPAIRED) != 0;
-    const bool is_mapped = (flag & BAM_FUNMAP) == 0;
-    const bool mate_mapped = (flag & BAM_FMUNMAP) == 0;
-
-    counts->values[FLAGSTAT_TOTAL][bucket]++;
-    if (is_primary) counts->values[FLAGSTAT_PRIMARY][bucket]++;
-    if (is_secondary) counts->values[FLAGSTAT_SECONDARY][bucket]++;
-    if (is_supplementary) counts->values[FLAGSTAT_SUPPLEMENTARY][bucket]++;
-    if (flag & BAM_FDUP) counts->values[FLAGSTAT_DUPLICATES][bucket]++;
-    if (is_primary && (flag & BAM_FDUP)) counts->values[FLAGSTAT_PRIMARY_DUPLICATES][bucket]++;
-    if (is_mapped) counts->values[FLAGSTAT_MAPPED][bucket]++;
-    if (is_primary && is_mapped) counts->values[FLAGSTAT_PRIMARY_MAPPED][bucket]++;
-
-    if (is_primary && is_paired) {
-        counts->values[FLAGSTAT_PAIRED][bucket]++;
-        if (flag & BAM_FREAD1) counts->values[FLAGSTAT_READ1][bucket]++;
-        if (flag & BAM_FREAD2) counts->values[FLAGSTAT_READ2][bucket]++;
-        if ((flag & BAM_FPROPER_PAIR) && is_mapped) {
-            counts->values[FLAGSTAT_PROPERLY_PAIRED][bucket]++;
-        }
-        if (is_mapped && mate_mapped) {
-            counts->values[FLAGSTAT_PAIR_MAPPED][bucket]++;
-            if (record->core.tid != record->core.mtid) {
-                counts->values[FLAGSTAT_DIFF_CHR][bucket]++;
-                if (record->core.qual >= 5) counts->values[FLAGSTAT_DIFF_CHR_MAPQ5][bucket]++;
-            }
-        }
-        if (is_mapped && !mate_mapped) {
-            counts->values[FLAGSTAT_SINGLETONS][bucket]++;
-        }
-    }
-}
-
-void MpiFlagstatMergeSlice(const MpiFlagstatCountSlice &slice,
-                           MpiFlagstatCounts *counts) {
-    for (int i = 0; i < FLAGSTAT_COUNTER_COUNT; ++i) {
-        counts->values[i][0] += slice.values[i][0];
-        counts->values[i][1] += slice.values[i][1];
-    }
-}
+using swbam::operators::FlagstatCounterId;
+using swbam::operators::FlagstatCounts;
+using swbam::operators::FlagstatMetrics;
 
 void MpiFlagstatFormatPct(char *buf, size_t buf_size, long long value, long long total) {
     if (total > 0) {
@@ -160,13 +21,13 @@ void MpiFlagstatFormatPct(char *buf, size_t buf_size, long long value, long long
     }
 }
 
-void MpiFlagstatPrintSimple(const MpiFlagstatCounts &counts,
+void MpiFlagstatPrintSimple(const FlagstatCounts &counts,
                             FlagstatCounterId id,
                             const char *label) {
     printf("%lld + %lld %s\n", counts.values[id][0], counts.values[id][1], label);
 }
 
-void MpiFlagstatPrintPct(const MpiFlagstatCounts &counts,
+void MpiFlagstatPrintPct(const FlagstatCounts &counts,
                          FlagstatCounterId id,
                          FlagstatCounterId denom_id,
                          const char *label) {
@@ -184,45 +45,53 @@ void MpiFlagstatPrintPct(const MpiFlagstatCounts &counts,
            fail_pct);
 }
 
-void MpiFlagstatPrintSamtoolsStyle(const MpiFlagstatCounts &counts) {
-    MpiFlagstatPrintSimple(counts, FLAGSTAT_TOTAL,
+void MpiFlagstatPrintSamtoolsStyle(const FlagstatCounts &counts) {
+    MpiFlagstatPrintSimple(counts, swbam::operators::kFlagstatTotal,
                            "in total (QC-passed reads + QC-failed reads)");
-    MpiFlagstatPrintSimple(counts, FLAGSTAT_PRIMARY, "primary");
-    MpiFlagstatPrintSimple(counts, FLAGSTAT_SECONDARY, "secondary");
-    MpiFlagstatPrintSimple(counts, FLAGSTAT_SUPPLEMENTARY, "supplementary");
-    MpiFlagstatPrintSimple(counts, FLAGSTAT_DUPLICATES, "duplicates");
-    MpiFlagstatPrintSimple(counts, FLAGSTAT_PRIMARY_DUPLICATES, "primary duplicates");
-    MpiFlagstatPrintPct(counts, FLAGSTAT_MAPPED, FLAGSTAT_TOTAL, "mapped");
-    MpiFlagstatPrintPct(counts, FLAGSTAT_PRIMARY_MAPPED, FLAGSTAT_PRIMARY, "primary mapped");
-    MpiFlagstatPrintSimple(counts, FLAGSTAT_PAIRED, "paired in sequencing");
-    MpiFlagstatPrintSimple(counts, FLAGSTAT_READ1, "read1");
-    MpiFlagstatPrintSimple(counts, FLAGSTAT_READ2, "read2");
-    MpiFlagstatPrintPct(counts, FLAGSTAT_PROPERLY_PAIRED, FLAGSTAT_PAIRED, "properly paired");
-    MpiFlagstatPrintSimple(counts, FLAGSTAT_PAIR_MAPPED, "with itself and mate mapped");
-    MpiFlagstatPrintPct(counts, FLAGSTAT_SINGLETONS, FLAGSTAT_PAIRED, "singletons");
-    MpiFlagstatPrintSimple(counts, FLAGSTAT_DIFF_CHR, "with mate mapped to a different chr");
-    MpiFlagstatPrintSimple(counts, FLAGSTAT_DIFF_CHR_MAPQ5,
+    MpiFlagstatPrintSimple(counts, swbam::operators::kFlagstatPrimary, "primary");
+    MpiFlagstatPrintSimple(counts, swbam::operators::kFlagstatSecondary, "secondary");
+    MpiFlagstatPrintSimple(counts, swbam::operators::kFlagstatSupplementary, "supplementary");
+    MpiFlagstatPrintSimple(counts, swbam::operators::kFlagstatDuplicates, "duplicates");
+    MpiFlagstatPrintSimple(counts, swbam::operators::kFlagstatPrimaryDuplicates,
+                           "primary duplicates");
+    MpiFlagstatPrintPct(counts, swbam::operators::kFlagstatMapped,
+                       swbam::operators::kFlagstatTotal, "mapped");
+    MpiFlagstatPrintPct(counts, swbam::operators::kFlagstatPrimaryMapped,
+                       swbam::operators::kFlagstatPrimary, "primary mapped");
+    MpiFlagstatPrintSimple(counts, swbam::operators::kFlagstatPaired,
+                           "paired in sequencing");
+    MpiFlagstatPrintSimple(counts, swbam::operators::kFlagstatRead1, "read1");
+    MpiFlagstatPrintSimple(counts, swbam::operators::kFlagstatRead2, "read2");
+    MpiFlagstatPrintPct(counts, swbam::operators::kFlagstatProperlyPaired,
+                       swbam::operators::kFlagstatPaired, "properly paired");
+    MpiFlagstatPrintSimple(counts, swbam::operators::kFlagstatPairMapped,
+                           "with itself and mate mapped");
+    MpiFlagstatPrintPct(counts, swbam::operators::kFlagstatSingletons,
+                       swbam::operators::kFlagstatPaired, "singletons");
+    MpiFlagstatPrintSimple(counts, swbam::operators::kFlagstatDiffChr,
+                           "with mate mapped to a different chr");
+    MpiFlagstatPrintSimple(counts, swbam::operators::kFlagstatDiffChrMapq5,
                            "with mate mapped to a different chr (mapQ>=5)");
 }
 
-void MpiFlagstatReduceStats(const MpiFlagstatStats &local_stats,
-                            MpiFlagstatStats *global_stats) {
+void MpiFlagstatReduceStats(const FlagstatMetrics &local_stats,
+                            FlagstatMetrics *global_stats) {
     long long local_long[3] = {
         local_stats.input_blocks,
-        local_stats.group_count,
+        local_stats.batch_count,
         local_stats.total_records
     };
     long long global_long[3] = {};
     double local_double[9] = {
-        local_stats.t_read,
-        local_stats.t_decomp,
-        local_stats.t_decomp_alloc,
-        local_stats.t_decomp_inflate,
-        local_stats.t_decomp_crc,
-        local_stats.t_decomp_parse,
-        local_stats.t_decomp_other,
-        local_stats.t_count,
-        local_stats.t_optimized_total
+        local_stats.read,
+        local_stats.kernel,
+        local_stats.decomp_alloc,
+        local_stats.decomp_inflate,
+        local_stats.decomp_crc,
+        local_stats.decomp_parse,
+        local_stats.decomp_other,
+        local_stats.post_process,
+        local_stats.total
     };
     double global_double[9] = {};
 
@@ -231,158 +100,18 @@ void MpiFlagstatReduceStats(const MpiFlagstatStats &local_stats,
 
     if (global_stats) {
         global_stats->input_blocks = global_long[0];
-        global_stats->group_count = global_long[1];
+        global_stats->batch_count = global_long[1];
         global_stats->total_records = global_long[2];
-        global_stats->t_read = global_double[0];
-        global_stats->t_decomp = global_double[1];
-        global_stats->t_decomp_alloc = global_double[2];
-        global_stats->t_decomp_inflate = global_double[3];
-        global_stats->t_decomp_crc = global_double[4];
-        global_stats->t_decomp_parse = global_double[5];
-        global_stats->t_decomp_other = global_double[6];
-        global_stats->t_count = global_double[7];
-        global_stats->t_optimized_total = global_double[8];
+        global_stats->read = global_double[0];
+        global_stats->kernel = global_double[1];
+        global_stats->decomp_alloc = global_double[2];
+        global_stats->decomp_inflate = global_double[3];
+        global_stats->decomp_crc = global_double[4];
+        global_stats->decomp_parse = global_double[5];
+        global_stats->decomp_other = global_double[6];
+        global_stats->post_process = global_double[7];
+        global_stats->total = global_double[8];
     }
-}
-
-class FlagstatCpeOperator : public swbam::cpe::CpeBatchOperator {
-public:
-    FlagstatCpeOperator(MpiFlagstatCounts *counts, MpiFlagstatStats *stats)
-        : counts_(counts), stats_(stats), count_slices_(nullptr),
-          scratch_data_(nullptr) {
-        memset(paras_, 0, sizeof(paras_));
-    }
-
-    const char *name() const { return "flagstat"; }
-    size_t batch_capacity() const { return kFlagstatNB; }
-
-    int Initialize() {
-        if (!counts_) return -1;
-        memset(counts_, 0, sizeof(*counts_));
-        if (stats_) memset(stats_, 0, sizeof(*stats_));
-        count_slices_ = (MpiFlagstatCountSlice *)aligned_alloc_custom(
-            64, (size_t)kFlagstatNB * sizeof(MpiFlagstatCountSlice));
-        scratch_data_ = aligned_alloc_custom(
-            64, (size_t)kFlagstatNB * MPI_BAM_BLOCK_ARENA_SIZE);
-        return count_slices_ && scratch_data_ ? 0 : -1;
-    }
-
-    void Shutdown() {
-        if (count_slices_) {
-            aligned_free_custom((unsigned char *)count_slices_);
-            count_slices_ = nullptr;
-        }
-        if (scratch_data_) {
-            aligned_free_custom(scratch_data_);
-            scratch_data_ = nullptr;
-        }
-    }
-
-    int Prepare(const swbam::BgzfBlockBatch &compressed,
-                swbam::BgzfBlockBatch *decoded,
-                size_t active_blocks) {
-        memset(count_slices_, 0,
-               (size_t)kFlagstatNB * sizeof(MpiFlagstatCountSlice));
-        for (int b = 0; b < kFlagstatNB; ++b) {
-            MpiFlagstatCountPara &para = paras_[b];
-            para.block_id = b;
-            para.scratch_data = scratch_data_ +
-                (size_t)b * MPI_BAM_BLOCK_ARENA_SIZE;
-            para.scratch_capacity = MPI_BAM_BLOCK_ARENA_SIZE;
-            para.counts = &count_slices_[b];
-            para.n_total_records = 0;
-            para.record_index = 0;
-            para.actual_value = 0;
-            para.limit_value = 0;
-            para.limit_id = BOUNDS_LIMIT_NONE;
-            para.decomp_alloc_cycles = 0;
-            para.decomp_inflate_cycles = 0;
-            para.decomp_crc_cycles = 0;
-            para.decomp_parse_cycles = 0;
-            para.decomp_total_cycles = 0;
-            if ((size_t)b < active_blocks) {
-                para.input_block = const_cast<bam_block *>(
-                    &compressed.blocks()[b]);
-                para.un_comp_block = &decoded->blocks()[b];
-                para.status = 0;
-            } else {
-                para.input_block = nullptr;
-                para.un_comp_block = nullptr;
-                para.status = -1;
-            }
-        }
-        return 0;
-    }
-
-    void *kernel_entry() const {
-        return (void *)slave_mpi_flagstat_count;
-    }
-    void *kernel_arguments() { return paras_; }
-
-    void ObserveKernel(double wall_seconds, size_t active_blocks) {
-        if (!stats_) return;
-        MpiFlagstatAccumulateDecompDetail(
-            paras_, (int)active_blocks, wall_seconds, stats_);
-    }
-
-    int Validate(size_t active_blocks) const {
-        for (size_t b = 0; b < active_blocks; ++b) {
-            const MpiFlagstatCountPara &para = paras_[b];
-            if (para.status == 0) continue;
-            if (para.status == -3) {
-                fprintf(stderr,
-                        "ERROR: MPI flagstat capacity exceeded on input block %zu. limit_id=%d limit=%lld actual=%lld record=%d.\n",
-                        b, para.limit_id, para.limit_value,
-                        para.actual_value, para.record_index);
-            } else {
-                fprintf(stderr,
-                        "ERROR: MPI flagstat count failed on input block %zu with status %d.\n",
-                        b, para.status);
-            }
-            return -1;
-        }
-        return 0;
-    }
-
-    int PostProcessBatch(size_t active_blocks, long long *records_processed) {
-        long long records = 0;
-        for (size_t b = 0; b < active_blocks; ++b) {
-            records += paras_[b].n_total_records;
-            MpiFlagstatMergeSlice(count_slices_[b], counts_);
-        }
-        if (records_processed) *records_processed = records;
-        return 0;
-    }
-
-    int Finish() { return 0; }
-
-private:
-    MpiFlagstatCounts *counts_;
-    MpiFlagstatStats *stats_;
-    MpiFlagstatCountPara paras_[kFlagstatNB];
-    MpiFlagstatCountSlice *count_slices_;
-    unsigned char *scratch_data_;
-};
-
-int OptimizedFlagstatMPI(const swbam::BamInputBackend &input,
-                     const swbam::BgzfBlockSpan *spans,
-                     size_t span_count,
-                     MpiFlagstatCounts *counts,
-                     MpiFlagstatStats *stats) {
-    FlagstatCpeOperator op(counts, stats);
-    swbam::cpe::CpeReadPipelineTiming timing;
-    const int ret = swbam::cpe::RunCpeReadPipeline(
-        input, spans, span_count, &op, &timing);
-    if (stats) {
-        stats->input_blocks = timing.input_blocks;
-        stats->group_count = timing.batch_count;
-        stats->total_records = timing.total_records;
-        stats->t_read = timing.read;
-        stats->t_decomp = timing.kernel;
-        stats->t_count = timing.post_process;
-        stats->t_optimized_total = timing.total;
-    }
-    return ret;
 }
 
 } // namespace
@@ -400,10 +129,10 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
     swbam::mpi::MpiBamInput input_handle;
     swbam::BamInputBackend *input = nullptr;
     swbam::mpi::MpiBamInputPlan input_plan;
-    MpiFlagstatCounts local_counts = {};
-    MpiFlagstatCounts global_counts = {};
-    MpiFlagstatStats local_stats = {};
-    MpiFlagstatStats global_stats = {};
+    FlagstatCounts local_counts;
+    FlagstatCounts global_counts;
+    FlagstatMetrics local_stats;
+    FlagstatMetrics global_stats;
 
     double init_cost = GetTime() - t_init;
     double init_cost_max = swbam::mpi::ReduceMaxCost(init_cost);
@@ -472,9 +201,10 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
         }
 
         double stage43_t0 = GetTime();
-        if (OptimizedFlagstatMPI(*input, input_plan.rank_spans(),
-                             input_plan.rank_block_count(),
-                             &local_counts, &local_stats) != 0) {
+        if (swbam::operators::RunFlagstatPipeline(
+                *input, input_plan.rank_spans(),
+                input_plan.rank_block_count(),
+                &local_counts, &local_stats) != 0) {
             local_ok = 0;
         }
         double stage43_cost = GetTime() - stage43_t0;
@@ -487,7 +217,8 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
 
         double stage44_t0 = GetTime();
         MPI_Reduce(&local_counts.values[0][0], &global_counts.values[0][0],
-                   FLAGSTAT_COUNTER_COUNT * 2, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+                   swbam::operators::kFlagstatCounterCount * 2,
+                   MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
         MpiFlagstatReduceStats(local_stats, rank == 0 ? &global_stats : nullptr);
         double stage44_cost = GetTime() - stage44_t0;
         double stage44_cost_max = swbam::mpi::ReduceMaxCost(stage44_cost);
@@ -496,19 +227,19 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
             printf("OptimizedFlagstatMPI finished. ranks=%d in_blocks=%lld groups=%lld total_records=%lld\n",
                    comm_size,
                    global_stats.input_blocks,
-                   global_stats.group_count,
+                   global_stats.batch_count,
                    global_stats.total_records);
             printf("  read_sum=%.3f  decomp_sum=%.3f  merge_sum=%.3f  optimized_total_sum=%.3f\n",
-                   global_stats.t_read,
-                   global_stats.t_decomp,
-                   global_stats.t_count,
-                   global_stats.t_optimized_total);
+                   global_stats.read,
+                   global_stats.kernel,
+                   global_stats.post_process,
+                   global_stats.total);
             printf("  decomp_detail_sum alloc=%.3f  inflate=%.3f  crc=%.3f  parse=%.3f  other=%.3f\n",
-                   global_stats.t_decomp_alloc,
-                   global_stats.t_decomp_inflate,
-                   global_stats.t_decomp_crc,
-                   global_stats.t_decomp_parse,
-                   global_stats.t_decomp_other);
+                   global_stats.decomp_alloc,
+                   global_stats.decomp_inflate,
+                   global_stats.decomp_crc,
+                   global_stats.decomp_parse,
+                   global_stats.decomp_other);
             printf("Complete the 4.4 flagstat reduce/print cost %lf\n", stage44_cost_max);
         }
 

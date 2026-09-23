@@ -9,6 +9,8 @@
 #include "swbam/composable_decode.h"
 #include "swbam/io.h"
 #include "swbam/mpi_runtime.h"
+#include "swbam/operators/flagstat.h"
+#include "swbam/operators/stats_basic.h"
 #include "swbam/raw_bam.h"
 #include "swbam/raw_bam_filter.h"
 #include "swbam/raw_bam_writer.h"

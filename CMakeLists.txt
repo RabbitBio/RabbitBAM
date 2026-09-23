@@ -147,6 +147,8 @@ if(PLATFORM_SUNWAY)
         lib/cpe/swbam_cpe_write_pipeline.cpp
         lib/cpe/swbam_composable_compress.cpp
         lib/cpe/swbam_composable_decode.cpp
+        lib/operators/swbam_flagstat_operator.cpp
+        lib/operators/swbam_stats_basic_operator.cpp
         lib/bam/swbam_bam1_reader.cpp
         lib/bam/swbam_bam1_writer.cpp
         lib/bam/swbam_raw_bam_reader.cpp
