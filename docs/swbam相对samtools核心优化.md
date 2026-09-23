@@ -88,7 +88,7 @@ slots，减少中间 scratch buffer。
 “读完再算、算完再写”的串行等待。抽象只在每个 batch 上调用虚接口，不进入逐记录
 热循环。
 
-对应代码：`lib/cpe/swbam_cpe_pipeline.cpp`、
+对应代码：`lib/cpe/swbam_cpe_read_pipeline.cpp`、
 `lib/cpe/swbam_cpe_write_pipeline.cpp`。
 
 ### 4.4 Composable path 与 Optimized path

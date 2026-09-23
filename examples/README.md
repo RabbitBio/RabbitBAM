@@ -12,7 +12,8 @@
 cmake -S . -B build_sunway_sduhpc -DPLATFORM=sunway
 cmake --build build_sunway_sduhpc \
   --target swbam-sdk-record-count swbam-sdk-bam1-stats \
-           swbam-sdk-filter-bam swbam-sdk-bam1-filter -j 8
+           swbam-sdk-filter-bam swbam-sdk-bam1-filter \
+           swbam-sdk-mpi-benchmark -j 8
 ```
 
 ## record count
@@ -91,3 +92,17 @@ Sunway CPE object 需要直接交给 hybrid linker，不能先封装进普通主
 - `RawBamRecordView` 只在当前 batch post-processor 回调期间有效，不能跨 batch 保存指针。
 - `Bam1BatchPostProcessor` 收到的 `bam1_t` 同样是 batch-local；需要保留时调用
   `bam_dup1()`，并由调用者负责 `bam_destroy1()`。
+
+## MPI 扩展性微基准
+
+`sdk_mpi_benchmark.cpp` 只使用公开 SDK 接口，将 MPI input plan 分配给各 rank，并在
+一次 memory backend 加载后依次测试 Raw read、Raw read-write、`bam1_t` read 和
+`bam1_t` read-write：
+
+```bash
+./swbam-sdk-mpi-benchmark input.bam
+```
+
+四条路径的 `core` 都不包含输入文件加载、block plan 和磁盘输出。Read-write 只写入
+rank-local `MemoryBamOutput`，不 dump 文件；该工具用于比较 Composable SDK 路径和
+`bam1_t` 物化开销，不代替生成单个分布式 BAM 文件的正式应用。

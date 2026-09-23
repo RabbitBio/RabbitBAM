@@ -143,13 +143,13 @@ if(PLATFORM_SUNWAY)
     target_link_libraries(swbam_mpi_runtime PUBLIC swbam_io)
 
     add_library(swbam_cpe_runtime STATIC
-        lib/cpe/swbam_cpe_pipeline.cpp
+        lib/cpe/swbam_cpe_read_pipeline.cpp
         lib/cpe/swbam_cpe_write_pipeline.cpp
         lib/cpe/swbam_composable_compress.cpp
         lib/cpe/swbam_composable_decode.cpp
-        lib/bam/swbam_bam1.cpp
+        lib/bam/swbam_bam1_reader.cpp
         lib/bam/swbam_bam1_writer.cpp
-        lib/bam/swbam_raw_bam.cpp
+        lib/bam/swbam_raw_bam_reader.cpp
         lib/bam/swbam_raw_bam_filter.cpp
         lib/bam/swbam_raw_bam_writer.cpp
     )
@@ -316,14 +316,18 @@ if(PLATFORM_SUNWAY)
             examples/sdk_bam1_stats.cpp)
         add_executable(swbam-sdk-bam1-filter
             examples/sdk_bam1_filter.cpp)
+        add_executable(swbam-sdk-mpi-benchmark
+            examples/sdk_mpi_benchmark.cpp)
         target_compile_options(swbam-sdk-record-count PRIVATE ${HOST_FLAGS})
         target_compile_options(swbam-sdk-filter-bam PRIVATE ${HOST_FLAGS})
         target_compile_options(swbam-sdk-bam1-stats PRIVATE ${HOST_FLAGS})
         target_compile_options(swbam-sdk-bam1-filter PRIVATE ${HOST_FLAGS})
+        target_compile_options(swbam-sdk-mpi-benchmark PRIVATE ${HOST_FLAGS})
         target_link_libraries(swbam-sdk-record-count PRIVATE swbam::swbam)
         target_link_libraries(swbam-sdk-filter-bam PRIVATE swbam::swbam)
         target_link_libraries(swbam-sdk-bam1-stats PRIVATE swbam::swbam)
         target_link_libraries(swbam-sdk-bam1-filter PRIVATE swbam::swbam)
+        target_link_libraries(swbam-sdk-mpi-benchmark PRIVATE swbam::swbam)
     endif()
     
     # Main executable with host code and slave objects

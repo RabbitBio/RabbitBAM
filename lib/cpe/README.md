@@ -5,7 +5,7 @@
 
 ## 文件
 
-- `swbam_cpe_pipeline.cpp`：两套 compressed/decoded batch，重叠 MPE 读取下一批与
+- `swbam_cpe_read_pipeline.cpp`：两套 compressed/decoded batch，重叠 MPE 读取下一批与
   CPE 处理当前批。
 - `swbam_composable_decode.cpp`：把 BGZF decode kernel 包装成 Composable
   `CpeBatchOperator`。

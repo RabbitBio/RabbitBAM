@@ -6,9 +6,9 @@ Composable 过滤和
 
 ## 文件
 
-- `swbam_raw_bam.cpp`：扫描 decoded block 中的记录边界，构造零拷贝
+- `swbam_raw_bam_reader.cpp`：扫描 decoded block 中的记录边界，构造零拷贝
   `RawBamRecordView` 并调用 batch post-processor。
-- `swbam_bam1.cpp`：将 raw record batch 物化为库管理的 `bam1_t` 对象池，供
+- `swbam_bam1_reader.cpp`：将 raw record batch 物化为库管理的 `bam1_t` 对象池，供
   HTSlib 兼容 batch post-processor 使用，并单独统计 materialize/post_process 时间。
 - `swbam_bam1_writer.cpp`：将只读或用户修改后的 `bam1_t` 批量编码回 raw BAM
   record，复用 arena、视图数组和 `RawBamWriter`，不为每条记录单独分配。
