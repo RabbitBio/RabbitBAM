@@ -12,15 +12,16 @@ namespace {
 
 const size_t kComposableCompressBatch = 64;
 
-class ComposableCompressOperator : public CpeWriteBatchOperator {
+class ComposableCompressOperator : public CpeWriteKernelOperator {
 public:
     ComposableCompressOperator(int level, ComposableCompressMetrics *metrics)
-        : level_(level), metrics_(metrics) {
+        : CpeWriteKernelOperator({"composable-compress",
+              reinterpret_cast<void *>(slave_swbam_compress_bgzf),
+              kComposableCompressBatch, false}),
+          level_(level), metrics_(metrics) {
         memset(paras_, 0, sizeof(paras_));
     }
 
-    const char *name() const { return "composable-compress"; }
-    size_t batch_capacity() const { return kComposableCompressBatch; }
     int Initialize() {
         if (level_ != 0 && level_ != 1 && level_ != 6) return -1;
         if (metrics_) *metrics_ = ComposableCompressMetrics();
@@ -56,7 +57,6 @@ public:
         return 0;
     }
 
-    void *kernel_entry() const { return (void *)slave_swbam_compress_bgzf; }
     void *kernel_arguments() { return paras_; }
 
     void ObserveKernel(double wall_seconds, size_t active_blocks) {

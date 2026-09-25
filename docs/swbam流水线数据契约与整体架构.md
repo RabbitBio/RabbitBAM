@@ -81,6 +81,13 @@ CPE kernel 中静态融合，例如 `decode+parse+flagstat`。开发与验证路
 
 原则概括为：**batch 层动态组合，record 层静态融合**。
 
+当前 BAM read 的从核基础步骤为 `swbam_cpe_decode_bam_block`（BGZF 解压）和
+`swbam_cpe_walk_bam_records`（BAM record 解析与遍历）。遍历接收编译期动作：
+filter、passthrough、flagstat、stats-basic、count 复用同一骨架，仍由一次 CPE
+launch 完成。主核 `BindBamReadBatch` 统一绑定 BGZF 输入/输出块；结果 arena、
+状态 slice 和后处理仍由各算子拥有。bam2sam 也使用 passthrough 解析动作，解析得到
+的记录仅在当前 batch 内交给 SAM write 流水线。
+
 ## Flagstat 首个迁移实例
 
 ```text
@@ -141,6 +148,9 @@ BamInputBackend + spans / MemReader
 `RunCpeWritePipeline` 是拉取式 source 的适配入口，`CpeRecordWriteSession` 是
 `RankBodySink` 和记录计划的推送式适配入口。两者共享压缩输出双缓冲及同一套
 `Prepare -> spawn -> flush(previous) -> join -> validate -> swap` 状态机。
+两类写算子由 `CpeWriteKernelSpec` 描述入口、batch 容量与是否需要未压缩块 scratch；
+从核共用 `swbam_cpe_compress_bam_block`。记录输入在同一次 CPE launch 中先序列化
+再压缩，已打包块输入直接压缩；不会先在主核物化另一份完整 BAM。
 写 session 在 `Submit()` 返回前完成当前批的压缩，上一批已压缩块可与压缩并行写出。
 因此下一个 read batch 复用记录 arena 时，不会留下悬空的 `bam1_t` 指针。
 这不表示 BAM read 与 BAM write 的 CPE kernel 同时执行。
@@ -176,6 +186,9 @@ SAM read 流水线拥有文本 chunk、解析后的记录池和数据 arena；�
 `PostProcessParsedBatch()` 回调期间有效。后处理只保存本批记录指针，提交写流水线
 后等待 CPE 完成，再允许下一波解析复用记录池。写出压缩仍与上一批的 MPE flush
 重叠；进入下一组 SAM chunk 的 CPE copy/count 时，也可 flush 最后待写的压缩批。
+`SamReadKernelSpec` 描述已有的 copy/count 与 parse 两阶段 CPE 入口；新应用通常只
+实现 `SamParsedBatchPostProcessor`，不改解析 kernel。自定义 kernel 必须遵守
+`MpiSamParseBatch` 参数和 status/arena 契约，两阶段不能任意交换顺序。
 命令层只保留 `MemWriter`/`RankBodySink` 适配、header 和最终 MPI 输出布局。
 
 WES_0.25G、6 ranks、level 1 的迁移前后均处理 `2,668,351` 条，输出 BAM
@@ -197,6 +210,10 @@ MPE flush 上批；最后一批由 `Finish()` 写出。命令层仅适配输入�
 这是 batch 级组合，不在逐记录格式化热路径加入虚调用。
 该算子选择读流水线的可选调度：在解码期间 flush 上批 SAM，在本批 CPE
 formatter 期间预读下一批 BGZF；其他 BAM read 算子继续使用默认预读调度。
+`SamWriteKernelSpec` 描述格式化入口与记录容量。新应用可使用
+`CpeSamWriteSession::SubmitRecords()` 批量提交指针；bam2sam 继续直接填写
+`RecordSlots()`，避免额外指针复制。两种入口都要求记录在本次 `Submit()` 返回前
+有效，文本缓冲由 session 持有直到下一批 flush 或 `Finish()`。
 
 WES_0.25G、6 ranks、memory backend：旧版与迁移版均输出 `2,668,351` 条，
 最终 SAM 逐字节一致；`4.3` 单次为旧版 `0.164583 s`、迁移版 `0.162327 s`。

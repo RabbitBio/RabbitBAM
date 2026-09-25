@@ -1,4 +1,5 @@
 #include "swbam/operators/bam_transform.h"
+#include "swbam/operators/bam_read_batch.h"
 
 #include <cstdio>
 #include <cstring>
@@ -238,17 +239,18 @@ private:
     MemReader *reader_;
 };
 
-class BamTransformOperator : public cpe::CpeBatchOperator {
+class BamTransformOperator : public BamReadBatchOperator {
 public:
     BamTransformOperator(RankBodySink *sink, const BamFilterOptions &filter,
                          int level, BamTransformMetrics *metrics)
-        : sink_(sink), filter_(filter), level_(level), metrics_(metrics),
+        : BamReadBatchOperator({"bam-transform",
+              reinterpret_cast<void *>(bam_filter_is_noop(filter)
+                  ? slave_mpi_decompress_bam2bam_passthrough
+                  : slave_mpi_decompress_filterfunc), kBatchBlocks}),
+          sink_(sink), filter_(filter), level_(level), metrics_(metrics),
           no_filter_(bam_filter_is_noop(filter)), decoded_(nullptr) {
         memset(paras_, 0, sizeof(paras_));
     }
-
-    const char *name() const { return "bam-transform"; }
-    size_t batch_capacity() const { return kBatchBlocks; }
 
     int Initialize() {
         if (!sink_ || !metrics_ || workspace_.Allocate() != 0 ||
@@ -265,6 +267,7 @@ public:
                 BgzfBlockBatch *decoded, size_t count) {
         if (!decoded || count > kBatchBlocks) return -1;
         decoded_ = decoded;
+        BindBamReadBatch(paras_, kBatchBlocks, compressed, decoded, count);
         for (int b = 0; b < kBatchBlocks; ++b) {
             Bam2BamPara &para = paras_[b];
             para.filter = filter_;
@@ -288,24 +291,10 @@ public:
             para.decomp_crc_cycles = 0;
             para.decomp_parse_cycles = 0;
             para.decomp_total_cycles = 0;
-            if (b < static_cast<int>(count)) {
-                para.input_block = const_cast<bam_block *>(&compressed.blocks()[b]);
-                para.un_comp_block = &decoded->blocks()[b];
-                para.status = 0;
-            } else {
-                para.input_block = nullptr;
-                para.un_comp_block = nullptr;
-                para.status = -1;
-            }
         }
         return 0;
     }
 
-    void *kernel_entry() const {
-        return reinterpret_cast<void *>(
-            no_filter_ ? slave_mpi_decompress_bam2bam_passthrough
-                       : slave_mpi_decompress_filterfunc);
-    }
     void *kernel_arguments() { return paras_; }
 
     void ObserveKernel(double wall, size_t count) {

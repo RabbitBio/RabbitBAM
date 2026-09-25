@@ -257,10 +257,17 @@ CpeSamReadTiming::CpeSamReadTiming()
       parse_core(0.0), parse_aux(0.0), parse_cg(0.0),
       parse_fallback(0.0), parse_other(0.0) {}
 
+SamReadKernelSpec DefaultSamReadKernelSpec() {
+    return {reinterpret_cast<void *>(slave_mpi_copy_and_count),
+            reinterpret_cast<void *>(slave_mpi_sam_parse_chunk)};
+}
+
 int RunCpeSamReadPipeline(MemReader *reader, const sam_hdr_t *header,
                           SamParsedBatchPostProcessor *post_processor,
-                          CpeSamReadTiming *timing) {
-    if (!reader || !header || !post_processor || !timing) return -1;
+                          CpeSamReadTiming *timing,
+                          const SamReadKernelSpec &kernels) {
+    if (!reader || !header || !post_processor || !timing ||
+        !kernels.copy_count_entry || !kernels.parse_entry) return -1;
     *timing = CpeSamReadTiming();
     SamReadWorkspace workspace;
     if (workspace.Initialize(header) != 0) {
@@ -281,8 +288,7 @@ int RunCpeSamReadPipeline(MemReader *reader, const sam_hdr_t *header,
         const double copy_t0 = GetTime();
         int flush_ret = 0;
 #ifdef PLATFORM_SUNWAY
-        __real_athread_spawn(reinterpret_cast<void *>(slave_mpi_copy_and_count),
-                             workspace.count_batch, 1);
+        __real_athread_spawn(kernels.copy_count_entry, workspace.count_batch, 1);
         flush_ret = post_processor->FlushPendingOutput();
         athread_join();
 #else
@@ -354,8 +360,7 @@ int RunCpeSamReadPipeline(MemReader *reader, const sam_hdr_t *header,
             for (int attempt = 0; attempt < 2; ++attempt) {
                 const double parse_t0 = GetTime();
 #ifdef PLATFORM_SUNWAY
-                __real_athread_spawn(reinterpret_cast<void *>(slave_mpi_sam_parse_chunk),
-                                     workspace.parse_batch, 1);
+                __real_athread_spawn(kernels.parse_entry, workspace.parse_batch, 1);
                 athread_join();
 #else
                 return -1;
@@ -398,6 +403,13 @@ int RunCpeSamReadPipeline(MemReader *reader, const sam_hdr_t *header,
         ++timing->chunk_groups;
     }
     return 0;
+}
+
+int RunCpeSamReadPipeline(MemReader *reader, const sam_hdr_t *header,
+                          SamParsedBatchPostProcessor *post_processor,
+                          CpeSamReadTiming *timing) {
+    return RunCpeSamReadPipeline(reader, header, post_processor, timing,
+                                 DefaultSamReadKernelSpec());
 }
 
 } // namespace cpe

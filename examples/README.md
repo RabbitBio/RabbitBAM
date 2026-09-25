@@ -119,16 +119,21 @@ CPE batch 流水线；`core` 是各 rank 核心处理时间的最大值，不含
 ./swbam-sdk-optimized-bam2bam input.bam
 ```
 
-`sdk_optimized_count.cpp` 在 CPE 解压 BGZF 后只遍历 record 长度并计数，
-不物化 `bam1_t`，也不计算 flagstat 指标；可与 `samtools view -c` 的记录数
-核对。它采用项目现有的 record 不跨 BGZF block 约束。
+`sdk_optimized_count.cpp` 在 CPE 解压 BGZF 后逐条解析到复用的临时
+`bam1_t` 再计数，不计算 flagstat 指标；可与 `samtools view -c` 的记录数核对。
+它采用项目现有的 record 不跨 BGZF block 约束。此前只扫描 BAM record 长度
+的 `core=0.047015 s` 是不同工作量的历史基线，不可作为此版本的性能结果。
 
 `sdk_optimized_bam2bam.cpp` 复用 `RunBamTransformPipeline`，不设置过滤条件，
 用 level 1 重新压缩，将各 rank 的 BGZF body 保存在内存中。它报告记录数和
 压缩 body 总字节数；不拼接 header/EOF，也不生成最终输出文件，因此是库的
 读写核心基准，不是完整的 BAM 转换命令。
 
-WES_0.25G、6 ranks 的简单 smoke：count 得到 `2,668,351` 条，
-`core=0.047015 s`；bam2bam 同样处理 `2,668,351` 条，
+WES_0.25G、6 ranks 的历史 smoke：count 得到 `2,668,351` 条；
+bam2bam 同样处理 `2,668,351` 条，
 `body_bytes=275,206,630`、两次 `core=0.196671/0.196398 s`。这些数字仅说明功能与
 测试口径正常，正式性能比较仍需同配置重复运行取中位数。
+
+改用 `bam1_t` 解析后，同一输入的 count 两次 smoke 均为 `2,668,351` 条，
+`core=0.050270/0.050454 s`。与旧的只扫长度路径相比，工作量已不同；也不能把
+这个核心时间与包含磁盘 I/O 的 Samtools wall time 直接等同比较。

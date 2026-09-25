@@ -7,7 +7,7 @@ launch/join 由 `lib/cpe/` 的 runtime 负责。
 - `swbam_flagstat_operator.cpp`：封装 decode + parse + flagstat count 融合
   CPE kernel，并公开 `FlagstatOperator` 与 `RunFlagstatPipeline`。
 - `swbam_record_count_operator.cpp`：封装只计记录数的 CPE kernel；解压后
-  按 BAM record 长度前进，不物化记录或计算其他统计。
+  逐条解析到复用的临时 `bam1_t`，但不计算其他统计。
 - `swbam_stats_basic_operator.cpp`：封装 decode + parse + basic stats 融合
   CPE kernel，并维护跨 batch 的计数直方图和坐标排序边界。
 - `swbam_bam_transform_operator.cpp`：封装 BAM 直通或过滤 CPE kernel，
@@ -19,3 +19,7 @@ launch/join 由 `lib/cpe/` 的 runtime 负责。
 
 对应的从核 kernel 位于 `slave/operators/`。这里的“operator”是批级执行单元，
 不会在逐记录热路径引入虚函数调用。
+新的 BAM read 算子可复用 `BamReadBatchOperator` 的 kernel 描述和
+`BindBamReadBatch` 的块绑定，再实现自己的 scratch/result slice 与批次归并。
+从核侧通过 `swbam_cpe_decode_bam_block`、`swbam_cpe_walk_bam_records`
+和编译期动作组合，仍只启动一次 CPE kernel。

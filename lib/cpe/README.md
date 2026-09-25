@@ -19,6 +19,13 @@
   适配器；调用统一写调度器，CPE 仍直接序列化 `bam1_t` 并压缩。
 - `swbam_composable_compress.cpp`：Composable BGZF compress operator。
 
+写算子使用 `CpeWriteKernelSpec` 选择已打包块压缩或记录序列化+压缩，
+共享 `CpeWritePipelineSession` 的压缩输出双缓冲。SAM read 使用
+`SamReadKernelSpec` 描述 copy/count 与 parse 两阶段入口；SAM write 使用
+`SamWriteKernelSpec` 描述 format 入口，应用既可直接填写 `RecordSlots()`，
+也可用 `SubmitRecords()` 提交当前批记录指针。上述可替换入口都必须遵守现有
+batch 参数布局；它们不是逐记录动态插件。
+
 ## 扩展方式
 
 简单工具使用 `RunComposableDecodePipeline` 或 `RunComposableRawBamPipeline`。需要融合

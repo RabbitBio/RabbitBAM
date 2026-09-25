@@ -11,6 +11,7 @@
 
 #include "BamTools.h"
 #include "swbam/cpe_bam_parser.h"
+#include "swbam/cpe_bam_write_steps.h"
 #include "swbam/cpe_codec.h"
 #include "libdeflate.h"
 #include <htslib/hts_endian.h>
@@ -1746,27 +1747,12 @@ extern "C" void slave_mpi_compressfunc(Comp_Para paras[64]) {
     }
     para->compress_serialize_cycles = (uint64_t)(slave_cycle_now() - serialize_t0);
 
-    struct libdeflate_compressor *z = nullptr;
-    if (compress_level != 0) {
-        z = swbam_cpe_get_compressor(
-            id, compress_level, 1, &para->compress_alloc_cycles);
-    }
-    if (compress_level != 0 && !z) {
-        para->status = -2;
-        para->compress_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
-        return;
-    }
-
-    size_t comp_size = BGZF_MAX_BLOCK_SIZE;
-    int ret = swbam_cpe_compress_bgzf(compressed->data, &comp_size,
-                                         uncompressed->data, uncompressed->pos,
-                                         compress_level,
-                                         z,
-                                         &para->compress_deflate_cycles,
-                                         &para->compress_footer_cycles);
-    compressed->length = ret == 0 ? (int)comp_size : -1;
-
-    if (compressed->length <= 0) {
+    if (swbam_cpe_compress_bam_block(
+            uncompressed, uncompressed->pos, compressed,
+            compress_level, id, 1, &para->compress_alloc_cycles,
+            &para->compress_deflate_cycles,
+            &para->compress_footer_cycles) != 0) {
+        compressed->length = -1;
         para->status = -2;
         para->compress_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
         return;

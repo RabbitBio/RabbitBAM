@@ -1,4 +1,5 @@
 #include "swbam/operators/bam_to_sam.h"
+#include "swbam/operators/bam_read_batch.h"
 
 #include <cstdio>
 #include <cstring>
@@ -130,16 +131,16 @@ void AccumulateDecodeDetail(const Bam2BamPara *paras, size_t count,
     metrics->t_decomp_other += other;
 }
 
-class BamToSamOperator : public cpe::CpeBatchOperator {
+class BamToSamOperator : public BamReadBatchOperator {
 public:
     BamToSamOperator(RankBodySink *sink, const sam_hdr_t *header,
                      BamToSamMetrics *metrics)
-        : sink_(sink), header_(header), metrics_(metrics) {
+        : BamReadBatchOperator({"bam-to-sam",
+              reinterpret_cast<void *>(slave_mpi_decompress_bam2bam_passthrough),
+              kBatchBlocks}),
+          sink_(sink), header_(header), metrics_(metrics) {
         memset(paras_, 0, sizeof(paras_));
     }
-
-    const char *name() const { return "bam-to-sam"; }
-    size_t batch_capacity() const { return kBatchBlocks; }
 
     int Initialize() {
         const double t0 = GetTime();
@@ -159,6 +160,7 @@ public:
     int Prepare(const BgzfBlockBatch &compressed,
                 BgzfBlockBatch *decoded, size_t count) {
         if (!decoded || count > kBatchBlocks) return -1;
+        BindBamReadBatch(paras_, kBatchBlocks, compressed, decoded, count);
         for (int b = 0; b < kBatchBlocks; ++b) {
             Bam2BamPara &para = paras_[b];
             para.block_id = b;
@@ -180,22 +182,10 @@ public:
             para.decomp_crc_cycles = 0;
             para.decomp_parse_cycles = 0;
             para.decomp_total_cycles = 0;
-            if (b < static_cast<int>(count)) {
-                para.input_block = const_cast<bam_block *>(&compressed.blocks()[b]);
-                para.un_comp_block = &decoded->blocks()[b];
-                para.status = 0;
-            } else {
-                para.input_block = nullptr;
-                para.un_comp_block = nullptr;
-                para.status = -1;
-            }
         }
         return 0;
     }
 
-    void *kernel_entry() const {
-        return reinterpret_cast<void *>(slave_mpi_decompress_bam2bam_passthrough);
-    }
     void *kernel_arguments() { return paras_; }
 
     int DuringKernel() { return writer_.FlushPrevious(); }

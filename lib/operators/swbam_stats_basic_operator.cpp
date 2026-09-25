@@ -1,4 +1,5 @@
 #include "swbam/operators/stats_basic.h"
+#include "swbam/operators/bam_read_batch.h"
 
 #include "BamTools.h"
 
@@ -180,20 +181,15 @@ StatsBasicOperator::StatsBasicOperator(
         StatsSortState *sort_state,
         StatsBasicMetrics *metrics,
         bool collect_orientation_diagnostics)
-    : impl_(new Impl(counts, sort_state, metrics,
+    : BamReadBatchOperator({"stats-basic",
+          reinterpret_cast<void *>(slave_mpi_stats_basic_count),
+          kStatsBatchBlocks}),
+      impl_(new Impl(counts, sort_state, metrics,
                      collect_orientation_diagnostics)) {}
 
 StatsBasicOperator::~StatsBasicOperator() {
     Shutdown();
     delete impl_;
-}
-
-const char *StatsBasicOperator::name() const {
-    return "stats-basic";
-}
-
-size_t StatsBasicOperator::batch_capacity() const {
-    return kStatsBatchBlocks;
 }
 
 int StatsBasicOperator::Initialize() {
@@ -236,6 +232,8 @@ int StatsBasicOperator::Prepare(const BgzfBlockBatch &compressed,
         !decoded || active_blocks > kStatsBatchBlocks) {
         return -1;
     }
+    BindBamReadBatch(impl_->paras, kStatsBatchBlocks,
+                     compressed, decoded, active_blocks);
     for (int b = 0; b < kStatsBatchBlocks; ++b) {
         MpiStatsBasicCountPara &para = impl_->paras[b];
         para.block_id = b;
@@ -258,22 +256,8 @@ int StatsBasicOperator::Prepare(const BgzfBlockBatch &compressed,
         para.decomp_crc_cycles = 0;
         para.decomp_parse_cycles = 0;
         para.decomp_total_cycles = 0;
-        if (static_cast<size_t>(b) < active_blocks) {
-            para.input_block = const_cast<bam_block *>(
-                &compressed.blocks()[b]);
-            para.un_comp_block = &decoded->blocks()[b];
-            para.status = 0;
-        } else {
-            para.input_block = nullptr;
-            para.un_comp_block = nullptr;
-            para.status = -1;
-        }
     }
     return 0;
-}
-
-void *StatsBasicOperator::kernel_entry() const {
-    return reinterpret_cast<void *>(slave_mpi_stats_basic_count);
 }
 
 void *StatsBasicOperator::kernel_arguments() {

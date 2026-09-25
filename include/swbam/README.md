@@ -26,7 +26,8 @@
 ## 流水线扩展接口
 
 - `cpe_pipeline.h`、`composable_decode.h`：CPE 读取、解压和批级 operator。
-- `cpe_sam_read_pipeline.h`：SAM 行分块、CPE 计数/解析和 parsed batch 回调。
+- `cpe_sam_read_pipeline.h`：SAM 行分块、CPE 计数/解析和 parsed batch 回调；
+  纯分析算子可只实现解析批次回调，写出算子可在计数阶段 flush 上批输出。
 - `cpe_sam_write_pipeline.h`：CPE SAM 格式化与顺序写出，双缓冲保留上批文本。
 - `cpe_write_pipeline.h`、`composable_compress.h`：CPE 压缩和输出流水。
 - `cpe_record_write_adapter.h`：把记录指针计划和 `RankBodySink` 接入公共 BAM 写流水线。
@@ -35,6 +36,9 @@
 
 - `cpe_codec.h`：CPE BGZF codec 与每核 codec cache。
 - `cpe_bam_parser.h`：decoded block 内的 BAM record fast parser。
+- `cpe_bam_read_steps.h`：从核 BGZF 解压、BAM record 遍历的可复用静态步骤。
+- `cpe_bam_write_steps.h`：从核共用的 BGZF 压缩步骤。
+- `operators/bam_read_batch.h`：BAM read kernel 描述与主核 batch 块绑定。
 
 公共接口目前仍暴露 `bam_block`、`sam_hdr_t`、MPI 和部分项目类型，因此适合作为
 当前神威工程 SDK，但尚未形成平台无关、ABI 稳定的外部软件包。

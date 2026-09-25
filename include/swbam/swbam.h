@@ -13,6 +13,7 @@
 #include "swbam/io.h"
 #include "swbam/mpi_runtime.h"
 #include "swbam/operators/flagstat.h"
+#include "swbam/operators/bam_read_batch.h"
 #include "swbam/operators/record_count.h"
 #include "swbam/operators/stats_basic.h"
 #include "swbam/operators/bam_transform.h"

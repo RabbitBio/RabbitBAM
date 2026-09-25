@@ -47,17 +47,17 @@ void AccumulateDetail(const Comp_Para *paras, size_t count,
     metrics->other += other;
 }
 
-class RecordCompressOperator : public CpeWriteBatchOperator {
+class RecordCompressOperator : public CpeWriteKernelOperator {
 public:
     explicit RecordCompressOperator(CpeRecordWriteMetrics *metrics)
-        : level_(1), metrics_(metrics) {
+        : CpeWriteKernelOperator({"bam-record-compress",
+              reinterpret_cast<void *>(slave_mpi_compressfunc),
+              kBatchBlocks, true}),
+          level_(1), metrics_(metrics) {
         for (size_t i = 0; i < kBatchBlocks; ++i) ResetPara(&paras_[i], i);
     }
 
     void set_level(int level) { level_ = level; }
-    const char *name() const { return "bam-record-compress"; }
-    size_t batch_capacity() const { return kBatchBlocks; }
-    bool needs_scratch() const { return true; }
     int Initialize() {
         return (level_ == 0 || level_ == 1 || level_ == 6) ? 0 : -1;
     }
@@ -86,7 +86,6 @@ public:
         return 0;
     }
 
-    void *kernel_entry() const { return (void *)slave_mpi_compressfunc; }
     void *kernel_arguments() { return paras_; }
     void ObserveKernel(double wall, size_t count) {
         AccumulateDetail(paras_, count, wall, metrics_);

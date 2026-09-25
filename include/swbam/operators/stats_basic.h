@@ -1,7 +1,7 @@
 #ifndef SWBAM_OPERATORS_STATS_BASIC_H
 #define SWBAM_OPERATORS_STATS_BASIC_H
 
-#include "swbam/cpe_pipeline.h"
+#include "swbam/operators/bam_read_batch.h"
 
 #include <cstddef>
 
@@ -113,7 +113,7 @@ struct StatsBasicMetrics {
 
 // Rank-local fused decode + parse + stats operator. Count histograms remain
 // private to each CPE slot across batches and are merged once in Finish().
-class StatsBasicOperator : public cpe::CpeBatchOperator {
+class StatsBasicOperator : public BamReadBatchOperator {
 public:
     StatsBasicOperator(StatsBasicCounts *counts,
                        StatsSortState *sort_state,
@@ -121,14 +121,11 @@ public:
                        bool collect_orientation_diagnostics);
     ~StatsBasicOperator();
 
-    const char *name() const;
-    size_t batch_capacity() const;
     int Initialize();
     void Shutdown();
     int Prepare(const BgzfBlockBatch &compressed,
                 BgzfBlockBatch *decoded,
                 size_t active_blocks);
-    void *kernel_entry() const;
     void *kernel_arguments();
     void ObserveKernel(double wall_seconds, size_t active_blocks);
     int Validate(size_t active_blocks) const;

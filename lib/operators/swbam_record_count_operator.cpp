@@ -1,4 +1,7 @@
 #include "swbam/operators/record_count.h"
+#include "swbam/operators/bam_read_batch.h"
+
+#include "BamTools.h"
 
 #include <cstdio>
 
@@ -8,29 +11,35 @@ namespace swbam {
 namespace operators {
 namespace {
 
-class RecordCountOperator : public cpe::CpeBatchOperator {
+class RecordCountOperator : public BamReadBatchOperator {
 public:
-    const char *name() const { return "record-count"; }
-    size_t batch_capacity() const { return 64; }
-    int Initialize() { return 0; }
-    void Shutdown() {}
+    RecordCountOperator()
+        : BamReadBatchOperator({"record-count",
+              reinterpret_cast<void *>(slave_swbam_record_count), 64}),
+          scratch_(nullptr) {}
+    ~RecordCountOperator() { Shutdown(); }
+    int Initialize() {
+        scratch_ = aligned_alloc_custom(64, 64 * MPI_BAM_BLOCK_ARENA_SIZE);
+        return scratch_ ? 0 : -1;
+    }
+    void Shutdown() {
+        if (scratch_) aligned_free_custom(scratch_);
+        scratch_ = nullptr;
+    }
 
     int Prepare(const BgzfBlockBatch &compressed,
                 BgzfBlockBatch *decoded, size_t count) {
-        if (!decoded || count > 64) return -1;
+        if (!decoded || !scratch_ || count > 64) return -1;
+        BindBamReadBatch(paras_, 64, compressed, decoded, count);
         for (size_t i = 0; i < 64; ++i) {
-            paras_[i].compressed = i < count
-                ? const_cast<bam_block *>(&compressed.blocks()[i]) : nullptr;
-            paras_[i].decoded = i < count ? &decoded->blocks()[i] : nullptr;
+            paras_[i].scratch_data = scratch_ +
+                i * MPI_BAM_BLOCK_ARENA_SIZE;
+            paras_[i].scratch_capacity = MPI_BAM_BLOCK_ARENA_SIZE;
             paras_[i].records = 0;
-            paras_[i].status = i < count ? 0 : -1;
         }
         return 0;
     }
 
-    void *kernel_entry() const {
-        return reinterpret_cast<void *>(slave_swbam_record_count);
-    }
     void *kernel_arguments() { return paras_; }
     void ObserveKernel(double, size_t) {}
 
@@ -55,6 +64,7 @@ public:
 
 private:
     RecordCountPara paras_[64];
+    unsigned char *scratch_;
 };
 
 } // namespace

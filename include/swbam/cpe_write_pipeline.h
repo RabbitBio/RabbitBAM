@@ -83,6 +83,29 @@ public:
     virtual int Finish() = 0;
 };
 
+struct CpeWriteKernelSpec {
+    const char *name;
+    void *entry;
+    size_t batch_capacity;
+    bool needs_scratch;
+};
+
+// Common batch-level dispatch for block compression and record serialization
+// plus compression. Operator-specific Prepare/Validate stay in the derived type.
+class CpeWriteKernelOperator : public CpeWriteBatchOperator {
+public:
+    explicit CpeWriteKernelOperator(const CpeWriteKernelSpec &spec)
+        : spec_(spec) {}
+
+    const char *name() const { return spec_.name; }
+    size_t batch_capacity() const { return spec_.batch_capacity; }
+    bool needs_scratch() const { return spec_.needs_scratch; }
+    void *kernel_entry() const { return spec_.entry; }
+
+private:
+    CpeWriteKernelSpec spec_;
+};
+
 // Shared double-buffered scheduler for pull-style block sources and push-style
 // record batches. The post-processor and operator must outlive this session.
 // The previous compressed batch is flushed during CPE work.

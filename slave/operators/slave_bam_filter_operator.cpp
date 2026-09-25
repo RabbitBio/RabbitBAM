@@ -1,6 +1,5 @@
 #include "BamTools.h"
-#include "swbam/cpe_bam_parser.h"
-#include "swbam/cpe_codec.h"
+#include "swbam/cpe_bam_read_steps.h"
 
 #include <climits>
 
@@ -53,87 +52,83 @@ void SetArenaError(Bam2BamPara *para, int record_index,
     para->status = -3;
 }
 
-} // namespace
+template <bool Filter>
+class BamTransformAction {
+public:
+    explicit BamTransformAction(Bam2BamPara *para)
+        : para_(para), arena_used_(0), kept_(0), kept_len_(0) {}
 
-extern "C" void slave_mpi_decompress_filterfunc(Bam2BamPara paras[64]) {
-    const int id = _PEN;
-    Bam2BamPara *para = &paras[id];
+    bam1_t *Prepare(int index) {
+        bam1_t *record = para_->record_base
+            ? para_->record_base + index : para_->output_records[index];
+        return PrepareRecord(para_, record, arena_used_, index) == 0
+            ? record : nullptr;
+    }
+
+    void Process(bam1_t *record, int) {
+        if (para_->data_arena) {
+            arena_used_ += ((size_t)record->l_data + 7u) & ~(size_t)7u;
+            para_->data_arena_used = arena_used_;
+        }
+        if (!Filter || bam_filter_matches(record, para_->filter)) {
+            const uint32_t bam_len =
+                (uint32_t)(record->l_data - record->core.l_extranul + 32);
+            para_->output_records[kept_] = record;
+            para_->bam_lens[kept_] = bam_len;
+            kept_len_ += bam_len + 4;
+            ++kept_;
+        }
+    }
+
+    size_t arena_used() const { return arena_used_; }
+    int kept() const { return kept_; }
+    uint32_t kept_len() const { return kept_len_; }
+
+private:
+    Bam2BamPara *para_;
+    size_t arena_used_;
+    int kept_;
+    uint32_t kept_len_;
+};
+
+template <bool Filter>
+void RunBamTransform(Bam2BamPara *para, int id) {
     ResetDiagnostics(para);
-
     bam_block *compressed = para->input_block;
     bam_block *decoded = para->un_comp_block;
     if (!compressed) return;
-
     const unsigned long total_t0 = swbam_cpe_cycle_now();
-    struct libdeflate_decompressor *decompressor =
-        swbam_cpe_get_decompressor(id, &para->decomp_alloc_cycles);
-    if (!decompressor) {
-        para->status = -19;
+    const int decode = swbam_cpe_decode_bam_block(
+        compressed, decoded, id, &para->decomp_alloc_cycles,
+        &para->decomp_inflate_cycles, &para->decomp_crc_cycles);
+    if (decode != 0) {
+        para->status = decode == -1 ? -19 : -20;
         para->decomp_total_cycles =
             (uint64_t)(swbam_cpe_cycle_now() - total_t0);
         return;
     }
-    if (swbam_cpe_decode_bgzf(
-            compressed, decoded, decompressor,
-            &para->decomp_inflate_cycles,
-            &para->decomp_crc_cycles) != 0) {
-        para->status = -20;
-        para->decomp_total_cycles =
-            (uint64_t)(swbam_cpe_cycle_now() - total_t0);
-        return;
-    }
-
     const int capacity = para->record_capacity > 0
         ? para->record_capacity : (int)MAX_RECORDS_PER_BLOCK;
-    size_t arena_used = 0;
-    int total_count = 0;
-    int kept_count = 0;
-    uint32_t kept_total_len = 0;
-    int read_result = -1;
+    BamTransformAction<Filter> action(para);
     const unsigned long parse_t0 = swbam_cpe_cycle_now();
-    while (total_count < capacity) {
-        bam1_t *record = para->record_base
-            ? para->record_base + total_count
-            : para->output_records[total_count];
-        if (PrepareRecord(para, record, arena_used, total_count) != 0) {
-            read_result = -5;
-            break;
-        }
-        read_result = swbam_cpe_read_bam_record(decoded, record);
-        if (read_result < 0) break;
-        if (para->data_arena) {
-            arena_used += ((size_t)record->l_data + 7u) & ~(size_t)7u;
-            para->data_arena_used = arena_used;
-        }
-
-        total_count++;
-        if (bam_filter_matches(record, para->filter)) {
-            const uint32_t bam_len =
-                (uint32_t)(record->l_data - record->core.l_extranul + 32);
-            para->output_records[kept_count] = record;
-            para->bam_lens[kept_count] = bam_len;
-            kept_total_len += bam_len + 4;
-            kept_count++;
-        }
-    }
+    const SwbamCpeWalkResult result =
+        swbam_cpe_walk_bam_records(decoded, capacity, action);
     para->decomp_parse_cycles =
         (uint64_t)(swbam_cpe_cycle_now() - parse_t0);
-    para->n_total_records = total_count;
-    para->n_kept_records = kept_count;
-    para->kept_total_len = kept_total_len;
-
-    if (read_result == -5) {
-        const bam1_t *record = para->record_base
-            ? para->record_base + total_count : nullptr;
-        SetArenaError(para, total_count, arena_used, record);
-    } else if (read_result < -1) {
-        para->status = -21;
-    } else if (total_count == capacity && decoded->pos < decoded->length) {
-        para->record_index = total_count;
-        para->actual_value = total_count + 1;
+    para->n_total_records = result.count;
+    para->n_kept_records = action.kept();
+    para->kept_total_len = action.kept_len();
+    if (result.read_result == -5) {
+        SetArenaError(para, result.count, action.arena_used(),
+                      result.last_record);
+    } else if (result.read_result == -6) {
+        para->record_index = result.count;
+        para->actual_value = result.count + 1;
         para->limit_value = capacity;
         para->limit_id = BOUNDS_LIMIT_MAX_RECORDS_PER_BLOCK;
         para->status = -3;
+    } else if (result.read_result < -1) {
+        para->status = -21;
     } else {
         para->status = 0;
     }
@@ -141,82 +136,13 @@ extern "C" void slave_mpi_decompress_filterfunc(Bam2BamPara paras[64]) {
         (uint64_t)(swbam_cpe_cycle_now() - total_t0);
 }
 
+} // namespace
+
+extern "C" void slave_mpi_decompress_filterfunc(Bam2BamPara paras[64]) {
+    RunBamTransform<true>(&paras[_PEN], _PEN);
+}
+
 extern "C" void slave_mpi_decompress_bam2bam_passthrough(
         Bam2BamPara paras[64]) {
-    const int id = _PEN;
-    Bam2BamPara *para = &paras[id];
-    ResetDiagnostics(para);
-
-    bam_block *compressed = para->input_block;
-    bam_block *decoded = para->un_comp_block;
-    if (!compressed) return;
-
-    const unsigned long total_t0 = swbam_cpe_cycle_now();
-    struct libdeflate_decompressor *decompressor =
-        swbam_cpe_get_decompressor(id, &para->decomp_alloc_cycles);
-    if (!decompressor) {
-        para->status = -19;
-        para->decomp_total_cycles =
-            (uint64_t)(swbam_cpe_cycle_now() - total_t0);
-        return;
-    }
-    if (swbam_cpe_decode_bgzf(
-            compressed, decoded, decompressor,
-            &para->decomp_inflate_cycles,
-            &para->decomp_crc_cycles) != 0) {
-        para->status = -20;
-        para->decomp_total_cycles =
-            (uint64_t)(swbam_cpe_cycle_now() - total_t0);
-        return;
-    }
-
-    const int capacity = para->record_capacity > 0
-        ? para->record_capacity : (int)MAX_RECORDS_PER_BLOCK;
-    size_t arena_used = 0;
-    int total_count = 0;
-    uint32_t kept_total_len = 0;
-    int read_result = -1;
-    const unsigned long parse_t0 = swbam_cpe_cycle_now();
-    while (total_count < capacity) {
-        bam1_t *record = para->output_records[total_count];
-        if (PrepareRecord(para, record, arena_used, total_count) != 0) {
-            read_result = -5;
-            break;
-        }
-        read_result = swbam_cpe_read_bam_record(decoded, record);
-        if (read_result < 0) break;
-        if (para->data_arena) {
-            arena_used += ((size_t)record->l_data + 7u) & ~(size_t)7u;
-            para->data_arena_used = arena_used;
-        }
-
-        const uint32_t bam_len =
-            (uint32_t)(record->l_data - record->core.l_extranul + 32);
-        para->bam_lens[total_count] = bam_len;
-        kept_total_len += bam_len + 4;
-        total_count++;
-    }
-    para->decomp_parse_cycles =
-        (uint64_t)(swbam_cpe_cycle_now() - parse_t0);
-    para->n_total_records = total_count;
-    para->n_kept_records = total_count;
-    para->kept_total_len = kept_total_len;
-
-    if (read_result == -5) {
-        const bam1_t *record = total_count < capacity
-            ? para->output_records[total_count] : nullptr;
-        SetArenaError(para, total_count, arena_used, record);
-    } else if (read_result < -1) {
-        para->status = -21;
-    } else if (total_count == capacity && decoded->pos < decoded->length) {
-        para->record_index = total_count;
-        para->actual_value = total_count + 1;
-        para->limit_value = capacity;
-        para->limit_id = BOUNDS_LIMIT_MAX_RECORDS_PER_BLOCK;
-        para->status = -3;
-    } else {
-        para->status = 0;
-    }
-    para->decomp_total_cycles =
-        (uint64_t)(swbam_cpe_cycle_now() - total_t0);
+    RunBamTransform<false>(&paras[_PEN], _PEN);
 }

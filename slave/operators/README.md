@@ -10,7 +10,10 @@
 - `slave_bam_filter_operator.cpp`：BAM2BAM decode+parse+filter/passthrough。
 - `slave_flagstat_operator.cpp`：decode+parse+flagstat count。
 - `slave_stats_basic_operator.cpp`：decode+parse+basic stats 和有序性信息。
+- `slave_record_count_operator.cpp`：解压、解析进复用 `bam1_t` 后计数。
 
 通用 operator 适合 SDK 组合；融合 operator 减少 decoded record 中间态和主从核传输，
 用于内置命令性能路径。新增 operator 时应把通用 codec/parser 留在 `core/`，不要复制
 解压和缓存实现。
+filter/passthrough、flagstat、stats、count 在编译期组合 BAM read 步骤与各自动作；
+BAM write 的已打包块/记录两类入口复用同一压缩步骤，无逐记录虚调用。

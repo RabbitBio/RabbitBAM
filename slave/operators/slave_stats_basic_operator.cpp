@@ -1,6 +1,5 @@
 #include "BamTools.h"
-#include "swbam/cpe_bam_parser.h"
-#include "swbam/cpe_codec.h"
+#include "swbam/cpe_bam_read_steps.h"
 
 #include <climits>
 #include <cstring>
@@ -347,6 +346,25 @@ static inline void rb_slave_stats_add_record(bam1_t *record,
     rb_slave_stats_update_sort(record, sort_state);
 }
 
+namespace {
+
+class StatsBasicAction : public SwbamCpeScratchRecord {
+public:
+    explicit StatsBasicAction(MpiStatsBasicCountPara *para)
+        : SwbamCpeScratchRecord(para->scratch_data, para->scratch_capacity),
+          para_(para) {}
+
+    void Process(bam1_t *record, int) {
+        rb_slave_stats_add_record(record, para_->counts, &para_->sort_state,
+                                  para_->collect_diag);
+    }
+
+private:
+    MpiStatsBasicCountPara *para_;
+};
+
+} // namespace
+
 extern "C" void slave_mpi_stats_basic_count(MpiStatsBasicCountPara paras[64]) {
     int id = _PEN;
     MpiStatsBasicCountPara *para = &paras[id];
@@ -366,55 +384,37 @@ extern "C" void slave_mpi_stats_basic_count(MpiStatsBasicCountPara paras[64]) {
     if (comp == NULL) return;
 
     unsigned long total_t0 = slave_cycle_now();
-    struct libdeflate_decompressor *z =
-        swbam_cpe_get_decompressor(id, &para->decomp_alloc_cycles);
-    if (!z || para->scratch_data == NULL || para->scratch_capacity == 0 || para->counts == NULL) {
+    if (para->scratch_data == NULL || para->scratch_capacity == 0 || para->counts == NULL) {
         para->status = -2;
         para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
         return;
     }
-
-    if (swbam_cpe_decode_bgzf(comp, un_comp, z,
-                                &para->decomp_inflate_cycles,
-                                &para->decomp_crc_cycles) != 0) {
+    if (swbam_cpe_decode_bam_block(
+            comp, un_comp, id, &para->decomp_alloc_cycles,
+            &para->decomp_inflate_cycles, &para->decomp_crc_cycles) != 0) {
         para->status = -2;
         para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
         return;
     }
-
-    bam1_t record;
-    memset(&record, 0, sizeof(record));
-    record.mempolicy = BAM_USER_OWNS_DATA;
-
-    int total_count = 0;
-    int ret = -1;
+    StatsBasicAction action(para);
     unsigned long parse_t0 = slave_cycle_now();
-    while (1) {
-        record.data = para->scratch_data;
-        record.m_data = para->scratch_capacity > UINT32_MAX ?
-            UINT32_MAX : (uint32_t)para->scratch_capacity;
-        record.l_data = 0;
-        record.mempolicy = BAM_USER_OWNS_DATA;
-        ret = swbam_cpe_read_bam_record(un_comp, &record);
-        if (ret < 0) break;
-        rb_slave_stats_add_record(&record, para->counts, &para->sort_state, para->collect_diag);
-        total_count++;
-    }
+    const SwbamCpeWalkResult result =
+        swbam_cpe_walk_bam_records(un_comp, INT_MAX, action);
     para->decomp_parse_cycles = (uint64_t)(slave_cycle_now() - parse_t0);
-    para->n_total_records = total_count;
+    para->n_total_records = result.count;
 
-    if (ret == -5) {
-        para->record_index = total_count;
-        para->actual_value = record.l_data;
+    if (result.read_result == -5) {
+        para->record_index = result.count;
+        para->actual_value = result.last_record->l_data;
         para->limit_value = para->scratch_capacity;
         para->limit_id = BOUNDS_LIMIT_INIT_DATA_SIZE;
         para->status = -3;
         para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
         return;
     }
-    if (ret < -1) {
-        para->record_index = total_count;
-        para->actual_value = ret;
+    if (result.read_result < -1) {
+        para->record_index = result.count;
+        para->actual_value = result.read_result;
         para->limit_value = 0;
         para->limit_id = BOUNDS_LIMIT_GENERIC_RUNTIME_ERROR;
         para->status = -2;
@@ -429,5 +429,4 @@ extern "C" void slave_mpi_stats_basic_count(MpiStatsBasicCountPara paras[64]) {
     para->decomp_total_cycles = (uint64_t)(slave_cycle_now() - total_t0);
     para->status = 0;
 }
-
 

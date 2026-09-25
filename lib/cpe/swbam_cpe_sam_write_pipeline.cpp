@@ -95,7 +95,11 @@ int ReserveForRecords(SamFormatBatch *batch, int count) {
 
 CpeSamWriteSession::CpeSamWriteSession()
     : sink_(nullptr), current_(nullptr), pending_(nullptr),
-      has_pending_(false) {}
+      has_pending_(false), kernel_(DefaultSamWriteKernelSpec()) {}
+
+SamWriteKernelSpec DefaultSamWriteKernelSpec() {
+    return {reinterpret_cast<void *>(slave_sam_format), BATCH_SIZE};
+}
 
 CpeSamWriteSession::~CpeSamWriteSession() {
     Close();
@@ -112,7 +116,15 @@ void CpeSamWriteSession::Close() {
 
 int CpeSamWriteSession::Initialize(RankBodySink *sink,
                                    const sam_hdr_t *header) {
-    if (!sink || !header || current_ || pending_) return -1;
+    return Initialize(sink, header, DefaultSamWriteKernelSpec());
+}
+
+int CpeSamWriteSession::Initialize(RankBodySink *sink,
+                                   const sam_hdr_t *header,
+                                   const SamWriteKernelSpec &kernel) {
+    if (!sink || !header || current_ || pending_ || !kernel.format_entry ||
+        !kernel.batch_capacity || kernel.batch_capacity > BATCH_SIZE) return -1;
+    kernel_ = kernel;
     sink_ = sink;
     current_ = reinterpret_cast<SamFormatBatch *>(
         aligned_alloc_custom(64, sizeof(SamFormatBatch)));
@@ -128,6 +140,13 @@ int CpeSamWriteSession::Initialize(RankBodySink *sink,
 
 bam1_t **CpeSamWriteSession::RecordSlots() {
     return current_ ? current_->bams : nullptr;
+}
+
+int CpeSamWriteSession::SubmitRecords(bam1_t *const *records, size_t count) {
+    if (!current_ || (count && !records) || count > capacity()) return -1;
+    if (count && records != current_->bams)
+        memcpy(current_->bams, records, count * sizeof(*records));
+    return Submit(count);
 }
 
 int CpeSamWriteSession::FlushPending() {
@@ -153,13 +172,13 @@ int CpeSamWriteSession::Submit(size_t count) {
 
 int CpeSamWriteSession::SubmitWithPrefetch(
         size_t count, CpeBatchPrefetch prefetch, void *context) {
-    if (!current_ || count > BATCH_SIZE) return -1;
+    if (!current_ || count > capacity()) return -1;
     if (!count) return prefetch ? prefetch(context) : 0;
     ResetBatch(current_, static_cast<int>(count));
     if (ReserveForRecords(current_, static_cast<int>(count)) != 0) return -1;
     const double t0 = GetTime();
 #ifdef PLATFORM_SUNWAY
-    __real_athread_spawn(reinterpret_cast<void *>(slave_sam_format), current_, 1);
+    __real_athread_spawn(kernel_.format_entry, current_, 1);
     const int prefetch_status = prefetch ? prefetch(context) : 0;
     athread_join();
     timing_.format += GetTime() - t0;
@@ -180,7 +199,7 @@ int CpeSamWriteSession::SubmitWithPrefetch(
     if (retry) {
         ResetBatch(current_, static_cast<int>(count));
         const double retry_t0 = GetTime();
-        __real_athread_spawn(reinterpret_cast<void *>(slave_sam_format), current_, 1);
+        __real_athread_spawn(kernel_.format_entry, current_, 1);
         athread_join();
         timing_.format += GetTime() - retry_t0;
         for (int i = 0; i < 64; ++i) {

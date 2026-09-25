@@ -35,8 +35,23 @@ public:
 
     // Called on the MPE while the copy/count CPE kernel runs. An output
     // adapter may use this opportunity to flush its prior compressed batch.
-    virtual int FlushPendingOutput() = 0;
+    virtual int FlushPendingOutput() { return 0; }
 };
+
+// Copy/count and parse run as two existing CPE phases. Custom entries must
+// accept MpiSamParseBatch and produce the same chunk/status/arena contract.
+// Applications usually customize only the MPE post-processor.
+struct SamReadKernelSpec {
+    void *copy_count_entry;
+    void *parse_entry;
+};
+
+SamReadKernelSpec DefaultSamReadKernelSpec();
+
+int RunCpeSamReadPipeline(MemReader *reader, const sam_hdr_t *header,
+                          SamParsedBatchPostProcessor *post_processor,
+                          CpeSamReadTiming *timing,
+                          const SamReadKernelSpec &kernels);
 
 int RunCpeSamReadPipeline(MemReader *reader, const sam_hdr_t *header,
                           SamParsedBatchPostProcessor *post_processor,

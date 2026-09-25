@@ -1,4 +1,5 @@
 #include "swbam/operators/flagstat.h"
+#include "swbam/operators/bam_read_batch.h"
 
 #include "BamTools.h"
 
@@ -114,19 +115,14 @@ public:
 
 FlagstatOperator::FlagstatOperator(FlagstatCounts *counts,
                                    FlagstatMetrics *metrics)
-    : impl_(new Impl(counts, metrics)) {}
+    : BamReadBatchOperator({"flagstat",
+          reinterpret_cast<void *>(slave_mpi_flagstat_count),
+          kFlagstatBatchBlocks}),
+      impl_(new Impl(counts, metrics)) {}
 
 FlagstatOperator::~FlagstatOperator() {
     Shutdown();
     delete impl_;
-}
-
-const char *FlagstatOperator::name() const {
-    return "flagstat";
-}
-
-size_t FlagstatOperator::batch_capacity() const {
-    return kFlagstatBatchBlocks;
 }
 
 int FlagstatOperator::Initialize() {
@@ -167,6 +163,8 @@ int FlagstatOperator::Prepare(const BgzfBlockBatch &compressed,
     std::memset(impl_->count_slices, 0,
                 static_cast<size_t>(kFlagstatBatchBlocks) *
                     sizeof(MpiFlagstatCountSlice));
+    BindBamReadBatch(impl_->paras, kFlagstatBatchBlocks,
+                     compressed, decoded, active_blocks);
     for (int b = 0; b < kFlagstatBatchBlocks; ++b) {
         MpiFlagstatCountPara &para = impl_->paras[b];
         para.block_id = b;
@@ -184,22 +182,8 @@ int FlagstatOperator::Prepare(const BgzfBlockBatch &compressed,
         para.decomp_crc_cycles = 0;
         para.decomp_parse_cycles = 0;
         para.decomp_total_cycles = 0;
-        if (static_cast<size_t>(b) < active_blocks) {
-            para.input_block = const_cast<bam_block *>(
-                &compressed.blocks()[b]);
-            para.un_comp_block = &decoded->blocks()[b];
-            para.status = 0;
-        } else {
-            para.input_block = nullptr;
-            para.un_comp_block = nullptr;
-            para.status = -1;
-        }
     }
     return 0;
-}
-
-void *FlagstatOperator::kernel_entry() const {
-    return reinterpret_cast<void *>(slave_mpi_flagstat_count);
 }
 
 void *FlagstatOperator::kernel_arguments() {
