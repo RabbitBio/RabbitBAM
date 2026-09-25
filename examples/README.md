@@ -13,7 +13,8 @@ cmake -S . -B build_sunway_sduhpc -DPLATFORM=sunway
 cmake --build build_sunway_sduhpc \
   --target swbam-sdk-record-count swbam-sdk-bam1-stats \
            swbam-sdk-filter-bam swbam-sdk-bam1-filter \
-           swbam-sdk-mpi-benchmark -j 8
+           swbam-sdk-mpi-benchmark swbam-sdk-optimized-count \
+           swbam-sdk-optimized-bam2bam -j 8
 ```
 
 ## record count
@@ -106,3 +107,28 @@ Sunway CPE object 需要直接交给 hybrid linker，不能先封装进普通主
 四条路径的 `core` 都不包含输入文件加载、block plan 和磁盘输出。Read-write 只写入
 rank-local `MemoryBamOutput`，不 dump 文件；该工具用于比较 Composable SDK 路径和
 `bam1_t` 物化开销，不代替生成单个分布式 BAM 文件的正式应用。
+
+## Optimized 路径核心基准
+
+下面两个独立示例使用与 MPI app 相同的 memory input backend、block plan 和
+CPE batch 流水线；`core` 是各 rank 核心处理时间的最大值，不含初始加载、扫描
+分区和最终磁盘 dump：
+
+```bash
+./swbam-sdk-optimized-count input.bam
+./swbam-sdk-optimized-bam2bam input.bam
+```
+
+`sdk_optimized_count.cpp` 在 CPE 解压 BGZF 后只遍历 record 长度并计数，
+不物化 `bam1_t`，也不计算 flagstat 指标；可与 `samtools view -c` 的记录数
+核对。它采用项目现有的 record 不跨 BGZF block 约束。
+
+`sdk_optimized_bam2bam.cpp` 复用 `RunBamTransformPipeline`，不设置过滤条件，
+用 level 1 重新压缩，将各 rank 的 BGZF body 保存在内存中。它报告记录数和
+压缩 body 总字节数；不拼接 header/EOF，也不生成最终输出文件，因此是库的
+读写核心基准，不是完整的 BAM 转换命令。
+
+WES_0.25G、6 ranks 的简单 smoke：count 得到 `2,668,351` 条，
+`core=0.047015 s`；bam2bam 同样处理 `2,668,351` 条，
+`body_bytes=275,206,630`、两次 `core=0.196671/0.196398 s`。这些数字仅说明功能与
+测试口径正常，正式性能比较仍需同配置重复运行取中位数。

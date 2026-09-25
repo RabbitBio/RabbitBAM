@@ -17,6 +17,7 @@
 - `raw_bam_writer.h`：Raw BAM pack、压缩和完整 BAM writer。
 - `mpi_runtime.h`：MPI input plan、MPI-IO 和分布式 BAM 输出。
 - `operators/flagstat.h`：可复用的融合 flagstat operator、rank-local 结果与计时。
+- `operators/record_count.h`：只计 BAM record 数的 CPE 批次算子与计时。
 - `operators/stats_basic.h`：可复用的融合 basic stats operator、直方图、排序边界与计时。
 - `operators/bam_transform.h`：BAM 转换/过滤的 batch 算子入口与 rank-local 计时。
 - `operators/bam_to_sam.h`：BAM read 与 SAM write 组合的转换入口及计时。

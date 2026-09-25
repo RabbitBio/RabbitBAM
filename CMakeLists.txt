@@ -151,6 +151,7 @@ if(PLATFORM_SUNWAY)
         lib/cpe/swbam_composable_compress.cpp
         lib/cpe/swbam_composable_decode.cpp
         lib/operators/swbam_flagstat_operator.cpp
+        lib/operators/swbam_record_count_operator.cpp
         lib/operators/swbam_stats_basic_operator.cpp
         lib/operators/swbam_bam_transform_operator.cpp
         lib/operators/swbam_bam_to_sam_operator.cpp
@@ -203,6 +204,7 @@ if(PLATFORM_SUNWAY)
         slave/operators/slave_decode_operator.cpp
         slave/operators/slave_compress_operator.cpp
         slave/operators/slave_flagstat_operator.cpp
+        slave/operators/slave_record_count_operator.cpp
         slave/operators/slave_stats_basic_operator.cpp
     )
     add_library(swbam_cpe_operator_objects OBJECT ${SWBAM_CPE_OPERATOR_FILES})
@@ -326,16 +328,24 @@ if(PLATFORM_SUNWAY)
             examples/sdk_bam1_filter.cpp)
         add_executable(swbam-sdk-mpi-benchmark
             examples/sdk_mpi_benchmark.cpp)
+        add_executable(swbam-sdk-optimized-count
+            examples/sdk_optimized_count.cpp)
+        add_executable(swbam-sdk-optimized-bam2bam
+            examples/sdk_optimized_bam2bam.cpp)
         target_compile_options(swbam-sdk-record-count PRIVATE ${HOST_FLAGS})
         target_compile_options(swbam-sdk-filter-bam PRIVATE ${HOST_FLAGS})
         target_compile_options(swbam-sdk-bam1-stats PRIVATE ${HOST_FLAGS})
         target_compile_options(swbam-sdk-bam1-filter PRIVATE ${HOST_FLAGS})
         target_compile_options(swbam-sdk-mpi-benchmark PRIVATE ${HOST_FLAGS})
+        target_compile_options(swbam-sdk-optimized-count PRIVATE ${HOST_FLAGS})
+        target_compile_options(swbam-sdk-optimized-bam2bam PRIVATE ${HOST_FLAGS})
         target_link_libraries(swbam-sdk-record-count PRIVATE swbam::swbam)
         target_link_libraries(swbam-sdk-filter-bam PRIVATE swbam::swbam)
         target_link_libraries(swbam-sdk-bam1-stats PRIVATE swbam::swbam)
         target_link_libraries(swbam-sdk-bam1-filter PRIVATE swbam::swbam)
         target_link_libraries(swbam-sdk-mpi-benchmark PRIVATE swbam::swbam)
+        target_link_libraries(swbam-sdk-optimized-count PRIVATE swbam::swbam)
+        target_link_libraries(swbam-sdk-optimized-bam2bam PRIVATE swbam::swbam)
     endif()
     
     # Main executable with host code and slave objects
