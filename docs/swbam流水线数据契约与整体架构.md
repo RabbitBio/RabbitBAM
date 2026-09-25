@@ -119,3 +119,89 @@ command 负责跨 rank 语义和用户可见格式。
 WES_0.25G、单节点 6 ranks 的迁移后 smoke 得到 `2,668,351` records、
 NM mismatches=`878,007`，全部 SN 字段和 `is sorted=0` 与既有输入基线一致；
 `4.3=0.072359 s`，低于历史 `0.099174 s`，确认本次迁移没有性能回退。
+
+## BAM2BAM / Filter 的读写流水线组合
+
+```text
+BamInputBackend + spans / MemReader
+    -> RunCpeReadPipeline (64-block double buffer)
+       -> BamTransformOperator
+          -> decode + parse + passthrough/filter CPE kernel
+          -> MPE 按记录长度生成最多 64 个 BGZF 打包计划
+          -> CpeRecordWriteSession::Submit
+             -> CpeWritePipelineSession (output double buffer)
+             -> record-serialize + compress CPE operator
+             -> RankBodySink
+```
+
+读流水线支持 backend span 和借用 `MemReader` 的 batch 输入。后者直接读取已有内存
+中的压缩块，不再复制完整 BAM。算子保留直通时的原块边界和过滤时的重新装块规则；
+`CpeWritePipelineSession` 是唯一的 BAM 写调度器：已打包 BGZF 块使用
+`ComposableCompressOperator`，记录打包计划使用 `RecordCompressOperator`；
+`RunCpeWritePipeline` 是拉取式 source 的适配入口，`CpeRecordWriteSession` 是
+`RankBodySink` 和记录计划的推送式适配入口。两者共享压缩输出双缓冲及同一套
+`Prepare -> spawn -> flush(previous) -> join -> validate -> swap` 状态机。
+写 session 在 `Submit()` 返回前完成当前批的压缩，上一批已压缩块可与压缩并行写出。
+因此下一个 read batch 复用记录 arena 时，不会留下悬空的 `bam1_t` 指针。
+这不表示 BAM read 与 BAM write 的 CPE kernel 同时执行。
+
+命令层的 `OptimizedBamToBamMPI` 现在只适配原有四种输入/输出签名，并继续负责
+header、BGZF EOF、MPI 输出布局、归约和打印。`t_read`、`t_decomp_filter`、
+`t_pack`、`t_compress`、`t_write` 保留原字段；read 与 decode、write 与 compress
+存在重叠，分项相加不能作为 `4.3` wall time。
+
+WES_0.25G、单节点 6 ranks 的迁移后 smoke：无过滤 `2,668,351` 条，
+`4.3=0.182463 s`；MAPQ >= 30 保留 `2,481,669` 条，`4.3=0.178360 s`。
+两份输出都经 `stats --basic` 重新读取；分别与同输入的旧版输出
+`io_refactor.bam`、`io_refactor_mapq30.bam` 做 `cmp`，均逐字节一致。
+已有同输入旧版无过滤日志的 `4.3` 为 `0.181363 s`，单次差约 `0.6%`；
+这只是一组节点运行结果，尚未作为稳定性能结论。
+
+共享 BAM write 调度器改造后，同数据、同过滤参数的 6-rank `run_all` 保留
+`2,481,669` 条，`4.3=0.179002 s`（改造前单次 `0.178360 s`），输出与
+`io_refactor_mapq30.bam` 逐字节一致；`stats --basic` 可复读。
+`io-check` 的合成块压缩、完整 BAM 回环和 MAPQ 过滤回环也全部通过。
+
+## SAM2BAM 的流水线组合
+
+```text
+MemReader (rank-local SAM body)
+    -> RunCpeSamReadPipeline
+       -> SAM 行边界分块 -> CPE copy/count -> CPE parse
+       -> SamToBamPostProcessor (MPE 生成 BGZF 记录打包计划)
+       -> CpeRecordWriteSession -> 公共 BAM write 流水线 -> RankBodySink
+```
+
+SAM read 流水线拥有文本 chunk、解析后的记录池和数据 arena；解析结果只在同步
+`PostProcessParsedBatch()` 回调期间有效。后处理只保存本批记录指针，提交写流水线
+后等待 CPE 完成，再允许下一波解析复用记录池。写出压缩仍与上一批的 MPE flush
+重叠；进入下一组 SAM chunk 的 CPE copy/count 时，也可 flush 最后待写的压缩批。
+命令层只保留 `MemWriter`/`RankBodySink` 适配、header 和最终 MPI 输出布局。
+
+WES_0.25G、6 ranks、level 1 的迁移前后均处理 `2,668,351` 条，输出 BAM
+逐字节一致；单次 `4.3` 从 `0.235816 s` 到 `0.235334 s`。这里只说明未观察到
+明显回退，不将单次运行作为加速结论。
+
+## BAM2SAM 的流水线组合
+
+```text
+BamInputBackend / MemReader
+    -> RunCpeReadPipeline (BGZF 双缓冲 + passthrough decode/parse kernel)
+    -> BamToSamOperator::PostProcessBatch (MPE 按 block 顺序收集记录指针)
+    -> CpeSamWriteSession (CPE format + 双文本缓冲 + RankBodySink)
+```
+
+record arena 由 BAM read 算子持有，`Submit()` 完成格式化后才可在下一批解码时
+复用。SAM write session 持有格式化文本，下一批 BAM read CPE kernel 运行时由
+MPE flush 上批；最后一批由 `Finish()` 写出。命令层仅适配输入、输出及 MPI 布局。
+这是 batch 级组合，不在逐记录格式化热路径加入虚调用。
+该算子选择读流水线的可选调度：在解码期间 flush 上批 SAM，在本批 CPE
+formatter 期间预读下一批 BGZF；其他 BAM read 算子继续使用默认预读调度。
+
+WES_0.25G、6 ranks、memory backend：旧版与迁移版均输出 `2,668,351` 条，
+最终 SAM 逐字节一致；`4.3` 单次为旧版 `0.164583 s`、迁移版 `0.162327 s`。
+该结果仅用于确认本轮未出现明显性能回退，不代表稳定加速比。
+
+同一输入的 POSIX backend smoke 得到 `2,668,351` 条，`stats --basic` 复读正常。
+由于命令行产生的输出 header 长度不同，完整 BAM 与 memory backend 输出不能
+直接逐字节比较；跳过各自 header 后，`275,206,630` 字节的压缩 body 逐字节一致。

@@ -237,13 +237,17 @@ helper；这些 helper 需要在构造更多边界样例后再决定是否并入
 
 `record/raw batch -> CPE pack/compress -> compressed BGZF batch -> output backend`
 
-当前 `CpeWritePipeline` 已统一管理：
+当前 `CpeWritePipelineSession` 已统一管理两种 BAM 写入输入：
 
-- 两套未压缩输入 batch 和两套压缩输出 batch；
+- 拉取式适配入口从 `UncompressedBgzfSource` 获取已打包 BGZF 块，推送式入口
+  接收记录指针和打包计划；两者共享同一写调度器；
+- 两套压缩输出 batch；拉取式适配入口另持有两套未压缩输入 batch，记录写入
+  operator 持有两套序列化 scratch batch；
 - CPE compress 当前批与 MPE 后处理上一批的重叠；
 - BGZF block 大小、CRC、compression level、codec cache、错误处理和统一计时；
 - `UncompressedBgzfSource` 与 `CompressedBgzfBatchPostProcessor` 两侧扩展接口；
-- `ComposableCompressOperator` 通用 BGZF 压缩实例。
+- `ComposableCompressOperator` 处理已打包 BGZF 块，`RecordCompressOperator`
+  让 CPE 直接序列化记录并压缩，避免 MPE 额外复制。
 
 `RawBamWriter` 已补齐通用 raw record 写路径：它将 `RawBamRecordView` 按记录
 边界装入 BGZF payload，以固定 256-block chunk 控制临时内存，再交给

@@ -28,9 +28,12 @@ public:
     }
     void Shutdown() {}
 
-    int Prepare(const BgzfBlockBatch &input,
-                BgzfBlockBatch *output,
-                size_t active_blocks) {
+    int Prepare(const CpeWriteBatchInput &input,
+                BgzfBlockBatch *scratch,
+                BgzfBlockBatch *output) {
+        if (input.kind != CpeWriteBatchInput::kUncompressedBgzf ||
+            !input.uncompressed || scratch) return -1;
+        const size_t active_blocks = input.count;
         for (size_t i = 0; i < kComposableCompressBatch; ++i) {
             SwbamCpeCompressPara &para = paras_[i];
             para.alloc_cycles = 0;
@@ -41,7 +44,7 @@ public:
             para.level = level_;
             if (i < active_blocks) {
                 para.uncompressed = const_cast<bam_block *>(
-                    &input.blocks()[i]);
+                    &input.uncompressed->blocks()[i]);
                 para.compressed = &output->blocks()[i];
                 para.status = 0;
             } else {

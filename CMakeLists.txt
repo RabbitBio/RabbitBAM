@@ -145,10 +145,16 @@ if(PLATFORM_SUNWAY)
     add_library(swbam_cpe_runtime STATIC
         lib/cpe/swbam_cpe_read_pipeline.cpp
         lib/cpe/swbam_cpe_write_pipeline.cpp
+        lib/cpe/swbam_cpe_record_write_adapter.cpp
+        lib/cpe/swbam_cpe_sam_read_pipeline.cpp
+        lib/cpe/swbam_cpe_sam_write_pipeline.cpp
         lib/cpe/swbam_composable_compress.cpp
         lib/cpe/swbam_composable_decode.cpp
         lib/operators/swbam_flagstat_operator.cpp
         lib/operators/swbam_stats_basic_operator.cpp
+        lib/operators/swbam_bam_transform_operator.cpp
+        lib/operators/swbam_bam_to_sam_operator.cpp
+        lib/operators/swbam_sam_to_bam_operator.cpp
         lib/bam/swbam_bam1_reader.cpp
         lib/bam/swbam_bam1_writer.cpp
         lib/bam/swbam_raw_bam_reader.cpp

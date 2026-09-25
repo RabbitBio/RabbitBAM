@@ -18,11 +18,17 @@
 - `mpi_runtime.h`：MPI input plan、MPI-IO 和分布式 BAM 输出。
 - `operators/flagstat.h`：可复用的融合 flagstat operator、rank-local 结果与计时。
 - `operators/stats_basic.h`：可复用的融合 basic stats operator、直方图、排序边界与计时。
+- `operators/bam_transform.h`：BAM 转换/过滤的 batch 算子入口与 rank-local 计时。
+- `operators/bam_to_sam.h`：BAM read 与 SAM write 组合的转换入口及计时。
+- `operators/sam_to_bam.h`：SAM read 与 BAM write 组合的转换入口及计时。
 
 ## 流水线扩展接口
 
 - `cpe_pipeline.h`、`composable_decode.h`：CPE 读取、解压和批级 operator。
+- `cpe_sam_read_pipeline.h`：SAM 行分块、CPE 计数/解析和 parsed batch 回调。
+- `cpe_sam_write_pipeline.h`：CPE SAM 格式化与顺序写出，双缓冲保留上批文本。
 - `cpe_write_pipeline.h`、`composable_compress.h`：CPE 压缩和输出流水。
+- `cpe_record_write_adapter.h`：把记录指针计划和 `RankBodySink` 接入公共 BAM 写流水线。
 
 ## 底层/高级接口
 

@@ -3,6 +3,9 @@
 
 #include "swbam.h"
 #include "swbam/io.h"
+#include "swbam/operators/bam_transform.h"
+#include "swbam/operators/bam_to_sam.h"
+#include "swbam/operators/sam_to_bam.h"
 
 #include <cstddef>
 #include <string>
@@ -17,95 +20,11 @@ struct MpiMemoryBam {
     MpiMemoryBam() : data(nullptr), size(0) {}
 };
 
-struct MpiBamToBamStats {
-    long long input_blocks;
-    long long group_count;
-    long long total_records;
-    long long kept_records;
-    long long dropped_records;
-    long long bgzf_blocks;
-    long long pack_records;
-    double t_decomp_filter;
-    double t_decomp_alloc;
-    double t_decomp_inflate;
-    double t_decomp_crc;
-    double t_decomp_parse;
-    double t_decomp_other;
-    double t_pack;
-    double t_compress;
-    double t_compress_serialize;
-    double t_compress_alloc;
-    double t_compress_deflate;
-    double t_compress_footer;
-    double t_compress_other;
-    double t_read;
-    double t_write;
-    double t_mpi_write;
-    double t_optimized_total;
-    double t_alloc_init;
-    double t_initial_read;
-    double t_prepare_decomp;
-    double t_decomp_check;
-    double t_compress_prepare;
-    double t_compress_check;
-    double t_empty_group_path;
-    double t_final_flush;
-    double t_free_workspace;
-};
+typedef swbam::operators::BamTransformMetrics MpiBamToBamStats;
 
-struct MpiBamToSamStats {
-    long long input_blocks;
-    long long group_count;
-    long long total_records;
-    long long format_tiles;
-    double t_decomp;
-    double t_decomp_alloc;
-    double t_decomp_inflate;
-    double t_decomp_crc;
-    double t_decomp_parse;
-    double t_decomp_other;
-    double t_format;
-    double t_collect;
-    double t_read;
-    double t_write;
-    double t_gather;
-    double t_optimized_total;
-    double t_alloc_init;
-    double t_free_workspace;
-};
+typedef swbam::operators::BamToSamMetrics MpiBamToSamStats;
 
-struct MpiSamToBamStats {
-    long long input_chunks;
-    long long chunk_groups;
-    long long total_records;
-    long long compress_groups;
-    long long bgzf_blocks;
-    long long parse_fast_records;
-    long long parse_fallback_records;
-    double t_split;
-    double t_copy_count;
-    double t_parse;
-    double t_parse_core;
-    double t_parse_aux;
-    double t_parse_cg;
-    double t_parse_fallback;
-    double t_parse_other;
-    double t_pack;
-    double t_compress;
-    double t_compress_serialize;
-    double t_compress_alloc;
-    double t_compress_deflate;
-    double t_compress_footer;
-    double t_compress_other;
-    double t_write;
-    double t_gather;
-    double t_optimized_total;
-    double t_alloc_init;
-    double t_setup_reset;
-    double t_compress_setup;
-    double t_status_check;
-    double t_free_workspace;
-};
+typedef swbam::operators::SamToBamMetrics MpiSamToBamStats;
 
 struct MpiSortStats {
     long long sort_mode;

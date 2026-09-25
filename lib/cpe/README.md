@@ -6,11 +6,17 @@
 ## 文件
 
 - `swbam_cpe_read_pipeline.cpp`：两套 compressed/decoded batch，重叠 MPE 读取下一批与
-  CPE 处理当前批。
+  CPE 处理当前批；BAM2SAM 可选择在批后格式化期间预读。
+- `swbam_cpe_sam_read_pipeline.cpp`：按完整 SAM 行分块，调度 CPE 计数和解析，
+  以同步的 parsed batch 回调交给 MPE 后处理。
+- `swbam_cpe_sam_write_pipeline.cpp`：提交 BAM 记录批次给 CPE formatter，
+  保留上批文本，在下一批读取 kernel 运行时写入 `RankBodySink`。
 - `swbam_composable_decode.cpp`：把 BGZF decode kernel 包装成 Composable
   `CpeBatchOperator`。
-- `swbam_cpe_write_pipeline.cpp`：两套 uncompressed/compressed batch，重叠 CPE
-  压缩与 MPE 输出 batch post-processing。
+- `swbam_cpe_write_pipeline.cpp`：统一的 BAM write 调度器，使用压缩输出双缓冲，
+  在 CPE 压缩本批时让 MPE 写出上批；支持拉取式 BGZF source 和推送式 batch。
+- `swbam_cpe_record_write_adapter.cpp`：记录计划 operator 与 `RankBodySink`
+  适配器；调用统一写调度器，CPE 仍直接序列化 `bam1_t` 并压缩。
 - `swbam_composable_compress.cpp`：Composable BGZF compress operator。
 
 ## 扩展方式
