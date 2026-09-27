@@ -1,4 +1,6 @@
 #include "swbam_mpi.h"
+#include "swbam/operators/bam_read_batch.h"
+#include "swbam/cpe_write_pipeline.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -75,15 +77,6 @@ private:
     MpiSortRawBuffer &operator=(const MpiSortRawBuffer &);
 };
 
-struct MpiSortExtractWorkspace {
-    MpiSortBlockSet input_blocks;
-    MpiSortBlockSet un_blocks;
-    unsigned char *raw_data;
-    MpiSortRecordMeta *records;
-    int n_blocks;
-    int records_per_block;
-    size_t raw_stride;
-};
 
 uint16_t MpiSortReadLe16(const unsigned char *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
@@ -365,43 +358,6 @@ void MpiSortFreeBlockSet(MpiSortBlockSet *set) {
     set->n = 0;
 }
 
-int MpiSortAllocateExtractWorkspace(MpiSortExtractWorkspace *ws,
-                                    int n_blocks,
-                                    int records_per_block,
-                                    size_t raw_stride) {
-    ws->n_blocks = n_blocks;
-    ws->records_per_block = records_per_block;
-    ws->raw_stride = raw_stride;
-    ws->raw_data = nullptr;
-    ws->records = nullptr;
-    if (MpiSortAllocateBlockSet(&ws->input_blocks, n_blocks) != 0 ||
-        MpiSortAllocateBlockSet(&ws->un_blocks, n_blocks) != 0) {
-        return -1;
-    }
-    ws->records = (MpiSortRecordMeta *)aligned_alloc_custom(
-        64, (size_t)n_blocks * records_per_block * sizeof(MpiSortRecordMeta));
-    if (!ws->records) {
-        MpiSortFreeBlockSet(&ws->input_blocks);
-        MpiSortFreeBlockSet(&ws->un_blocks);
-        if (ws->records) aligned_free_custom((unsigned char *)ws->records);
-        ws->raw_data = nullptr;
-        ws->records = nullptr;
-        return -1;
-    }
-    return 0;
-}
-
-void MpiSortFreeExtractWorkspace(MpiSortExtractWorkspace *ws) {
-    MpiSortFreeBlockSet(&ws->input_blocks);
-    MpiSortFreeBlockSet(&ws->un_blocks);
-    if (ws->raw_data) aligned_free_custom(ws->raw_data);
-    if (ws->records) aligned_free_custom((unsigned char *)ws->records);
-    ws->raw_data = nullptr;
-    ws->records = nullptr;
-    ws->n_blocks = 0;
-    ws->records_per_block = 0;
-    ws->raw_stride = 0;
-}
 
 //从内存里读取 BGZF block
 int MpiSortMemReadBlock(char *base, size_t size, size_t &pos, bam_block *block) {
@@ -568,209 +524,204 @@ private:
     swbam::BgzfSpanBatchReader reader_;
 };
 
-// CPE 批量提取 BAM records
+// The app owns persistent raw/metadata; the read runtime owns batch buffers.
+class MpiSortReadSource : public swbam::cpe::CpeReadBatchSource {
+public:
+    MpiSortReadSource(MpiSortBatchReader *reader, MpiSortStats *stats,
+                     bool overlap)
+        : reader_(reader), stats_(stats), overlap_(overlap), first_(true),
+          start_(GetTime()) {}
+
+    int ReadNext(swbam::BgzfBlockBatch *batch, size_t *count) {
+        if (first_) stats_->t_setup += GetTime() - start_;
+        MpiSortBlockSet blocks = {batch->blocks(), nullptr,
+                                  (int)batch->capacity()};
+        int n = 0;
+        const double t0 = GetTime();
+        const int ret = reader_->Read(&blocks, &n);
+        const double wall = GetTime() - t0;
+        stats_->t_extract_read += wall;
+        if (first_ || !overlap_) stats_->t_extract_read_unhidden += wall;
+        first_ = false;
+        *count = n < 0 ? 0 : (size_t)n;
+        return ret;
+    }
+
+private:
+    MpiSortBatchReader *reader_;
+    MpiSortStats *stats_;
+    bool overlap_;
+    bool first_;
+    double start_;
+};
+
+class MpiSortExtractOperator : public swbam::operators::BamReadBatchOperator {
+public:
+    MpiSortExtractOperator(long long global_block_begin, MpiSortStats *stats)
+        : BamReadBatchOperator({"sort-extract",
+              (void *)slave_mpi_sort_extract_raw, kSortCpeBlocks}),
+          stats_(stats), global_block_begin_(global_block_begin), local_block_(0),
+          metadata_(nullptr) {}
+
+    int Initialize() {
+        metadata_ = (MpiSortRecordMeta *)aligned_alloc_custom(
+            64, (size_t)kSortCpeBlocks * MPI_RECORDS_PER_BLOCK *
+                sizeof(MpiSortRecordMeta));
+        return metadata_ ? 0 : -1;
+    }
+    void Shutdown() {
+        const double t0 = GetTime();
+        if (metadata_) aligned_free_custom((unsigned char *)metadata_);
+        metadata_ = nullptr;
+        stats_->t_cleanup += GetTime() - t0;
+    }
+    int Prepare(const swbam::BgzfBlockBatch &compressed,
+                swbam::BgzfBlockBatch *decoded, size_t active) {
+        const double t0 = GetTime();
+        for (size_t b = 0; b < active; ++b) {
+            raw_sizes_[b] = MpiSortBgzfISize(&compressed.blocks()[b]);
+            if (raw_sizes_[b] > BGZF_MAX_BLOCK_SIZE) {
+                fprintf(stderr, "ERROR: sort invalid BGZF ISIZE at block %lld.\n",
+                        global_block_begin_ + (long long)local_block_ + (long long)b);
+                return -1;
+            }
+            raw_offsets_[b] = b * BGZF_MAX_BLOCK_SIZE;
+        }
+        if (PrepareStorage(active) != 0) return -1;
+        memset(paras_, 0, sizeof(paras_));
+        swbam::operators::BindBamReadBatch(
+            paras_, kSortCpeBlocks, compressed, decoded, active);
+        for (size_t b = 0; b < active; ++b) {
+            MpiSortExtractPara &para = paras_[b];
+            para.block_id = (int)b;
+            para.un_comp_block->length = (int)raw_sizes_[b];
+            para.un_comp_block->pos = 0;
+            para.un_comp_block->errcode = 0;
+            para.raw_arena = para.un_comp_block->data;
+            para.raw_capacity = raw_sizes_[b];
+            para.raw_base_offset = raw_offsets_[b];
+            para.records = metadata_ + b * MPI_RECORDS_PER_BLOCK;
+            para.record_capacity = (int)MPI_RECORDS_PER_BLOCK;
+            para.global_block_index =
+                global_block_begin_ + (long long)local_block_ + b;
+            para.limit_id = BOUNDS_LIMIT_NONE;
+        }
+        stats_->input_blocks += (long long)active;
+        stats_->t_extract_prepare += GetTime() - t0;
+        return 0;
+    }
+    void *kernel_arguments() { return paras_; }
+    void ObserveKernel(double wall, size_t active) {
+        stats_->t_extract += wall;
+        MpiSortAccumulateExtractDetail(paras_, (int)active, wall, stats_);
+    }
+    int Validate(size_t active) const {
+        const double t0 = GetTime();
+        for (size_t b = 0; b < active; ++b) {
+            const MpiSortExtractPara &para = paras_[b];
+            if (para.status != 0 || para.raw_used != raw_sizes_[b] ||
+                para.n_records < 0 || para.n_records > para.record_capacity) {
+                fprintf(stderr,
+                        "ERROR: sort extract failed block=%lld status=%d "
+                        "record=%d limit_id=%d actual=%lld limit=%lld "
+                        "raw=%zu expected=%zu. Records must not cross BGZF blocks.\n",
+                        para.global_block_index, para.status, para.record_index,
+                        para.limit_id, para.actual_value, para.limit_value,
+                        para.raw_used, raw_sizes_[b]);
+                stats_->t_status_check += GetTime() - t0;
+                return -1;
+            }
+        }
+        stats_->t_status_check += GetTime() - t0;
+        return 0;
+    }
+    int PostProcessBatch(size_t active, long long *records_processed) {
+        if (AppendBatch(active) != 0) return -1;
+        *records_processed = 0;
+        for (size_t b = 0; b < active; ++b)
+            *records_processed += paras_[b].n_records;
+        stats_->local_records += *records_processed;
+        local_block_ += active;
+        return 0;
+    }
+    int Finish() { return 0; }
+
+protected:
+    virtual int PrepareStorage(size_t) { return 0; }
+    virtual int AppendBatch(size_t active) = 0;
+    MpiSortExtractPara paras_[kSortCpeBlocks];
+    size_t raw_sizes_[kSortCpeBlocks];
+    uint64_t raw_offsets_[kSortCpeBlocks];
+    MpiSortStats *stats_;
+
+private:
+    long long global_block_begin_;
+    size_t local_block_;
+    MpiSortRecordMeta *metadata_;
+};
+
+class MpiSortMemoryExtractOperator : public MpiSortExtractOperator {
+public:
+    MpiSortMemoryExtractOperator(long long begin,
+                                std::vector<MpiSortRecordMeta> *records,
+                                MpiSortRawBuffer *raw, MpiSortStats *stats)
+        : MpiSortExtractOperator(begin, stats), records_(records), raw_(raw),
+          raw_end_(0) {}
+
+protected:
+    int PrepareStorage(size_t active) {
+        raw_end_ = raw_->size;
+        for (size_t b = 0; b < active; ++b) {
+            raw_offsets_[b] = raw_end_;
+            if (raw_sizes_[b] > SIZE_MAX - raw_end_) return -1;
+            raw_end_ += raw_sizes_[b];
+        }
+        return MpiSortRawReserve(raw_, raw_end_);
+    }
+    int AppendBatch(size_t active) {
+        const double t0 = GetTime();
+        for (size_t b = 0; b < active; ++b) {
+            const MpiSortExtractPara &para = paras_[b];
+            if (raw_sizes_[b])
+                memcpy(raw_->data + raw_offsets_[b],
+                       para.un_comp_block->data, raw_sizes_[b]);
+            for (int r = 0; r < para.n_records; ++r)
+                records_->push_back(para.records[r]);
+        }
+        raw_->size = raw_end_;
+        stats_->t_extract_merge += GetTime() - t0;
+        return 0;
+    }
+
+private:
+    std::vector<MpiSortRecordMeta> *records_;
+    MpiSortRawBuffer *raw_;
+    size_t raw_end_;
+};
+
+int MpiSortRunReadPipeline(MpiSortBatchReader *reader,
+                          MpiSortExtractOperator *op,
+                          MpiSortStats *stats, bool overlap) {
+    MpiSortReadSource source(reader, stats, overlap);
+    swbam::cpe::CpeReadPipelineOptions options;
+    options.overlap_input = overlap;
+    return swbam::cpe::RunCpeReadPipeline(&source, op, nullptr, options);
+}
+
 int MpiSortExtractLocalRecordsCpeImpl(
         MpiSortBatchReader *block_reader,
         long long global_block_begin,
         std::vector<MpiSortRecordMeta> *records,
         MpiSortRawBuffer *raw_data,
         MpiSortStats *stats) {
-    // 一次处理 64 个 block。输入 block 使用双缓冲：CPE 处理当前批次时，
-    // MPE 读取下一批；CPE 直接解压到最终 local_raw 位置，metadata scratch 复用一套。
-    MpiSortExtractWorkspace ws = {};
-    MpiSortBlockSet input_pending_set = {};
-    MpiSortExtractPara paras[kSortCpeBlocks];
-    const int records_per_block = (int)MPI_RECORDS_PER_BLOCK;
-    const size_t raw_stride = 0;
-    double setup_t0 = GetTime();
-    if (MpiSortAllocateExtractWorkspace(&ws, kSortCpeBlocks, records_per_block, raw_stride) != 0 ||
-        MpiSortAllocateBlockSet(&input_pending_set, kSortCpeBlocks) != 0) {
-        fprintf(stderr, "ERROR: failed to allocate MPI sort extract workspace.\n");
-        MpiSortFreeBlockSet(&input_pending_set);
-        MpiSortFreeExtractWorkspace(&ws);
-        return -1;
-    }
-    stats->t_setup += GetTime() - setup_t0;
-
-    MpiSortBlockSet *input_active = &ws.input_blocks;
-    MpiSortBlockSet *input_pending = &input_pending_set;
-
-    auto do_read_group = [&](MpiSortBlockSet *input_blocks,
-                             int *n_blocks,
-                             bool unhidden) -> int {
-        double read_t0 = GetTime();
-        int count = 0;
-        const int read_ret = block_reader->Read(input_blocks, &count);
-        double read_wall = GetTime() - read_t0;
-        *n_blocks = count;
-        stats->t_extract_read += read_wall;
-        if (unhidden) stats->t_extract_read_unhidden += read_wall;
-        return read_ret;
-    };
-
-    size_t local_block = 0;
-    int n_blocks = 0;
-    if (do_read_group(input_active, &n_blocks, true) != 0) {
-        MpiSortFreeBlockSet(&input_pending_set);
-        MpiSortFreeExtractWorkspace(&ws);
-        return -1;
-    }
-    while (n_blocks > 0) {
-        stats->input_blocks += n_blocks;
-
-        double prepare_t0 = GetTime();
-        size_t block_raw_offsets[kSortCpeBlocks] = {};
-        size_t block_raw_sizes[kSortCpeBlocks] = {};
-        size_t group_raw_begin = raw_data->size;
-        size_t group_raw_total = 0;
-        for (int b = 0; b < n_blocks; ++b) {
-            uint32_t isize = MpiSortBgzfISize(&input_active->blocks[b]);
-            if (isize > BGZF_MAX_BLOCK_SIZE) {
-                fprintf(stderr,
-                        "ERROR: MPI sort extract saw invalid BGZF ISIZE=%u on input block %lld.\n",
-                        isize, global_block_begin + (long long)local_block + b);
-                double cleanup_t0 = GetTime();
-                MpiSortFreeBlockSet(&input_pending_set);
-                MpiSortFreeExtractWorkspace(&ws);
-                stats->t_cleanup += GetTime() - cleanup_t0;
-                return -1;
-            }
-            block_raw_offsets[b] = group_raw_begin + group_raw_total;
-            block_raw_sizes[b] = (size_t)isize;
-            group_raw_total += (size_t)isize;
-        }
-        if (MpiSortRawReserve(raw_data, group_raw_begin + group_raw_total) != 0) {
-            fprintf(stderr, "ERROR: MPI sort failed to reserve final raw buffer for extract.\n");
-            double cleanup_t0 = GetTime();
-            MpiSortFreeBlockSet(&input_pending_set);
-            MpiSortFreeExtractWorkspace(&ws);
-            stats->t_cleanup += GetTime() - cleanup_t0;
-            return -1;
-        }
-
-        for (int b = 0; b < kSortCpeBlocks; ++b) {
-            if (b < n_blocks) {
-                ws.un_blocks.blocks[b].data =
-                    ws.un_blocks.data + (size_t)b * BGZF_MAX_BLOCK_SIZE;
-                ws.un_blocks.blocks[b].length = (int)block_raw_sizes[b];
-                ws.un_blocks.blocks[b].pos = 0;
-                ws.un_blocks.blocks[b].errcode = 0;
-            }
-            paras[b].block_id = b;
-            paras[b].input_block = b < n_blocks ? &input_active->blocks[b] : nullptr;
-            paras[b].un_comp_block = b < n_blocks ? &ws.un_blocks.blocks[b] : nullptr;
-            paras[b].raw_arena = b < n_blocks ? ws.un_blocks.blocks[b].data : nullptr;
-            paras[b].raw_capacity = b < n_blocks ? block_raw_sizes[b] : 0;
-            paras[b].raw_used = 0;
-            paras[b].raw_base_offset = b < n_blocks ? (uint64_t)block_raw_offsets[b] : 0;
-            paras[b].records = ws.records + (size_t)b * records_per_block;
-            paras[b].record_capacity = records_per_block;
-            paras[b].n_records = 0;
-            paras[b].global_block_index = global_block_begin + (long long)local_block + b;
-            paras[b].status = b < n_blocks ? 0 : -1;
-            paras[b].record_index = 0;
-            paras[b].actual_value = 0;
-            paras[b].limit_value = 0;
-            paras[b].limit_id = BOUNDS_LIMIT_NONE;
-            paras[b].decomp_alloc_cycles = 0;
-            paras[b].decomp_inflate_cycles = 0;
-            paras[b].decomp_crc_cycles = 0;
-            paras[b].decomp_parse_cycles = 0;
-            paras[b].decomp_total_cycles = 0;
-        }
-        stats->t_extract_prepare += GetTime() - prepare_t0;
-
-        // 把解压、CRC、BAM record 解析交给 CPE；同时由 MPE 读取下一批输入。
-        double t0 = GetTime();
-        __real_athread_spawn((void *)slave_mpi_sort_extract_raw, paras, 1);
-        int next_n_blocks = 0;
+    MpiSortMemoryExtractOperator op(global_block_begin, records, raw_data, stats);
 #ifdef ENABLE_MASKING
-        if (do_read_group(input_pending, &next_n_blocks, false) != 0) {
-            athread_join();
-            MpiSortFreeBlockSet(&input_pending_set);
-            MpiSortFreeExtractWorkspace(&ws);
-            return -1;
-        }
+    const bool overlap = true;
+#else
+    const bool overlap = false;
 #endif
-        athread_join();
-        double wall = GetTime() - t0;
-#ifndef ENABLE_MASKING
-        if (do_read_group(input_pending, &next_n_blocks, true) != 0) {
-            MpiSortFreeBlockSet(&input_pending_set);
-            MpiSortFreeExtractWorkspace(&ws);
-            return -1;
-        }
-#endif
-        stats->t_extract += wall;
-        MpiSortAccumulateExtractDetail(paras, n_blocks, wall, stats);
-
-        double status_t0 = GetTime();
-        for (int b = 0; b < n_blocks; ++b) {
-            if (paras[b].status != 0) {
-                if (paras[b].status == -3) {
-                    fprintf(stderr,
-                            "ERROR: MPI sort extract capacity exceeded on input block %lld. limit_id=%d limit=%lld actual=%lld record=%d.\n",
-                            global_block_begin + (long long)local_block + b,
-                            paras[b].limit_id, paras[b].limit_value,
-                            paras[b].actual_value, paras[b].record_index);
-                } else if (paras[b].status == -4) {
-                    fprintf(stderr,
-                            "ERROR: MPI sort v1 assumes BAM records do not cross BGZF blocks; boundary crossed near global block %lld.\n",
-                            global_block_begin + (long long)local_block + b);
-                } else {
-                    fprintf(stderr, "ERROR: MPI sort extract failed on input block %lld with status %d.\n",
-                            global_block_begin + (long long)local_block + b, paras[b].status);
-                }
-                stats->t_status_check += GetTime() - status_t0;
-                double cleanup_t0 = GetTime();
-                MpiSortFreeBlockSet(&input_pending_set);
-                MpiSortFreeExtractWorkspace(&ws);
-                stats->t_cleanup += GetTime() - cleanup_t0;
-                return -1;
-            }
-        }
-        stats->t_status_check += GetTime() - status_t0;
-
-        // 从核每处理一个 BGZF block，会把结果先放在 workspace 的临时区域里；
-        // raw bytes 已经直接写入最终 local_raw，这里只追加 metadata。
-        double merge_t0 = GetTime();
-        for (int b = 0; b < n_blocks; ++b) {
-            if (paras[b].raw_used != block_raw_sizes[b]) {
-                fprintf(stderr,
-                        "ERROR: MPI sort extract raw size mismatch on input block %lld. expected=%zu actual=%zu.\n",
-                        global_block_begin + (long long)local_block + b,
-                        block_raw_sizes[b], paras[b].raw_used);
-                double cleanup_t0 = GetTime();
-                MpiSortFreeBlockSet(&input_pending_set);
-                MpiSortFreeExtractWorkspace(&ws);
-                stats->t_cleanup += GetTime() - cleanup_t0;
-                return -1;
-            }
-            if (block_raw_sizes[b] > 0) {
-                memcpy(raw_data->data + block_raw_offsets[b],
-                       ws.un_blocks.blocks[b].data,
-                       block_raw_sizes[b]);
-            }
-            MpiSortRecordMeta *block_records = ws.records + (size_t)b * records_per_block;
-            for (int r = 0; r < paras[b].n_records; ++r) {
-                records->push_back(block_records[r]);
-            }
-        }
-        raw_data->size = group_raw_begin + group_raw_total;
-        stats->t_extract_merge += GetTime() - merge_t0;
-        local_block += (size_t)n_blocks;
-        std::swap(input_active, input_pending);
-        n_blocks = next_n_blocks;
-    }
-
-    stats->local_records += (long long)records->size();
-    double cleanup_t0 = GetTime();
-    MpiSortFreeBlockSet(&input_pending_set);
-    MpiSortFreeExtractWorkspace(&ws);
-    stats->t_cleanup += GetTime() - cleanup_t0;
-    return 0;
+    return MpiSortRunReadPipeline(block_reader, &op, stats, overlap);
 }
-
 int MpiSortExtractLocalRecordsCpe(
         MemReader &reader, long long global_block_begin,
         std::vector<MpiSortRecordMeta> *records,
@@ -1274,28 +1225,153 @@ int MpiSortKWayMergeReceivedRecords(const std::vector<long long> &source_counts,
     return 0;
 }
 
-void MpiSortInitEmptyRawCompressPara(MpiSortRawCompressPara *para, int block_id) {
-    para->block_id = block_id;
-    para->un_comp_block = nullptr;
-    para->un_comp_size = 0;
-    para->output_block = nullptr;
-    para->output_size = 0;
-    para->status = -1;
-    para->compress_level = 1;
-    para->compress_pack_cycles = 0;
-    para->compress_alloc_cycles = 0;
-    para->compress_deflate_cycles = 0;
-    para->compress_footer_cycles = 0;
-    para->compress_total_cycles = 0;
+class MpiSortCompressOperator : public swbam::cpe::CpeWriteKernelOperator {
+public:
+    MpiSortCompressOperator(int level, MpiSortStats *stats, bool simulated)
+        : CpeWriteKernelOperator({"sort-compress",
+              (void *)slave_mpi_sort_compress_payload, kSortCpeBlocks, false}),
+          level_(level), stats_(stats), simulated_(simulated) {}
+
+    int Initialize() {
+        return level_ == 0 || level_ == 1 || level_ == 6 ? 0 : -1;
+    }
+    void Shutdown() {}
+    int Prepare(const swbam::cpe::CpeWriteBatchInput &input,
+                swbam::BgzfBlockBatch *scratch, swbam::BgzfBlockBatch *output) {
+        if (scratch || input.kind !=
+                swbam::cpe::CpeWriteBatchInput::kUncompressedBgzf) return -1;
+        memset(paras_, 0, sizeof(paras_));
+        for (int b = 0; b < kSortCpeBlocks; ++b) {
+            MpiSortRawCompressPara &para = paras_[b];
+            para.block_id = b;
+            para.status = b < (int)input.count ? 0 : -1;
+            if (para.status != 0) continue;
+            para.un_comp_block = const_cast<bam_block *>(
+                &input.uncompressed->blocks()[b]);
+            para.un_comp_size = (int)para.un_comp_block->pos;
+            if (para.un_comp_size <= 0 || para.un_comp_size > BGZF_BLOCK_SIZE)
+                return -1;
+            para.output_block = &output->blocks()[b];
+            para.compress_level = level_;
+        }
+        return 0;
+    }
+    void *kernel_arguments() { return paras_; }
+    void ObserveKernel(double wall, size_t active) {
+        stats_->t_compress += wall;
+        double detail_wall = wall;
+        if (simulated_) {
+            detail_wall = MpiSortEstimateCompressSeconds(
+                paras_, (int)active, wall, stats_);
+            stats_->t_compress_simulated += detail_wall;
+        }
+        MpiSortAccumulateCompressDetail(paras_, (int)active, detail_wall, stats_);
+    }
+    int Validate(size_t active) const {
+        const double t0 = GetTime();
+        int ret = 0;
+        for (size_t b = 0; b < active; ++b) {
+            if (paras_[b].status != 0 || paras_[b].output_size <= 0) {
+                fprintf(stderr, "ERROR: sort compression failed block=%zu status=%d.\n",
+                        b, paras_[b].status);
+                ret = -1;
+                break;
+            }
+        }
+        if (!simulated_) stats_->t_status_check += GetTime() - t0;
+        return ret;
+    }
+    long long OutputBytes(size_t active) const {
+        long long bytes = 0;
+        for (size_t b = 0; b < active; ++b) bytes += paras_[b].output_size;
+        return bytes;
+    }
+    int Finish() { return 0; }
+
+private:
+    int level_;
+    MpiSortStats *stats_;
+    bool simulated_;
+    MpiSortRawCompressPara paras_[kSortCpeBlocks];
+};
+
+class MpiSortCompressedOutput : public swbam::cpe::CompressedBgzfBatchPostProcessor {
+public:
+    MpiSortCompressedOutput(swbam::RankBodySink *sink, MpiSortStats *stats)
+        : sink_(sink), stats_(stats) {}
+    int PostProcessCompressedBatch(const bam_block *blocks, size_t count) {
+        const double t0 = GetTime();
+        for (size_t b = 0; b < count; ++b) {
+            if (swbam::AppendBgzfBlock(sink_, blocks + b) != 0) return -1;
+            stats_->bgzf_blocks++;
+        }
+        stats_->t_write += GetTime() - t0;
+        return 0;
+    }
+private:
+    swbam::RankBodySink *sink_;
+    MpiSortStats *stats_;
+};
+
+enum MpiSortPayloadMode { kSortMemoryPayload, kSortMergedPayload, kSortStrictPayload };
+
+// Fill remains app-owned; compression/flush and buffer rotation belong to the library.
+template <typename FillFn>
+class MpiSortPayloadSource : public swbam::cpe::UncompressedBgzfSource {
+public:
+    MpiSortPayloadSource(FillFn fill, MpiSortPayloadMode mode, MpiSortStats *stats)
+        : fill_(fill), mode_(mode), stats_(stats), first_(true), start_(GetTime()) {}
+    int Fill(swbam::BgzfBlockBatch *batch, size_t *count) {
+        if (first_) stats_->t_setup += GetTime() - start_;
+        MpiSortBlockSet blocks = {batch->blocks(), nullptr, (int)batch->capacity()};
+        int n = 0;
+        const double actual_before = stats_->t_temp_read_actual;
+        const double sim_before = stats_->t_temp_read_sim;
+        const double t0 = GetTime();
+        const int ret = fill_(&blocks, &n);
+        const double wall = GetTime() - t0;
+        *count = n < 0 ? 0 : (size_t)n;
+        if (mode_ == kSortMemoryPayload) {
+            if (first_) stats_->t_setup += wall;
+        } else {
+            stats_->t_final_sort += wall;
+            stats_->t_run_merge += wall;
+            double unhidden = wall;
+            if (mode_ == kSortStrictPayload) {
+                unhidden = std::max(0.0, wall -
+                    (stats_->t_temp_read_actual - actual_before));
+                stats_->t_merge_simulated += unhidden;
+                stats_->t_merge_temp_read_sim += stats_->t_temp_read_sim - sim_before;
+            }
+            if (first_) stats_->t_merge_unhidden += unhidden;
+        }
+        first_ = false;
+        return ret;
+    }
+private:
+    FillFn fill_;
+    MpiSortPayloadMode mode_;
+    MpiSortStats *stats_;
+    bool first_;
+    double start_;
+};
+
+template <typename Fill>
+int MpiSortRunWritePipeline(Fill fill, swbam::RankBodySink &sink,
+                           int level, MpiSortStats *stats,
+                           MpiSortPayloadMode mode) {
+    MpiSortCompressOperator op(level, stats, mode == kSortStrictPayload);
+    MpiSortCompressedOutput output(&sink, stats);
+    MpiSortPayloadSource<Fill> source(fill, mode, stats);
+    swbam::cpe::CpeWritePipelineOptions options;
+    options.overlap_source = true;
+    return swbam::cpe::RunCpeWritePipeline(&source, &output, &op, nullptr, options);
 }
 
 int MpiSortPreparePayloadBatch(const std::vector<MpiSortRecordMeta> &records,
                                const std::vector<unsigned char> &raw,
                                size_t *record_pos,
                                MpiSortBlockSet *payload_blocks,
-                               MpiSortBlockSet *output_blocks,
-                               MpiSortRawCompressPara *paras,
-                               int compress_level,
                                int *active_blocks) {
     int active = 0;
     while (*record_pos < records.size() && active < kSortCpeBlocks) {
@@ -1320,23 +1396,7 @@ int MpiSortPreparePayloadBatch(const std::vector<MpiSortRecordMeta> &records,
             return -1;
         }
 #endif
-
-        paras[active].block_id = active;
-        paras[active].un_comp_block = payload;
-        paras[active].un_comp_size = (int)payload->pos;
-        paras[active].output_block = &output_blocks->blocks[active];
-        paras[active].output_size = 0;
-        paras[active].status = 0;
-        paras[active].compress_level = compress_level;
-        paras[active].compress_pack_cycles = 0;
-        paras[active].compress_alloc_cycles = 0;
-        paras[active].compress_deflate_cycles = 0;
-        paras[active].compress_footer_cycles = 0;
-        paras[active].compress_total_cycles = 0;
         active++;
-    }
-    for (int i = active; i < kSortCpeBlocks; ++i) {
-        MpiSortInitEmptyRawCompressPara(&paras[i], i);
     }
     *active_blocks = active;
     return 0;
@@ -1347,113 +1407,13 @@ int MpiSortCompressSortedRecordsCpe(const std::vector<MpiSortRecordMeta> &record
                                     swbam::RankBodySink &body_sink,
                                     int compress_level,
                                     MpiSortStats *stats) {
-    double setup_t0 = GetTime();
-    MpiSortBlockSet payload_a = {}, payload_b = {}, out_a = {}, out_b = {};
-    MpiSortRawCompressPara paras_a[kSortCpeBlocks], paras_b[kSortCpeBlocks];
-    if (MpiSortAllocateBlockSet(&payload_a, kSortCpeBlocks) != 0 ||
-        MpiSortAllocateBlockSet(&payload_b, kSortCpeBlocks) != 0 ||
-        MpiSortAllocateBlockSet(&out_a, kSortCpeBlocks) != 0 ||
-        MpiSortAllocateBlockSet(&out_b, kSortCpeBlocks) != 0) {
-        fprintf(stderr, "ERROR: failed to allocate MPI sort compress workspace.\n");
-        MpiSortFreeBlockSet(&payload_a);
-        MpiSortFreeBlockSet(&payload_b);
-        MpiSortFreeBlockSet(&out_a);
-        MpiSortFreeBlockSet(&out_b);
-        return -1;
-    }
-    for (int i = 0; i < kSortCpeBlocks; ++i) {
-        MpiSortInitEmptyRawCompressPara(&paras_a[i], i);
-        MpiSortInitEmptyRawCompressPara(&paras_b[i], i);
-    }
-
-    MpiSortBlockSet *payload_active = &payload_a;
-    MpiSortBlockSet *payload_pending = &payload_b;
-    MpiSortBlockSet *out_active = &out_a;
-    MpiSortBlockSet *out_pending = &out_b;
-    MpiSortRawCompressPara *paras_active = paras_a;
-    MpiSortRawCompressPara *paras_pending = paras_b;
-    bool has_pending = false;
-
-    auto flush_pending = [&]() -> int {
-        if (!has_pending) return 0;
-        double t0 = GetTime();
-        for (int i = 0; i < kSortCpeBlocks; ++i) {
-            if (paras_pending[i].status == 0 && paras_pending[i].output_block) {
-                if (swbam::AppendBgzfBlock(
-                        &body_sink, paras_pending[i].output_block) != 0) {
-                    return -1;
-                }
-                stats->bgzf_blocks++;
-            }
-            MpiSortInitEmptyRawCompressPara(&paras_pending[i], i);
-        }
-        has_pending = false;
-        stats->t_write += GetTime() - t0;
-        return 0;
-    };
-
     size_t record_pos = 0;
-    int active_blocks = 0;
-    if (MpiSortPreparePayloadBatch(records, raw, &record_pos, payload_active, out_active,
-                                   paras_active, compress_level, &active_blocks) != 0) {
-        MpiSortFreeBlockSet(&payload_a);
-        MpiSortFreeBlockSet(&payload_b);
-        MpiSortFreeBlockSet(&out_a);
-        MpiSortFreeBlockSet(&out_b);
-        return -1;
-    }
-    stats->t_setup += GetTime() - setup_t0;
-
-    int ret_code = 0;
-    while (active_blocks > 0) {
-        int next_active_blocks = 0;
-        double t0 = GetTime();
-        __real_athread_spawn((void *)slave_mpi_sort_compress_payload, paras_active, 1);
-        if (flush_pending() != 0) {
-            athread_join();
-            ret_code = -1;
-            break;
-        }
-        if (MpiSortPreparePayloadBatch(records, raw, &record_pos, payload_pending, out_pending,
-                                       paras_pending, compress_level, &next_active_blocks) != 0) {
-            athread_join();
-            ret_code = -1;
-            break;
-        }
-        athread_join();
-        double wall = GetTime() - t0;
-        stats->t_compress += wall;
-        MpiSortAccumulateCompressDetail(paras_active, active_blocks, wall, stats);
-
-        double status_t0 = GetTime();
-        for (int i = 0; i < active_blocks; ++i) {
-            if (paras_active[i].status != 0) {
-                fprintf(stderr, "ERROR: MPI sort raw compress failed on block %d with status %d.\n",
-                        i, paras_active[i].status);
-                ret_code = -1;
-                break;
-            }
-        }
-        stats->t_status_check += GetTime() - status_t0;
-        if (ret_code != 0) break;
-
-        has_pending = active_blocks > 0;
-        std::swap(payload_active, payload_pending);
-        std::swap(out_active, out_pending);
-        std::swap(paras_active, paras_pending);
-        active_blocks = next_active_blocks;
-    }
-
-    int ret = ret_code == 0 ? flush_pending() : ret_code;
-    double cleanup_t0 = GetTime();
-    MpiSortFreeBlockSet(&payload_a);
-    MpiSortFreeBlockSet(&payload_b);
-    MpiSortFreeBlockSet(&out_a);
-    MpiSortFreeBlockSet(&out_b);
-    stats->t_cleanup += GetTime() - cleanup_t0;
-    return ret;
+    const auto fill = [&](MpiSortBlockSet *payload, int *count) {
+        return MpiSortPreparePayloadBatch(records, raw, &record_pos, payload, count);
+    };
+    return MpiSortRunWritePipeline(
+        fill, body_sink, compress_level, stats, kSortMemoryPayload);
 }
-
 struct MpiSortExternalRunRange {
     size_t byte_begin;
     size_t byte_end;
@@ -1704,9 +1664,6 @@ int MpiSortAppendReceivedSegments(std::vector<MpiSortRecordMeta> *recv_records,
 
 int MpiSortPreparePayloadBatchFromSegments(MpiSortLoserTree *tree,
                                            MpiSortBlockSet *payload_blocks,
-                                           MpiSortBlockSet *output_blocks,
-                                           MpiSortRawCompressPara *paras,
-                                           int compress_level,
                                            int *active_blocks) {
     if (!tree) return -1;
 
@@ -1740,22 +1697,7 @@ int MpiSortPreparePayloadBatchFromSegments(MpiSortLoserTree *tree,
         }
 #endif
 
-        paras[active].block_id = active;
-        paras[active].un_comp_block = payload;
-        paras[active].un_comp_size = (int)payload->pos;
-        paras[active].output_block = &output_blocks->blocks[active];
-        paras[active].output_size = 0;
-        paras[active].status = 0;
-        paras[active].compress_level = compress_level;
-        paras[active].compress_pack_cycles = 0;
-        paras[active].compress_alloc_cycles = 0;
-        paras[active].compress_deflate_cycles = 0;
-        paras[active].compress_footer_cycles = 0;
-        paras[active].compress_total_cycles = 0;
         active++;
-    }
-    for (int i = active; i < kSortCpeBlocks; ++i) {
-        MpiSortInitEmptyRawCompressPara(&paras[i], i);
     }
     *active_blocks = active;
     return 0;
@@ -1766,25 +1708,8 @@ int MpiSortCompressExternalSegmentsCpe(const std::vector<MpiSortExternalReceived
                                        swbam::RankBodySink &body_sink,
                                        int compress_level,
                                        MpiSortStats *stats) {
-    double setup_t0 = GetTime();
-    MpiSortBlockSet payload_a = {}, payload_b = {}, out_a = {}, out_b = {};
-    MpiSortRawCompressPara paras_a[kSortCpeBlocks], paras_b[kSortCpeBlocks];
-    if (MpiSortAllocateBlockSet(&payload_a, kSortCpeBlocks) != 0 ||
-        MpiSortAllocateBlockSet(&payload_b, kSortCpeBlocks) != 0 ||
-        MpiSortAllocateBlockSet(&out_a, kSortCpeBlocks) != 0 ||
-        MpiSortAllocateBlockSet(&out_b, kSortCpeBlocks) != 0) {
-        fprintf(stderr, "ERROR: failed to allocate MPI sort external compress workspace.\n");
-        MpiSortFreeBlockSet(&payload_a);
-        MpiSortFreeBlockSet(&payload_b);
-        MpiSortFreeBlockSet(&out_a);
-        MpiSortFreeBlockSet(&out_b);
-        return -1;
-    }
-    for (int i = 0; i < kSortCpeBlocks; ++i) {
-        MpiSortInitEmptyRawCompressPara(&paras_a[i], i);
-        MpiSortInitEmptyRawCompressPara(&paras_b[i], i);
-    }
-
+    (void)batches;
+    const double t0 = GetTime();
     std::vector<MpiSortMergeCursor> cursors;
     cursors.reserve(segments.size());
     for (size_t i = 0; i < segments.size(); ++i) {
@@ -1798,106 +1723,13 @@ int MpiSortCompressExternalSegmentsCpe(const std::vector<MpiSortExternalReceived
         }
     }
     MpiSortLoserTree tree(std::move(cursors));
-
-    MpiSortBlockSet *payload_active = &payload_a;
-    MpiSortBlockSet *payload_pending = &payload_b;
-    MpiSortBlockSet *out_active = &out_a;
-    MpiSortBlockSet *out_pending = &out_b;
-    MpiSortRawCompressPara *paras_active = paras_a;
-    MpiSortRawCompressPara *paras_pending = paras_b;
-    bool has_pending = false;
-
-    auto flush_pending = [&]() -> int {
-        if (!has_pending) return 0;
-        double t0 = GetTime();
-        for (int i = 0; i < kSortCpeBlocks; ++i) {
-            if (paras_pending[i].status == 0 && paras_pending[i].output_block) {
-                if (swbam::AppendBgzfBlock(
-                        &body_sink, paras_pending[i].output_block) != 0) {
-                    return -1;
-                }
-                stats->bgzf_blocks++;
-            }
-            MpiSortInitEmptyRawCompressPara(&paras_pending[i], i);
-        }
-        has_pending = false;
-        stats->t_write += GetTime() - t0;
-        return 0;
+    stats->t_setup += GetTime() - t0;
+    const auto fill = [&](MpiSortBlockSet *payload, int *count) {
+        return MpiSortPreparePayloadBatchFromSegments(&tree, payload, count);
     };
-
-    int active_blocks = 0;
-    double merge_t0 = GetTime();
-    stats->t_setup += GetTime() - setup_t0;
-
-    if (MpiSortPreparePayloadBatchFromSegments(&tree,
-                                               payload_active, out_active,
-                                               paras_active, compress_level, &active_blocks) != 0) {
-        MpiSortFreeBlockSet(&payload_a);
-        MpiSortFreeBlockSet(&payload_b);
-        MpiSortFreeBlockSet(&out_a);
-        MpiSortFreeBlockSet(&out_b);
-        return -1;
-    }
-    double merge_wall = GetTime() - merge_t0;
-    stats->t_final_sort += merge_wall;
-    stats->t_run_merge += merge_wall;
-    stats->t_merge_unhidden += merge_wall;
-
-    int ret_code = 0;
-    while (active_blocks > 0) {
-        int next_active_blocks = 0;
-        double t0 = GetTime();
-        __real_athread_spawn((void *)slave_mpi_sort_compress_payload, paras_active, 1);
-        if (flush_pending() != 0) {
-            athread_join();
-            ret_code = -1;
-            break;
-        }
-        merge_t0 = GetTime();
-        if (MpiSortPreparePayloadBatchFromSegments(&tree,
-                                                   payload_pending, out_pending,
-                                                   paras_pending, compress_level, &next_active_blocks) != 0) {
-            athread_join();
-            ret_code = -1;
-            break;
-        }
-        merge_wall = GetTime() - merge_t0;
-        stats->t_final_sort += merge_wall;
-        stats->t_run_merge += merge_wall;
-        athread_join();
-        double wall = GetTime() - t0;
-        stats->t_compress += wall;
-        MpiSortAccumulateCompressDetail(paras_active, active_blocks, wall, stats);
-
-        double status_t0 = GetTime();
-        for (int i = 0; i < active_blocks; ++i) {
-            if (paras_active[i].status != 0) {
-                fprintf(stderr, "ERROR: MPI sort external raw compress failed on block %d with status %d.\n",
-                        i, paras_active[i].status);
-                ret_code = -1;
-                break;
-            }
-        }
-        stats->t_status_check += GetTime() - status_t0;
-        if (ret_code != 0) break;
-
-        has_pending = active_blocks > 0;
-        std::swap(payload_active, payload_pending);
-        std::swap(out_active, out_pending);
-        std::swap(paras_active, paras_pending);
-        active_blocks = next_active_blocks;
-    }
-
-    int ret = ret_code == 0 ? flush_pending() : ret_code;
-    double cleanup_t0 = GetTime();
-    MpiSortFreeBlockSet(&payload_a);
-    MpiSortFreeBlockSet(&payload_b);
-    MpiSortFreeBlockSet(&out_a);
-    MpiSortFreeBlockSet(&out_b);
-    stats->t_cleanup += GetTime() - cleanup_t0;
-    return ret;
+    return MpiSortRunWritePipeline(
+        fill, body_sink, compress_level, stats, kSortMergedPayload);
 }
-
 const size_t kSortStrictControlReserve = 16ull * 1024ull * 1024ull;
 const size_t kSortStrictSimScratch = 8ull * 1024ull * 1024ull;
 const size_t kSortStrictMetaBuffer = 64ull * 1024ull;
@@ -2315,11 +2147,78 @@ void MpiSortStrictRetainRun(MpiSortStrictRunArena *arena,
 }
 
 size_t MpiSortStrictExtractWorkspaceBytes() {
-    return 2ull * kSortCpeBlocks *
+    // The shared reader owns two compressed and two decoded batches.
+    return 4ull * kSortCpeBlocks *
                (sizeof(bam_block) + (size_t)BGZF_MAX_BLOCK_SIZE) +
            (size_t)kSortCpeBlocks * MPI_RECORDS_PER_BLOCK *
                sizeof(MpiSortRecordMeta);
 }
+
+class MpiSortStrictExtractOperator : public MpiSortExtractOperator {
+public:
+    MpiSortStrictExtractOperator(
+            long long begin, int rank, int comm_size,
+            MpiSortStrictRunArena *arena, MpiSortStrictTempStore *store,
+            unsigned char *scratch, size_t scratch_size,
+            MpiSortMemoryTracker *tracker,
+            std::vector<MpiSortStrictRun> *runs,
+            std::vector<MpiSortKey> *samples, MpiSortStats *stats)
+        : MpiSortExtractOperator(begin, stats), rank_(rank),
+          comm_size_(comm_size), arena_(arena), store_(store),
+          scratch_(scratch), scratch_size_(scratch_size), tracker_(tracker),
+          runs_(runs), samples_(samples) {}
+
+    int Finish() {
+        MpiSortStrictRetainRun(arena_, comm_size_, runs_, samples_, stats_);
+        return 0;
+    }
+
+protected:
+    int AppendBatch(size_t active) {
+        for (size_t b = 0; b < active; ++b) {
+            const MpiSortExtractPara &para = paras_[b];
+            double t0 = GetTime();
+            int ret = MpiSortStrictAppendBlock(
+                arena_, para.un_comp_block->data, para.raw_used,
+                para.raw_base_offset, para.records, (size_t)para.n_records);
+            stats_->t_extract_merge += GetTime() - t0;
+            if (ret == 1 && arena_->record_count > 0) {
+                if (MpiSortStrictSpillRun(
+                        arena_, store_, scratch_, scratch_size_, comm_size_,
+                        runs_, samples_, stats_) != 0) return -1;
+                t0 = GetTime();
+                ret = MpiSortStrictAppendBlock(
+                    arena_, para.un_comp_block->data, para.raw_used,
+                    para.raw_base_offset, para.records, (size_t)para.n_records);
+                stats_->t_extract_merge += GetTime() - t0;
+            }
+            if (ret != 0) {
+                const size_t minimum = kSortStrictControlReserve +
+                    kSortStrictSimScratch + MpiSortStrictExtractWorkspaceBytes() +
+                    para.raw_used + para.n_records * sizeof(MpiSortRecordMeta);
+                fprintf(stderr,
+                        "[rank %d] ERROR: one BGZF block cannot fit in the "
+                        "external run arena. minimum_memory=%zu limit=%zu "
+                        "block_raw=%zu records=%d\n",
+                        rank_, minimum, tracker_->limit,
+                        para.raw_used, para.n_records);
+                return -1;
+            }
+        }
+        return 0;
+    }
+
+private:
+    int rank_;
+    int comm_size_;
+    MpiSortStrictRunArena *arena_;
+    MpiSortStrictTempStore *store_;
+    unsigned char *scratch_;
+    size_t scratch_size_;
+    MpiSortMemoryTracker *tracker_;
+    std::vector<MpiSortStrictRun> *runs_;
+    std::vector<MpiSortKey> *samples_;
+};
 
 int MpiSortStrictGenerateRunsImpl(MpiSortBatchReader *block_reader,
                               long long global_block_begin,
@@ -2336,143 +2235,19 @@ int MpiSortStrictGenerateRunsImpl(MpiSortBatchReader *block_reader,
     const size_t workspace_bytes = MpiSortStrictExtractWorkspaceBytes();
     if (!tracker->acquire(workspace_bytes)) {
         fprintf(stderr,
-                "[rank %d] ERROR: -m cannot hold the minimum external extract workspace. required_at_least=%zu limit=%zu\n",
+                "[rank %d] ERROR: -m cannot hold the minimum external extract "
+                "workspace. required_at_least=%zu limit=%zu\n",
                 rank, tracker->current + workspace_bytes, tracker->limit);
         return -1;
     }
-    MpiSortExtractWorkspace ws = {};
-    if (MpiSortAllocateExtractWorkspace(&ws, kSortCpeBlocks,
-                                        (int)MPI_RECORDS_PER_BLOCK, 0) != 0) {
-        tracker->release(workspace_bytes);
-        return -1;
-    }
-    MpiSortExtractPara paras[kSortCpeBlocks];
-    size_t local_block = 0;
-    int ret = 0;
-    while (true) {
-        int n_blocks = 0;
-        double read_t0 = GetTime();
-        const int read_ret = block_reader->Read(
-            &ws.input_blocks, &n_blocks);
-        double read_wall = GetTime() - read_t0;
-        stats->t_extract_read += read_wall;
-        stats->t_extract_read_unhidden += read_wall;
-        if (read_ret != 0) {
-            ret = -1;
-            break;
-        }
-        if (n_blocks == 0) break;
-        stats->input_blocks += n_blocks;
-
-        double prepare_t0 = GetTime();
-        for (int b = 0; b < kSortCpeBlocks; ++b) {
-            uint32_t isize = b < n_blocks ? MpiSortBgzfISize(&ws.input_blocks.blocks[b]) : 0;
-            if (b < n_blocks && isize > BGZF_MAX_BLOCK_SIZE) {
-                fprintf(stderr, "[rank %d] ERROR: invalid BGZF ISIZE=%u.\n", rank, isize);
-                ret = -1;
-                break;
-            }
-            if (b < n_blocks) {
-                ws.un_blocks.blocks[b].data =
-                    ws.un_blocks.data + (size_t)b * BGZF_MAX_BLOCK_SIZE;
-                ws.un_blocks.blocks[b].length = (int)isize;
-                ws.un_blocks.blocks[b].pos = 0;
-                ws.un_blocks.blocks[b].errcode = 0;
-            }
-            paras[b].block_id = b;
-            paras[b].input_block = b < n_blocks ? &ws.input_blocks.blocks[b] : nullptr;
-            paras[b].un_comp_block = b < n_blocks ? &ws.un_blocks.blocks[b] : nullptr;
-            paras[b].raw_arena = b < n_blocks ? ws.un_blocks.blocks[b].data : nullptr;
-            paras[b].raw_capacity = b < n_blocks ? (size_t)isize : 0;
-            paras[b].raw_used = 0;
-            paras[b].raw_base_offset = (uint64_t)b * BGZF_MAX_BLOCK_SIZE;
-            paras[b].records = ws.records + (size_t)b * MPI_RECORDS_PER_BLOCK;
-            paras[b].record_capacity = (int)MPI_RECORDS_PER_BLOCK;
-            paras[b].n_records = 0;
-            paras[b].global_block_index =
-                global_block_begin + (long long)local_block + b;
-            paras[b].status = b < n_blocks ? 0 : -1;
-            paras[b].record_index = 0;
-            paras[b].actual_value = 0;
-            paras[b].limit_value = 0;
-            paras[b].limit_id = BOUNDS_LIMIT_NONE;
-            paras[b].decomp_alloc_cycles = 0;
-            paras[b].decomp_inflate_cycles = 0;
-            paras[b].decomp_crc_cycles = 0;
-            paras[b].decomp_parse_cycles = 0;
-            paras[b].decomp_total_cycles = 0;
-        }
-        stats->t_extract_prepare += GetTime() - prepare_t0;
-        if (ret != 0) break;
-
-        double extract_t0 = GetTime();
-        __real_athread_spawn((void *)slave_mpi_sort_extract_raw, paras, 1);
-        athread_join();
-        double extract_wall = GetTime() - extract_t0;
-        stats->t_extract += extract_wall;
-        MpiSortAccumulateExtractDetail(paras, n_blocks, extract_wall, stats);
-
-        for (int b = 0; b < n_blocks; ++b) {
-            if (paras[b].status != 0) {
-                if (paras[b].status == -4) {
-                    fprintf(stderr,
-                            "[rank %d] ERROR: sort assumes BAM records do not cross BGZF blocks; global_block=%lld.\n",
-                            rank, global_block_begin + (long long)local_block + b);
-                } else {
-                    fprintf(stderr,
-                            "[rank %d] ERROR: external sort extract failed. global_block=%lld status=%d limit=%lld actual=%lld\n",
-                            rank, global_block_begin + (long long)local_block + b,
-                            paras[b].status, paras[b].limit_value, paras[b].actual_value);
-                }
-                ret = -1;
-                break;
-            }
-            const size_t block_raw = paras[b].raw_used;
-            const size_t block_records = (size_t)paras[b].n_records;
-            const uint64_t block_base = (uint64_t)b * BGZF_MAX_BLOCK_SIZE;
-            double append_t0 = GetTime();
-            int append_ret = MpiSortStrictAppendBlock(
-                arena, ws.un_blocks.blocks[b].data, block_raw, block_base,
-                ws.records + (size_t)b * MPI_RECORDS_PER_BLOCK,
-                block_records);
-            stats->t_extract_merge += GetTime() - append_t0;
-            if (append_ret == 1 && arena->record_count > 0) {
-                if (MpiSortStrictSpillRun(arena, store, sim_scratch,
-                                          sim_scratch_size, comm_size,
-                                          runs, samples, stats) != 0) {
-                    ret = -1;
-                    break;
-                }
-                append_t0 = GetTime();
-                append_ret = MpiSortStrictAppendBlock(
-                    arena, ws.un_blocks.blocks[b].data, block_raw, block_base,
-                    ws.records + (size_t)b * MPI_RECORDS_PER_BLOCK,
-                    block_records);
-                stats->t_extract_merge += GetTime() - append_t0;
-            }
-            if (append_ret != 0) {
-                size_t minimum = kSortStrictControlReserve + kSortStrictSimScratch +
-                                 workspace_bytes + block_raw +
-                                 block_records * sizeof(MpiSortRecordMeta);
-                fprintf(stderr,
-                        "[rank %d] ERROR: one BGZF block cannot fit in the external run arena. minimum_memory=%zu limit=%zu block_raw=%zu records=%zu\n",
-                        rank, minimum, tracker->limit, block_raw, block_records);
-                ret = -1;
-                break;
-            }
-            stats->local_records += (long long)block_records;
-        }
-        if (ret != 0) break;
-        local_block += (size_t)n_blocks;
-    }
-    if (ret == 0) {
-        MpiSortStrictRetainRun(arena, comm_size, runs, samples, stats);
-    }
-    MpiSortFreeExtractWorkspace(&ws);
+    MpiSortStrictExtractOperator op(
+        global_block_begin, rank, comm_size, arena, store, sim_scratch,
+        sim_scratch_size, tracker, runs, samples, stats);
+    // Keep external read costs disjoint from extraction in the simulated model.
+    const int ret = MpiSortRunReadPipeline(block_reader, &op, stats, false);
     tracker->release(workspace_bytes);
     return ret;
 }
-
 int MpiSortStrictGenerateRuns(
         MemReader &reader, long long global_block_begin,
         int rank, int comm_size,
@@ -3317,9 +3092,6 @@ int MpiSortStrictPreparePayloadBatch(
         unsigned char *sim_scratch,
         size_t sim_scratch_size,
         MpiSortBlockSet *payload_blocks,
-        MpiSortBlockSet *output_blocks,
-        MpiSortRawCompressPara *paras,
-        int compress_level,
         MpiSortStats *stats,
         int *active_blocks) {
     int active = 0;
@@ -3359,22 +3131,7 @@ int MpiSortStrictPreparePayloadBatch(
             return -1;
         }
 #endif
-        paras[active].block_id = active;
-        paras[active].un_comp_block = payload;
-        paras[active].un_comp_size = (int)payload->pos;
-        paras[active].output_block = &output_blocks->blocks[active];
-        paras[active].output_size = 0;
-        paras[active].status = 0;
-        paras[active].compress_level = compress_level;
-        paras[active].compress_pack_cycles = 0;
-        paras[active].compress_alloc_cycles = 0;
-        paras[active].compress_deflate_cycles = 0;
-        paras[active].compress_footer_cycles = 0;
-        paras[active].compress_total_cycles = 0;
         active++;
-    }
-    for (int i = active; i < kSortCpeBlocks; ++i) {
-        MpiSortInitEmptyRawCompressPara(&paras[i], i);
     }
     *active_blocks = active;
     return 0;
@@ -3394,171 +3151,43 @@ int MpiSortStrictMergeCompress(
     const size_t cursor_bytes = segments.size() * cursor_stride;
     const size_t compress_bytes = MpiSortStrictCompressWorkspaceBytes();
     MpiSortStrictBuffer cursor_memory;
-    bool compress_acquired = tracker->acquire(compress_bytes);
+    const bool compress_acquired = tracker->acquire(compress_bytes);
     if (!compress_acquired ||
         MpiSortStrictAlloc(tracker, cursor_bytes, &cursor_memory) != 0) {
         if (compress_acquired) tracker->release(compress_bytes);
         return -1;
     }
-    MpiSortBlockSet payload_a = {}, payload_b = {}, out_a = {}, out_b = {};
-    MpiSortRawCompressPara paras_a[kSortCpeBlocks], paras_b[kSortCpeBlocks];
-    if (MpiSortAllocateBlockSet(&payload_a, kSortCpeBlocks) != 0 ||
-        MpiSortAllocateBlockSet(&payload_b, kSortCpeBlocks) != 0 ||
-        MpiSortAllocateBlockSet(&out_a, kSortCpeBlocks) != 0 ||
-        MpiSortAllocateBlockSet(&out_b, kSortCpeBlocks) != 0) {
-        MpiSortStrictFree(tracker, &cursor_memory);
-        tracker->release(compress_bytes);
-        return -1;
-    }
-    for (int i = 0; i < kSortCpeBlocks; ++i) {
-        MpiSortInitEmptyRawCompressPara(&paras_a[i], i);
-        MpiSortInitEmptyRawCompressPara(&paras_b[i], i);
-    }
     std::vector<MpiSortStrictCursor> cursors;
-    double merge_read_actual_before = stats->t_temp_read_actual;
-    double merge_read_sim_before = stats->t_temp_read_sim;
-    double merge_t0 = GetTime();
-    if (MpiSortStrictBuildCursors(segments, 0, segments.size(),
-                                  &cursor_memory, store,
-                                  sim_scratch, sim_scratch_size,
-                                  stats, &cursors) != 0) {
-        MpiSortFreeBlockSet(&payload_a);
-        MpiSortFreeBlockSet(&payload_b);
-        MpiSortFreeBlockSet(&out_a);
-        MpiSortFreeBlockSet(&out_b);
+    const double actual_before = stats->t_temp_read_actual;
+    const double sim_before = stats->t_temp_read_sim;
+    const double t0 = GetTime();
+    if (MpiSortStrictBuildCursors(
+            segments, 0, segments.size(), &cursor_memory, store,
+            sim_scratch, sim_scratch_size, stats, &cursors) != 0) {
         MpiSortStrictFree(tracker, &cursor_memory);
         tracker->release(compress_bytes);
         return -1;
     }
-    double merge_wall = GetTime() - merge_t0;
-    double merge_actual_io =
-        stats->t_temp_read_actual - merge_read_actual_before;
-    double merge_simulated = merge_wall - merge_actual_io;
-    if (merge_simulated < 0.0) merge_simulated = 0.0;
-    stats->t_final_sort += merge_wall;
-    stats->t_run_merge += merge_wall;
-    stats->t_merge_simulated += merge_simulated;
-    stats->t_merge_temp_read_sim +=
-        stats->t_temp_read_sim - merge_read_sim_before;
-    stats->t_merge_unhidden += merge_simulated;
+    const double wall = GetTime() - t0;
+    const double simulated = std::max(
+        0.0, wall - (stats->t_temp_read_actual - actual_before));
+    stats->t_final_sort += wall;
+    stats->t_run_merge += wall;
+    stats->t_merge_simulated += simulated;
+    stats->t_merge_temp_read_sim += stats->t_temp_read_sim - sim_before;
+    stats->t_merge_unhidden += simulated;
     MpiSortStrictLoserTree tree(&cursors);
-    MpiSortBlockSet *payload_active = &payload_a;
-    MpiSortBlockSet *payload_pending = &payload_b;
-    MpiSortBlockSet *out_active = &out_a;
-    MpiSortBlockSet *out_pending = &out_b;
-    MpiSortRawCompressPara *paras_active = paras_a;
-    MpiSortRawCompressPara *paras_pending = paras_b;
-    bool has_pending = false;
-    auto flush_pending = [&]() -> int {
-        if (!has_pending) return 0;
-        double t0 = GetTime();
-        for (int i = 0; i < kSortCpeBlocks; ++i) {
-            if (paras_pending[i].status == 0 &&
-                paras_pending[i].output_block) {
-                if (swbam::AppendBgzfBlock(
-                        &body_sink,
-                        paras_pending[i].output_block) != 0) {
-                    return -1;
-                }
-                stats->bgzf_blocks++;
-            }
-            MpiSortInitEmptyRawCompressPara(&paras_pending[i], i);
-        }
-        has_pending = false;
-        stats->t_write += GetTime() - t0;
-        return 0;
-    };
-
-    int active_blocks = 0;
-    merge_read_actual_before = stats->t_temp_read_actual;
-    merge_read_sim_before = stats->t_temp_read_sim;
-    merge_t0 = GetTime();
-    if (MpiSortStrictPreparePayloadBatch(
+    const auto fill = [&](MpiSortBlockSet *payload, int *count) {
+        return MpiSortStrictPreparePayloadBatch(
             &tree, &cursors, store, sim_scratch, sim_scratch_size,
-            payload_active, out_active, paras_active,
-            compress_level, stats, &active_blocks) != 0) {
-        MpiSortFreeBlockSet(&payload_a);
-        MpiSortFreeBlockSet(&payload_b);
-        MpiSortFreeBlockSet(&out_a);
-        MpiSortFreeBlockSet(&out_b);
-        MpiSortStrictFree(tracker, &cursor_memory);
-        tracker->release(compress_bytes);
-        return -1;
-    }
-    merge_wall = GetTime() - merge_t0;
-    merge_actual_io = stats->t_temp_read_actual - merge_read_actual_before;
-    merge_simulated = merge_wall - merge_actual_io;
-    if (merge_simulated < 0.0) merge_simulated = 0.0;
-    stats->t_final_sort += merge_wall;
-    stats->t_run_merge += merge_wall;
-    stats->t_merge_simulated += merge_simulated;
-    stats->t_merge_temp_read_sim +=
-        stats->t_temp_read_sim - merge_read_sim_before;
-    stats->t_merge_unhidden += merge_simulated;
-
-    int ret = 0;
-    while (active_blocks > 0) {
-        int next_active = 0;
-        double t0 = GetTime();
-        __real_athread_spawn((void *)slave_mpi_sort_compress_payload,
-                             paras_active, 1);
-        if (flush_pending() != 0) {
-            athread_join();
-            ret = -1;
-            break;
-        }
-        merge_read_actual_before = stats->t_temp_read_actual;
-        merge_read_sim_before = stats->t_temp_read_sim;
-        merge_t0 = GetTime();
-        if (MpiSortStrictPreparePayloadBatch(
-                &tree, &cursors, store, sim_scratch, sim_scratch_size,
-                payload_pending, out_pending, paras_pending,
-                compress_level, stats, &next_active) != 0) {
-            athread_join();
-            ret = -1;
-            break;
-        }
-        merge_wall = GetTime() - merge_t0;
-        merge_actual_io =
-            stats->t_temp_read_actual - merge_read_actual_before;
-        merge_simulated = merge_wall - merge_actual_io;
-        if (merge_simulated < 0.0) merge_simulated = 0.0;
-        stats->t_final_sort += merge_wall;
-        stats->t_run_merge += merge_wall;
-        stats->t_merge_simulated += merge_simulated;
-        stats->t_merge_temp_read_sim +=
-            stats->t_temp_read_sim - merge_read_sim_before;
-        athread_join();
-        double wall = GetTime() - t0;
-        stats->t_compress += wall;
-        double compress_simulated = MpiSortEstimateCompressSeconds(
-            paras_active, active_blocks, wall, stats);
-        stats->t_compress_simulated += compress_simulated;
-        MpiSortAccumulateCompressDetail(paras_active, active_blocks,
-                                        compress_simulated, stats);
-        for (int i = 0; i < active_blocks; ++i) {
-            if (paras_active[i].status != 0) {
-                ret = -1;
-                break;
-            }
-        }
-        if (ret != 0) break;
-        has_pending = active_blocks > 0;
-        std::swap(payload_active, payload_pending);
-        std::swap(out_active, out_pending);
-        std::swap(paras_active, paras_pending);
-        active_blocks = next_active;
-    }
-    if (ret == 0) ret = flush_pending();
-    MpiSortFreeBlockSet(&payload_a);
-    MpiSortFreeBlockSet(&payload_b);
-    MpiSortFreeBlockSet(&out_a);
-    MpiSortFreeBlockSet(&out_b);
+            payload, stats, count);
+    };
+    const int ret = MpiSortRunWritePipeline(
+        fill, body_sink, compress_level, stats, kSortStrictPayload);
     MpiSortStrictFree(tracker, &cursor_memory);
     tracker->release(compress_bytes);
     return ret;
 }
-
 } // namespace
 
 

@@ -1,5 +1,7 @@
 #include "swbam_mpi.h"
 #include "swbam/mpi_runtime.h"
+#include "swbam/operators/bam_read_batch.h"
+#include "swbam/cpe_write_pipeline.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -8,6 +10,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <new>
 #include <string>
@@ -191,12 +194,24 @@ struct MdBoundaryCandidateIdHash {
 
 struct MdOnePassBoundaryPlan {
     int enabled;
+    uint64_t first_probe_end_block;
+    uint64_t last_probe_begin_block;
     std::vector<MdCoordBoundary> boundaries;
     std::unordered_set<MdBoundaryCandidateId,
                        MdBoundaryCandidateIdHash> candidates;
     std::unordered_map<uint64_t, uint8_t> decisions;
 
-    MdOnePassBoundaryPlan() : enabled(0) {}
+    MdOnePassBoundaryPlan()
+        : enabled(0), first_probe_end_block(0), last_probe_begin_block(0) {}
+
+    bool MayContainBatch(
+            const std::vector<MpiMarkdupCandidateShared> &batch) const {
+        if (!enabled || candidates.empty() || batch.empty()) return false;
+        // Extraction preserves file order. Only the two probed block ranges
+        // can contain precomputed IDs; interior batches need no hash lookups.
+        return (batch.front().global_order >> 32) < first_probe_end_block ||
+               (batch.back().global_order >> 32) >= last_probe_begin_block;
+    }
 };
 
 typedef int (*MdRemoteCandidateObserver)(
@@ -555,7 +570,7 @@ static int MdExtractCandidatesPass(
     // 工作区分配
     const int records_per_block = (int)MPI_RECORDS_PER_BLOCK;
     struct MdExtractSlot {
-        MdBlockSet input;
+        MdBlockSet input; // Borrowed runtime descriptors; never freed by the slot.
         MdBlockSet uncompressed;
         MdRecordSet records;
         MdCandidateWorkspace candidate_workspace;
@@ -571,10 +586,8 @@ static int MdExtractCandidatesPass(
 
     MdExtractSlot slots[2];
     memset(slots, 0, sizeof(slots));
-    swbam::BgzfBlockBatch input_views[2];
 
     auto free_slot = [](MdExtractSlot *slot) {
-        MdFreeBlockSet(&slot->input);
         MdFreeBlockSet(&slot->uncompressed);
         MdFreeRecordSet(&slot->records);
         MdFreeCandidateWorkspace(&slot->candidate_workspace);
@@ -588,8 +601,7 @@ static int MdExtractCandidatesPass(
     };
 
     for (int s = 0; s < 2; ++s) {
-        if (MdAllocateBlockSet(&slots[s].input, kMarkdupNB) != 0 ||
-            MdAllocateBlockSet(&slots[s].uncompressed, kMarkdupNB) != 0 ||
+        if (MdAllocateBlockSet(&slots[s].uncompressed, kMarkdupNB) != 0 ||
             MdAllocateRecordSet(&slots[s].records, kMarkdupNB,
                                 records_per_block,
                                 MPI_BAM_BLOCK_ARENA_SIZE) != 0 ||
@@ -600,12 +612,6 @@ static int MdExtractCandidatesPass(
                     "[rank %d] ERROR: failed to allocate markdup "
                     "candidate pipeline workspace.\n",
                     rank);
-            free_slots();
-            return -1;
-        }
-        if (source.uses_backend() &&
-            input_views[s].Attach(
-                slots[s].input.blocks, kMarkdupNB) != 0) {
             free_slots();
             return -1;
         }
@@ -627,6 +633,9 @@ static int MdExtractCandidatesPass(
         return -1;
     }
     fixed_workspace += fixed_workspace_per_slot;
+    // The runtime also owns decoded double buffers; this operator keeps its
+    // own transferable decoded arenas for the one-pass pending window.
+    fixed_workspace += (size_t)2 * kMarkdupNB * BGZF_MAX_BLOCK_SIZE;
     if (MdCheckMemory(fixed_workspace, memory_limit, stats, rank,
                       "candidate pipeline workspace") != 0) {
         free_slots();
@@ -635,7 +644,6 @@ static int MdExtractCandidatesPass(
 
     // ordinal 是本 rank 内 record 编号，作为索引
     uint64_t ordinal = 0;
-    long long block_group_base = global_block_begin;
     int previous_tid = -1;
     int previous_pos = -1;
     int have_previous = 0;
@@ -645,57 +653,6 @@ static int MdExtractCandidatesPass(
     *range_first_pos = -1;
     *range_last_tid = -1;
     *range_last_pos = -1;
-
-    auto read_slot = [&](MdExtractSlot *slot, long long block_base,
-                         uint64_t ordinal_base) -> int {
-        slot->block_group_base = block_base;
-        slot->ordinal_base = ordinal_base;
-        slot->ordinal_end = ordinal_base;
-        const int slot_index = (int)(slot - slots);
-        if (source.Read(&slot->input, input_views + slot_index,
-                        &slot->n_blocks, stats) != 0) {
-            return -1;
-        }
-        if (slot->n_blocks > 0) {
-            stats->input_blocks += slot->n_blocks;
-        }
-        return 0;
-    };
-
-    auto prepare_decomp = [&](MdExtractSlot *slot) {
-        for (int b = 0; b < kMarkdupNB; ++b) {
-            MdInitDecompPara(slot->decomp + b, b, &slot->input,
-                             &slot->uncompressed, &slot->records,
-                             b < slot->n_blocks);
-        }
-    };
-
-    auto launch_decomp = [&](MdExtractSlot *slot) {
-        prepare_decomp(slot);
-        __real_athread_spawn(
-            (void *)slave_mpi_decompress_bam2bam_passthrough,
-            slot->decomp, 1);
-    };
-
-    auto join_decomp = [&](MdExtractSlot *slot) -> int {
-        double cpe_sync_t0 = GetTime();
-        athread_join();
-        const double sync_dt = GetTime() - cpe_sync_t0;
-        stats->t_cpe_sync += sync_dt;
-        stats->t_candidate_decomp += sync_dt;
-        for (int b = 0; b < slot->n_blocks; ++b) {
-            if (slot->decomp[b].status != 0) {
-                fprintf(stderr,
-                        "[rank %d] ERROR: markdup candidate BAM decode failed "
-                        "at global block %lld status=%d record=%d.\n",
-                        rank, slot->block_group_base + b,
-                        slot->decomp[b].status,
-                        slot->decomp[b].record_index);
-                return -1;
-            }
-        }
-        return 0;
-    };
 
     auto prepare_extract = [&](MdExtractSlot *slot) {
         uint64_t block_ordinal = slot->ordinal_base;
@@ -740,15 +697,6 @@ static int MdExtractCandidatesPass(
         const double sync_dt = GetTime() - cpe_sync_t0;
         stats->t_cpe_sync += sync_dt;
         stats->t_candidate_extract += sync_dt;
-    };
-
-    auto run_slot_cpe = [&](MdExtractSlot *slot) -> int {
-        launch_decomp(slot);
-        if (join_decomp(slot) != 0) return -1;
-        prepare_extract(slot);
-        launch_extract(slot);
-        join_extract(slot);
-        return 0;
     };
 
     auto process_slot = [&](MdExtractSlot *slot) -> int {
@@ -878,79 +826,129 @@ static int MdExtractCandidatesPass(
         return 0;
     };
 
-    int current = 0;
-    int next = 1;
-    if (read_slot(slots + current, global_block_begin, ordinal) != 0) {
-        free_slots();
-        return -1;
-    }
-    if (slots[current].n_blocks == 0) {
-        *local_records = 0;
-        while (batch_post_processor && processed_batches < target_batches) {
-            if (batch_post_processor(batch_context, local_candidates,
-                               local_qnames, -1, -1, 0,
-                               nullptr) != 0) {
-                free_slots();
-                return -1;
+
+    class MdCandidateReadSource : public swbam::cpe::CpeReadBatchSource {
+    public:
+        MdCandidateReadSource(MdInputPass &pass, MpiMarkdupStats *stats)
+            : pass_(pass), stats_(stats) {}
+        int ReadNext(swbam::BgzfBlockBatch *batch, size_t *count) {
+            MdBlockSet view = {batch->blocks(), nullptr, (int)batch->capacity()};
+            int n = 0;
+            const int ret = pass_.Read(&view, batch, &n, stats_);
+            *count = (size_t)n;
+            return ret;
+        }
+    private:
+        MdInputPass &pass_;
+        MpiMarkdupStats *stats_;
+    };
+
+    // Delay the previous batch's MPE merge until the next decode is running.
+    // Its record/candidate pools are distinct; the MPI post-processing runs
+    // only after that decode joins, since it may itself launch compression.
+    class MdCandidateReadOperator : public swbam::operators::BamReadBatchOperator {
+    public:
+        MdCandidateReadOperator(MdExtractSlot *slots, long long block_begin, int rank,
+                     MpiMarkdupStats *stats,
+                     std::function<int(MdExtractSlot *)> merge,
+                     std::function<int(MdExtractSlot *)> post,
+                     std::function<void(MdExtractSlot *)> extract)
+            : BamReadBatchOperator({"markdup-candidates",
+                  (void *)slave_mpi_decompress_bam2bam_passthrough, kMarkdupNB}),
+              slots_(slots), next_block_(block_begin), rank_(rank), stats_(stats),
+              merge_(merge), post_(post), extract_(extract), current_(1),
+              have_previous_(false), merge_wall_(0.0) {}
+        int Initialize() { return 0; }
+        void Shutdown() {}
+        int Prepare(const swbam::BgzfBlockBatch &input,
+                    swbam::BgzfBlockBatch *, size_t count) {
+            const uint64_t ordinal_base = have_previous_
+                ? slots_[current_].ordinal_end : 0;
+            current_ ^= 1;
+            MdExtractSlot &slot = slots_[current_];
+            slot.input = {const_cast<bam_block *>(input.blocks()), nullptr,
+                          (int)input.capacity()};
+            slot.n_blocks = (int)count;
+            slot.block_group_base = next_block_;
+            slot.ordinal_base = slot.ordinal_end = ordinal_base;
+            next_block_ += (long long)count;
+            stats_->input_blocks += (long long)count;
+            for (int b = 0; b < kMarkdupNB; ++b)
+                MdInitDecompPara(slot.decomp + b, b, &slot.input,
+                    &slot.uncompressed, &slot.records, b < slot.n_blocks);
+            return 0;
+        }
+        void *kernel_arguments() { return slots_[current_].decomp; }
+        int DuringKernel() {
+            const double t0 = GetTime();
+            const int ret = have_previous_ ? merge_(&slots_[current_ ^ 1]) : 0;
+            merge_wall_ = GetTime() - t0;
+            return ret;
+        }
+        void ObserveKernel(double wall, size_t) {
+            // Like the old loop, exclude overlapped MPE candidate merging.
+            const double exposed = std::max(0.0, wall - merge_wall_);
+            stats_->t_candidate_decomp += exposed;
+            stats_->t_cpe_sync += exposed;
+        }
+        int Validate(size_t count) const {
+            const MdExtractSlot &slot = slots_[current_];
+            for (size_t b = 0; b < count; ++b) {
+                if (slot.decomp[b].status != 0) {
+                    fprintf(stderr,
+                        "[rank %d] ERROR: markdup candidate BAM decode failed "
+                        "at global block %lld status=%d record=%d.\n",
+                        rank_, slot.block_group_base + (long long)b,
+                        slot.decomp[b].status, slot.decomp[b].record_index);
+                    return -1;
+                }
             }
-            processed_batches++;
+            return 0;
         }
-        free_slots();
-        return 0;
-    }
-    if (run_slot_cpe(slots + current) != 0) {
-        free_slots();
-        return -1;
-    }
+        int PostProcessBatch(size_t, long long *records) {
+            if (have_previous_ && post_(&slots_[current_ ^ 1]) != 0) return -1;
+            MdExtractSlot &slot = slots_[current_];
+            extract_(&slot);
+            *records = (long long)(slot.ordinal_end - slot.ordinal_base);
+            have_previous_ = true;
+            return 0;
+        }
+        int Finish() {
+            if (!have_previous_) return 0;
+            MdExtractSlot *last = &slots_[current_];
+            return merge_(last) == 0 ? post_(last) : -1;
+        }
+    private:
+        MdExtractSlot *slots_;
+        long long next_block_;
+        int rank_;
+        MpiMarkdupStats *stats_;
+        std::function<int(MdExtractSlot *)> merge_, post_;
+        std::function<void(MdExtractSlot *)> extract_;
+        int current_;
+        bool have_previous_;
+        double merge_wall_;
+    };
 
-    for (;;) {
-        const long long next_block_base =
-            slots[current].block_group_base + slots[current].n_blocks;
-        const uint64_t next_ordinal_base = slots[current].ordinal_end;
-        if (read_slot(slots + next, next_block_base,
-                      next_ordinal_base) != 0) {
-            free_slots();
-            return -1;
-        }
-        const int have_next = slots[next].n_blocks > 0;
-        if (have_next) {
-            launch_decomp(slots + next);
-        }
-
-        int process_status = process_slot(slots + current);
-        int decomp_status = 0;
-        if (have_next) {
-            decomp_status = join_decomp(slots + next);
-        }
-        int post_process_status = 0;
-        if (process_status == 0 && decomp_status == 0) {
-            post_process_status = post_process_slot(slots + current);
-        }
-        if (process_status != 0 || decomp_status != 0 ||
-            post_process_status != 0) {
-            free_slots();
-            return -1;
-        }
-        if (!have_next) break;
-
-        prepare_extract(slots + next);
-        launch_extract(slots + next);
-        join_extract(slots + next);
-        std::swap(current, next);
-    }
-
-    while (batch_post_processor && processed_batches < target_batches) {
-        if (batch_post_processor(batch_context, local_candidates,
-                           local_qnames, previous_tid,
-                           previous_pos, ordinal, nullptr) != 0) {
-            free_slots();
-            return -1;
-        }
-        processed_batches++;
+    MdCandidateReadSource input(source, stats);
+    MdCandidateReadOperator op(slots, global_block_begin, rank, stats,
+        process_slot, post_process_slot, [&](MdExtractSlot *slot) {
+            prepare_extract(slot);
+            launch_extract(slot);
+            join_extract(slot);
+        });
+    swbam::cpe::CpeReadPipelineOptions options;
+    options.overlap_input = false;
+    int ret = swbam::cpe::RunCpeReadPipeline(&input, &op, nullptr, options);
+    while (ret == 0 && batch_post_processor &&
+           processed_batches < target_batches) {
+        ret = batch_post_processor(batch_context, local_candidates,
+            local_qnames, previous_tid, previous_pos, ordinal, nullptr);
+        ++processed_batches;
     }
     *local_records = ordinal;
     free_slots();
-    return 0;
+    return ret;
 }
 
 static int MdExtractCandidates(
@@ -2179,21 +2177,25 @@ struct MdBoundaryProbeContext {
     int first_last_pos;
     int last_first_tid;
     int last_first_pos;
+    bool captured;
+    std::vector<MpiMarkdupCandidateShared> candidates;
+    std::vector<unsigned char> qnames;
 
     MdBoundaryProbeContext()
         : first_end(0), last_begin(0), first_last_tid(-1),
           first_last_pos(-1), last_first_tid(-1),
-          last_first_pos(-1) {}
+          last_first_pos(-1), captured(false) {}
 };
 
 static int MdCaptureBoundaryProbe(
         void *opaque,
-        std::vector<MpiMarkdupCandidateShared> *,
-        std::vector<unsigned char> *, int, int, uint64_t,
+        std::vector<MpiMarkdupCandidateShared> *candidates,
+        std::vector<unsigned char> *qnames, int, int, uint64_t,
         MdExtractBatchView *batch) {
     MdBoundaryProbeContext *probe =
         (MdBoundaryProbeContext *)opaque;
-    if (!probe || !batch || !batch->decomp || batch->n_blocks <= 0) {
+    if (!probe || !candidates || !qnames || probe->captured ||
+        !batch || !batch->decomp || batch->n_blocks <= 0) {
         return -1;
     }
     size_t first_end = std::min(
@@ -2217,6 +2219,11 @@ static int MdCaptureBoundaryProbe(
         probe->last_first_pos = record->core.pos;
         break;
     }
+    // The extractor clears batch vectors after this callback. Retain the
+    // single-batch halo payload, including the QNAME storage its offsets use.
+    probe->candidates.swap(*candidates);
+    probe->qnames.swap(*qnames);
+    probe->captured = true;
     return 0;
 }
 
@@ -2250,6 +2257,8 @@ static int MdBuildOnePassBoundaryPlan(
     const size_t side_blocks = std::min(
         span_count, (size_t)kMarkdupNB / 2);
     const size_t last_actual_begin = span_count - side_blocks;
+    plan->first_probe_end_block = (uint64_t)global_block_begin + side_blocks;
+    plan->last_probe_begin_block = (uint64_t)global_block_begin + last_actual_begin;
     std::vector<swbam::BgzfBlockSpan> probe_spans;
     std::vector<size_t> probe_indices;
     if (last_actual_begin <= side_blocks) {
@@ -2296,6 +2305,20 @@ static int MdBuildOnePassBoundaryPlan(
         &ignored_records, &first_has, &first_tid, &first_pos,
         &last_tid, &last_pos, &probe_stats,
         MdCaptureBoundaryProbe, &probe) == 0;
+    if (!MdAllRanksOk(local_ok)) return -1;
+
+    probe_candidates.swap(probe.candidates);
+    probe_qnames.swap(probe.qnames);
+    local_ok = probe.captured &&
+        probe_candidates.size() == (size_t)(
+            probe_stats.pair_candidates + probe_stats.single_candidates);
+    if (!local_ok) {
+        fprintf(stderr,
+                "[rank %d] ERROR: incomplete markdup boundary probe "
+                "candidates: retained=%zu expected=%lld.\n",
+                rank, probe_candidates.size(),
+                probe_stats.pair_candidates + probe_stats.single_candidates);
+    }
     if (!MdAllRanksOk(local_ok)) return -1;
 
     for (size_t i = 0; i < probe_candidates.size(); ++i) {
@@ -4714,6 +4737,79 @@ struct MdOnePassReadyBlock {
     int block_index;
 };
 
+class MdOnePassCompressOperator : public swbam::cpe::CpeWriteKernelOperator {
+public:
+    explicit MdOnePassCompressOperator(int level)
+        : CpeWriteKernelOperator({"markdup-window-compress",
+              (void *)slave_mpi_sort_compress_payload, kMarkdupNB, false}),
+          level_(level) {}
+    int Initialize() { return 0; }
+    void Shutdown() {}
+    int Prepare(const swbam::cpe::CpeWriteBatchInput &input,
+                swbam::BgzfBlockBatch *, swbam::BgzfBlockBatch *output) {
+        if (input.kind != swbam::cpe::CpeWriteBatchInput::kUncompressedBgzf)
+            return -1;
+        for (int i = 0; i < kMarkdupNB; ++i) {
+            MdInitEmptyRawCompress(paras_ + i, i);
+            if ((size_t)i < input.count) {
+                bam_block *block = const_cast<bam_block *>(
+                    input.uncompressed->blocks() + i);
+                if (block->length == 0 || block->length > BGZF_BLOCK_SIZE)
+                    return -1;
+                MdSetupRawCompress(paras_ + i, i, block,
+                                   output->blocks() + i, level_);
+            }
+        }
+        return 0;
+    }
+    void *kernel_arguments() { return paras_; }
+    void ObserveKernel(double, size_t) {}
+    int Validate(size_t count) const {
+        for (size_t i = 0; i < count; ++i) {
+            if (paras_[i].status != 0 || !paras_[i].output_block ||
+                paras_[i].output_block->length == 0 ||
+                paras_[i].output_block->length > BGZF_MAX_BLOCK_SIZE)
+                return -1;
+        }
+        return 0;
+    }
+    long long OutputBytes(size_t count) const {
+        long long bytes = 0;
+        for (size_t i = 0; i < count; ++i)
+            bytes += paras_[i].output_block->length;
+        return bytes;
+    }
+    int Finish() { return 0; }
+private:
+    int level_;
+    MpiSortRawCompressPara paras_[kMarkdupNB];
+};
+
+class MdOnePassOutput : public swbam::cpe::CompressedBgzfBatchPostProcessor {
+public:
+    MdOnePassOutput(swbam::RankBodySink *sink, MpiMarkdupStats *stats,
+                    long long *written)
+        : sink_(sink), stats_(stats), written_(written) {}
+    int PostProcessCompressedBatch(const bam_block *blocks, size_t count) {
+        const double t0 = GetTime();
+        int ret = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (swbam::AppendBgzfBlock(sink_, blocks + i) != 0) {
+                ret = -1;
+                break;
+            }
+            ++stats_->bgzf_blocks;
+            ++*written_;
+        }
+        stats_->t_write += GetTime() - t0;
+        return ret;
+    }
+private:
+    swbam::RankBodySink *sink_;
+    MpiMarkdupStats *stats_;
+    long long *written_;
+};
+
 struct MdOnePassContext {
     int rank;
     int comm_size;
@@ -4734,8 +4830,11 @@ struct MdOnePassContext {
     std::deque<MdOnePassPendingBatch> pending;
     std::vector<MdBlockSet> free_block_sets;
     MdBlockSet fallback_payload;
-    MdBlockSet compressed_output;
-    MpiSortRawCompressPara compress_paras[kMarkdupNB];
+    bam_block prepared_payload[kMarkdupNB];
+    swbam::BgzfBlockBatch prepared_view;
+    std::unique_ptr<MdOnePassCompressOperator> compress_op;
+    std::unique_ptr<MdOnePassOutput> output_post;
+    std::unique_ptr<swbam::cpe::CpeWritePipelineSession> write_session;
     std::vector<MdOnePassReadyBlock> prepared_inputs;
     int prepared_outputs;
     int compression_running;
@@ -4757,18 +4856,16 @@ struct MdOnePassContext {
           captured_records(0), retired_records(0),
           launched_output_blocks(0), written_output_blocks(0) {
         memset(&fallback_payload, 0, sizeof(fallback_payload));
-        memset(&compressed_output, 0, sizeof(compressed_output));
-        memset(compress_paras, 0, sizeof(compress_paras));
+        memset(prepared_payload, 0, sizeof(prepared_payload));
         compress_level = 1;
     }
 };
 
 static void MdOnePassCleanup(MdOnePassContext *context) {
     if (!context) return;
-    if (context->compression_running) {
-        athread_join();
-        context->compression_running = 0;
-    }
+    // Session destruction joins an in-flight CPE before any borrowed arena dies.
+    context->write_session.reset();
+    context->compression_running = 0;
     if (context->window) {
         MpiMarkdupStreamingWindowDestroy(context->window);
         context->window = nullptr;
@@ -4779,7 +4876,6 @@ static void MdOnePassCleanup(MdOnePassContext *context) {
     }
     context->free_block_sets.clear();
     MdFreeBlockSet(&context->fallback_payload);
-    MdFreeBlockSet(&context->compressed_output);
 }
 
 static void MdOnePassRecycleBlockSet(MdOnePassContext *context,
@@ -5011,7 +5107,8 @@ static int MdOnePassCaptureBatch(
     context->captured_blocks += view->n_blocks;
     context->captured_records += view->ordinal_end - view->ordinal_base;
 
-    if (context->boundary_plan && context->boundary_plan->enabled) {
+    if (context->boundary_plan &&
+        context->boundary_plan->MayContainBatch(candidates)) {
         for (size_t i = 0; i < candidates.size(); ++i) {
             const MpiMarkdupCandidateShared &candidate = candidates[i];
             if (!MdBoundaryDecisionCandidate(candidate)) {
@@ -5131,11 +5228,8 @@ static int MdOnePassPrepareOversizedBlock(
             context->fallback_payload.blocks + active, raw,
             (uint32_t)raw_len64);
         if (append_status == 1) {
-            MdSetupRawCompress(
-                context->compress_paras + active, active,
-                context->fallback_payload.blocks + active,
-                context->compressed_output.blocks + active,
-                context->compress_level);
+            context->prepared_payload[active] =
+                context->fallback_payload.blocks[active];
             ++active;
             if (active >= kMarkdupNB) return -1;
             MdResetPayloadBlock(
@@ -5151,11 +5245,7 @@ static int MdOnePassPrepareOversizedBlock(
         context->fallback_payload.blocks[active].pos <= 0) {
         return -1;
     }
-    MdSetupRawCompress(
-        context->compress_paras + active, active,
-        context->fallback_payload.blocks + active,
-        context->compressed_output.blocks + active,
-        context->compress_level);
+    context->prepared_payload[active] = context->fallback_payload.blocks[active];
     *output_count = active + 1;
     return 0;
 }
@@ -5168,9 +5258,6 @@ static int MdOnePassPrepareOutput(MdOnePassContext *context) {
     int output_count = 0;
     double patch_t0 = GetTime();
     auto commit_prepared = [&]() -> int {
-        for (int i = output_count; i < kMarkdupNB; ++i) {
-            MdInitEmptyRawCompress(context->compress_paras + i, i);
-        }
         context->prepared_outputs = output_count;
         context->stats->t_pack += GetTime() - patch_t0;
         return 0;
@@ -5211,11 +5298,7 @@ static int MdOnePassPrepareOutput(MdOnePassContext *context) {
                     return -1;
                 }
             } else {
-                MdSetupRawCompress(
-                    context->compress_paras + output_count,
-                    output_count, source,
-                    context->compressed_output.blocks + output_count,
-                    context->compress_level);
+                context->prepared_payload[output_count] = *source;
                 output_count++;
             }
             MdOnePassReadyBlock ready = {&*it, b};
@@ -5230,9 +5313,11 @@ static int MdOnePassLaunchOutput(MdOnePassContext *context) {
         return 0;
     }
     const double launch_t0 = GetTime();
-    __real_athread_spawn((void *)slave_mpi_sort_compress_payload,
-                         context->compress_paras, 1);
+    const int ret = context->write_session->Start(
+        swbam::cpe::CpeWriteBatchInput(&context->prepared_view,
+                                     (size_t)context->prepared_outputs));
     context->stats->t_cpe_launch += GetTime() - launch_t0;
+    if (ret != 0) return -1;
     context->compression_running = 1;
     context->launched_output_blocks += context->prepared_outputs;
     return 0;
@@ -5247,22 +5332,11 @@ static int MdOnePassFinishOutput(MdOnePassContext *context) {
     if (context->compression_running) {
         const double compress_t0 = GetTime();
         const double sync_t0 = GetTime();
-        athread_join();
+        const int ret = context->write_session->Complete();
         context->stats->t_cpe_sync += GetTime() - sync_t0;
         context->stats->t_compress += GetTime() - compress_t0;
         context->compression_running = 0;
-        const double write_t0 = GetTime();
-        for (int i = 0; i < context->prepared_outputs; ++i) {
-            if (context->compress_paras[i].status != 0 ||
-                swbam::AppendBgzfBlock(
-                    context->sink,
-                    context->compressed_output.blocks + i) != 0) {
-                return -1;
-            }
-            context->stats->bgzf_blocks++;
-            context->written_output_blocks++;
-        }
-        context->stats->t_write += GetTime() - write_t0;
+        if (ret != 0 || context->write_session->Flush() != 0) return -1;
     }
 
     for (size_t i = 0; i < context->prepared_inputs.size(); ++i) {
@@ -5461,7 +5535,8 @@ static int MdPostProcessOnePassBatch(
         return -1;
     }
 
-    if (context->boundary_plan && context->boundary_plan->enabled) {
+    if (context->boundary_plan &&
+        context->boundary_plan->MayContainBatch(*local_candidates)) {
         size_t write = 0;
         for (size_t i = 0; i < local_candidates->size(); ++i) {
             const MpiMarkdupCandidateShared &candidate =
@@ -5529,7 +5604,7 @@ static int MdPostProcessOnePassBatch(
     const size_t window_bytes =
         MpiMarkdupStreamingWindowMemory(context->window);
     const size_t output_workspace_bytes =
-        (size_t)2 * kMarkdupNB *
+        (size_t)3 * kMarkdupNB *
         (sizeof(bam_block) + BGZF_MAX_BLOCK_SIZE);
     size_t boundary_plan_bytes = 0;
     if (context->boundary_plan && context->boundary_plan->enabled) {
@@ -5647,13 +5722,16 @@ static int MdMarkdupOnePassToSink(
     context.boundary_plan = boundary_plan;
     context.compress_level = compress_level;
     context.decisions_by_source.resize((size_t)comm_size);
+    context.compress_op.reset(new MdOnePassCompressOperator(compress_level));
+    context.output_post.reset(new MdOnePassOutput(
+        sink, stats, &context.written_output_blocks));
+    context.write_session.reset(new swbam::cpe::CpeWritePipelineSession);
     if (MdAllocateBlockSet(&context.fallback_payload, kMarkdupNB) != 0 ||
-        MdAllocateBlockSet(&context.compressed_output, kMarkdupNB) != 0) {
+        context.prepared_view.Attach(context.prepared_payload, kMarkdupNB) != 0 ||
+        context.write_session->Initialize(context.output_post.get(),
+                                          context.compress_op.get()) != 0) {
         MdOnePassCleanup(&context);
         return -1;
-    }
-    for (int i = 0; i < kMarkdupNB; ++i) {
-        MdInitEmptyRawCompress(context.compress_paras + i, i);
     }
 
     long long max_local_blocks = 0;
@@ -5715,6 +5793,7 @@ static int MdMarkdupOnePassToSink(
     if (local_ok && MdDrainOnePassOutput(&context) != 0) {
         local_ok = 0;
     }
+    if (local_ok && context.write_session->Finish() != 0) local_ok = 0;
     if (!MdAllRanksOkTimed(local_ok, stats)) {
         MdOnePassCleanup(&context);
         return -1;

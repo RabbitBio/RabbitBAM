@@ -61,3 +61,47 @@ fixmate `-m` 的坐标有序 BAM。
 
 从 `ProcessMarkdupMPI()` 开始，依次理解 input plan、candidate pass、owner/group、
 rewrite pass 和 output；边界 candidate 与 rank 间交换是正确性的重点。
+
+## 公共流水线端点（2026-09-26）
+
+本轮完成默认标记的单遍 `--stream` 主路径迁移：
+
+```text
+MdInputPass -> RunCpeReadPipeline + MdCandidateReadOperator
+  -> passthrough decode/parse CPE
+  -> app candidate 提取、归并、MPI exchange、坐标窗口
+  -> app pending decoded blocks / KEEP-DUP / flag patch
+  -> CpeWritePipelineSession + MdOnePassCompressOperator
+  -> MdOnePassOutput -> RankBodySink
+```
+
+- 读端在 `DuringKernel()` 中归并上一槽 candidate，保持与当前槽 decode 的覆盖；
+  decode join 后再处理上一槽窗口并提取当前槽 candidate。最后一槽在 `Finish()`
+  排空。批容量、全局 block index、rank 内 ordinal、空 rank 的 MPI 轮数不变。
+- app 独立拥有可转移的 decoded arena；进入 pending 环时交换所有权，不复制整批
+  raw。runtime 的输入 buffer 只是借用，不交给 pending 环释放。
+- 写端借用 ready block 的描述符，`Start()` 启动压缩，MPE 同时处理窗口/通信，
+  `Complete()` join 后 Flush，再退休/recycle 输入块。超过安全压缩大小的块仍仅
+  按完整 record 边界重新打包。结束和错误清理都先等待 CPE，再释放 arena。
+- 判重规则、halo、optimistic KEEP、remote-only exchange 保持不变；
+  `swbam_markdup_stream_mpi.cpp` 和 CPE 算法 kernel 本轮没有修改。
+
+范围：candidate 读端是共享入口，两遍 `--stream` 和默认非流式模式也会复用。
+`-r/-c`、强制两遍 fallback 的第二遍 rewrite/write 以及首坐标预探测仍保留原调度，
+不能称为所有 markdup 分支都已迁移；完整 dedup-pipeline 本轮未重测。
+
+小数据、6 ranks、memory 单次 4.3：0.724634 -> 0.722752 s，完整 BAM 与迁移前
+逐字节一致。跟踪工作区峰值约 120.6 -> 132.6 MiB/rank，增加约 12 MiB 固定 buffer，
+pending 峰值仍约 12.0 MiB。新增容量已纳入原 `-m` 检查；这不是进程 RSS，默认整文件
+输入和输出驻留仍由 backend 策略决定。
+
+详见 [markdup 流水线迁移验证](../../../../docs/results/markdup_流水线迁移验证.md)。
+
+## Halo 候选生命周期修复（2026-09-27）
+
+批次后处理返回后，extract 会清空 candidate/QNAME 容器。边界 probe 必须在回调内
+同时接管二者，再构建预判计划；只保存坐标会让空 halo 错误启用，造成特定 rank
+分界下漏标。现使用容器 swap 保留数据并校验数量，首尾 probe 范围之外的批次
+跳过预判查表。此次完整串联输入曾少标 1 条，修复后 np=6 完整 BAM 与 np=1
+逐字节一致，4.3 单次 0.671349 s。历史固定输入性能与正确性不能替代分界回归。
+详见 [去重串联与边界回归](../../../../docs/results/去重串联_边界回归验证.md)。

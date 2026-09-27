@@ -1,5 +1,7 @@
 #include "swbam_mpi.h"
 #include "swbam/mpi_runtime.h"
+#include "swbam/operators/bam_read_batch.h"
+#include "swbam/cpe_write_pipeline.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -15,10 +17,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
-
-#ifdef PLATFORM_SUNWAY
-#include <athread.h>
-#endif
 
 #include <mpi.h>
 
@@ -91,14 +89,6 @@ struct CollateBlockSet {
     int count;
 
     CollateBlockSet() : blocks(nullptr), data(nullptr), count(0) {}
-};
-
-struct CollateExtractWorkspace {
-    CollateBlockSet input;
-    CollateBlockSet output;
-    CollateMeta *records;
-
-    CollateExtractWorkspace() : records(nullptr) {}
 };
 
 struct CollateMemorySegment {
@@ -394,34 +384,9 @@ static void CollateFreeBlockSet(CollateBlockSet *set) {
     set->count = 0;
 }
 
-static int CollateAllocateExtract(
-        CollateExtractWorkspace *ws) {
-    if (CollateAllocateBlockSet(
-            &ws->input, kCollateCpes) != 0 ||
-        CollateAllocateBlockSet(
-            &ws->output, kCollateCpes) != 0) {
-        return -1;
-    }
-    ws->records = (CollateMeta *)aligned_alloc_custom(
-        64, (size_t)kCollateCpes *
-                MPI_RECORDS_PER_BLOCK *
-                sizeof(CollateMeta));
-    return ws->records ? 0 : -1;
-}
-
-static void CollateFreeExtract(
-        CollateExtractWorkspace *ws) {
-    CollateFreeBlockSet(&ws->input);
-    CollateFreeBlockSet(&ws->output);
-    if (ws->records) {
-        aligned_free_custom(
-            (unsigned char *)ws->records);
-    }
-    ws->records = nullptr;
-}
-
 static size_t CollateExtractWorkspaceBytes() {
-    return 2ull * kCollateCpes *
+    // Public read pipeline owns two compressed and two decoded batches.
+    return 4ull * kCollateCpes *
                ((size_t)BGZF_MAX_BLOCK_SIZE +
                 sizeof(bam_block)) +
            (size_t)kCollateCpes *
@@ -577,6 +542,177 @@ static int CollateEstimateRawBytes(
     return result;
 }
 
+class CollateReadSource : public swbam::cpe::CpeReadBatchSource {
+public:
+    CollateReadSource(CollateBatchReader *reader, MpiCollateStats *stats)
+        : reader_(reader), stats_(stats) {}
+
+    int ReadNext(swbam::BgzfBlockBatch *batch, size_t *count) {
+        CollateBlockSet blocks;
+        blocks.blocks = batch->blocks();
+        blocks.count = (int)batch->capacity();
+        int n = 0;
+        const double t0 = GetTime();
+        const int ret = reader_->Read(&blocks, &n);
+        stats_->t_extract_read += GetTime() - t0;
+        *count = n < 0 ? 0 : (size_t)n;
+        return ret;
+    }
+
+private:
+    CollateBatchReader *reader_;
+    MpiCollateStats *stats_;
+};
+
+class CollateExtractOperator : public swbam::operators::BamReadBatchOperator {
+public:
+    CollateExtractOperator(long long global_begin, int bins,
+                           CollateRawArena *raw, MpiCollateStats *stats)
+        : BamReadBatchOperator({"collate-extract",
+              (void *)slave_mpi_collate_extract, kCollateCpes}),
+          global_begin_(global_begin), local_block_(0), bins_(bins),
+          raw_(raw), stats_(stats), records_(nullptr) {}
+
+    ~CollateExtractOperator() { Shutdown(); }
+
+    int Initialize() {
+        const double t0 = GetTime();
+        records_ = (CollateMeta *)aligned_alloc_custom(
+            64, (size_t)kCollateCpes * MPI_RECORDS_PER_BLOCK * sizeof(CollateMeta));
+        stats_->t_extract_alloc += GetTime() - t0;
+        return records_ ? 0 : -1;
+    }
+
+    void Shutdown() {
+        if (!records_) return;
+        const double t0 = GetTime();
+        aligned_free_custom((unsigned char *)records_);
+        records_ = nullptr;
+        stats_->t_extract_free += GetTime() - t0;
+    }
+
+    int Prepare(const swbam::BgzfBlockBatch &compressed,
+                swbam::BgzfBlockBatch *decoded, size_t active) {
+        const double t0 = GetTime();
+        memset(paras_, 0, sizeof(paras_));
+        swbam::operators::BindBamReadBatch(
+            paras_, kCollateCpes, compressed, decoded, active);
+        size_t raw_pos = raw_ ? raw_->size : 0;
+        int ret = 0;
+        for (size_t b = 0; b < active; ++b) {
+            MpiCollateExtractPara &para = paras_[b];
+            const uint32_t isize = CollateBgzfISize(compressed.blocks()[b]);
+            if (isize > BGZF_MAX_BLOCK_SIZE ||
+                (raw_ && (raw_pos > raw_->capacity ||
+                          isize > raw_->capacity - raw_pos))) {
+                ret = -1;
+                break;
+            }
+            // App-owned descriptors keep the pipeline's decoded arenas intact.
+            // Memory mode decodes directly into the persistent raw arena.
+            destinations_[b] = decoded->blocks()[b];
+            if (raw_ && isize) destinations_[b].data = raw_->data + raw_pos;
+            destinations_[b].length = isize;
+            para.block_id = (int)b;
+            para.un_comp_block = &destinations_[b];
+            para.raw_arena = destinations_[b].data;
+            para.raw_capacity = isize;
+            para.raw_base_offset = raw_ ? raw_pos : 0;
+            para.records = records_ + b * MPI_RECORDS_PER_BLOCK;
+            para.record_capacity = MPI_RECORDS_PER_BLOCK;
+            para.n_bins = bins_;
+            para.global_block_index = global_begin_ + local_block_ + (long long)b;
+            raw_pos += isize;
+        }
+        if (ret == 0 && raw_) raw_->size = raw_pos;
+        stats_->t_extract_setup += GetTime() - t0;
+        return ret;
+    }
+
+    void *kernel_arguments() { return paras_; }
+
+    void ObserveKernel(double wall, size_t) { stats_->t_extract += wall; }
+
+    int Validate(size_t active) const {
+        const double t0 = GetTime();
+        int ret = 0;
+        for (size_t b = 0; b < active; ++b) {
+            const MpiCollateExtractPara &para = paras_[b];
+            if (para.status != 0 || para.raw_used != para.raw_capacity ||
+                para.n_records < 0 || para.n_records > MPI_RECORDS_PER_BLOCK) {
+                fprintf(stderr,
+                        "ERROR: collate extract failed at global block %lld "
+                        "status=%d record=%d.\n",
+                        global_begin_ + local_block_ + (long long)b,
+                        para.status, para.record_index);
+                ret = -1;
+                break;
+            }
+        }
+        stats_->t_extract_status += GetTime() - t0;
+        return ret;
+    }
+
+    int Finish() { return 0; }
+
+protected:
+    void CommitBatch(size_t active, long long records) {
+        local_block_ += (long long)active;
+        stats_->input_blocks += (long long)active;
+        stats_->total_records += records;
+    }
+
+    long long global_begin_;
+    long long local_block_;
+    int bins_;
+    CollateRawArena *raw_;
+    MpiCollateStats *stats_;
+    CollateMeta *records_;
+    bam_block destinations_[kCollateCpes];
+    MpiCollateExtractPara paras_[kCollateCpes];
+};
+
+class CollateMemoryExtractOperator : public CollateExtractOperator {
+public:
+    CollateMemoryExtractOperator(long long global_begin, int bins,
+                                 std::vector<CollateMeta> *records,
+                                 CollateRawArena *raw, MpiCollateStats *stats)
+        : CollateExtractOperator(global_begin, bins, raw, stats), output_(records) {}
+
+    int PostProcessBatch(size_t active, long long *records_processed) {
+        const double t0 = GetTime();
+        long long count = 0;
+        try {
+            for (size_t b = 0; b < active; ++b) {
+                const MpiCollateExtractPara &para = paras_[b];
+                output_->insert(output_->end(), para.records,
+                                para.records + para.n_records);
+                count += para.n_records;
+            }
+        } catch (...) {
+            stats_->t_extract_merge += GetTime() - t0;
+            return -1;
+        }
+        stats_->t_extract_merge += GetTime() - t0;
+        CommitBatch(active, count);
+        *records_processed = count;
+        return 0;
+    }
+
+private:
+    std::vector<CollateMeta> *output_;
+};
+
+static int CollateRunReadPipeline(
+        CollateBatchReader *reader, CollateExtractOperator *op,
+        MpiCollateStats *stats) {
+    CollateReadSource source(reader, stats);
+    swbam::cpe::CpeReadPipelineOptions options;
+    // Preserve disjoint extract_read/extract timings, including external I/O.
+    options.overlap_input = false;
+    return swbam::cpe::RunCpeReadPipeline(&source, op, nullptr, options);
+}
+
 static int CollateExtractAllImpl(
         CollateBatchReader *block_reader,
         size_t raw_capacity,
@@ -584,152 +720,15 @@ static int CollateExtractAllImpl(
         int bins, std::vector<CollateMeta> *records,
         CollateRawArena *raw,
         MpiCollateStats *stats) {
-    double alloc_t0 = GetTime();
-    CollateExtractWorkspace ws;
-    if (CollateAllocateExtract(&ws) != 0) {
-        CollateFreeExtract(&ws);
-        stats->t_extract_alloc += GetTime() - alloc_t0;
-        return -1;
-    }
-    stats->t_extract_alloc += GetTime() - alloc_t0;
-
-    double resize_t0 = GetTime();
-    if (raw->data) {
-        stats->t_extract_raw_resize +=
-            GetTime() - resize_t0;
-        double free_t0 = GetTime();
-        CollateFreeExtract(&ws);
-        stats->t_extract_free += GetTime() - free_t0;
-        return -1;
-    }
-    if (raw_capacity > 0) {
-        raw->data = aligned_alloc_custom(64, raw_capacity);
-        if (!raw->data) {
-            stats->t_extract_raw_resize +=
-                GetTime() - resize_t0;
-            double free_t0 = GetTime();
-            CollateFreeExtract(&ws);
-            stats->t_extract_free += GetTime() - free_t0;
-            return -1;
-        }
-    }
+    const double t0 = GetTime();
+    if (raw->data) return -1;
+    if (raw_capacity) raw->data = aligned_alloc_custom(64, raw_capacity);
+    stats->t_extract_raw_resize += GetTime() - t0;
+    if (raw_capacity && !raw->data) return -1;
     raw->capacity = raw_capacity;
     raw->size = 0;
-    stats->t_extract_raw_resize += GetTime() - resize_t0;
-
-    MpiCollateExtractPara paras[kCollateCpes];
-    long long local_block = 0;
-    int ret = 0;
-    while (true) {
-        int n_blocks = 0;
-        size_t group_raw = 0;
-        double read_t0 = GetTime();
-        const int read_ret = block_reader->Read(
-            &ws.input, &n_blocks);
-        for (int b = 0; b < n_blocks; ++b) {
-            uint32_t isize =
-                CollateBgzfISize(ws.input.blocks[b]);
-            if (isize > BGZF_MAX_BLOCK_SIZE) {
-                ret = -1;
-                break;
-            }
-            ws.output.blocks[b].data =
-                ws.output.data +
-                (size_t)b * BGZF_MAX_BLOCK_SIZE;
-            ws.output.blocks[b].length = isize;
-            group_raw += isize;
-        }
-        stats->t_extract_read += GetTime() - read_t0;
-        if (read_ret != 0) ret = -1;
-        if (ret != 0 || n_blocks == 0) break;
-        const size_t group_begin = raw->size;
-        if (group_raw > raw->capacity - group_begin) {
-            ret = -1;
-            break;
-        }
-        raw->size = group_begin + group_raw;
-        size_t raw_pos = group_begin;
-        double setup_t0 = GetTime();
-        for (int b = 0; b < kCollateCpes; ++b) {
-            memset(&paras[b], 0, sizeof(paras[b]));
-            paras[b].block_id = b;
-            paras[b].status = b < n_blocks ? 0 : -1;
-            if (b >= n_blocks) continue;
-            uint32_t isize =
-                CollateBgzfISize(ws.input.blocks[b]);
-            ws.output.blocks[b].data =
-                raw->data + raw_pos;
-            ws.output.blocks[b].length = isize;
-            paras[b].input_block =
-                &ws.input.blocks[b];
-            paras[b].un_comp_block =
-                &ws.output.blocks[b];
-            paras[b].raw_arena =
-                raw->data + raw_pos;
-            paras[b].raw_capacity = isize;
-            paras[b].raw_base_offset = raw_pos;
-            paras[b].records =
-                ws.records +
-                (size_t)b * MPI_RECORDS_PER_BLOCK;
-            paras[b].record_capacity =
-                MPI_RECORDS_PER_BLOCK;
-            paras[b].n_bins = bins;
-            paras[b].global_block_index =
-                global_block_begin + local_block + b;
-            raw_pos += isize;
-        }
-        stats->t_extract_setup += GetTime() - setup_t0;
-        double t0 = GetTime();
-        __real_athread_spawn(
-            (void *)slave_mpi_collate_extract,
-            paras, 1);
-        athread_join();
-        stats->t_extract += GetTime() - t0;
-        for (int b = 0; b < n_blocks; ++b) {
-            double status_t0 = GetTime();
-            if (paras[b].status != 0 ||
-                paras[b].raw_used !=
-                    CollateBgzfISize(ws.input.blocks[b])) {
-                stats->t_extract_status +=
-                    GetTime() - status_t0;
-                fprintf(stderr,
-                        "ERROR: collate extract failed at "
-                        "global block %lld status=%d record=%d.\n",
-                        global_block_begin + local_block + b,
-                        paras[b].status,
-                        paras[b].record_index);
-                ret = -1;
-                break;
-            }
-            stats->t_extract_status +=
-                GetTime() - status_t0;
-            double merge_t0 = GetTime();
-            try {
-                records->insert(
-                    records->end(), paras[b].records,
-                    paras[b].records +
-                        paras[b].n_records);
-            } catch (...) {
-                stats->t_extract_merge +=
-                    GetTime() - merge_t0;
-                ret = -1;
-                break;
-            }
-            stats->t_extract_merge +=
-                GetTime() - merge_t0;
-        }
-        if (ret != 0) break;
-        stats->input_blocks += n_blocks;
-        local_block += n_blocks;
-    }
-    double free_t0 = GetTime();
-    CollateFreeExtract(&ws);
-    stats->t_extract_free += GetTime() - free_t0;
-    if (ret == 0) {
-        stats->total_records =
-            (long long)records->size();
-    }
-    return ret;
+    CollateMemoryExtractOperator op(global_block_begin, bins, records, raw, stats);
+    return CollateRunReadPipeline(block_reader, &op, stats);
 }
 
 static int CollateExtractAll(
@@ -1298,14 +1297,6 @@ private:
     size_t base_;
 };
 
-static void CollateInitCompressPara(
-        MpiSortRawCompressPara *para, int id) {
-    memset(para, 0, sizeof(*para));
-    para->block_id = id;
-    para->status = -1;
-    para->compress_level = 1;
-}
-
 static void CollateCountGroup(
         const CollateMeta &meta,
         const unsigned char *raw,
@@ -1313,271 +1304,180 @@ static void CollateCountGroup(
         uint32_t *previous_hash,
         MpiCollateStats *stats);
 
+class CollateCompressOperator : public swbam::cpe::CpeWriteKernelOperator {
+public:
+    CollateCompressOperator(int level, MpiCollateStats *stats)
+        : CpeWriteKernelOperator({"collate-compress",
+              (void *)slave_mpi_sort_compress_payload, kCollateCpes, false}),
+          level_(level), stats_(stats) {}
+
+    int Initialize() { return level_ == 0 || level_ == 1 || level_ == 6 ? 0 : -1; }
+    void Shutdown() {}
+
+    int Prepare(const swbam::cpe::CpeWriteBatchInput &input,
+                swbam::BgzfBlockBatch *scratch, swbam::BgzfBlockBatch *output) {
+        if (scratch || input.kind !=
+                swbam::cpe::CpeWriteBatchInput::kUncompressedBgzf) return -1;
+        memset(paras_, 0, sizeof(paras_));
+        for (int b = 0; b < kCollateCpes; ++b) {
+            MpiSortRawCompressPara &para = paras_[b];
+            para.block_id = b;
+            para.status = b < (int)input.count ? 0 : -1;
+            if (para.status != 0) continue;
+            para.un_comp_block = const_cast<bam_block *>(
+                &input.uncompressed->blocks()[b]);
+            para.un_comp_size = (int)para.un_comp_block->pos;
+            if (para.un_comp_size <= 0 || para.un_comp_size > BGZF_BLOCK_SIZE)
+                return -1;
+            para.output_block = &output->blocks()[b];
+            para.compress_level = level_;
+        }
+        return 0;
+    }
+
+    void *kernel_arguments() { return paras_; }
+    void ObserveKernel(double wall, size_t) { stats_->t_compress += wall; }
+
+    int Validate(size_t active) const {
+        for (size_t b = 0; b < active; ++b) {
+            if (paras_[b].status != 0 || paras_[b].output_size <= 0) {
+                fprintf(stderr, "ERROR: collate compression failed "
+                        "block=%zu status=%d.\n", b, paras_[b].status);
+                return -1;
+            }
+        }
+        return 0;
+    }
+
+    long long OutputBytes(size_t active) const {
+        long long bytes = 0;
+        for (size_t b = 0; b < active; ++b) bytes += paras_[b].output_size;
+        return bytes;
+    }
+
+    int Finish() { return 0; }
+
+private:
+    int level_;
+    MpiCollateStats *stats_;
+    MpiSortRawCompressPara paras_[kCollateCpes];
+};
+
+class CollateCompressedOutput : public swbam::cpe::CompressedBgzfBatchPostProcessor {
+public:
+    CollateCompressedOutput(swbam::RankBodySink *sink, MpiCollateStats *stats)
+        : sink_(sink), stats_(stats) {}
+
+    int PostProcessCompressedBatch(const bam_block *blocks, size_t count) {
+        const double t0 = GetTime();
+        int ret = 0;
+        for (size_t b = 0; b < count; ++b) {
+            if (swbam::AppendBgzfBlock(sink_, blocks + b) != 0) {
+                ret = -1;
+                break;
+            }
+            ++stats_->bgzf_blocks;
+        }
+        stats_->t_write += GetTime() - t0;
+        return ret;
+    }
+
+private:
+    swbam::RankBodySink *sink_;
+    MpiCollateStats *stats_;
+};
+
+// Only batch dispatch is virtual; the memory loser-tree loop stays in the app.
+template <typename FillFn>
+class CollatePayloadSource : public swbam::cpe::UncompressedBgzfSource {
+public:
+    CollatePayloadSource(FillFn fill, MpiCollateStats *stats)
+        : fill_(fill), stats_(stats) {}
+
+    int Fill(swbam::BgzfBlockBatch *batch, size_t *count) {
+        const double t0 = GetTime();
+        const int ret = fill_(batch, count);
+        stats_->t_compress_fill += GetTime() - t0;
+        return ret;
+    }
+
+private:
+    FillFn fill_;
+    MpiCollateStats *stats_;
+};
+
+template <typename Fill>
+static int CollateRunWritePipeline(
+        Fill fill, int level, swbam::RankBodySink *sink, MpiCollateStats *stats) {
+    CollatePayloadSource<Fill> source(fill, stats);
+    CollateCompressOperator op(level, stats);
+    CollateCompressedOutput output(sink, stats);
+    swbam::cpe::CpeWritePipelineOptions options;
+    options.overlap_source = true;
+    return swbam::cpe::RunCpeWritePipeline(
+        &source, &output, &op, nullptr, options);
+}
+
 static int CollateCompressStream(
         const std::function<int(
             const unsigned char **, uint32_t *)> &next,
         int compress_level, swbam::RankBodySink *body_sink,
         MpiCollateStats *stats) {
-    CollateBlockSet payload_a, payload_b;
-    CollateBlockSet output_a, output_b;
-    if (CollateAllocateBlockSet(
-            &payload_a, kCollateCpes) != 0 ||
-        CollateAllocateBlockSet(
-            &payload_b, kCollateCpes) != 0 ||
-        CollateAllocateBlockSet(
-            &output_a, kCollateCpes) != 0 ||
-        CollateAllocateBlockSet(
-            &output_b, kCollateCpes) != 0) {
-        CollateFreeBlockSet(&payload_a);
-        CollateFreeBlockSet(&payload_b);
-        CollateFreeBlockSet(&output_a);
-        CollateFreeBlockSet(&output_b);
-        return -1;
-    }
-    MpiSortRawCompressPara paras_a[kCollateCpes];
-    MpiSortRawCompressPara paras_b[kCollateCpes];
-    for (int i = 0; i < kCollateCpes; ++i) {
-        CollateInitCompressPara(&paras_a[i], i);
-        CollateInitCompressPara(&paras_b[i], i);
-    }
-    CollateBlockSet *payload_active = &payload_a;
-    CollateBlockSet *payload_pending = &payload_b;
-    CollateBlockSet *output_active = &output_a;
-    CollateBlockSet *output_pending = &output_b;
-    MpiSortRawCompressPara *active = paras_a;
-    MpiSortRawCompressPara *pending = paras_b;
-    int pending_count = 0;
     bool source_done = false;
-
-    auto fill = [&](CollateBlockSet *payload,
-                    CollateBlockSet *output,
-                    MpiSortRawCompressPara *paras,
-                    int *active_count) -> int {
-        int count = 0;
-        while (!source_done && count < kCollateCpes) {
-            bam_block *block =
-                &payload->blocks[count];
+    const unsigned char *held_record = nullptr;
+    uint32_t held_length = 0;
+    // The source advances its cursor on the next call, so a held record remains
+    // valid until copied into the next payload, including across batch boundaries.
+    auto fill = [&](swbam::BgzfBlockBatch *payload, size_t *active) -> int {
+        size_t count = 0;
+        while (!source_done && count < payload->capacity()) {
+            bam_block *block = &payload->blocks()[count];
             block->pos = 0;
             block->length = 0;
             while (!source_done) {
                 const unsigned char *record = nullptr;
                 uint32_t length = 0;
-                int ret = next(&record, &length);
-                if (ret < 0) return -1;
-                if (ret == 0) {
-                    source_done = true;
-                    break;
-                }
-                if (!record || length > BGZF_BLOCK_SIZE) {
-                    return -1;
-                }
-                if (block->pos > 0 &&
-                    block->pos + length >
-                        BGZF_BLOCK_SIZE) {
-                    return -2;
-                }
-                memcpy(block->data + block->pos,
-                       record, length);
-                block->pos += length;
-                block->length = block->pos;
-            }
-            if (block->pos == 0) break;
-            memset(&paras[count], 0,
-                   sizeof(paras[count]));
-            paras[count].block_id = count;
-            paras[count].un_comp_block = block;
-            paras[count].un_comp_size =
-                (int)block->pos;
-            paras[count].output_block =
-                &output->blocks[count];
-            paras[count].compress_level =
-                compress_level;
-            paras[count].status = 0;
-            ++count;
-        }
-        for (int i = count; i < kCollateCpes; ++i) {
-            CollateInitCompressPara(&paras[i], i);
-        }
-        *active_count = count;
-        return 0;
-    };
-
-    /*
-     * A one-record lookahead is needed when the next record does not fit
-     * in the current BGZF payload. Wrap the source once so fill() never
-     * post_processs a record it cannot place.
-     */
-    const unsigned char *held_record = nullptr;
-    uint32_t held_length = 0;
-    std::function<int(const unsigned char **, uint32_t *)>
-        original_next = next;
-    auto buffered_next =
-        [&](const unsigned char **record,
-            uint32_t *length) -> int {
-            if (held_record) {
-                *record = held_record;
-                *length = held_length;
-                held_record = nullptr;
-                held_length = 0;
-                return 1;
-            }
-            return original_next(record, length);
-        };
-
-    auto fill_buffered =
-        [&](CollateBlockSet *payload,
-            CollateBlockSet *output,
-            MpiSortRawCompressPara *paras,
-            int *active_count) -> int {
-            int count = 0;
-            while (!source_done &&
-                   count < kCollateCpes) {
-                bam_block *block =
-                    &payload->blocks[count];
-                block->pos = 0;
-                block->length = 0;
-                while (!source_done) {
-                    const unsigned char *record = nullptr;
-                    uint32_t length = 0;
-                    int ret =
-                        buffered_next(&record, &length);
+                if (held_record) {
+                    record = held_record;
+                    length = held_length;
+                    held_record = nullptr;
+                } else {
+                    const int ret = next(&record, &length);
                     if (ret < 0) return -1;
                     if (ret == 0) {
                         source_done = true;
                         break;
                     }
-                    if (!record ||
-                        length > BGZF_BLOCK_SIZE) {
-                        return -1;
-                    }
-                    if (block->pos > 0 &&
-                        block->pos + length >
-                            BGZF_BLOCK_SIZE) {
-                        held_record = record;
-                        held_length = length;
-                        break;
-                    }
-                    memcpy(block->data + block->pos,
-                           record, length);
-                    block->pos += length;
-                    block->length = block->pos;
                 }
-                if (block->pos == 0) break;
-                memset(&paras[count], 0,
-                       sizeof(paras[count]));
-                paras[count].block_id = count;
-                paras[count].un_comp_block = block;
-                paras[count].un_comp_size =
-                    (int)block->pos;
-                paras[count].output_block =
-                    &output->blocks[count];
-                paras[count].compress_level =
-                    compress_level;
-                paras[count].status = 0;
-                ++count;
+                if (!record || length == 0 || length > BGZF_BLOCK_SIZE) return -1;
+                if (block->pos > 0 && block->pos + length > BGZF_BLOCK_SIZE) {
+                    held_record = record;
+                    held_length = length;
+                    break;
+                }
+                memcpy(block->data + block->pos, record, length);
+                block->pos += length;
+                block->length = block->pos;
             }
-            for (int i = count;
-                 i < kCollateCpes; ++i) {
-                CollateInitCompressPara(
-                    &paras[i], i);
-            }
-            *active_count = count;
-            return 0;
-        };
-
-    auto flush_pending = [&]() -> int {
-        double t0 = GetTime();
-        for (int i = 0; i < pending_count; ++i) {
-            if (pending[i].status != 0 ||
-                !pending[i].output_block ||
-                swbam::AppendBgzfBlock(
-                    body_sink,
-                    pending[i].output_block) != 0) {
-                return -1;
-            }
-            ++stats->bgzf_blocks;
+            if (block->pos == 0) break;
+            ++count;
         }
-        stats->t_write += GetTime() - t0;
-        pending_count = 0;
+        *active = count;
         return 0;
     };
-
-    int active_count = 0;
-    {
-        double fill_t0 = GetTime();
-        int fill_ret = fill_buffered(
-            payload_active, output_active,
-            active, &active_count);
-        stats->t_compress_fill +=
-            GetTime() - fill_t0;
-        if (fill_ret != 0) {
-            CollateFreeBlockSet(&payload_a);
-            CollateFreeBlockSet(&payload_b);
-            CollateFreeBlockSet(&output_a);
-            CollateFreeBlockSet(&output_b);
-            return -1;
-        }
-    }
-    while (active_count > 0) {
-        double t0 = GetTime();
-        __real_athread_spawn(
-            (void *)slave_mpi_sort_compress_payload,
-            active, 1);
-        if (flush_pending() != 0) {
-            athread_join();
-            active_count = -1;
-            break;
-        }
-        int next_count = 0;
-        double fill_t0 = GetTime();
-        int fill_ret = fill_buffered(
-            payload_pending, output_pending,
-            pending, &next_count);
-        stats->t_compress_fill +=
-            GetTime() - fill_t0;
-        if (fill_ret != 0) {
-            athread_join();
-            active_count = -1;
-            break;
-        }
-        athread_join();
-        stats->t_compress += GetTime() - t0;
-        for (int i = 0; i < active_count; ++i) {
-            if (active[i].status != 0) {
-                active_count = -1;
-                break;
-            }
-        }
-        if (active_count < 0) break;
-        pending_count = active_count;
-        std::swap(payload_active, payload_pending);
-        std::swap(output_active, output_pending);
-        std::swap(active, pending);
-        active_count = next_count;
-    }
-    int result = active_count < 0
-        ? -1 : flush_pending();
-    CollateFreeBlockSet(&payload_a);
-    CollateFreeBlockSet(&payload_b);
-    CollateFreeBlockSet(&output_a);
-    CollateFreeBlockSet(&output_b);
-    (void)fill;
-    return result;
+    return CollateRunWritePipeline(fill, compress_level, body_sink, stats);
 }
 
 static int CollateFillMemoryPayload(
         CollateMemoryLoserTree *tree,
         std::string *previous,
         uint32_t *previous_hash,
-        CollateBlockSet *payload,
-        CollateBlockSet *output,
-        MpiSortRawCompressPara *paras,
-        int compress_level,
+        swbam::BgzfBlockBatch *payload,
         MpiCollateStats *stats,
-        int *active_count) {
-    int count = 0;
-    while (count < kCollateCpes) {
-        bam_block *block = &payload->blocks[count];
+        size_t *active_count) {
+    size_t count = 0;
+    while (count < payload->capacity()) {
+        bam_block *block = &payload->blocks()[count];
         block->pos = 0;
         block->length = 0;
         while (true) {
@@ -1587,39 +1487,23 @@ static int CollateFillMemoryPayload(
             const CollateMeta *meta = nullptr;
             const unsigned char *record = nullptr;
             tree->current(winner, &meta, &record);
-            if (!meta || !record ||
+            if (!meta || !record || meta->raw_len == 0 ||
                 meta->raw_len > BGZF_BLOCK_SIZE) {
                 return -1;
             }
             if (block->pos > 0 &&
-                block->pos + meta->raw_len >
-                    BGZF_BLOCK_SIZE) {
+                block->pos + meta->raw_len > BGZF_BLOCK_SIZE) {
                 break;
             }
 
-            CollateCountGroup(
-                *meta, record, previous,
-                previous_hash, stats);
-            memcpy(block->data + block->pos,
-                   record, meta->raw_len);
+            CollateCountGroup(*meta, record, previous, previous_hash, stats);
+            memcpy(block->data + block->pos, record, meta->raw_len);
             block->pos += meta->raw_len;
             block->length = block->pos;
             tree->advance(winner);
         }
         if (block->pos == 0) break;
-        memset(&paras[count], 0,
-               sizeof(paras[count]));
-        paras[count].block_id = count;
-        paras[count].un_comp_block = block;
-        paras[count].un_comp_size = (int)block->pos;
-        paras[count].output_block =
-            &output->blocks[count];
-        paras[count].compress_level = compress_level;
-        paras[count].status = 0;
         ++count;
-    }
-    for (int i = count; i < kCollateCpes; ++i) {
-        CollateInitCompressPara(&paras[i], i);
     }
     *active_count = count;
     return 0;
@@ -1631,121 +1515,11 @@ static int CollateCompressMemoryStream(
         uint32_t *previous_hash,
         int compress_level, swbam::RankBodySink *body_sink,
         MpiCollateStats *stats) {
-    CollateBlockSet payload_a, payload_b;
-    CollateBlockSet output_a, output_b;
-    if (CollateAllocateBlockSet(
-            &payload_a, kCollateCpes) != 0 ||
-        CollateAllocateBlockSet(
-            &payload_b, kCollateCpes) != 0 ||
-        CollateAllocateBlockSet(
-            &output_a, kCollateCpes) != 0 ||
-        CollateAllocateBlockSet(
-            &output_b, kCollateCpes) != 0) {
-        CollateFreeBlockSet(&payload_a);
-        CollateFreeBlockSet(&payload_b);
-        CollateFreeBlockSet(&output_a);
-        CollateFreeBlockSet(&output_b);
-        return -1;
-    }
-
-    MpiSortRawCompressPara paras_a[kCollateCpes];
-    MpiSortRawCompressPara paras_b[kCollateCpes];
-    for (int i = 0; i < kCollateCpes; ++i) {
-        CollateInitCompressPara(&paras_a[i], i);
-        CollateInitCompressPara(&paras_b[i], i);
-    }
-
-    CollateBlockSet *payload_active = &payload_a;
-    CollateBlockSet *payload_pending = &payload_b;
-    CollateBlockSet *output_active = &output_a;
-    CollateBlockSet *output_pending = &output_b;
-    MpiSortRawCompressPara *active = paras_a;
-    MpiSortRawCompressPara *pending = paras_b;
-    int pending_count = 0;
-
-    auto flush_pending = [&]() -> int {
-        double t0 = GetTime();
-        for (int i = 0; i < pending_count; ++i) {
-            if (pending[i].status != 0 ||
-                !pending[i].output_block ||
-                swbam::AppendBgzfBlock(
-                    body_sink,
-                    pending[i].output_block) != 0) {
-                return -1;
-            }
-            ++stats->bgzf_blocks;
-        }
-        stats->t_write += GetTime() - t0;
-        pending_count = 0;
-        return 0;
+    auto fill = [&](swbam::BgzfBlockBatch *payload, size_t *count) -> int {
+        return CollateFillMemoryPayload(
+            tree, previous, previous_hash, payload, stats, count);
     };
-
-    int active_count = 0;
-    {
-        double fill_t0 = GetTime();
-        int fill_ret = CollateFillMemoryPayload(
-            tree, previous, previous_hash,
-            payload_active, output_active,
-            active, compress_level, stats,
-            &active_count);
-        stats->t_compress_fill +=
-            GetTime() - fill_t0;
-        if (fill_ret != 0) {
-            CollateFreeBlockSet(&payload_a);
-            CollateFreeBlockSet(&payload_b);
-            CollateFreeBlockSet(&output_a);
-            CollateFreeBlockSet(&output_b);
-            return -1;
-        }
-    }
-
-    while (active_count > 0) {
-        double t0 = GetTime();
-        __real_athread_spawn(
-            (void *)slave_mpi_sort_compress_payload,
-            active, 1);
-        if (flush_pending() != 0) {
-            athread_join();
-            active_count = -1;
-            break;
-        }
-        int next_count = 0;
-        double fill_t0 = GetTime();
-        int fill_ret = CollateFillMemoryPayload(
-            tree, previous, previous_hash,
-            payload_pending, output_pending,
-            pending, compress_level, stats,
-            &next_count);
-        stats->t_compress_fill +=
-            GetTime() - fill_t0;
-        if (fill_ret != 0) {
-            athread_join();
-            active_count = -1;
-            break;
-        }
-        athread_join();
-        stats->t_compress += GetTime() - t0;
-        for (int i = 0; i < active_count; ++i) {
-            if (active[i].status != 0) {
-                active_count = -1;
-                break;
-            }
-        }
-        if (active_count < 0) break;
-        pending_count = active_count;
-        std::swap(payload_active, payload_pending);
-        std::swap(output_active, output_pending);
-        std::swap(active, pending);
-        active_count = next_count;
-    }
-
-    int result = active_count < 0
-        ? -1 : flush_pending();
-    CollateFreeBlockSet(&payload_a);
-    CollateFreeBlockSet(&payload_b);
-    CollateFreeBlockSet(&output_a);
-    CollateFreeBlockSet(&output_b);
-    return result;
+    return CollateRunWritePipeline(fill, compress_level, body_sink, stats);
 }
 
 static void CollateCountGroup(
@@ -2466,6 +2240,71 @@ static int CollateSpillArena(
     return 0;
 }
 
+class CollateRunExtractOperator : public CollateExtractOperator {
+public:
+    CollateRunExtractOperator(long long global_begin, int bins,
+                             CollateRunArena *arena, CollateTempStore *store,
+                             unsigned char *scratch, size_t scratch_size,
+                             std::vector<CollateRun> *runs, MpiCollateStats *stats)
+        : CollateExtractOperator(global_begin, bins, nullptr, stats),
+          arena_(arena), store_(store), scratch_(scratch),
+          scratch_size_(scratch_size), runs_(runs) {}
+
+    int PostProcessBatch(size_t active, long long *records_processed) {
+        long long count = 0;
+        for (size_t b = 0; b < active; ++b) {
+            const MpiCollateExtractPara &para = paras_[b];
+            double t0 = GetTime();
+            int append = CollateArenaAppendBlock(
+                arena_, para.raw_arena, para.raw_used,
+                para.records, (size_t)para.n_records);
+            stats_->t_extract_merge += GetTime() - t0;
+            if (append == 1) {
+                if (CollateSpillArena(arena_, bins_, store_, scratch_,
+                                     scratch_size_, stats_, runs_) != 0) return -1;
+                t0 = GetTime();
+                append = CollateArenaAppendBlock(
+                    arena_, para.raw_arena, para.raw_used,
+                    para.records, (size_t)para.n_records);
+                stats_->t_extract_merge += GetTime() - t0;
+            }
+            if (append != 0) {
+                fprintf(stderr,
+                        "ERROR: collate -m is too small for one BGZF block "
+                        "(raw=%zu records=%d arena=%zu).\n",
+                        para.raw_used, para.n_records, arena_->capacity);
+                return -1;
+            }
+            count += para.n_records;
+        }
+        CommitBatch(active, count);
+        *records_processed = count;
+        return 0;
+    }
+
+    int Finish() {
+        if (arena_->record_count > 0) {
+            CollateSortArena(arena_, bins_, stats_);
+            CollateRun resident;
+            resident.resident = true;
+            resident.extent.record_count = arena_->record_count;
+            resident.extent.raw_size = arena_->raw_used;
+            runs_->insert(runs_->begin(), resident);
+            stats_->resident_run_records = (long long)arena_->record_count;
+            stats_->resident_run_raw_bytes = (long long)arena_->raw_used;
+        }
+        stats_->runs = (long long)runs_->size();
+        return 0;
+    }
+
+private:
+    CollateRunArena *arena_;
+    CollateTempStore *store_;
+    unsigned char *scratch_;
+    size_t scratch_size_;
+    std::vector<CollateRun> *runs_;
+};
+
 static int CollateExtractRunsImpl(
         CollateBatchReader *block_reader,
         long long global_block_begin,
@@ -2474,146 +2313,9 @@ static int CollateExtractRunsImpl(
         unsigned char *scratch, size_t scratch_size,
         std::vector<CollateRun> *runs,
         MpiCollateStats *stats) {
-    double alloc_t0 = GetTime();
-    CollateExtractWorkspace ws;
-    if (CollateAllocateExtract(&ws) != 0) {
-        CollateFreeExtract(&ws);
-        stats->t_extract_alloc += GetTime() - alloc_t0;
-        return -1;
-    }
-    stats->t_extract_alloc += GetTime() - alloc_t0;
-    MpiCollateExtractPara paras[kCollateCpes];
-    long long local_block = 0;
-    int result = 0;
-    while (true) {
-        int n_blocks = 0;
-        double read_t0 = GetTime();
-        const int read_ret = block_reader->Read(
-            &ws.input, &n_blocks);
-        for (int b = 0; b < n_blocks; ++b) {
-            uint32_t isize =
-                CollateBgzfISize(ws.input.blocks[b]);
-            if (isize > BGZF_MAX_BLOCK_SIZE) {
-                result = -1;
-                break;
-            }
-            ws.output.blocks[b].data =
-                ws.output.data +
-                (size_t)b * BGZF_MAX_BLOCK_SIZE;
-            ws.output.blocks[b].length = isize;
-            memset(&paras[b], 0, sizeof(paras[b]));
-            paras[b].block_id = b;
-            paras[b].input_block =
-                &ws.input.blocks[b];
-            paras[b].un_comp_block =
-                &ws.output.blocks[b];
-            paras[b].raw_arena =
-                ws.output.blocks[b].data;
-            paras[b].raw_capacity = isize;
-            paras[b].raw_base_offset = 0;
-            paras[b].records =
-                ws.records +
-                (size_t)b * MPI_RECORDS_PER_BLOCK;
-            paras[b].record_capacity =
-                MPI_RECORDS_PER_BLOCK;
-            paras[b].n_bins = bins;
-            paras[b].global_block_index =
-                global_block_begin + local_block + b;
-        }
-        stats->t_extract_read += GetTime() - read_t0;
-        if (read_ret != 0) result = -1;
-        double setup_t0 = GetTime();
-        for (int b = n_blocks; b < kCollateCpes; ++b) {
-            memset(&paras[b], 0, sizeof(paras[b]));
-            paras[b].status = -1;
-        }
-        stats->t_extract_setup += GetTime() - setup_t0;
-        if (result != 0 || n_blocks == 0) break;
-        double t0 = GetTime();
-        __real_athread_spawn(
-            (void *)slave_mpi_collate_extract,
-            paras, 1);
-        athread_join();
-        stats->t_extract += GetTime() - t0;
-        for (int b = 0; b < n_blocks; ++b) {
-            double status_t0 = GetTime();
-            if (paras[b].status != 0 ||
-                paras[b].raw_used !=
-                    CollateBgzfISize(ws.input.blocks[b])) {
-                stats->t_extract_status +=
-                    GetTime() - status_t0;
-                fprintf(
-                    stderr,
-                    "ERROR: collate external extract failed "
-                    "at block %lld status=%d.\n",
-                    global_block_begin + local_block + b,
-                    paras[b].status);
-                result = -1;
-                break;
-            }
-            stats->t_extract_status +=
-                GetTime() - status_t0;
-            CollateMeta *block_records =
-                ws.records +
-                (size_t)b * MPI_RECORDS_PER_BLOCK;
-            double merge_t0 = GetTime();
-            int append = CollateArenaAppendBlock(
-                arena, ws.output.blocks[b].data,
-                paras[b].raw_used, block_records,
-                (size_t)paras[b].n_records);
-            stats->t_extract_merge +=
-                GetTime() - merge_t0;
-            if (append == 1) {
-                if (CollateSpillArena(
-                        arena, bins, store, scratch,
-                        scratch_size, stats, runs) != 0) {
-                    result = -1;
-                    break;
-                }
-                merge_t0 = GetTime();
-                append = CollateArenaAppendBlock(
-                    arena, ws.output.blocks[b].data,
-                    paras[b].raw_used, block_records,
-                    (size_t)paras[b].n_records);
-                stats->t_extract_merge +=
-                    GetTime() - merge_t0;
-            }
-            if (append != 0) {
-                fprintf(
-                    stderr,
-                    "ERROR: collate -m is too small for one "
-                    "BGZF block (raw=%zu records=%d arena=%zu).\n",
-                    paras[b].raw_used,
-                    paras[b].n_records,
-                    arena->capacity);
-                result = -1;
-                break;
-            }
-            stats->total_records += paras[b].n_records;
-        }
-        if (result != 0) break;
-        stats->input_blocks += n_blocks;
-        local_block += n_blocks;
-    }
-    double free_t0 = GetTime();
-    CollateFreeExtract(&ws);
-    stats->t_extract_free += GetTime() - free_t0;
-    if (result != 0) return result;
-    if (arena->record_count > 0) {
-        CollateSortArena(arena, bins, stats);
-        CollateRun resident;
-        resident.resident = true;
-        resident.extent.record_count =
-            arena->record_count;
-        resident.extent.raw_size = arena->raw_used;
-        runs->insert(runs->begin(), resident);
-        stats->resident_run_records =
-            (long long)arena->record_count;
-        stats->resident_run_raw_bytes =
-            (long long)arena->raw_used;
-    }
-    stats->runs = (long long)runs->size();
-    return 0;
+    CollateRunExtractOperator op(global_block_begin, bins, arena, store,
+                                 scratch, scratch_size, runs, stats);
+    return CollateRunReadPipeline(block_reader, &op, stats);
 }
 
 static int CollateExtractRuns(

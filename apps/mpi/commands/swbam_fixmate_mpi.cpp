@@ -1,11 +1,14 @@
 #include "swbam_mpi.h"
 #include "swbam/mpi_runtime.h"
+#include "swbam/operators/bam_read_batch.h"
+#include "swbam/cpe_record_write_adapter.h"
 
 #include <algorithm>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -20,7 +23,6 @@ extern "C" {
     void slave_mpi_decompress_bam2bam_passthrough();
     void slave_mpi_fixmate_plan();
     void slave_mpi_fixmate_rewrite();
-    void slave_mpi_compressfunc();
 }
 
 int MpiCommonLoadFileToMemory(const std::string &path,
@@ -56,12 +58,6 @@ const unsigned char kFixmateBgzfEofBlock[28] = {
     0x00, 0xff, 0x06, 0x00, 0x42, 0x43, 0x02, 0x00,
     0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00
-};
-
-struct FmBlockSet {
-    bam_block *blocks;
-    unsigned char *data;
-    int n;
 };
 
 struct FmRecordSet {
@@ -110,12 +106,6 @@ struct FmWireRecordHeader {
     uint32_t reserved;
 };
 
-struct FmPackPlan {
-    bam1_t **records;
-    int n_records;
-    uint32_t total_len;
-};
-
 static int FmAllRanksOk(int local_ok) {
     int global_ok = 0;
     MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN,
@@ -143,29 +133,6 @@ struct FmOutputStageCosts {
     double stage45_malloc;
     double stage46;
 };
-
-static int FmAllocateBlockSet(FmBlockSet *set, int n) {
-    memset(set, 0, sizeof(*set));
-    set->n = n;
-    set->blocks = (bam_block *)aligned_alloc_custom(
-        64, (size_t)n * sizeof(bam_block));
-    set->data = aligned_alloc_custom(
-        64, (size_t)n * BGZF_MAX_BLOCK_SIZE);
-    if (!set->blocks || !set->data) return -1;
-    memset(set->blocks, 0, (size_t)n * sizeof(bam_block));
-    for (int i = 0; i < n; ++i) {
-        set->blocks[i].data =
-            set->data + (size_t)i * BGZF_MAX_BLOCK_SIZE;
-        set->blocks[i].block_id = i;
-    }
-    return 0;
-}
-
-static void FmFreeBlockSet(FmBlockSet *set) {
-    if (set->blocks) aligned_free_custom((unsigned char *)set->blocks);
-    if (set->data) aligned_free_custom(set->data);
-    memset(set, 0, sizeof(*set));
-}
 
 static int FmAllocateRecordSet(FmRecordSet *set, int n_blocks,
                                int records_per_block,
@@ -228,38 +195,45 @@ static int FmMemReadBlock(MemReader &reader, bam_block *block) {
     return 0;
 }
 
-static int FmReadGroup(MemReader &reader, FmBlockSet *input,
-                       int *n_blocks, MpiFixmateStats *stats) {
-    double t0 = GetTime();
-    int count = 0;
-    for (int i = 0; i < kFixmateNB; ++i) {
-        if (FmMemReadBlock(reader, input->blocks + i) != 0) break;
-        input->blocks[i].block_id = i;
-        ++count;
-    }
-    *n_blocks = count;
-    stats->t_read += GetTime() - t0;
-    return 0;
-}
+class FmReadSource : public swbam::cpe::CpeReadBatchSource {
+public:
+    FmReadSource(MemReader *memory, const swbam::BamInputBackend *backend,
+                 const swbam::BgzfBlockSpan *spans, size_t count,
+                 MpiFixmateStats *stats)
+        : memory_(memory), reader_(backend, spans, count), stats_(stats) {}
 
-static int FmReadGroup(
-        swbam::BgzfSpanBatchReader *reader,
-        swbam::BgzfBlockBatch *input,
-        int *n_blocks, MpiFixmateStats *stats) {
-    if (!reader || !input || !n_blocks || !stats) return -1;
-    double t0 = GetTime();
-    size_t count = 0;
-    const int ret = reader->ReadNext(input, &count);
-    if (ret == 0 && count > (size_t)INT_MAX) return -1;
-    *n_blocks = ret == 0 ? (int)count : 0;
-    stats->t_read += GetTime() - t0;
-    return ret;
-}
+    int ReadNext(swbam::BgzfBlockBatch *batch, size_t *count) {
+        const double t0 = GetTime();
+        *count = 0;
+        int ret = 0;
+        if (memory_) {
+            if (memory_->pos > memory_->size ||
+                (memory_->size && !memory_->base)) return -1;
+            while (*count < batch->capacity() && memory_->pos < memory_->size) {
+                bam_block *block = &batch->blocks()[*count];
+                if (FmMemReadBlock(*memory_, block) != 0) {
+                    ret = -1;
+                    break;
+                }
+                block->block_id = (int)*count;
+                ++*count;
+            }
+        } else {
+            ret = reader_.ReadNext(batch, count);
+        }
+        stats_->t_read += GetTime() - t0;
+        return ret;
+    }
+
+private:
+    MemReader *memory_;
+    swbam::BgzfSpanBatchReader reader_;
+    MpiFixmateStats *stats_;
+};
 
 static void FmInitDecompPara(
         Bam2BamPara *para, int block_id,
-        FmBlockSet *input, FmBlockSet *uncompressed,
-        FmRecordSet *records, int active) {
+        FmRecordSet *records) {
     const int records_per_block = records->records_per_block;
     memset(para, 0, sizeof(*para));
     para->block_id = block_id;
@@ -280,13 +254,6 @@ static void FmInitDecompPara(
     para->filter.ref_tid = -1;
     para->filter.min_read_len = -1;
     para->filter.max_read_len = -1;
-    if (active) {
-        para->input_block = input->blocks + block_id;
-        para->un_comp_block = uncompressed->blocks + block_id;
-        para->status = 0;
-    } else {
-        para->status = -1;
-    }
 }
 
 static int FmAppendStoredRecord(FmStoredGroup *group,
@@ -398,161 +365,58 @@ static int FmAppendSerializedGroup(
     return pos == wire_size ? 0 : -1;
 }
 
-static void FmInitEmptyComp(Comp_Para *para, int block_id) {
-    memset(para, 0, sizeof(*para));
-    para->block_id = block_id;
-    para->status = -1;
-}
-
 static int FmCompressPlans(
         const std::vector<bam1_t *> &records,
         const std::vector<uint32_t> &bam_lens,
         int compress_level, swbam::RankBodySink *writer,
         int rank, MpiFixmateStats *stats) {
-    double workspace_t0 = GetTime();
-    FmBlockSet un_a = {};
-    FmBlockSet un_b = {};
-    FmBlockSet out_a = {};
-    FmBlockSet out_b = {};
-    if (FmAllocateBlockSet(&un_a, kFixmateNB) != 0 ||
-        FmAllocateBlockSet(&un_b, kFixmateNB) != 0 ||
-        FmAllocateBlockSet(&out_a, kFixmateNB) != 0 ||
-        FmAllocateBlockSet(&out_b, kFixmateNB) != 0) {
-        FmFreeBlockSet(&un_a);
-        FmFreeBlockSet(&un_b);
-        FmFreeBlockSet(&out_a);
-        FmFreeBlockSet(&out_b);
-        stats->t_compress_setup += GetTime() - workspace_t0;
-        return -1;
-    }
-    stats->t_compress_setup += GetTime() - workspace_t0;
-
-    double pack_t0 = GetTime();
-    std::vector<FmPackPlan> plans;
+    if (records.size() != bam_lens.size()) return -1;
+    const double pack_t0 = GetTime();
+    std::vector<swbam::cpe::BamRecordPackBlock> plans;
     plans.reserve((records.size() + 1) / 2);
     size_t begin = 0;
     while (begin < records.size()) {
         size_t end = begin;
         uint32_t total = 0;
         while (end < records.size()) {
-            const uint32_t packed = bam_lens[end] + 4;
-            if (packed > BGZF_BLOCK_SIZE) {
+            if (bam_lens[end] > BGZF_BLOCK_SIZE - 4) {
                 fprintf(stderr,
                         "[rank %d] ERROR: fixmate record exceeds BGZF payload.\n",
                         rank);
-                FmFreeBlockSet(&un_a);
-                FmFreeBlockSet(&un_b);
-                FmFreeBlockSet(&out_a);
-                FmFreeBlockSet(&out_b);
                 return -1;
             }
+            const uint32_t packed = bam_lens[end] + 4;
             if (total + packed > BGZF_BLOCK_SIZE) break;
             total += packed;
             ++end;
         }
-        FmPackPlan plan;
-        plan.records =
-            const_cast<bam1_t **>(records.data() + begin);
-        plan.n_records = (int)(end - begin);
-        plan.total_len = total;
+        swbam::cpe::BamRecordPackBlock plan = {
+            const_cast<bam1_t **>(records.data() + begin),
+            (int)(end - begin), total};
         plans.push_back(plan);
         begin = end;
     }
     stats->t_pack += GetTime() - pack_t0;
 
-    double setup_t0 = GetTime();
-    Comp_Para comp_a[kFixmateNB];
-    Comp_Para comp_b[kFixmateNB];
-    for (int i = 0; i < kFixmateNB; ++i) {
-        FmInitEmptyComp(comp_a + i, i);
-        FmInitEmptyComp(comp_b + i, i);
-    }
+    const double setup_t0 = GetTime();
+    std::unique_ptr<swbam::cpe::CpeRecordWriteSession> session(
+        new swbam::cpe::CpeRecordWriteSession);
+    int ret = session->Initialize(writer, compress_level);
     stats->t_compress_setup += GetTime() - setup_t0;
-    Comp_Para *active = comp_a;
-    Comp_Para *pending = comp_b;
-    FmBlockSet *active_un = &un_a;
-    FmBlockSet *pending_un = &un_b;
-    FmBlockSet *active_out = &out_a;
-    FmBlockSet *pending_out = &out_b;
-    int pending_count = 0;
-
-    auto flush_pending = [&]() -> int {
-        double t0 = GetTime();
-        for (int i = 0; i < pending_count; ++i) {
-            if (pending[i].status != 0 ||
-                !pending[i].output_block ||
-                swbam::AppendBgzfBlock(
-                    writer, pending[i].output_block) != 0) {
-                return -1;
-            }
-            stats->bgzf_blocks++;
-        }
-        stats->t_write += GetTime() - t0;
-        pending_count = 0;
-        return 0;
-    };
-
-    size_t plan_pos = 0;
-    while (plan_pos < plans.size()) {
-        const int active_count = (int)std::min(
-            (size_t)kFixmateNB, plans.size() - plan_pos);
-        for (int i = 0; i < active_count; ++i) {
-            memset(active + i, 0, sizeof(active[i]));
-            active[i].block_id = i;
-            active[i].input_records = plans[plan_pos + i].records;
-            active[i].n_records = plans[plan_pos + i].n_records;
-            active[i].un_comp_block = active_un->blocks + i;
-            active[i].output_block = active_out->blocks + i;
-            active[i].compress_level = compress_level;
-            active[i].status = 0;
-        }
-        for (int i = active_count; i < kFixmateNB; ++i) {
-            FmInitEmptyComp(active + i, i);
-        }
-        double t0 = GetTime();
-        __real_athread_spawn((void *)slave_mpi_compressfunc,
-                             active, 1);
-        if (flush_pending() != 0) {
-            athread_join();
-            double free_t0 = GetTime();
-            FmFreeBlockSet(&un_a);
-            FmFreeBlockSet(&un_b);
-            FmFreeBlockSet(&out_a);
-            FmFreeBlockSet(&out_b);
-            stats->t_workspace_free += GetTime() - free_t0;
-            return -1;
-        }
-        athread_join();
-        stats->t_compress += GetTime() - t0;
-        for (int i = 0; i < active_count; ++i) {
-            if (active[i].status != 0) {
-                fprintf(stderr,
-                        "[rank %d] ERROR: fixmate compression failed "
-                        "at block %d status=%d.\n",
-                        rank, i, active[i].status);
-                double free_t0 = GetTime();
-                FmFreeBlockSet(&un_a);
-                FmFreeBlockSet(&un_b);
-                FmFreeBlockSet(&out_a);
-                FmFreeBlockSet(&out_b);
-                stats->t_workspace_free += GetTime() - free_t0;
-                return -1;
-            }
-        }
-        pending_count = active_count;
-        std::swap(active, pending);
-        std::swap(active_un, pending_un);
-        std::swap(active_out, pending_out);
-        plan_pos += active_count;
+    for (size_t pos = 0; ret == 0 && pos < plans.size(); pos += kFixmateNB) {
+        const size_t count = std::min((size_t)kFixmateNB, plans.size() - pos);
+        ret = session->Submit(plans.data() + pos, count);
     }
-    const int result = flush_pending();
-    double free_t0 = GetTime();
-    FmFreeBlockSet(&un_a);
-    FmFreeBlockSet(&un_b);
-    FmFreeBlockSet(&out_a);
-    FmFreeBlockSet(&out_b);
+    // Finish flushes the final BGZF batch before the caller frees rewritten records.
+    if (ret == 0) ret = session->Finish();
+    const swbam::cpe::CpeRecordWriteMetrics &metrics = session->metrics();
+    stats->t_compress += metrics.compress;
+    stats->t_write += metrics.write;
+    stats->bgzf_blocks += metrics.bgzf_blocks;
+    const double free_t0 = GetTime();
+    session.reset();
     stats->t_workspace_free += GetTime() - free_t0;
-    return result;
+    return ret;
 }
 
 static int FmProcessGroups(
@@ -609,14 +473,23 @@ static int FmProcessGroups(
 
     double output_index_t0 = GetTime();
     std::vector<uint64_t> offsets(records.size() + 1, 0);
-    for (size_t i = 0; i < records.size(); ++i) {
-        if (plans[i].output_data_len >
-            UINT64_MAX - offsets[i]) {
-            return -1;
+    uint64_t output_bytes = 0;
+    for (int c = 0; c < kFixmateNB; ++c) {
+        const size_t begin = records.size() * c / kFixmateNB;
+        const size_t end = records.size() * (c + 1) / kFixmateNB;
+        if (begin == end) continue;
+        // Isolate CPE writers: unaligned memcpy may update a neighbouring word.
+        // Padding is workspace-only; compression uses each record's l_data.
+        if (output_bytes > UINT64_MAX - 63) return -1;
+        output_bytes = (output_bytes + 63) & ~uint64_t(63);
+        for (size_t i = begin; i < end; ++i) {
+            offsets[i] = output_bytes;
+            if (plans[i].output_data_len > UINT64_MAX - output_bytes)
+                return -1;
+            output_bytes += plans[i].output_data_len;
         }
-        offsets[i + 1] =
-            offsets[i] + plans[i].output_data_len;
     }
+    offsets.back() = output_bytes;
     stats->t_output_index += GetTime() - output_index_t0;
 
     if (offsets.back() > SIZE_MAX) return -1;
@@ -770,6 +643,170 @@ static void FmBuildRanges(
     }
 }
 
+class FmReadOperator : public swbam::operators::BamReadBatchOperator {
+public:
+    FmReadOperator(int compress_level, swbam::RankBodySink *middle_writer,
+                   FmStoredGroup *leading, FmStoredGroup *trailing,
+                   int *single_group, int rank, MpiFixmateStats *stats)
+        : BamReadBatchOperator({"fixmate-read",
+              (void *)slave_mpi_decompress_bam2bam_passthrough, kFixmateNB}),
+          compress_level_(compress_level), middle_writer_(middle_writer),
+          leading_(leading), trailing_(trailing), single_group_(single_group),
+          rank_(rank), stats_(stats), record_set_(), leading_ready_(false) {}
+
+    ~FmReadOperator() { Shutdown(); }
+
+    int Initialize() {
+        return FmAllocateRecordSet(&record_set_, kFixmateNB,
+                                  (int)MPI_RECORDS_PER_BLOCK,
+                                  MPI_BAM_BLOCK_ARENA_SIZE);
+    }
+
+    void Shutdown() { FmFreeRecordSet(&record_set_); }
+
+    int Prepare(const swbam::BgzfBlockBatch &compressed,
+                swbam::BgzfBlockBatch *decoded, size_t count) {
+        for (int b = 0; b < kFixmateNB; ++b)
+            FmInitDecompPara(decomp_ + b, b, &record_set_);
+        swbam::operators::BindBamReadBatch(
+            decomp_, kFixmateNB, compressed, decoded, count);
+        return 0;
+    }
+
+    void *kernel_arguments() { return decomp_; }
+    void ObserveKernel(double wall, size_t) { stats_->t_decompress += wall; }
+
+    int Validate(size_t count) const {
+        const double t0 = GetTime();
+        int ret = 0;
+        for (size_t b = 0; b < count; ++b) {
+            const Bam2BamPara &para = decomp_[b];
+            if (para.status != 0 || para.n_total_records < 0 ||
+                para.n_total_records > record_set_.records_per_block) {
+                fprintf(stderr,
+                        "[rank %d] ERROR: fixmate decode failed "
+                        "block=%zu status=%d record=%d "
+                        "actual=%lld limit=%lld limit_id=%d.\n",
+                        rank_, b, para.status, para.record_index,
+                        para.actual_value, para.limit_value, para.limit_id);
+                ret = -1;
+                break;
+            }
+        }
+        stats_->t_record_collect += GetTime() - t0;
+        return ret;
+    }
+
+    int PostProcessBatch(size_t count, long long *records_processed) {
+        const double collect_t0 = GetTime();
+        std::vector<bam1_t *> records;
+        for (size_t b = 0; b < count; ++b) {
+            const Bam2BamPara &para = decomp_[b];
+            records.insert(records.end(), para.output_records,
+                           para.output_records + para.n_total_records);
+        }
+        stats_->input_blocks += (long long)count;
+        stats_->total_records += (long long)records.size();
+        stats_->t_record_collect += GetTime() - collect_t0;
+
+        // RunCpeReadPipeline has joined the decode kernel before this callback.
+        // The app's plan/rewrite and the write pipeline can now use the CPEs.
+        double t0 = GetTime();
+        size_t cursor = 0;
+        if (!pending_.empty()) {
+            while (cursor < records.size() &&
+                   pending_.qname ==
+                       bam_get_qname(records[cursor])) {
+                if (FmAppendStoredRecord(
+                        &pending_, records[cursor]) != 0) {
+                    return -1;
+                }
+                ++cursor;
+            }
+            if (cursor < records.size()) {
+                if (!leading_ready_) {
+                    *leading_ = std::move(pending_);
+                    leading_ready_ = true;
+                } else {
+                    stats_->t_group_scan += GetTime() - t0;
+                    if (FmProcessStoredGroup(
+                            &pending_, compress_level_,
+                            middle_writer_, rank_, stats_) != 0) {
+                        return -1;
+                    }
+                    t0 = GetTime();
+                }
+                pending_.clear();
+            }
+        }
+
+        if (cursor < records.size()) {
+            std::vector<std::pair<size_t, size_t> > ranges;
+            FmBuildRanges(records, cursor, &ranges);
+            const size_t last = ranges.size() - 1;
+            size_t direct_begin = 0;
+            if (!leading_ready_ && last > 0) {
+                if (FmAppendStoredRange(
+                        leading_, records,
+                        ranges[0].first,
+                        ranges[0].second) != 0) {
+                    return -1;
+                }
+                leading_ready_ = true;
+                direct_begin = 1;
+            }
+            if (direct_begin < last) {
+                stats_->t_group_scan += GetTime() - t0;
+                if (FmProcessDirectRange(
+                        records, ranges, direct_begin, last,
+                        compress_level_, middle_writer_,
+                        rank_, stats_) != 0) {
+                    return -1;
+                }
+                t0 = GetTime();
+            }
+            if (FmAppendStoredRange(
+                    &pending_, records,
+                    ranges[last].first,
+                    ranges[last].second) != 0) {
+                return -1;
+            }
+        }
+        stats_->t_group_scan += GetTime() - t0;
+        *records_processed = (long long)records.size();
+        return 0;
+    }
+
+    int Finish() {
+        if (!pending_.empty()) {
+            if (!leading_ready_) {
+                *leading_ = std::move(pending_);
+                *single_group_ = 1;
+            } else {
+                *trailing_ = std::move(pending_);
+                *single_group_ = 0;
+            }
+        } else {
+            *single_group_ = leading_ready_ ? 1 : 0;
+        }
+        return 0;
+    }
+
+private:
+    int compress_level_;
+    swbam::RankBodySink *middle_writer_;
+    FmStoredGroup *leading_;
+    FmStoredGroup *trailing_;
+    int *single_group_;
+    int rank_;
+    MpiFixmateStats *stats_;
+    FmRecordSet record_set_;
+    Bam2BamPara decomp_[kFixmateNB];
+    // Only unfinished/edge groups outlive a decoded batch; they own their bytes.
+    FmStoredGroup pending_;
+    bool leading_ready_;
+};
+
 static int FmStreamLocalGroupsCore(
         MemReader *memory_reader,
         const swbam::BamInputBackend *backend,
@@ -781,180 +818,15 @@ static int FmStreamLocalGroupsCore(
         FmStoredGroup *trailing,
         int *single_group,
         int rank, MpiFixmateStats *stats) {
-    if ((!memory_reader && !backend) ||
-        (memory_reader && backend)) {
-        return -1;
-    }
-    const int records_per_block = (int)MPI_RECORDS_PER_BLOCK;
-    FmBlockSet input = {};
-    FmBlockSet uncompressed = {};
-    FmRecordSet record_set = {};
-    swbam::BgzfBlockBatch backend_input;
-    swbam::BgzfSpanBatchReader backend_reader(
-        backend, spans, span_count);
-    const bool use_backend = backend != nullptr;
-    Bam2BamPara decomp[kFixmateNB];
-    if ((!use_backend &&
-         FmAllocateBlockSet(&input, kFixmateNB) != 0) ||
-        (use_backend &&
-         backend_input.Allocate(kFixmateNB) != 0) ||
-        FmAllocateBlockSet(&uncompressed, kFixmateNB) != 0 ||
-        FmAllocateRecordSet(
-            &record_set, kFixmateNB, records_per_block,
-            MPI_BAM_BLOCK_ARENA_SIZE) != 0) {
-        if (!use_backend) FmFreeBlockSet(&input);
-        FmFreeBlockSet(&uncompressed);
-        FmFreeRecordSet(&record_set);
-        return -1;
-    }
-    if (use_backend) {
-        input.blocks = backend_input.blocks();
-        input.n = kFixmateNB;
-    }
-    const auto release_workspaces = [&]() {
-        if (!use_backend) FmFreeBlockSet(&input);
-        FmFreeBlockSet(&uncompressed);
-        FmFreeRecordSet(&record_set);
-    };
-    const auto read_group = [&](int *n_blocks) {
-        return use_backend
-            ? FmReadGroup(&backend_reader, &backend_input,
-                          n_blocks, stats)
-            : FmReadGroup(*memory_reader, &input,
-                          n_blocks, stats);
-    };
-
-    FmStoredGroup pending;
-    bool leading_ready = false;
-    int n_blocks = 0;
-    if (read_group(&n_blocks) != 0) {
-        release_workspaces();
-        return -1;
-    }
-    while (n_blocks > 0) {
-        for (int b = 0; b < kFixmateNB; ++b) {
-            FmInitDecompPara(
-                decomp + b, b, &input, &uncompressed,
-                &record_set, b < n_blocks);
-        }
-        double t0 = GetTime();
-        __real_athread_spawn(
-            (void *)slave_mpi_decompress_bam2bam_passthrough,
-            decomp, 1);
-        athread_join();
-        stats->t_decompress += GetTime() - t0;
-
-        double collect_t0 = GetTime();
-        std::vector<bam1_t *> records;
-        for (int b = 0; b < n_blocks; ++b) {
-            if (decomp[b].status != 0) {
-                fprintf(stderr,
-                        "[rank %d] ERROR: fixmate decode failed "
-                        "block=%d status=%d record=%d "
-                        "actual=%lld limit=%lld limit_id=%d.\n",
-                        rank, b, decomp[b].status,
-                        decomp[b].record_index,
-                        decomp[b].actual_value,
-                        decomp[b].limit_value,
-                        decomp[b].limit_id);
-                release_workspaces();
-                return -1;
-            }
-            stats->input_blocks++;
-            stats->total_records += decomp[b].n_total_records;
-            records.insert(
-                records.end(), decomp[b].output_records,
-                decomp[b].output_records +
-                    decomp[b].n_total_records);
-        }
-        stats->t_record_collect += GetTime() - collect_t0;
-
-        t0 = GetTime();
-        size_t cursor = 0;
-        if (!pending.empty()) {
-            while (cursor < records.size() &&
-                   pending.qname ==
-                       bam_get_qname(records[cursor])) {
-                if (FmAppendStoredRecord(
-                        &pending, records[cursor]) != 0) {
-                    release_workspaces();
-                    return -1;
-                }
-                ++cursor;
-            }
-            if (cursor < records.size()) {
-                if (!leading_ready) {
-                    *leading = std::move(pending);
-                    leading_ready = true;
-                } else {
-                    stats->t_group_scan += GetTime() - t0;
-                    if (FmProcessStoredGroup(
-                            &pending, compress_level,
-                            middle_writer, rank, stats) != 0) {
-                        release_workspaces();
-                        return -1;
-                    }
-                    t0 = GetTime();
-                }
-                pending.clear();
-            }
-        }
-
-        if (cursor < records.size()) {
-            std::vector<std::pair<size_t, size_t> > ranges;
-            FmBuildRanges(records, cursor, &ranges);
-            const size_t last = ranges.size() - 1;
-            size_t direct_begin = 0;
-            if (!leading_ready && last > 0) {
-                if (FmAppendStoredRange(
-                        leading, records,
-                        ranges[0].first,
-                        ranges[0].second) != 0) {
-                    release_workspaces();
-                    return -1;
-                }
-                leading_ready = true;
-                direct_begin = 1;
-            }
-            if (direct_begin < last) {
-                stats->t_group_scan += GetTime() - t0;
-                if (FmProcessDirectRange(
-                        records, ranges, direct_begin, last,
-                        compress_level, middle_writer,
-                        rank, stats) != 0) {
-                    release_workspaces();
-                    return -1;
-                }
-                t0 = GetTime();
-            }
-            if (FmAppendStoredRange(
-                    &pending, records,
-                    ranges[last].first,
-                    ranges[last].second) != 0) {
-                release_workspaces();
-                return -1;
-            }
-        }
-        stats->t_group_scan += GetTime() - t0;
-        if (read_group(&n_blocks) != 0) {
-            release_workspaces();
-            return -1;
-        }
-    }
-
-    if (!pending.empty()) {
-        if (!leading_ready) {
-            *leading = std::move(pending);
-            *single_group = 1;
-        } else {
-            *trailing = std::move(pending);
-            *single_group = 0;
-        }
-    } else {
-        *single_group = leading_ready ? 1 : 0;
-    }
-    release_workspaces();
-    return 0;
+    if ((!memory_reader && !backend) || (memory_reader && backend) ||
+        (backend && span_count && !spans)) return -1;
+    FmReadSource source(memory_reader, backend, spans, span_count, stats);
+    FmReadOperator op(compress_level, middle_writer, leading, trailing,
+                      single_group, rank, stats);
+    swbam::cpe::CpeReadPipelineOptions options;
+    // Keep read/decompress timing disjoint during this scheduling migration.
+    options.overlap_input = false;
+    return swbam::cpe::RunCpeReadPipeline(&source, &op, nullptr, options);
 }
 
 static int FmStreamLocalGroups(

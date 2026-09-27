@@ -23,9 +23,15 @@ struct CpeWritePipelineTiming {
 
 struct CpeWritePipelineOptions {
     bool overlap_output;
+    // Pull sources may fill the next input buffer during current compression.
+    bool overlap_source;
 
-    CpeWritePipelineOptions() : overlap_output(true) {}
+    CpeWritePipelineOptions() : overlap_output(true), overlap_source(false) {}
 };
+
+// MPE work only: the callback must not launch another CPE kernel or touch
+// the current input/output batch. It completes before Submit returns.
+typedef int (*CpeWriteBatchPrefetch)(void *context);
 
 class UncompressedBgzfSource {
 public:
@@ -47,7 +53,7 @@ struct BamRecordPackBlock {
     uint32_t total_len;
 };
 
-// Inputs are borrowed only until Submit returns, after the CPE has joined.
+// Inputs are borrowed until Submit returns, or until Complete after Start.
 struct CpeWriteBatchInput {
     enum Kind { kUncompressedBgzf, kBamRecords };
 
@@ -118,6 +124,15 @@ public:
                    CpeWriteBatchOperator *op,
                    const CpeWritePipelineOptions &options = CpeWritePipelineOptions());
     int Submit(const CpeWriteBatchInput &input);
+    int SubmitWithPrefetch(const CpeWriteBatchInput &input,
+                           CpeWriteBatchPrefetch prefetch, void *context);
+    // Split submission for stateful apps: do MPE-only work between these calls.
+    // Input bytes and operator arguments must remain valid and unchanged until
+    // Complete. No other CPE kernel may be launched during this interval.
+    // Empty Start is a no-op; Complete/Flush/Finish require no other submission
+    // in flight. Destruction joins unfinished work but does not flush output.
+    int Start(const CpeWriteBatchInput &input);
+    int Complete();
     int Flush();
     int Finish();
     const CpeWritePipelineTiming &timing() const;

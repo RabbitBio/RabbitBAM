@@ -446,8 +446,9 @@ extern "C" void slave_mpi_fixmate_rewrite(
         const uint64_t offset = para->output_offsets[i];
         const uint64_t next = para->output_offsets[i + 1];
         const MpiFixmateRecordPlanShared *plan = &para->plans[i];
+        // The next CPE's slice may start after alignment padding.
         if (next < offset ||
-            next - offset != plan->output_data_len ||
+            next - offset < plan->output_data_len ||
             next > para->output_capacity) {
             para->status = -3;
             para->record_index = i;
