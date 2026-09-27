@@ -1,8 +1,10 @@
 #include "swbam/cpe_pipeline.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
+#include <unistd.h>
 
 #ifdef PLATFORM_SUNWAY
 #include <athread.h>
@@ -61,6 +63,16 @@ int RunCpeReadPipeline(CpeReadBatchSource *source,
 
     CpeReadPipelineTiming local_timing;
     const double total_t0 = GetTime();
+    const char *diagnostics = std::getenv("SWBAM_DIAGNOSTICS");
+    const bool trace = diagnostics && std::strcmp(diagnostics, "0") != 0;
+    const auto mark = [&](const char *stage) {
+        if (!trace) return;
+        fprintf(stderr, "[swbam-read pid=%ld] op=%s elapsed=%.6f stage=%s batches=%lld blocks=%lld records=%lld\n",
+                static_cast<long>(getpid()), op->name(), GetTime() - total_t0,
+                stage, local_timing.batch_count, local_timing.input_blocks,
+                local_timing.total_records);
+        fflush(stderr);
+    };
     int ret = -1;
     bool initialized = false;
     BgzfBlockBatch compressed_a;
@@ -73,7 +85,9 @@ int RunCpeReadPipeline(CpeReadBatchSource *source,
     BgzfBlockBatch *next_decoded = &decoded_b;
     size_t active_blocks = 0;
 
+    mark("initialize.begin");
     const int initialize_ret = op->Initialize();
+    mark("initialize.done");
     initialized = true;
     if (initialize_ret != 0) {
         fprintf(stderr, "ERROR: failed to initialize CPE operator %s.\n",
@@ -91,15 +105,20 @@ int RunCpeReadPipeline(CpeReadBatchSource *source,
     }
 
     {
+        mark("first_read.begin");
         const double read_t0 = GetTime();
         const int read_ret = source->ReadNext(current_compressed, &active_blocks);
         local_timing.read += GetTime() - read_t0;
         if (read_ret != 0 || active_blocks > op->batch_capacity()) goto cleanup;
+        mark("first_read.done");
     }
 
     while (active_blocks > 0) {
         local_timing.input_blocks += static_cast<long long>(active_blocks);
         local_timing.batch_count++;
+        const bool trace_batch = trace && (local_timing.batch_count == 1 ||
+                                           local_timing.batch_count % 256 == 0);
+        if (trace_batch) mark("prepare.begin");
         if (op->Prepare(*current_compressed, current_decoded,
                         active_blocks) != 0) {
             fprintf(stderr, "ERROR: failed to prepare CPE operator %s.\n",
@@ -108,6 +127,7 @@ int RunCpeReadPipeline(CpeReadBatchSource *source,
         }
 
         const double kernel_t0 = GetTime();
+        if (trace_batch) mark("kernel.begin");
 #ifdef PLATFORM_SUNWAY
         __real_athread_spawn(op->kernel_entry(), op->kernel_arguments(), 1);
 #else
@@ -130,6 +150,7 @@ int RunCpeReadPipeline(CpeReadBatchSource *source,
 #ifdef PLATFORM_SUNWAY
         athread_join();
 #endif
+        if (trace_batch) mark("kernel.done");
         if (overlap_status != 0) goto cleanup;
         const double kernel_wall = GetTime() - kernel_t0;
         local_timing.kernel += kernel_wall;
@@ -147,6 +168,7 @@ int RunCpeReadPipeline(CpeReadBatchSource *source,
 
         const double post_process_t0 = GetTime();
         long long batch_records = 0;
+        if (trace_batch) mark("post_pack_write.begin");
         if (options.prefetch_during_post_process) {
             PrefetchContext context = {source, next_compressed,
                                        &next_active_blocks, op->batch_capacity(),
@@ -160,6 +182,7 @@ int RunCpeReadPipeline(CpeReadBatchSource *source,
         }
         local_timing.post_process += GetTime() - post_process_t0;
         local_timing.total_records += batch_records;
+        if (trace_batch) mark("post_pack_write.done");
 
         std::swap(current_compressed, next_compressed);
         std::swap(current_decoded, next_decoded);
@@ -167,15 +190,19 @@ int RunCpeReadPipeline(CpeReadBatchSource *source,
     }
 
     {
+        mark("finish.begin");
         const double post_process_t0 = GetTime();
         if (op->Finish() != 0) goto cleanup;
         local_timing.post_process += GetTime() - post_process_t0;
+        mark("finish.done");
     }
     ret = 0;
 
 cleanup:
     local_timing.total = GetTime() - total_t0;
+    mark("shutdown.begin");
     if (initialized) op->Shutdown();
+    mark("shutdown.done");
     if (timing) *timing = local_timing;
     return ret;
 }

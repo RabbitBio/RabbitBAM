@@ -324,13 +324,31 @@ int MpiBamInput::Open(const std::string &path,
 
     int local_ok = 1;
     if (selected == 0) {
+        const char *diagnostics = std::getenv("SWBAM_DIAGNOSTICS");
+        const bool trace = diagnostics && std::strcmp(diagnostics, "0") != 0;
         MemoryBamInput *memory = new MemoryBamInput();
         const double data_t0 = GetTime();
+        if (trace) {
+            fprintf(stderr, "[swbam-input rank=%d pid=%ld] load.begin path=%s\n",
+                    rank, static_cast<long>(getpid()), path.c_str());
+            fflush(stderr);
+        }
         if (memory->Load(path) != 0) local_ok = 0;
         data_open_cost_ = GetTime() - data_t0;
+        if (trace) {
+            fprintf(stderr, "[swbam-input rank=%d pid=%ld] load.done ok=%d bytes=%zu seconds=%.6f\n",
+                    rank, static_cast<long>(getpid()), local_ok,
+                    memory->size(), data_open_cost_);
+            fflush(stderr);
+        }
         const double header_t0 = GetTime();
         if (local_ok && memory->ParseHeader() != 0) local_ok = 0;
         header_open_cost_ = GetTime() - header_t0;
+        if (trace) {
+            fprintf(stderr, "[swbam-input rank=%d pid=%ld] header.done ok=%d seconds=%.6f; entering open Allreduce\n",
+                    rank, static_cast<long>(getpid()), local_ok, header_open_cost_);
+            fflush(stderr);
+        }
         backend_ = memory;
         selected_backend_ = "memory";
     } else if (selected == 1) {
