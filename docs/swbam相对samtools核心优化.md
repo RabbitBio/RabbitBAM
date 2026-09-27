@@ -1,5 +1,9 @@
 # SWBAM 相对 SAMtools 的核心优化说明
 
+> 版本说明（2026-09-27）：本文包含历史实现分析，旧 Composable Raw/MPE adapter
+> 不再保留。当前架构和 SDK 入口以[流水线契约](swbam流水线数据契约与整体架构.md)
+> 和[SDK 使用说明](swbam_sdk使用说明.md)为准，历史性能数字未在本次整理中重测。
+
 ## 1. 文档目的
 
 本文用于回答两个问题：
@@ -88,8 +92,8 @@ slots，减少中间 scratch buffer。
 “读完再算、算完再写”的串行等待。抽象只在每个 batch 上调用虚接口，不进入逐记录
 热循环。
 
-对应代码：`lib/cpe/swbam_cpe_read_pipeline.cpp`、
-`lib/cpe/swbam_cpe_write_pipeline.cpp`。
+对应代码：`lib/cpe/swbam_cpe_bam_read_pipeline.cpp`、
+`lib/cpe/swbam_cpe_bam_write_pipeline.cpp`。
 
 ### 4.4 Composable path 与 Optimized path
 

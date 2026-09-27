@@ -1,4 +1,4 @@
-#include "swbam/composable_compress.h"
+#include "swbam/operators/bgzf_compress.h"
 #include "swbam/cpe_codec.h"
 
 #include <cstdio>
@@ -10,21 +10,21 @@ namespace swbam {
 namespace cpe {
 namespace {
 
-const size_t kComposableCompressBatch = 64;
+const size_t kBgzfCompressBatch = 64;
 
-class ComposableCompressOperator : public CpeWriteKernelOperator {
+class BgzfCompressOperator : public CpeWriteKernelOperator {
 public:
-    ComposableCompressOperator(int level, ComposableCompressMetrics *metrics)
-        : CpeWriteKernelOperator({"composable-compress",
+    BgzfCompressOperator(int level, BgzfCompressMetrics *metrics)
+        : CpeWriteKernelOperator({"bgzf-compress",
               reinterpret_cast<void *>(slave_swbam_compress_bgzf),
-              kComposableCompressBatch, false}),
+              kBgzfCompressBatch, false}),
           level_(level), metrics_(metrics) {
         memset(paras_, 0, sizeof(paras_));
     }
 
     int Initialize() {
         if (level_ != 0 && level_ != 1 && level_ != 6) return -1;
-        if (metrics_) *metrics_ = ComposableCompressMetrics();
+        if (metrics_) *metrics_ = BgzfCompressMetrics();
         return 0;
     }
     void Shutdown() {}
@@ -35,7 +35,7 @@ public:
         if (input.kind != CpeWriteBatchInput::kUncompressedBgzf ||
             !input.uncompressed || scratch) return -1;
         const size_t active_blocks = input.count;
-        for (size_t i = 0; i < kComposableCompressBatch; ++i) {
+        for (size_t i = 0; i < kBgzfCompressBatch; ++i) {
             SwbamCpeCompressPara &para = paras_[i];
             para.alloc_cycles = 0;
             para.deflate_cycles = 0;
@@ -89,7 +89,7 @@ public:
         for (size_t i = 0; i < active_blocks; ++i) {
             if (paras_[i].status != 0 || paras_[i].output_size <= 0) {
                 fprintf(stderr,
-                        "ERROR: composable BGZF compression failed on block %zu with status %d.\n",
+                        "ERROR: BGZF compression failed on block %zu with status %d.\n",
                         i, paras_[i].status);
                 return -1;
             }
@@ -108,23 +108,23 @@ public:
 
 private:
     int level_;
-    ComposableCompressMetrics *metrics_;
-    SwbamCpeCompressPara paras_[kComposableCompressBatch];
+    BgzfCompressMetrics *metrics_;
+    SwbamCpeCompressPara paras_[kBgzfCompressBatch];
 };
 
 } // namespace
 
-ComposableCompressMetrics::ComposableCompressMetrics()
+BgzfCompressMetrics::BgzfCompressMetrics()
     : alloc(0.0), deflate(0.0), footer(0.0), other(0.0) {}
 
-int RunComposableCompressPipeline(
+int RunBgzfCompressPipeline(
         UncompressedBgzfSource *source,
         CompressedBgzfBatchPostProcessor *post_processor,
         int compression_level,
         CpeWritePipelineTiming *timing,
-        ComposableCompressMetrics *metrics,
+        BgzfCompressMetrics *metrics,
         const CpeWritePipelineOptions &options) {
-    ComposableCompressOperator op(compression_level, metrics);
+    BgzfCompressOperator op(compression_level, metrics);
     return RunCpeWritePipeline(source, post_processor, &op, timing, options);
 }
 

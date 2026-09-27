@@ -1,7 +1,15 @@
 #ifndef SWBAM_MPI_H
 #define SWBAM_MPI_H
 
-#include "swbam.h"
+#include "BamTools.h"
+#include "CmdInfo.h"
+
+#include <algorithm>
+#include <functional>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "swbam/io.h"
 #include "swbam/operators/bam_transform.h"
 #include "swbam/operators/bam_to_sam.h"

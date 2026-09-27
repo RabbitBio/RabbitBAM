@@ -12,9 +12,9 @@ public:
     CmdInfo();
 
 public:
-    std::string in_file_name_;   
-    std::string out_file_name_;  
-    bool verbose_;       
+    std::string in_file_name_;
+    std::string out_file_name_;
+    bool verbose_;
     bool validate_bounds_;
     int min_mapq_;
     int max_mapq_;

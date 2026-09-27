@@ -37,18 +37,6 @@ const int FUSED_SAM2BAM_BAM_POOL_SIZE = 720999;  // SAM2BAM subgroup record capa
 const size_t MPI_BAM_BLOCK_ARENA_SIZE = BGZF_MAX_BLOCK_SIZE * 2;
 
 
-const int CGS_NUM_CGS = 6;
-const int CGS_PES_PER_CG = 64;
-const int CGS_NB = CGS_NUM_CGS * CGS_PES_PER_CG;
-// const int CGS_BAM2SAM_FORMAT_RECORDS_PER_CPE = 192;
-const int CGS_BAM2SAM_FORMAT_RECORDS_PER_CPE = 900;
-const size_t CGS_SAM_CHUNK_SIZE = 512 * 1024;
-const size_t CGS_SAM_CHUNK_BUFFER_SIZE = CGS_SAM_CHUNK_SIZE + MAX_SAM_LINE_SIZE;
-const int CGS_SAM2BAM_MAX_BAMS_PER_CHUNK = 4096;
-const int CGS_SAM2BAM_RECORD_POOL_SIZE = FUSED_SAM2BAM_BAM_POOL_SIZE;
-const size_t CGS_SAM_FORMAT_CORE_BUFFER_SIZE =
-    MAX_SAM_LINE_SIZE * (CGS_BAM2SAM_FORMAT_RECORDS_PER_CPE + 1);
-
 #define SAM_CHUNK_SIZE (4 * 1024 * 1024)         
 #define CHUNK_BUFFER_SIZE (5 * 1024 * 1024)      
 #define MAX_BAMS_PER_CHUNK 12110              // 4MB最多包含的记录数
@@ -494,21 +482,6 @@ struct BoundsCheckError {
 };
 
 
-typedef struct {
-    const char *src_ptr;                 
-    size_t src_len;                      
-    char *text_buf;                      
-    size_t text_len;                     
-    bam1_t *bams[MAX_BAMS_PER_CHUNK];
-    uint32_t *bam_lens;             
-    int count;                           
-} SamParseChunk;
-
-typedef struct {
-    const sam_hdr_t *hdr;
-    SamParseChunk chunks[64];            
-} SamParseBatch; 
-
 struct MpiSamParseChunk {
     const char *src_ptr;
     size_t src_len;
@@ -544,15 +517,6 @@ struct MpiSamParseBatch {
     MpiSamParseChunk chunks[64];
 };
 
-typedef struct {
-    const sam_hdr_t *hdr;
-    bam1_t *bams[BATCH_SIZE];
-    kstring_t sam_lines[BATCH_SIZE];  
-    int count;   
-} SamParseByteBatch;
-
-
-
 struct MemReader {
     char *base;
     size_t size;
@@ -562,18 +526,6 @@ struct MemWriter {
     char *data;
     size_t size;
     size_t capacity;
-};
-
-struct Para {
-    int block_id;       
-
-    bam_block* input_block;   
-    bam_block* un_comp_block;
-
-    int decompress_size;      
-    std::vector<bam1_t*> output_records;  
-    int n_records;             
-    int status;               
 };
 
 struct BamFilterOptions {
@@ -611,70 +563,6 @@ struct Bam2BamPara {
     uint64_t decomp_crc_cycles;
     uint64_t decomp_parse_cycles;
     uint64_t decomp_total_cycles;
-};
-
-struct CgsBamDecodePara {
-    int block_id;
-    bam_block *input_block;
-    bam_block *un_comp_block;
-    bam1_t **output_records;
-    int n_records;
-    int status;
-};
-
-struct CgsSamFormatBatch {
-    const sam_hdr_t *hdr;
-    bam1_t **records;
-    int total_records;
-    kstring_t core_out_lines[CGS_NB];
-    kstring_t core_line_bufs[CGS_NB];
-    int status[CGS_NB];
-    int formatted_records[CGS_NB];
-};
-
-struct CgsSamParseChunk {
-    const char *src_ptr;
-    size_t src_len;
-    char *text_buf;
-    size_t text_len;
-    bam1_t **bams;
-    uint32_t *bam_lens;
-    int count;
-    int status;
-};
-
-struct CgsSamParseBatch {
-    const sam_hdr_t *hdr;
-    CgsSamParseChunk chunks[CGS_NB];
-};
-
-struct CheckedPara {
-    int block_id;
-    bam_block *input_block;
-    bam_block *un_comp_block;
-    bam1_t **output_records;
-    int n_records;
-    int status;
-    int record_index;
-    long long actual_value;
-    long long limit_value;
-    int limit_id;
-};
-
-struct CheckedBam2BamPara {
-    int block_id;
-    bam_block *input_block;
-    bam_block *un_comp_block;
-    bam1_t **output_records;
-    uint32_t *bam_lens;
-    BamFilterOptions filter;
-    int n_total_records;
-    int n_kept_records;
-    int status;
-    int record_index;
-    long long actual_value;
-    long long limit_value;
-    int limit_id;
 };
 
 struct Comp_Para {
@@ -740,51 +628,13 @@ inline void aligned_free_custom(unsigned char* aligned_ptr) {
     }
 }
 
-void bam_destroy1_sw(bam1_t *b);
-
-typedef struct {
-    int size;
-    uint8_t *block;
-    int64_t end_offset;
-} cache_t;
-KHASH_MAP_INIT_INT64(cache, cache_t
-)
 static const uint8_t g_magic[19] = "\037\213\010\4\0\0\0\0\0\377\6\0\102\103\2\0\0\0";
-
-struct bgzf_cache_t {
-    khash_t(cache) *h;
-    khint_t last_pos;
-};
-
-struct BamCrossBlockStats {
-    long long total_records;
-    long long cross_block_records;
-};
-
-
-#define KS_SEP_SPACE 0 // isspace(): \t, \n, \v, \f, \r
-#define KS_SEP_TAB   1 // isspace() && !' '
-#define KS_SEP_LINE  2 // line separator: "\n" (Unix) or "\r\n" (Windows)
-#define KS_SEP_MAX   2
-
-
-int check_bam_cross_block(const char *bam_path);
-int check_bam_cross_block_ex(const char *bam_path, BamCrossBlockStats *stats, bool verbose);
-void print_bam1(const bam1_t *b);
-void print_bam_block(struct bam_block *blk) ;
-
-
-int read_block(BGZF *fp, struct bam_block *j);
-
-int sam_write1_sw(samFile *fp, const sam_hdr_t *h, const bam1_t *b);
 
 int sam_realloc_bam_data(bam1_t *b, size_t desired);
 
 int realloc_bam_data(bam1_t *b, size_t desired);
 
-const char *bgzf_zerr(int errnum, z_stream *zs);
 
-int sam_read1_sw(samFile *fp, sam_hdr_t *h, bam1_t *b);
 
 void swap_data(const bam1_core_t *c, int l_data, uint8_t *data, int is_host);
 

@@ -770,7 +770,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
 
     if (cmd_info->validate_bounds_) {
         if (rank == 0) {
-            fprintf(stderr, "ERROR: --validate-bounds is not supported by RabbitBAM-MPI. Use RabbitBAM-X for checked paths.\n");
+            fprintf(stderr, "ERROR: --validate-bounds is not supported by RabbitBAM-MPI. Use io-check on a small BAM to validate the current pipelines.\n");
         }
         local_ok = 0;
     }

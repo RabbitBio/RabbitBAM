@@ -20,7 +20,7 @@ Input backend
     -> output sink/backend
 ```
 
-规划中的四条类型化流水线为：
+当前四条类型化流水线为：
 
 | 流水线 | 输入 | 主要 operator | 输出 |
 | --- | --- | --- | --- |
@@ -78,9 +78,9 @@ Input backend
 ## Operator 组合原则
 
 operator 可以复用 codec、parser、counter、filter 等源代码组件，但生产路径在一次
-CPE kernel 中静态融合，例如 `decode+parse+flagstat`。开发与验证路径可以输出
-`RawBamRecordView` 或 `bam1_t` 供 MPE 自定义后处理，但这不是性能关键命令必须经过
-的中间层。
+CPE kernel 中静态融合，例如 `decode+parse+flagstat`。算子可输出 batch-local
+`bam1_t`、解压块或算法元数据供 MPE 后处理；旧 `RawBamRecordView`/MPE 物化的
+高层 adapter 已退役，不再作为另一套 SDK 实现。
 
 原则概括为：**batch 层动态组合，record 层静态融合**。
 
@@ -147,7 +147,7 @@ BamInputBackend + spans / MemReader
 读流水线支持 backend span 和借用 `MemReader` 的 batch 输入。后者直接读取已有内存
 中的压缩块，不再复制完整 BAM。算子保留直通时的原块边界和过滤时的重新装块规则；
 `CpeWritePipelineSession` 是唯一的 BAM 写调度器：已打包 BGZF 块使用
-`ComposableCompressOperator`，记录打包计划使用 `RecordCompressOperator`；
+`BgzfCompressOperator`，记录打包计划使用 `RecordCompressOperator`；
 `RunCpeWritePipeline` 是拉取式 source 的适配入口，`CpeRecordWriteSession` 是
 `RankBodySink` 和记录计划的推送式适配入口。两者共享压缩输出双缓冲及同一套
 `Prepare -> spawn -> flush(previous) -> join -> validate -> swap` 状态机。

@@ -1,46 +1,15 @@
 #include "swbam_mpi.h"
-#include "swbam/composable_compress.h"
-#include "swbam/io.h"
 #include "swbam/mpi_runtime.h"
-#include "swbam/raw_bam.h"
-#include "swbam/raw_bam_filter.h"
-#include "swbam/raw_bam_writer.h"
+#include "swbam/operators/record_count.h"
+#include "swbam/operators/bgzf_compress.h"
 
 #include <cstdio>
 #include <cstring>
 #include <vector>
-
 #include "libdeflate.h"
-
 #include <mpi.h>
 
 namespace {
-
-class DecodeCheckBatchPostProcessor : public swbam::cpe::RawBamBatchPostProcessor {
-public:
-    DecodeCheckBatchPostProcessor() : records_(0), encoded_bytes_(0) {}
-
-    int PostProcessRawBatch(const swbam::cpe::RawBamRecordView *records,
-                   size_t count) {
-        if (!records && count != 0) return -1;
-        for (size_t i = 0; i < count; ++i) {
-            if (!records[i].encoded || records[i].block_size < 32 ||
-                records[i].encoded_size != records[i].block_size + 4) {
-                return -1;
-            }
-            records_++;
-            encoded_bytes_ += records[i].encoded_size;
-        }
-        return 0;
-    }
-
-    long long records() const { return records_; }
-    long long encoded_bytes() const { return encoded_bytes_; }
-
-private:
-    long long records_;
-    long long encoded_bytes_;
-};
 
 unsigned char SyntheticByte(int block_id, size_t offset) {
     return (unsigned char)(((size_t)block_id * 17u + offset) % 251u);
@@ -168,414 +137,187 @@ int SameBamHeader(const sam_hdr_t *lhs, const sam_hdr_t *rhs) {
     return 1;
 }
 
-int VerifyMemoryBam(const swbam::MemoryBamOutput &output,
-                    const sam_hdr_t *expected_header,
-                    long long expected_records,
-                    long long expected_raw_bytes) {
-    if (!output.data() || output.size() < 28) return -1;
-    swbam::MemoryBamInput verified_input;
-    std::vector<swbam::BgzfBlockSpan> spans;
-    if (verified_input.OpenMemoryCopy(output.data(), output.size()) != 0 ||
-        verified_input.format() != bam ||
-        !SameBamHeader(verified_input.header(), expected_header) ||
-        verified_input.ScanBlocks(&spans) != 0) {
-        return -1;
-    }
-    const size_t body_end = spans.empty()
-        ? (size_t)verified_input.body_offset()
-        : (size_t)(spans.back().offset + spans.back().compressed_size);
-    if (body_end + 28 != output.size()) return -1;
-
-    struct libdeflate_decompressor *decompressor =
-        libdeflate_alloc_decompressor();
-    if (!decompressor) return -1;
-    std::vector<unsigned char> decoded(BGZF_MAX_BLOCK_SIZE);
+struct ReferenceCounts {
     long long records = 0;
-    long long raw_bytes = 0;
-    int result = 0;
-    for (size_t i = 0; i < spans.size(); ++i) {
-        const unsigned char *compressed =
-            output.data() + (size_t)spans[i].offset;
-        const size_t compressed_size = spans[i].compressed_size;
-        if (compressed_size < BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH) {
-            result = -1;
+    long long bytes = 0;
+    long long kept = 0;
+    long long kept_bytes = 0;
+};
+
+// Independent MPE validation, not part of the performance measurement. Check
+// CRC, record boundaries and MAPQ against the new CPE count/filter pipelines.
+int ScanReference(const swbam::MemoryBamInput &input,
+                  const swbam::BgzfBlockSpan *spans, size_t count,
+                  ReferenceCounts *counts) {
+    struct libdeflate_decompressor *decoder = libdeflate_alloc_decompressor();
+    if (!decoder) return -1;
+    std::vector<unsigned char> raw(BGZF_MAX_BLOCK_SIZE);
+    int status = 0;
+    for (size_t i = 0; i < count && status == 0; ++i) {
+        if (spans[i].offset > input.size() ||
+            spans[i].compressed_size > input.size() - spans[i].offset ||
+            spans[i].compressed_size < BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH) {
+            status = -1;
             break;
         }
-        size_t decoded_size = decoded.size();
-        const int ret = libdeflate_deflate_decompress(
-            decompressor, compressed + BLOCK_HEADER_LENGTH,
-            compressed_size - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH,
-            decoded.data(), decoded.size(), &decoded_size);
-        if (ret != 0 ||
-            decoded_size != ReadLe32(compressed + compressed_size - 4) ||
-            libdeflate_crc32(0, decoded.data(), decoded_size) !=
-                ReadLe32(compressed + compressed_size - 8)) {
-            result = -1;
+        const unsigned char *block = reinterpret_cast<const unsigned char *>(
+            input.data()) + spans[i].offset;
+        const size_t length = spans[i].compressed_size;
+        size_t size = 0;
+        if (libdeflate_deflate_decompress(decoder, block + BLOCK_HEADER_LENGTH,
+                length - BLOCK_HEADER_LENGTH - BLOCK_FOOTER_LENGTH,
+                raw.data(), raw.size(), &size) != 0 ||
+            size != ReadLe32(block + length - 4) ||
+            libdeflate_crc32(0, raw.data(), size) != ReadLe32(block + length - 8)) {
+            status = -1;
             break;
         }
-        size_t offset = 0;
-        while (offset < decoded_size) {
-            if (decoded_size - offset < 4) {
-                result = -1;
-                break;
+        for (size_t offset = 0; offset < size;) {
+            if (size - offset < 4) { status = -1; break; }
+            const uint64_t length = (uint64_t)ReadLe32(raw.data() + offset) + 4;
+            if (length < 36 || length > size - offset) { status = -1; break; }
+            ++counts->records;
+            counts->bytes += length;
+            if (raw[offset + 13] >= 30) {
+                ++counts->kept;
+                counts->kept_bytes += length;
             }
-            const uint32_t block_size = ReadLe32(decoded.data() + offset);
-            const uint64_t encoded_size = (uint64_t)block_size + 4;
-            if (block_size < 32 || encoded_size > decoded_size - offset) {
-                result = -1;
-                break;
-            }
-            records++;
-            raw_bytes += (long long)encoded_size;
-            offset += (size_t)encoded_size;
+            offset += length;
         }
-        if (result != 0) break;
     }
-    libdeflate_free_decompressor(decompressor);
-    if (result != 0 || records != expected_records ||
-        raw_bytes != expected_raw_bytes) {
-        return -1;
+    libdeflate_free_decompressor(decoder);
+    return status;
+}
+
+int CheckRoundtrip(const swbam::MemoryBamInput &input,
+                   const swbam::mpi::MpiBamInputPlan &plan,
+                   const ReferenceCounts &expected, bool filter, int rank) {
+    swbam::AdaptiveRankBodySink body;
+    size_t reserve = 1024 * 1024;
+    for (size_t i = plan.rank_begin; i < plan.rank_end; ++i)
+        reserve += plan.blocks[i].compressed_size;
+    int ok = body.Open("memory", 0, reserve, "io-check-body", "") == 0;
+    swbam::operators::BamTransformMetrics metrics = {};
+    swbam::BamFilterOptions options = swbam::DefaultBamFilterOptions();
+    if (filter) options.min_mapq = 30;
+    if (ok) ok = swbam::operators::RunBamTransformPipeline(
+        input, plan.rank_spans(), plan.rank_block_count(), &body,
+        options, 1, &metrics) == 0;
+    const long long expected_records = filter ? expected.kept : expected.records;
+    const long long expected_bytes = filter ? expected.kept_bytes : expected.bytes;
+    ok = ok && metrics.total_records == expected.records &&
+         metrics.kept_records == expected_records &&
+         metrics.dropped_records == expected.records - expected_records;
+
+    swbam::MemoryBamOutput output;
+    char *header = nullptr;
+    size_t header_size = 0;
+    if (ok) ok = MpiCommonBuildBamHeaderMemory(
+        const_cast<sam_hdr_t *>(input.header()), 1, &header, &header_size) == 0;
+    if (ok) ok = output.Write(header, header_size) == 0;
+    free(header);
+    std::vector<unsigned char> buffer(8u * 1024u * 1024u);
+    for (uint64_t offset = 0; ok && offset < body.size();) {
+        const size_t n = (size_t)std::min<uint64_t>(buffer.size(), body.size() - offset);
+        ok = body.ReadAt(offset, buffer.data(), n) == 0 &&
+             output.Write(buffer.data(), n) == 0;
+        offset += n;
     }
+    if (ok) ok = swbam::WriteBgzfEof(&output) == 0;
+    swbam::MemoryBamInput reread;
+    std::vector<swbam::BgzfBlockSpan> spans;
+    ReferenceCounts actual;
+    if (ok) ok = reread.OpenMemoryCopy(output.data(), output.size()) == 0 &&
+        SameBamHeader(reread.header(), input.header()) &&
+        reread.ScanBlocks(&spans) == 0 &&
+        ScanReference(reread, spans.data(), spans.size(), &actual) == 0;
+    if (ok) {
+        const uint64_t end = spans.empty() ? reread.body_offset()
+            : spans.back().offset + spans.back().compressed_size;
+        ok = end + 28 == output.size() && actual.records == expected_records &&
+             actual.bytes == expected_bytes && (!filter || actual.kept == actual.records);
+    }
+    if (!ok) fprintf(stderr, "[rank %d] io-check %s roundtrip FAILED.\n",
+                     rank, filter ? "filter" : "BAM");
+    if (!swbam::mpi::AllRanksOk(ok)) return -1;
+    long long local[3] = {metrics.total_records, metrics.kept_records,
+                          (long long)output.size()};
+    long long global[3] = {};
+    MPI_Reduce(local, global, 3, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    const double cost = swbam::mpi::ReduceMaxCost(metrics.t_optimized_total);
+    if (rank == 0) printf("SWBAM BAM read -> BAM write %s check PASS. "
+        "total=%lld kept=%lld output_bytes=%lld pipeline_max=%.6f\n",
+        filter ? "MAPQ>=30 filter" : "roundtrip", global[0], global[1], global[2], cost);
     return 0;
 }
 
 } // namespace
 
 int ProcessIoCheckMPI(CmdInfo *cmd_info) {
-    int rank = 0;
-    int comm_size = 1;
+    if (!cmd_info) return 1;
+    int rank = 0, ranks = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
-
-    int exit_code = 1;
-    int local_ok = 1;
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     swbam::MemoryBamInput input;
     swbam::mpi::MpiBamInputPlan plan;
-    DecodeCheckBatchPostProcessor post_processor;
-    swbam::cpe::CpeReadPipelineTiming timing;
-    swbam::cpe::ComposableDecodeMetrics metrics;
-    swbam::cpe::ComposableRawBamMetrics raw_metrics;
-    swbam::cpe::CpeWritePipelineTiming write_timing;
-    swbam::cpe::ComposableCompressMetrics compress_metrics;
+    int ok = input.Open(cmd_info->in_file_name_) == 0 && input.format() == bam;
+    if (!swbam::mpi::AllRanksOk(ok)) return 1;
+    if (swbam::mpi::PrepareMpiBamInputPlan(input, &plan) != 0) return 1;
+    ReferenceCounts expected;
+    ok = ScanReference(input, plan.rank_spans(), plan.rank_block_count(), &expected) == 0;
+    if (!swbam::mpi::AllRanksOk(ok)) return 1;
 
-    if (!cmd_info || input.Load(cmd_info->in_file_name_) != 0 ||
-        input.ParseHeader() != 0 || input.format() != bam) {
-        local_ok = 0;
-    }
-    if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
-
-    if (swbam::mpi::PrepareMpiBamInputPlan(input, &plan) != 0) {
-        local_ok = 0;
-    }
-    if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
-
-    if (swbam::cpe::RunComposableRawBamPipeline(
-            input, plan.rank_spans(), plan.rank_block_count(),
-            &post_processor, &timing, &metrics, &raw_metrics) != 0 ||
-        metrics.decoded_blocks != (long long)plan.rank_block_count() ||
-        raw_metrics.records != post_processor.records() ||
-        raw_metrics.encoded_bytes != post_processor.encoded_bytes() ||
-        raw_metrics.encoded_bytes != metrics.decoded_bytes) {
-        local_ok = 0;
-    }
-    if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
-
-    {
-        long long local_values[3] = {
-            metrics.decoded_blocks, metrics.decoded_bytes,
-            post_processor.records()
-        };
-        long long global_values[3] = {};
-        MPI_Reduce(local_values, global_values, 3, MPI_LONG_LONG,
-                   MPI_SUM, 0, MPI_COMM_WORLD);
-        const double max_total = swbam::mpi::ReduceMaxCost(timing.total);
-        const double max_kernel = swbam::mpi::ReduceMaxCost(timing.kernel);
-        const double max_post_process = swbam::mpi::ReduceMaxCost(timing.post_process);
-        if (rank == 0) {
-            const long long expected_blocks =
-                (long long)plan.blocks.size();
-            printf("SWBAM composable raw BAM check finished. ranks=%d blocks=%lld expected=%lld decoded_bytes=%lld records=%lld\n",
-                   comm_size, global_values[0], expected_blocks,
-                   global_values[1], global_values[2]);
-            printf("  pipeline_max=%.6f kernel_max=%.6f post_process_max=%.6f\n",
-                   max_total, max_kernel, max_post_process);
-            if (global_values[0] != expected_blocks) local_ok = 0;
+    swbam::PosixBamInput posix_input;
+    swbam::mpi::MpiIoBamInput mpiio_input;
+    swbam::BamInputBackend *backends[] = {&input, &posix_input, &mpiio_input};
+    const char *names[] = {"memory", "posix", "mpiio"};
+    for (size_t b = 0; b < 3; ++b) {
+        swbam::BamInputBackend &backend = *backends[b];
+        ok = b == 0 || backend.Open(cmd_info->in_file_name_) == 0;
+        if (!swbam::mpi::AllRanksOk(ok)) return 1;
+        ok = backend.format() == bam && backend.size() == input.size() &&
+             backend.body_offset() == input.body_offset() &&
+             SameBamHeader(backend.header(), input.header());
+        if (!swbam::mpi::AllRanksOk(ok)) return 1;
+        swbam::mpi::MpiBamInputPlan current;
+        if (swbam::mpi::PrepareMpiBamInputPlan(backend, &current) != 0) return 1;
+        ok = current.blocks.size() == plan.blocks.size() &&
+             current.rank_begin == plan.rank_begin && current.rank_end == plan.rank_end;
+        for (size_t i = 0; ok && i < plan.blocks.size(); ++i) {
+            ok = current.blocks[i].offset == plan.blocks[i].offset &&
+                 current.blocks[i].compressed_size == plan.blocks[i].compressed_size;
         }
-        MPI_Bcast(&local_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
-        if (!local_ok) goto cleanup;
+        if (!swbam::mpi::AllRanksOk(ok)) return 1;
+        swbam::operators::RecordCountMetrics metrics = {};
+        ok = swbam::operators::RunRecordCountPipeline(
+            backend, current.rank_spans(), current.rank_block_count(), &metrics) == 0 &&
+            metrics.records == expected.records &&
+            metrics.blocks == (long long)current.rank_block_count();
+        if (!ok) fprintf(stderr, "[rank %d] io-check %s count FAILED.\n", rank, names[b]);
+        if (!swbam::mpi::AllRanksOk(ok)) return 1;
+        long long local[3] = {metrics.blocks, metrics.records, expected.bytes};
+        long long global[3] = {};
+        MPI_Reduce(local, global, 3, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        const double total = swbam::mpi::ReduceMaxCost(metrics.total);
+        const double kernel = swbam::mpi::ReduceMaxCost(metrics.kernel);
+        if (rank == 0) printf("SWBAM BAM read/count %s check PASS. ranks=%d "
+            "blocks=%lld records=%lld decoded_bytes=%lld pipeline_max=%.6f kernel_max=%.6f\n",
+            names[b], ranks, global[0], global[1], global[2], total, kernel);
     }
 
-    {
-        swbam::PosixBamInput posix_input;
-        swbam::mpi::MpiBamInputPlan posix_plan;
-        DecodeCheckBatchPostProcessor posix_post_processor;
-        swbam::cpe::CpeReadPipelineTiming posix_timing;
-        swbam::cpe::ComposableDecodeMetrics posix_decode_metrics;
-        swbam::cpe::ComposableRawBamMetrics posix_raw_metrics;
-
-        if (posix_input.Open(cmd_info->in_file_name_) != 0 ||
-            posix_input.format() != bam ||
-            posix_input.size() != input.size() ||
-            posix_input.body_offset() != input.body_offset() ||
-            !SameBamHeader(posix_input.header(), input.header()) ||
-            swbam::mpi::PrepareMpiBamInputPlan(
-                posix_input, &posix_plan) != 0 ||
-            posix_plan.blocks.size() != plan.blocks.size()) {
-            local_ok = 0;
-        }
-        if (local_ok) {
-            for (size_t i = 0; i < plan.blocks.size(); ++i) {
-                if (posix_plan.blocks[i].offset != plan.blocks[i].offset ||
-                    posix_plan.blocks[i].compressed_size !=
-                        plan.blocks[i].compressed_size) {
-                    local_ok = 0;
-                    break;
-                }
-            }
-        }
-        if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
-
-        if (swbam::cpe::RunComposableRawBamPipeline(
-                posix_input, posix_plan.rank_spans(),
-                posix_plan.rank_block_count(), &posix_post_processor,
-                &posix_timing, &posix_decode_metrics,
-                &posix_raw_metrics) != 0 ||
-            posix_decode_metrics.decoded_blocks !=
-                metrics.decoded_blocks ||
-            posix_decode_metrics.decoded_bytes != metrics.decoded_bytes ||
-            posix_raw_metrics.records != raw_metrics.records ||
-            posix_raw_metrics.encoded_bytes != raw_metrics.encoded_bytes ||
-            posix_post_processor.records() != post_processor.records() ||
-            posix_post_processor.encoded_bytes() != post_processor.encoded_bytes()) {
-            local_ok = 0;
-        }
-        if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
-
-        const double posix_total_max =
-            swbam::mpi::ReduceMaxCost(posix_timing.total);
-        const double posix_read_max =
-            swbam::mpi::ReduceMaxCost(posix_timing.read);
-        long long local_posix[3] = {
-            posix_decode_metrics.decoded_blocks,
-            posix_decode_metrics.decoded_bytes,
-            posix_raw_metrics.records
-        };
-        long long global_posix[3] = {};
-        MPI_Reduce(local_posix, global_posix, 3, MPI_LONG_LONG,
-                   MPI_SUM, 0, MPI_COMM_WORLD);
-        if (rank == 0) {
-            printf("SWBAM POSIX streaming input check finished. blocks=%lld decoded_bytes=%lld records=%lld\n",
-                   global_posix[0], global_posix[1], global_posix[2]);
-            printf("  pipeline_max=%.6f pread_max=%.6f\n",
-                   posix_total_max, posix_read_max);
-        }
-    }
-
-    {
-        swbam::mpi::MpiIoBamInput mpiio_input;
-        swbam::mpi::MpiBamInputPlan mpiio_plan;
-        DecodeCheckBatchPostProcessor mpiio_post_processor;
-        swbam::cpe::CpeReadPipelineTiming mpiio_timing;
-        swbam::cpe::ComposableDecodeMetrics mpiio_decode_metrics;
-        swbam::cpe::ComposableRawBamMetrics mpiio_raw_metrics;
-
-        if (mpiio_input.Open(cmd_info->in_file_name_) != 0 ||
-            mpiio_input.format() != bam ||
-            mpiio_input.size() != input.size() ||
-            mpiio_input.body_offset() != input.body_offset() ||
-            !SameBamHeader(mpiio_input.header(), input.header()) ||
-            swbam::mpi::PrepareMpiBamInputPlan(
-                mpiio_input, &mpiio_plan) != 0 ||
-            mpiio_plan.blocks.size() != plan.blocks.size()) {
-            local_ok = 0;
-        }
-        if (local_ok) {
-            for (size_t i = 0; i < plan.blocks.size(); ++i) {
-                if (mpiio_plan.blocks[i].offset != plan.blocks[i].offset ||
-                    mpiio_plan.blocks[i].compressed_size !=
-                        plan.blocks[i].compressed_size) {
-                    local_ok = 0;
-                    break;
-                }
-            }
-        }
-        if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
-
-        if (swbam::cpe::RunComposableRawBamPipeline(
-                mpiio_input, mpiio_plan.rank_spans(),
-                mpiio_plan.rank_block_count(), &mpiio_post_processor,
-                &mpiio_timing, &mpiio_decode_metrics,
-                &mpiio_raw_metrics) != 0 ||
-            mpiio_decode_metrics.decoded_blocks != metrics.decoded_blocks ||
-            mpiio_decode_metrics.decoded_bytes != metrics.decoded_bytes ||
-            mpiio_raw_metrics.records != raw_metrics.records ||
-            mpiio_raw_metrics.encoded_bytes != raw_metrics.encoded_bytes ||
-            mpiio_post_processor.records() != post_processor.records() ||
-            mpiio_post_processor.encoded_bytes() != post_processor.encoded_bytes()) {
-            local_ok = 0;
-        }
-        if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
-
-        const double mpiio_total_max =
-            swbam::mpi::ReduceMaxCost(mpiio_timing.total);
-        const double mpiio_read_max =
-            swbam::mpi::ReduceMaxCost(mpiio_timing.read);
-        long long local_mpiio[3] = {
-            mpiio_decode_metrics.decoded_blocks,
-            mpiio_decode_metrics.decoded_bytes,
-            mpiio_raw_metrics.records
-        };
-        long long global_mpiio[3] = {};
-        MPI_Reduce(local_mpiio, global_mpiio, 3, MPI_LONG_LONG,
-                   MPI_SUM, 0, MPI_COMM_WORLD);
-        if (rank == 0) {
-            printf("SWBAM MPI-IO streaming input check finished. blocks=%lld decoded_bytes=%lld records=%lld\n",
-                   global_mpiio[0], global_mpiio[1], global_mpiio[2]);
-            printf("  pipeline_max=%.6f mpi_read_max=%.6f\n",
-                   mpiio_total_max, mpiio_read_max);
-        }
-    }
-
-    {
-        const int synthetic_blocks = 128;
-        SyntheticBgzfSource source(synthetic_blocks);
-        VerifyingBgzfBatchPostProcessor write_post_processor;
-        if (swbam::cpe::RunComposableCompressPipeline(
-                &source, &write_post_processor, 1,
-                &write_timing, &compress_metrics) != 0 ||
-            write_post_processor.blocks() != synthetic_blocks ||
-            write_timing.input_blocks != synthetic_blocks ||
-            write_timing.output_blocks != synthetic_blocks ||
-            write_timing.output_bytes != write_post_processor.bytes()) {
-            local_ok = 0;
-        }
-        if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
-
-        const double write_max =
-            swbam::mpi::ReduceMaxCost(write_timing.total);
-        const double compress_max =
-            swbam::mpi::ReduceMaxCost(write_timing.kernel);
-        const double output_max =
-            swbam::mpi::ReduceMaxCost(write_timing.post_process);
-        if (rank == 0) {
-            printf("SWBAM composable write check finished. blocks_per_rank=%d compression=1\n",
-                   synthetic_blocks);
-            printf("  pipeline_max=%.6f compress_max=%.6f output_verify_max=%.6f\n",
-                   write_max, compress_max, output_max);
-        }
-    }
-
-    {
-        swbam::MemoryBamOutput roundtrip_output;
-        swbam::cpe::RawBamMemoryWriter writer;
-        swbam::cpe::CpeReadPipelineTiming roundtrip_read_timing;
-        swbam::cpe::ComposableDecodeMetrics roundtrip_decode_metrics;
-        swbam::cpe::ComposableRawBamMetrics roundtrip_raw_metrics;
-        const size_t reserve_size = input.size() /
-            (size_t)(comm_size > 0 ? comm_size : 1) + 1024 * 1024;
-        if (roundtrip_output.Reserve(reserve_size) != 0 ||
-            writer.InitializeBam(
-                &roundtrip_output, input.header(), 1, 256) != 0 ||
-            swbam::cpe::RunComposableRawBamPipeline(
-                input, plan.rank_spans(), plan.rank_block_count(),
-                &writer, &roundtrip_read_timing,
-                &roundtrip_decode_metrics, &roundtrip_raw_metrics) != 0 ||
-            writer.Finish(true) != 0 ||
-            writer.metrics().records != roundtrip_raw_metrics.records ||
-            writer.metrics().raw_bytes != roundtrip_raw_metrics.encoded_bytes ||
-            VerifyMemoryBam(
-                roundtrip_output, input.header(),
-                roundtrip_raw_metrics.records,
-                roundtrip_raw_metrics.encoded_bytes) != 0) {
-            local_ok = 0;
-        }
-        if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
-
-        const double roundtrip_max =
-            swbam::mpi::ReduceMaxCost(roundtrip_read_timing.total);
-        const double writer_max =
-            swbam::mpi::ReduceMaxCost(writer.metrics().total);
-        long long local_output[3] = {
-            writer.metrics().records,
-            writer.metrics().packed_blocks,
-            (long long)roundtrip_output.size()
-        };
-        long long global_output[3] = {};
-        MPI_Reduce(local_output, global_output, 3, MPI_LONG_LONG,
-                   MPI_SUM, 0, MPI_COMM_WORLD);
-        if (rank == 0) {
-            printf("SWBAM complete BAM memory roundtrip finished. records=%lld bgzf_blocks=%lld output_bytes=%lld\n",
-                   global_output[0], global_output[1], global_output[2]);
-            printf("  read_pack_write_max=%.6f writer_flush_max=%.6f\n",
-                   roundtrip_max, writer_max);
-        }
-    }
-
-    {
-        BamFilterOptions filter;
-        filter.min_mapq = 30;
-        filter.max_mapq = -1;
-        filter.require_flag = 0;
-        filter.exclude_flag = 0;
-        filter.ref_tid = -2;
-        filter.min_read_len = -1;
-        filter.max_read_len = -1;
-
-        swbam::MemoryBamOutput filtered_output;
-        swbam::cpe::RawBamMemoryWriter writer;
-        swbam::cpe::RawBamFilterBatchPostProcessor filter_post_processor(filter, &writer);
-        swbam::cpe::CpeReadPipelineTiming filter_timing;
-        swbam::cpe::ComposableDecodeMetrics filter_decode_metrics;
-        swbam::cpe::ComposableRawBamMetrics filter_raw_metrics;
-        const size_t reserve_size = input.size() /
-            (size_t)(comm_size > 0 ? comm_size : 1) + 1024 * 1024;
-        if (filtered_output.Reserve(reserve_size) != 0 ||
-            writer.InitializeBam(
-                &filtered_output, input.header(), 1, 256) != 0 ||
-            swbam::cpe::RunComposableRawBamPipeline(
-                input, plan.rank_spans(), plan.rank_block_count(),
-                &filter_post_processor, &filter_timing,
-                &filter_decode_metrics, &filter_raw_metrics) != 0 ||
-            writer.Finish(true) != 0 ||
-            filter_post_processor.metrics().total_records !=
-                filter_raw_metrics.records ||
-            filter_post_processor.metrics().kept_records !=
-                writer.metrics().records ||
-            filter_post_processor.metrics().kept_bytes !=
-                writer.metrics().raw_bytes ||
-            VerifyMemoryBam(
-                filtered_output, input.header(),
-                writer.metrics().records,
-                writer.metrics().raw_bytes) != 0) {
-            local_ok = 0;
-        }
-        if (!swbam::mpi::AllRanksOk(local_ok)) goto cleanup;
-
-        long long local_filter[4] = {
-            filter_post_processor.metrics().total_records,
-            filter_post_processor.metrics().kept_records,
-            filter_post_processor.metrics().dropped_records,
-            (long long)filtered_output.size()
-        };
-        long long global_filter[4] = {};
-        MPI_Reduce(local_filter, global_filter, 4, MPI_LONG_LONG,
-                   MPI_SUM, 0, MPI_COMM_WORLD);
-        const double filter_max = swbam::mpi::ReduceMaxCost(
-            filter_post_processor.metrics().filter);
-        const double pipeline_max =
-            swbam::mpi::ReduceMaxCost(filter_timing.total);
-        if (rank == 0) {
-            printf("SWBAM composable BAM filter check finished. min_mapq=30 total=%lld kept=%lld dropped=%lld output_bytes=%lld\n",
-                   global_filter[0], global_filter[1],
-                   global_filter[2], global_filter[3]);
-            printf("  pipeline_max=%.6f filter_max=%.6f\n",
-                   pipeline_max, filter_max);
-        }
-    }
-
-    exit_code = 0;
-
-cleanup:
-    input.Close();
-    return exit_code;
+    // Two full batches exercise output flushing while CPE compression runs.
+    SyntheticBgzfSource source(128);
+    VerifyingBgzfBatchPostProcessor verifier;
+    swbam::cpe::CpeWritePipelineTiming timing;
+    swbam::cpe::BgzfCompressMetrics compress;
+    ok = swbam::cpe::RunBgzfCompressPipeline(&source, &verifier, 1,
+        &timing, &compress) == 0 && verifier.blocks() == 128 &&
+        timing.input_blocks == 128 && timing.output_blocks == 128 &&
+        timing.output_bytes == verifier.bytes();
+    if (!swbam::mpi::AllRanksOk(ok)) return 1;
+    if (rank == 0) printf("SWBAM BAM write/compress check PASS. blocks_per_rank=128\n");
+    if (CheckRoundtrip(input, plan, expected, false, rank) != 0 ||
+        CheckRoundtrip(input, plan, expected, true, rank) != 0) return 1;
+    if (rank == 0) printf("io-check: PASS (BAM read/write, count/filter, memory/POSIX/MPI-IO)\n");
+    return 0;
 }
