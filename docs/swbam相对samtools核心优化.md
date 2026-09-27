@@ -65,8 +65,8 @@ CPE decode / parse / operator
 相对逐条调用 `sam_read1()`，这种接口让 CPE 一次获得一批连续、对齐的压缩块，也让
 统计、转换、sort、collate 和 markdup 复用相同的数据入口。
 
-对应代码：`include/swbam/io.h`、`lib/io/`、`include/swbam/mpi_runtime.h`、
-`lib/mpi/`。
+对应代码：`swbam-sdk/include/swbam/io.h`、`swbam-sdk/lib/io/`、
+`swbam-sdk/include/swbam/mpi_runtime.h`、`swbam-sdk/lib/mpi/`。
 
 ### 4.2 大窗口 BGZF scanner 与批量读取
 
@@ -92,8 +92,8 @@ slots，减少中间 scratch buffer。
 “读完再算、算完再写”的串行等待。抽象只在每个 batch 上调用虚接口，不进入逐记录
 热循环。
 
-对应代码：`lib/cpe/swbam_cpe_bam_read_pipeline.cpp`、
-`lib/cpe/swbam_cpe_bam_write_pipeline.cpp`。
+对应代码：`swbam-sdk/lib/cpe/swbam_cpe_bam_read_pipeline.cpp`、
+`swbam-sdk/lib/cpe/swbam_cpe_bam_write_pipeline.cpp`。
 
 ### 4.4 Composable path 与 Optimized path
 
@@ -129,8 +129,8 @@ collate 的 raw arena 优化曾将 `raw_resize` 从约 2.732 s/rank 降到约 0.
 缓存 libdeflate compressor/decompressor，避免每批重复创建和销毁。压缩级别 1 还保留
 针对 matchfinder 的快速策略。
 
-对应代码：`slave/core/`、`include/swbam/cpe_codec.h`、
-`include/swbam/cpe_bam_parser.h`。
+对应代码：`swbam-sdk/slave/core/`、`swbam-sdk/include/swbam/cpe_codec.h`、
+`swbam-sdk/include/swbam/cpe_bam_parser.h`。
 
 ### 4.7 RankBodySink 与分布式输出
 

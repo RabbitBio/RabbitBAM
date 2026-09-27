@@ -34,6 +34,21 @@ Input backend
 已接入公共 BAM 流水线；markdup 的单遍 `--stream` 主路径也已接入，两遍 fallback
 的第二遍 rewrite/write 仍保留原调度。
 
+### 独立项目边界
+
+`swbam-sdk/` 是可独立构建、安装的库项目，包含四条流水线、operator、I/O/MPI
+运行时和通用 CPE 实现。`swbam-app/` 是依赖 SDK 的应用项目，包含命令、复杂算法、
+去重编排及应用专用 CPE kernel。根目录 CMake 仅负责联合构建。
+
+应用可通过 `find_package(SWBAM CONFIG REQUIRED)` 加载安装包。MPE 程序链接
+`swbam::swbam`，自定义 CPE object 用 `swbam::cpe` 编译，再加入应用的 hybrid
+链接。库的公共类型位于 `swbam-sdk/include/swbam/bam_types.h`，应用算法参数位于
+`swbam-app/include/algorithm_types.h`；两者的字段布局保持原样。
+
+安装包包含主核静态库、通用 CPE object、适配的 HTSlib/libdeflate 和公共头文件。
+app 不依赖库源码目录；MPI、athread 和神威工具链仍由部署环境提供。独立构建方法
+见 [SDK 使用说明](swbam_sdk使用说明.md)。此拆分不改变下述 batch 契约和计时范围。
+
 ## Batch 数据契约
 
 ### 所有权与生命周期

@@ -1,5 +1,5 @@
 #include "crc32_bench.h"
-#include "Globals.h"
+#include "swbam/platform.h"
 
 #ifdef PLATFORM_SUNWAY
 #include <athread.h>

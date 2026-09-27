@@ -1,0 +1,11 @@
+# Usable both as CMAKE_TOOLCHAIN_FILE and before project() in the workspace.
+if(DEFINED PLATFORM AND NOT PLATFORM STREQUAL "sunway")
+    message(FATAL_ERROR "SWBAM requires the Sunway host/CPE toolchain")
+endif()
+find_program(SWBAM_SUNWAY_C_COMPILER swgcc HINTS /usr/sw/bin)
+find_program(SWBAM_SUNWAY_CXX_COMPILER swg++ HINTS /usr/sw/bin)
+if(NOT SWBAM_SUNWAY_C_COMPILER OR NOT SWBAM_SUNWAY_CXX_COMPILER)
+    message(FATAL_ERROR "Sunway compilers swgcc/swg++ were not found")
+endif()
+set(CMAKE_C_COMPILER "${SWBAM_SUNWAY_C_COMPILER}" CACHE FILEPATH "C compiler" FORCE)
+set(CMAKE_CXX_COMPILER "${SWBAM_SUNWAY_CXX_COMPILER}" CACHE FILEPATH "C++ compiler" FORCE)

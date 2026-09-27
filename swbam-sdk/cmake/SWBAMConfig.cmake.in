@@ -1,0 +1,11 @@
+@PACKAGE_INIT@
+
+set(SUNWAY_MPI_ROOT "@SUNWAY_MPI_ROOT@" CACHE PATH "Sunway MPI installation root")
+set_and_check(SWBAM_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
+set_and_check(SWBAM_LIBRARY_DIR "@PACKAGE_CMAKE_INSTALL_LIBDIR@")
+include("${CMAKE_CURRENT_LIST_DIR}/SWBAMDependencies.cmake")
+swbam_define_dependencies(
+    "${SWBAM_INCLUDE_DIR}" "${SWBAM_LIBRARY_DIR}/libhts.a"
+    "${SWBAM_INCLUDE_DIR}" "${SWBAM_LIBRARY_DIR}/libdeflate.a")
+include("${CMAKE_CURRENT_LIST_DIR}/SWBAMTargets.cmake")
+check_required_components(SWBAM)

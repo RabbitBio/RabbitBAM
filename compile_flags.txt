@@ -5,6 +5,8 @@
 -ffast-math
 -DTIMING
 -DPLATFORM_SUNWAY
--I./include
+-I./swbam-sdk/include
+-I./swbam-app/include
+-I./swbam-app/third_party
 -I./ext/htslib-1.20
 -I./ext/libdeflate-1.20

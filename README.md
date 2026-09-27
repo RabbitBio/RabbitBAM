@@ -33,32 +33,36 @@ input backend → MPI input plan → BAM/SAM read pipeline
              → CPE operator → MPE batch post-processing / app algorithm
              → BAM/SAM write pipeline → rank body sink → distributed output
 
-include/swbam/     库接口、四条流水线及 operator 契约
-lib/io/           memory/POSIX 输入输出、rank body memory/spool
-lib/mpi/          MPI-IO、输入分区与分布式输出
-lib/cpe/          MPE 侧四条流水线和写出适配器
-lib/operators/    批次参数准备、状态校验、结果归并及读写连接
-slave/core/       CPE 共享 BGZF codec、BAM parser 与辅助函数
-slave/operators/  CPE 计数、过滤、解析、格式化、压缩 kernel
-slave/algorithms/ sort/collate/fixmate/markdup 的算法专用 kernel
-apps/mpi/         CLI、命令、复杂算法和去重编排
-examples/         两个与应用复用同一流水线的 SDK 示例
-tools/            正确性验证、内存与 CRC 探测工具
-docs/             架构契约、实验方案、结果与研究记录
-ext/              HTSlib、libdeflate 等依赖及神威适配
-overleaf/         论文材料
+swbam-sdk/              可独立构建、安装的库项目
+  include/swbam/        公共类型、四条流水线及 operator 契约
+  lib/{io,mpi,cpe,operators}/  MPE 实现
+  slave/{core,operators}/ CPE 共享 codec、parser 和算子
+  slave/slave_zlib/       神威适配的 CPE 编解码支持
+  cmake/               Sunway 工具链及 SWBAM 安装包导出
+  examples/            两个示例，也可单独 find_package 构建
+swbam-app/              独立依赖 SDK 的应用项目
+  commands/            转换、统计、fixmate 等命令
+  algorithms/          sort/collate/markdup 的 MPE 算法
+  pipelines/           两种去重编排
+  slave/               四个应用专用算法 kernel
+  include/             CLI 配置、应用接口和算法共享参数
+  third_party/         CLI11
+tools/                  正确性验证、内存与 CRC 探测工具
+docs/                   架构契约、实验方案、结果与研究记录
+ext/                    构建 SDK 时使用的 HTSlib/libdeflate 依赖
+overleaf/               论文材料
 ```
 
 **batch 层组合，record 层静态融合。** 例如解压、解析、count/filter 可以在一次 CPE
 kernel 中完成；MPE 回调只发生在批次边界。双缓冲重叠输入预取与计算、压缩与上一批
 输出，不表示同一核组的读写 CPE kernel 同时运行。
 
-`include/BamTools.h` 保存仍在使用的 MPE/CPE 共享参数布局；`apps/mpi/CmdInfo.h`
-和 `apps/mpi/swbam_mpi.h` 是应用内部接口，不属于 SDK。
+库的 MPE/CPE 公共布局在 `swbam-sdk/include/swbam/bam_types.h`；应用算法布局在
+`swbam-app/include/algorithm_types.h`。SDK 不包含应用参数、CLI 或应用算法 kernel。
 
 ## 构建
 
-需要 Sunway `swgcc`/`swg++`、athread、MPI、CMake ≥ 3.13，以及本仓库神威适配的
+需要 Sunway `swgcc`/`swg++`、athread、MPI、CMake ≥ 3.15，以及本仓库神威适配的
 HTSlib 1.20 / libdeflate 1.20。不是直接在 x86 上运行的程序。
 
 在仓库根目录执行：
@@ -83,8 +87,31 @@ MPI 默认路径为 `/usr/sw/mpi/mpi_20220608_SEA`，可通过 `-DSUNWAY_MPI_ROO
 - `libswbam_io.a`、`libswbam_mpi_runtime.a`、`libswbam_cpe_runtime.a`：三个主核静态库。
 - CPE kernel 以 object target 参与神威 hybrid 链接，不作为普通主核静态库打包。
 
-验证/探测工具通过 `-DBUILD_SWBAM_TOOLS=ON` 开启。对外统一 CMake 链接目标为
-`swbam::swbam`；当前采用源码树内集成，尚未提供 install/find_package 分发包。
+验证/探测工具通过 `-DBUILD_SWBAM_TOOLS=ON` 开启。根目录只是便利的联合构建入口，
+原来的 `build_sunway_sduhpc/RabbitBAM-MPI` 和两个示例路径保持可用。
+
+### 独立构建 SDK 和 app
+
+下面演示 app 仅通过安装包链接 SDK；两者可以放在不同的源码目录。
+
+```bash
+cmake -S swbam-sdk -B build_sunway_sduhpc/sdk \
+  -DBUILD_SWBAM_EXAMPLES=OFF \
+  -DCMAKE_INSTALL_LIBDIR=lib \
+  -DCMAKE_INSTALL_PREFIX="$PWD/build_sunway_sduhpc/sdk-install"
+cmake --build build_sunway_sduhpc/sdk -j 8
+cmake --install build_sunway_sduhpc/sdk
+
+cmake -S swbam-app -B build_sunway_sduhpc/app \
+  -DCMAKE_PREFIX_PATH="$PWD/build_sunway_sduhpc/sdk-install" \
+  -DCMAKE_TOOLCHAIN_FILE="$PWD/build_sunway_sduhpc/sdk-install/lib/cmake/SWBAM/SunwayToolchain.cmake"
+cmake --build build_sunway_sduhpc/app -j 8
+```
+
+SDK 单独复制到其他位置时，用 `-DSWBAM_DEPENDENCY_ROOT=/path/to/ext` 指定已经构建的
+神威依赖。安装包带三个主核静态库、通用 CPE 对象、HTSlib/libdeflate 静态依赖与
+头文件，通过 `find_package(SWBAM CONFIG REQUIRED)` 和 `swbam::swbam` 使用。
+MPI、athread 和神威工具链仍由目标环境提供。
 
 ## 运行示例
 
@@ -129,8 +156,8 @@ bsub.py swls -q q_share -I -b -J swbam_check \
 
 | 示例 | 库入口与行为 |
 | --- | --- |
-| [sdk_optimized_count.cpp](examples/sdk_optimized_count.cpp) | `RunRecordCountPipeline`：CPE 解压、解析为可复用 `bam1_t` 并计数，不执行完整 flagstat |
-| [sdk_optimized_bam2bam.cpp](examples/sdk_optimized_bam2bam.cpp) | `RunBamTransformPipeline`：BAM read → 打包 → BAM write，压缩 body 写入 memory sink |
+| [sdk_optimized_count.cpp](swbam-sdk/examples/sdk_optimized_count.cpp) | `RunRecordCountPipeline`：CPE 解压、解析为可复用 `bam1_t` 并计数，不执行完整 flagstat |
+| [sdk_optimized_bam2bam.cpp](swbam-sdk/examples/sdk_optimized_bam2bam.cpp) | `RunBamTransformPipeline`：BAM read → 打包 → BAM write，压缩 body 写入 memory sink |
 
 命令体分别是 `./swbam-sdk-optimized-count input.bam` 和
 `./swbam-sdk-optimized-bam2bam input.bam`。后者是库读写微基准，**不生成带 header/EOF

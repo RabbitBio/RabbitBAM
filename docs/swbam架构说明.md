@@ -5,18 +5,22 @@
 另一套 Raw/MPE bam1_t adapter 架构。
 
 ```text
-lib/io + lib/mpi
+swbam-sdk/lib/io + lib/mpi
     backend、block plan、rank body sink、distributed output
                        |
-lib/cpe                四条 MPE 调度流水线
+swbam-sdk/lib/cpe       四条 MPE 调度流水线
     BAM read / BAM write / SAM read / SAM write
                        |
-lib/operators          batch 参数、校验、归并和流水线连接
+swbam-sdk/lib/operators batch 参数、校验、归并和流水线连接
                        |
-slave/core + operators CPE 编解码、解析与编译期业务动作组合
+swbam-sdk/slave         CPE 编解码、解析与编译期业务动作组合
                        |
-apps/mpi               CLI、MPI 协同、复杂算法状态和流程编排
+swbam-app              CLI、MPI 协同、复杂算法状态和流程编排
+swbam-app/slave         应用专用 CPE kernel
 ```
+
+`slave/` 专门存放实际从核源码；`lib/cpe/` 保留原名，存放在 MPE 上执行的
+流水线调度。`swbam::cpe` 等接口名仍表示从核编译环境，不是源码目录名。
 
 ## 职责边界
 
@@ -33,11 +37,17 @@ apps/mpi               CLI、MPI 协同、复杂算法状态和流程编排
 
 主程序 `RabbitBAM-MPI`；SDK 示例只有 `sdk_optimized_count.cpp` 和
 `sdk_optimized_bam2bam.cpp`。三个主核静态库与 CPE object 通过 `swbam::swbam`
-统一链接，未提供独立安装包。见[SDK 使用说明](swbam_sdk使用说明.md)。
+统一链接。SDK 和 app 是两个独立 CMake 项目；app 可通过安装包
+`find_package(SWBAM CONFIG REQUIRED)` 构建。见[SDK 使用说明](swbam_sdk使用说明.md)。
 
-旧 `src/` 程序、CGS 应用和旧五个 SDK 已删除；旧 `slave/slave.cpp` 中的有效函数
-迁入 `slave/core/slave_bam_support.cpp` 及 SAM parse/format、record compress
-operator。`apps/mpi/CmdInfo.h`、`apps/mpi/swbam_mpi.h` 为应用内部接口。
+SDK 公共头文件仅位于 `swbam-sdk/include/swbam/`。原 `BamTools.h` 的库类型迁入
+`bam_types.h`；sort/collate/fixmate/markdup 的参数原样迁入
+`swbam-app/include/algorithm_types.h`，由 app 主从核共同包含。
+`CmdInfo.h`、`swbam_mpi.h` 和 CLI11 为应用私有依赖，不随 SDK 安装。
+
+安装包保留 CPE object 的直接 hybrid 链接，未增加运行时分发。构建选项通过
+`swbam::host`、`swbam::cpe` 传递；源码树不再使用全局 include/link 搜索目录。
+应用自定义 CPE kernel 用 `swbam::cpe` 编译，仍可使用库的解压/解析/压缩步骤。
 
 ## I/O 与实验边界
 
