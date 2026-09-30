@@ -140,7 +140,7 @@ int ProcessDedupWorkflowMPI(CmdInfo *cmd_info) {
                "(%d MPE + %d CPEs)!!!\n",
                comm_size, comm_size * 64);
         printf("dedup-workflow stages: collate -> fixmate -m -> "
-               "sort -> markdup coordinate-stream-two-pass\n");
+               "sort -> markdup coordinate-stream-one-pass\n");
         printf("dedup-workflow temp_prefix=%s keep_intermediates=%d "
                "memory='%s' bins=%d compression=%d\n",
                cmd_info->workflow_temp_prefix_.c_str(),
@@ -200,10 +200,8 @@ int ProcessDedupWorkflowMPI(CmdInfo *cmd_info) {
     markdup.markdup_memory_ = cmd_info->pipeline_memory_;
     markdup.markdup_remove_dups_ = false;
     markdup.markdup_clear_ = false;
-    // Reuse the validated coordinate-stream implementation used by the
-    // in-memory pipeline without enabling the newer one-pass experiment.
     markdup.markdup_streaming_ = true;
-    markdup.markdup_force_two_pass_ = true;
+    markdup.markdup_force_two_pass_ = false;
     if (WorkflowRunStage("markdup", ProcessMarkdupMPI, &markdup,
                          rank, &markdup_wall) != 0) {
         return 1;

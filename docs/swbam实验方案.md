@@ -30,7 +30,7 @@ generic/fused 模式。算子的解压、解析和动作可在一次 CPE kernel 
 
 | 项目 | D1 | D2 | D3 |
 |---|:---:|:---:|:---:|
-| SDK count / BAM read-write | 是 | 是 | 容量允许时 |
+| SDK count / BAM read-write | 是 | 是 | 是，分块内存模式 |
 | 转换、过滤、flagstat、stats --basic | 是 | 是 | 是 |
 | fixmate、markdup --stream | 是 | 是 | 是 |
 | sort/collate 内排及内排四步流程 | 是 | 是 | 否 |
@@ -62,6 +62,10 @@ D3 的 sort/collate 只测 external mode；其他命令不因此自动变成“�
 SDK count 的 `core` 包含内存 batch 读取、CPE 解压/解析/计数及 MPE 批次归并。
 SDK bam2bam 的 `core` 包含内存 batch 读取、解析、pack、压缩和本 rank 内存 body 写入。
 它不含完整输出 header/EOF、rank 汇集及全文件输出布局，不能等同于 app 的 4.1~4.6。
+D3 分块模式的 `core` 为每 rank 各段流水线时间之和，再对 rank 取最大值；段间真实
+磁盘预读不计入。额外报告 `simulated_total`，包含轻量 header open、缓存索引的
+内存分区/广播、输出缓冲准备、流水线及结果归约，不包含磁盘建索引、索引文件读取、
+分段预读/缓冲准备及最终 dump。该值也不包含 MPI_Init/Finalize，不能称为进程 wall。
 
 现阶段按已有部署测量，不要求为了本轮实验切换 SAMtools 到 tmpfs。两种时间边界在
 图表中分别写明；如给出 `SAMtools wall / SWBAM core`，标为该口径下的耗时比，
@@ -69,12 +73,15 @@ SDK bam2bam 的 `core` 包含内存 batch 读取、解析、pack、压缩和本 
 
 ### 3.3 大数据容量预检查
 
-memory backend 每 rank 保存完整输入，不能用“文件大小 / ranks”估计输入内存。
+默认 memory backend 每 rank 保存完整输入，不能用“文件大小 / ranks”估计输入内存。
 还需容纳本 rank 输出、算法工作区；完整 memory output 在 rank0 汇集时还需整份输出。
 现有大共享配置约 85 GiB 可用堆不意味着约 90 GB 的 D3 能连同输出和工作区装入。
 
-D3 先核算容量，再选择 POSIX/MPI-IO 输入和 spool/MPI-IO 输出，或另行实现并验证
-rank-local preload。不同 I/O 策略单列，不能静默切换。外排 run/temp 与 rank body
+D3 SDK 已增加 rank-local BGZF 分段预读和固定容量内存 body sink，默认每段压缩数据
+不超过 2 GiB、输出环形缓冲为 256 MiB。所有核组档位使用同一模式；BGZF 块索引
+可预先建立并缓存，实际磁盘准备时间单列排除，内存中的索引分区/广播计入
+`simulated_total`。这只解决 SDK 的两项基准，不代表所有 app 都已有该能力。
+不同 I/O 策略单列，不能静默切换。外排 run/temp 与 rank body
 spool 是独立开销，记录各自字节数、真实时间、模拟时间；不能把必要临时 I/O 当作
 初始 load/最终 dump 一并删除。当前计划不宣称全部内存状态与输入规模无关。
 
@@ -164,7 +171,10 @@ SAMtools 完整 `stats` 工作量大于 SWBAM `stats --basic`；可核对对应 
 
 节点数 `1/2/4/8/16/24/32/48`，以程序打印的实际 MPI ranks 校验放置。
 其余核组提供内存，不计为活跃计算核组。D2 先做容量检查与代表点，再决定是否复核
-全曲线；D3 不做扩展性。SAMtools 可沿用当前 A4 的 `-@ 0/2/4/8/16/24/32/47/48/64/96/127`
+全曲线；这里的 D3 应用算法暂不做扩展性。**SDK 两项库基准**另按 D1/D2 已用的
+`1/2/4/6/8/12` 活跃核组，对 D3 也各运行三次并取中位数。D3 的输入/输出采用
+分块有界模式，图表须标注与 D1/D2 全文件 memory 模式的区别。
+SAMtools 可沿用当前 A4 的 `-@ 0/2/4/8/16/24/32/47/48/64/96/127`
 基线；额外线程数不等于实际 CPU 总占用数。
 
 应用扩展性优先选择 sort、collate、markdup 和四步流程；线性应用用代表点确认即可，
