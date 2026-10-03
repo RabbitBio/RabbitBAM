@@ -41,9 +41,9 @@ int main(int argc, char **argv) {
     run_all->add_option("-i,--inFile", cmd_info.in_file_name_, "input sam/bam name")->required()->check(CLI::ExistingFile);
     run_all->add_option("-o,--outFile", cmd_info.out_file_name_, "output sam/bam name")->required();
     run_all->add_option("--io-backend", cmd_info.io_backend_,
-                        "Input backend: memory, posix, mpiio, or auto")
+                        "Input backend: memory, rank-memory (local BAM blocks/plain SAM lines), posix, mpiio, or auto")
         ->default_val("memory")
-        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     run_all->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                         "Per-rank memory input limit used by --io-backend auto")
         ->default_val("8G");
@@ -74,9 +74,9 @@ int main(int argc, char **argv) {
     CLI::App *flagstat = app.add_subcommand("flagstat", "Run MPI BAM flagstat");
     flagstat->add_option("-i,--inFile", cmd_info.in_file_name_, "input bam name")->required()->check(CLI::ExistingFile);
     flagstat->add_option("--io-backend", cmd_info.io_backend_,
-                         "Input backend: memory, posix, mpiio, or auto")
+                         "Input backend: memory (whole file), rank-memory (local BAM blocks), posix, mpiio, or auto")
         ->default_val("memory")
-        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     flagstat->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                          "Per-rank memory input limit used by --io-backend auto")
         ->default_val("8G");
@@ -85,9 +85,9 @@ int main(int argc, char **argv) {
     CLI::App *stats = app.add_subcommand("stats", "Run MPI BAM stats");
     stats->add_option("-i,--inFile", cmd_info.in_file_name_, "input bam name")->required()->check(CLI::ExistingFile);
     stats->add_option("--io-backend", cmd_info.io_backend_,
-                      "Input backend: memory, posix, mpiio, or auto")
+                      "Input backend: memory (whole file), rank-memory (local BAM blocks), posix, mpiio, or auto")
         ->default_val("memory")
-        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     stats->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                       "Per-rank memory input limit used by --io-backend auto")
         ->default_val("8G");
@@ -103,9 +103,9 @@ int main(int argc, char **argv) {
     sort->add_option("-i,--inFile", cmd_info.in_file_name_, "input bam name")->required()->check(CLI::ExistingFile);
     sort->add_option("-o,--outFile", cmd_info.out_file_name_, "output bam name")->required();
     sort->add_option("--io-backend", cmd_info.io_backend_,
-                     "Input backend: memory, posix, mpiio, or auto")
+                     "Input backend: memory (whole file), rank-memory (local BAM blocks), posix, mpiio, or auto")
         ->default_val("memory")
-        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     sort->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                      "Per-rank memory input limit used by --io-backend auto")
         ->default_val("8G");
@@ -132,9 +132,9 @@ int main(int argc, char **argv) {
     collate->add_option("-i,--inFile", cmd_info.in_file_name_, "input BAM name")->required()->check(CLI::ExistingFile);
     collate->add_option("-o,--outFile", cmd_info.out_file_name_, "output BAM name")->required();
     collate->add_option("--io-backend", cmd_info.io_backend_,
-                        "Input backend: memory, posix, mpiio, or auto")
+                        "Input backend: memory (whole file), rank-memory (local BAM blocks), posix, mpiio, or auto")
         ->default_val("memory")
-        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     collate->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                         "Per-rank memory input limit used by --io-backend auto")
         ->default_val("8G");
@@ -162,9 +162,9 @@ int main(int argc, char **argv) {
     markdup->add_option("-i,--inFile", cmd_info.in_file_name_, "coordinate-sorted fixmate BAM name")->required()->check(CLI::ExistingFile);
     markdup->add_option("-o,--outFile", cmd_info.out_file_name_, "output bam name")->required();
     markdup->add_option("--io-backend", cmd_info.io_backend_,
-                        "Input backend: memory, posix, mpiio, or auto")
+                        "Input backend: memory (whole file), rank-memory (local BAM blocks), posix, mpiio, or auto")
         ->default_val("memory")
-        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     markdup->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                         "Per-rank memory input limit used by --io-backend auto")
         ->default_val("8G");
@@ -194,9 +194,9 @@ int main(int argc, char **argv) {
     fixmate->add_option("-i,--inFile", cmd_info.in_file_name_, "name-collated or queryname-sorted BAM name")->required()->check(CLI::ExistingFile);
     fixmate->add_option("-o,--outFile", cmd_info.out_file_name_, "output bam name")->required();
     fixmate->add_option("--io-backend", cmd_info.io_backend_,
-                        "Input backend: memory, posix, mpiio, or auto")
+                        "Input backend: memory (whole file), rank-memory (local BAM blocks), posix, mpiio, or auto")
         ->default_val("memory")
-        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     fixmate->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                         "Per-rank memory input limit used by --io-backend auto")
         ->default_val("8G");
@@ -251,9 +251,9 @@ int main(int argc, char **argv) {
                                "Maximum read length for coordinate-stream markdup")
         ->default_val(300)->check(CLI::PositiveNumber);
     dedup_workflow->add_option("--io-backend", cmd_info.io_backend_,
-                               "Input backend for every stage: memory, posix, mpiio, or auto")
+                               "Input backend for every stage: memory, rank-memory, posix, mpiio, or auto")
         ->default_val("memory")
-        ->check(CLI::IsMember(std::vector<std::string>{"memory", "posix", "mpiio", "auto"}));
+        ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     dedup_workflow->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                                "Per-rank memory input limit used by --io-backend auto")
         ->default_val("8G");

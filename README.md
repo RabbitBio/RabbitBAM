@@ -169,6 +169,15 @@ bsub.py swls -q q_share -I -b -J swbam_check \
   核心时间不包含预加载和最终文件 dump，不能描述为真实磁盘端到端时间。
 - Standalone 命令提供 `--io-backend memory|posix|mpiio|auto`，输出可选
   `--io-output-backend memory|mpiio`；具体支持范围以命令帮助为准。
+- `run_all`、`sort`、`collate`、`fixmate`、`markdup`、`flagstat`、`stats` 和
+  `dedup-workflow` 还支持 `--io-backend rank-memory`：按全局 BGZF 计划只预加载
+  本 rank 的压缩块；`run_all` 的 SAM→BAM 按完整文本行预加载本 rank 区间。
+  计算期间不回退读盘。`memory` 默认行为和 SDK 示例保持不变。
+  物理扫描读盘与分片缓存准备单独排除，索引构建、MPI 分区/广播、内存读写及
+  算法计算仍计入核心时间；该模式不减少算法自身或输出缓存的内存需求。
+  大数据转换建议使用 `--io-output-backend mpiio`，避免最终 root 全量 gather。
+  BAM→SAM 在 rank-memory 模式下最多预分配 64 MiB，再按实际输出扩容；完整
+  rank body 和模拟输出副本仍需驻留，不能将分片输入等同于有界内存输出。
 - `--rank-body-backend memory|spool|auto` 控制 rank 本地输出缓存；其临时目录
   由 `--rank-body-temp-dir` 指定，与 sort/collate 的 `-T` 外排临时文件独立。
 - **要求单条 BAM record 不跨 BGZF block**。一般来源的 BAM 不保证满足此条件；

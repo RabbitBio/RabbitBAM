@@ -105,6 +105,10 @@ public:
     size_t size() const;
     uint64_t body_offset() const;
     int ScanBlocks(std::vector<BgzfBlockSpan> *spans) const;
+    // Optional physical-read timing for preparing a memory-backed simulation.
+    int ScanBlocks(std::vector<BgzfBlockSpan> *spans,
+                   double *physical_read_cost) const;
+    int ReadRange(uint64_t offset, void *data, size_t size) const;
     int ReadBatch(const BgzfBlockSpan *spans, size_t count,
                   BgzfBlockBatch *batch) const;
 
@@ -144,6 +148,10 @@ public:
     int SplitRanges(int range_count,
                     std::vector<long long> *offsets,
                     std::vector<long long> *lengths) const;
+    int SplitRanges(int range_count,
+                    std::vector<long long> *offsets,
+                    std::vector<long long> *lengths,
+                    double *physical_read_cost) const;
     int ReadRange(uint64_t offset, size_t length,
                   std::vector<char> *data) const;
 

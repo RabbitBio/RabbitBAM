@@ -173,8 +173,7 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
             printf("Enable MPI FLAGSTAT mode (%d MPE + %d CPEs)!!!\n",
                    comm_size, comm_size * 64);
         }
-        if (swbam::mpi::PrepareMpiBamInputPlan(
-                *input, &input_plan) != 0) {
+        if (input_handle.PreparePlan(&input_plan) != 0) {
             if (rank == 0) {
                 fprintf(stderr, "ERROR: failed to prepare BGZF input plan for flagstat.\n");
             }
@@ -186,7 +185,7 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
                    (long long)input_plan.body_offset,
                    (long long)input->body_offset());
         }
-        double stage41_cost = GetTime() - stage41_t0;
+        double stage41_cost = GetTime() - stage41_t0 - input_handle.simulation_prepare_cost();
         double stage41_cost_max = swbam::mpi::ReduceMaxCost(stage41_cost);
         if (rank == 0 && local_ok) {
             printf("Complete the 4.1 scan/split/broadcast/select cost %lf\n", stage41_cost_max);
@@ -243,7 +242,7 @@ int ProcessFlagstatMPI(CmdInfo *cmd_info) {
             printf("Complete the 4.4 flagstat reduce/print cost %lf\n", stage44_cost_max);
         }
 
-        double body_total_cost = GetTime() - body_total_t0;
+        double body_total_cost = GetTime() - body_total_t0 - input_handle.simulation_prepare_cost();
         double body_total_cost_max = swbam::mpi::ReduceMaxCost(body_total_cost);
         if (rank == 0) {
             printf("444Complete the total body cost %lf\n", body_total_cost_max);

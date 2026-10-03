@@ -50,6 +50,15 @@ struct MpiCollateRecordMetaShared {
     uint64_t global_order;
 };
 
+enum MpiCollateExtractStatus {
+    COLLATE_EXTRACT_BAD_BGZF = -20,
+    COLLATE_EXTRACT_DECOMP_ALLOC = -21,
+    COLLATE_EXTRACT_INFLATE = -22,
+    COLLATE_EXTRACT_CRC = -23,
+    COLLATE_EXTRACT_QNAME_LENGTH = -24,
+    COLLATE_EXTRACT_QNAME_NUL = -25
+};
+
 struct MpiCollateExtractPara {
     int block_id;
     bam_block *input_block;

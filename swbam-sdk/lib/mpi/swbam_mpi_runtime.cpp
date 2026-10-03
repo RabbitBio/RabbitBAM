@@ -47,6 +47,10 @@ int SelectBackend(const std::string &path,
         *selected = 0;
         return 0;
     }
+    if (requested == "rank-memory") {
+        *selected = 3;
+        return 0;
+    }
     if (requested == "posix") {
         *selected = 1;
         return 0;
@@ -80,6 +84,98 @@ int SelectBackend(const std::string &path,
     *selected = (uint64_t)file_stat.st_size <= *budget ? 0 : 1;
     return 0;
 }
+
+// The cache contains a BAM body slice, not an independently readable BAM file.
+// Metadata and all spans retain file-global coordinates. There is no disk fallback.
+class RankMemoryBamInput : public BamInputBackend {
+public:
+    RankMemoryBamInput()
+        : data_(nullptr), offset_(0), bytes_(0), scan_read_cost_(0.0) {}
+    ~RankMemoryBamInput() { Close(); }
+
+    int Open(const std::string &path) { Close(); return metadata_.Open(path); }
+    void Close() {
+        free(data_);
+        data_ = nullptr;
+        offset_ = 0;
+        bytes_ = 0;
+        scan_read_cost_ = 0.0;
+        metadata_.Close();
+    }
+    const sam_hdr_t *header() const { return metadata_.header(); }
+    int format() const { return metadata_.format(); }
+    size_t size() const { return metadata_.size(); }
+    uint64_t body_offset() const { return metadata_.body_offset(); }
+    int ScanBlocks(std::vector<BgzfBlockSpan> *spans) const {
+        return metadata_.ScanBlocks(spans, &scan_read_cost_);
+    }
+    double scan_read_cost() const { return scan_read_cost_; }
+
+    int Load(const BgzfBlockSpan *spans, size_t count) {
+        if (count && !spans) return -1;
+        free(data_);
+        data_ = nullptr;
+        bytes_ = 0;
+        offset_ = count ? spans[0].offset : body_offset();
+        uint64_t end = offset_;
+        for (size_t i = 0; i < count; ++i) {
+            const size_t length = spans[i].compressed_size;
+            if (spans[i].offset != end ||
+                length < BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH ||
+                length > BGZF_MAX_BLOCK_SIZE || end > size() ||
+                length > size() - (size_t)end) return -1;
+            end += length;
+        }
+        bytes_ = (size_t)(end - offset_);
+        if (!bytes_) return 0;
+        data_ = (char *)malloc(bytes_);
+        if (!data_) return -1;
+        for (size_t pos = 0; pos < bytes_;) {
+            const size_t chunk = std::min<size_t>(bytes_ - pos, 8u * 1024u * 1024u);
+            if (metadata_.ReadRange(offset_ + pos, data_ + pos, chunk) != 0) return -1;
+            pos += chunk;
+        }
+        return 0;
+    }
+
+    char *memory_range(uint64_t offset, size_t length) const {
+        if (!data_ || offset < offset_ || offset - offset_ > bytes_ ||
+            length > bytes_ - (size_t)(offset - offset_)) return nullptr;
+        return data_ + (size_t)(offset - offset_);
+    }
+
+    int ReadBatch(const BgzfBlockSpan *spans, size_t count,
+                  BgzfBlockBatch *batch) const {
+        if (!batch || count > batch->capacity() ||
+            (count && (!spans || !batch->blocks()))) return -1;
+        for (size_t i = 0; i < count; ++i) {
+            const size_t length = spans[i].compressed_size;
+            const char *src = memory_range(spans[i].offset, length);
+            if (!src || length < BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH ||
+                length > BGZF_MAX_BLOCK_SIZE || !batch->blocks()[i].data) return -1;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            bam_block &block = batch->blocks()[i];
+            memcpy(block.data, memory_range(spans[i].offset, spans[i].compressed_size),
+                   spans[i].compressed_size);
+            block.length = spans[i].compressed_size;
+            block.pos = 0;
+            block.errcode = 0;
+            block.block_address = (int64_t)spans[i].offset;
+            block.block_id = (int)i;
+        }
+        return 0;
+    }
+
+private:
+    RankMemoryBamInput(const RankMemoryBamInput &);
+    RankMemoryBamInput &operator=(const RankMemoryBamInput &);
+    PosixBamInput metadata_;
+    char *data_;
+    uint64_t offset_;
+    size_t bytes_;
+    mutable double scan_read_cost_;
+};
 
 } // namespace
 
@@ -288,7 +384,7 @@ int MpiIoSamInput::ReadRange(uint64_t offset, size_t length,
 
 MpiBamInput::MpiBamInput()
     : backend_(nullptr), data_open_cost_(0.0), header_open_cost_(0.0),
-      auto_memory_budget_(0) {}
+      auto_memory_budget_(0), simulation_prepare_cost_(0.0) {}
 
 MpiBamInput::~MpiBamInput() {
     Close();
@@ -367,6 +463,13 @@ int MpiBamInput::Open(const std::string &path,
         header_open_cost_ = 0.0;
         backend_ = mpiio;
         selected_backend_ = "mpiio";
+    } else if (selected == 3) {
+        RankMemoryBamInput *memory = new RankMemoryBamInput();
+        const double header_t0 = GetTime();
+        if (memory->Open(path) != 0) local_ok = 0;
+        header_open_cost_ = GetTime() - header_t0;
+        backend_ = memory;
+        selected_backend_ = "rank-memory";
     } else {
         local_ok = 0;
     }
@@ -402,6 +505,58 @@ void MpiBamInput::Close() {
     data_open_cost_ = 0.0;
     header_open_cost_ = 0.0;
     auto_memory_budget_ = 0;
+    simulation_prepare_cost_ = 0.0;
+}
+
+char *MpiBamInput::memory_range(uint64_t offset, size_t size) const {
+    if (const RankMemoryBamInput *memory =
+            dynamic_cast<const RankMemoryBamInput *>(backend_)) {
+        return memory->memory_range(offset, size);
+    }
+    if (MemoryBamInput *memory = dynamic_cast<MemoryBamInput *>(backend_)) {
+        if (offset <= memory->size() && size <= memory->size() - (size_t)offset)
+            return memory->data() + (size_t)offset;
+    }
+    return nullptr;
+}
+
+int MpiBamInput::PreparePlan(MpiBamInputPlan *plan, int root, MPI_Comm comm) {
+    simulation_prepare_cost_ = 0.0;
+    RankMemoryBamInput *memory = dynamic_cast<RankMemoryBamInput *>(backend_);
+    // Start the physical scan only after every rank has entered the timed phase.
+    if (memory) MPI_Barrier(comm);
+    if (!backend_ || PrepareMpiBamInputPlan(*backend_, plan, root, comm) != 0)
+        return -1;
+    if (!memory) return 0;
+
+    int rank = 0;
+    MPI_Comm_rank(comm, &rank);
+    double scan_read_cost = rank == root ? memory->scan_read_cost() : 0.0;
+    MPI_Bcast(&scan_read_cost, 1, MPI_DOUBLE, root, comm);
+    // All ranks wait for the root's physical scan reads. Exclude that same cost
+    // everywhere, but retain header parsing, index construction and broadcasts.
+    simulation_prepare_cost_ = scan_read_cost;
+    MPI_Barrier(comm);
+    const double load_t0 = GetTime();
+    const int local_ok = memory->Load(plan->rank_spans(), plan->rank_block_count()) == 0;
+    const int ready = AllRanksOk(local_ok, comm);
+    const double load_cost = GetTime() - load_t0;
+    simulation_prepare_cost_ += load_cost;
+    data_open_cost_ = simulation_prepare_cost_;
+    fprintf(stderr,
+            "[rank %d] rank-memory preload offset=%llu bytes=%zu blocks=%zu "
+            "load_wait_s=%.6f scan_disk_s=%.6f excluded_prepare_s=%.6f ok=%d\n",
+            rank, (unsigned long long)(plan->rank_block_count()
+                ? plan->rank_spans()[0].offset : plan->body_offset),
+            plan->rank_block_count() ? (size_t)(plan->rank_spans()[plan->rank_block_count()-1].offset +
+                plan->rank_spans()[plan->rank_block_count()-1].compressed_size - plan->rank_spans()[0].offset) : 0,
+            plan->rank_block_count(), load_cost, scan_read_cost,
+            simulation_prepare_cost_, local_ok);
+    fflush(stderr);
+    const double prepare_max = ReduceMaxCost(simulation_prepare_cost_, root, comm);
+    if (rank == root)
+        printf("222Complete the input open cost %lf-- (rank-local preparation)\n", prepare_max);
+    return ready ? 0 : -1;
 }
 
 MpiFileOutput::MpiFileOutput() : file_(MPI_FILE_NULL) {}

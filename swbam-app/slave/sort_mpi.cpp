@@ -458,9 +458,13 @@ extern "C" void slave_mpi_sort_bucket_pack(MpiSortBucketPackPara paras[64]) {
         MpiSortRecordMetaShared dst = *src;
         dst.raw_offset = raw_in_bucket;
         para->send_meta[meta_pos] = dst;
-        sort_copy_record_bytes(para->send_raw + raw_pos,
-                               para->local_raw + src->raw_offset,
-                               src->raw_len);
+        // CPE byte stores can read/modify/write a shared machine word.
+        // The MPE copies the interval's edge records after all CPEs join.
+        if (i != para->record_begin && i + 1 != para->record_end) {
+            sort_copy_record_bytes(para->send_raw + raw_pos,
+                                   para->local_raw + src->raw_offset,
+                                   src->raw_len);
+        }
     }
     para->pack_cycles = (uint64_t)(sort_slave_cycle_now() - pack_t0);
     para->total_cycles = (uint64_t)(sort_slave_cycle_now() - total_t0);

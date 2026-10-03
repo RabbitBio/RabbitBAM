@@ -96,7 +96,7 @@ static int collate_decode_block(
         uint64_t *crc_cycles) {
     if (!input || !output || !z ||
         input->length < BLOCK_HEADER_LENGTH + BLOCK_FOOTER_LENGTH) {
-        return -1;
+        return COLLATE_EXTRACT_BAD_BGZF;
     }
     size_t capacity =
         output->length > 0 &&
@@ -113,7 +113,7 @@ static int collate_decode_block(
         *inflate_cycles +=
             (uint64_t)(collate_cycle_now() - t0);
     }
-    if (ret != 0) return -1;
+    if (ret != 0) return COLLATE_EXTRACT_INFLATE;
 
     uint32_t expected_crc = collate_read_le32(
         input->data + input->length - 8);
@@ -124,7 +124,7 @@ static int collate_decode_block(
         *crc_cycles +=
             (uint64_t)(collate_cycle_now() - t0);
     }
-    if (actual_crc != expected_crc) return -1;
+    if (actual_crc != expected_crc) return COLLATE_EXTRACT_CRC;
     output->length = (unsigned int)output_len;
     output->pos = 0;
     output->errcode = 0;
@@ -151,11 +151,13 @@ extern "C" void slave_mpi_collate_extract(
     unsigned long total_t0 = collate_cycle_now();
     struct libdeflate_decompressor *z =
         collate_get_decompressor(id, &para->decomp_alloc_cycles);
-    if (!z || collate_decode_block(
+    const int decode_status = !z ? COLLATE_EXTRACT_DECOMP_ALLOC :
+              collate_decode_block(
                   para->input_block, para->un_comp_block, z,
                   &para->decomp_inflate_cycles,
-                  &para->decomp_crc_cycles) != 0) {
-        para->status = -2;
+                  &para->decomp_crc_cycles);
+    if (decode_status != 0) {
+        para->status = decode_status;
         para->decomp_total_cycles =
             (uint64_t)(collate_cycle_now() - total_t0);
         return;
@@ -193,7 +195,7 @@ extern "C" void slave_mpi_collate_extract(
         const uint16_t flag = collate_read_le16(body + 14);
         if (RB_COLLATE_UNLIKELY(
                 l_qname == 0 || raw_len < 36u + l_qname)) {
-            para->status = -2;
+            para->status = COLLATE_EXTRACT_QNAME_LENGTH;
             break;
         }
         const unsigned char *qname = record + 36;
@@ -202,7 +204,7 @@ extern "C" void slave_mpi_collate_extract(
             collate_hash_qname(qname, l_qname, &qname_len);
         if (RB_COLLATE_UNLIKELY(
                 qname_len >= l_qname || qname[qname_len] != 0)) {
-            para->status = -2;
+            para->status = COLLATE_EXTRACT_QNAME_NUL;
             break;
         }
 

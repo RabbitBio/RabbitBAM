@@ -2363,8 +2363,7 @@ static int MdBuildOnePassBoundaryPlan(
         }
     }
 
-    if (!first_has || probe.first_last_tid < 0 ||
-        probe.last_first_tid < 0) {
+    if (!first_has) {
         local_ok = 0;
     }
     if (local_ok && previous_rank >= 0) {
@@ -2375,8 +2374,9 @@ static int MdBuildOnePassBoundaryPlan(
         const int64_t needed = cut.first_coord >
                 INT64_MAX - max_read_length
             ? INT64_MAX : cut.first_coord + max_read_length;
-        local_ok = MdCompareCoord(halo_ref, halo_coord,
-                                  cut.first_ref, needed) >= 0;
+        local_ok = probe.first_last_tid >= 0 &&
+            MdCompareCoord(halo_ref, halo_coord,
+                           cut.first_ref, needed) >= 0;
     }
     if (local_ok && next_rank >= 0) {
         const MdCoordBoundary &cut =
@@ -2386,8 +2386,10 @@ static int MdBuildOnePassBoundaryPlan(
         const int64_t needed = cut.first_coord <
                 INT64_MIN + max_read_length
             ? INT64_MIN : cut.first_coord - max_read_length;
-        local_ok = MdCompareCoord(halo_ref, halo_coord,
-                                  cut.first_ref, needed) <= 0;
+        // An unmapped file tail needs no right halo on the final rank.
+        local_ok = probe.last_first_tid >= 0 &&
+            MdCompareCoord(halo_ref, halo_coord,
+                           cut.first_ref, needed) <= 0;
     }
     int coverage_ok = 0;
     MPI_Allreduce(&local_ok, &coverage_ok, 1, MPI_INT, MPI_MIN,
@@ -4845,6 +4847,7 @@ struct MdOnePassContext {
     uint64_t retired_records;
     long long launched_output_blocks;
     long long written_output_blocks;
+    long long processed_batches;
 
     MdOnePassContext()
         : rank(0), comm_size(1), max_read_length(300), memory_limit(0),
@@ -4854,7 +4857,8 @@ struct MdOnePassContext {
           boundary_plan(nullptr), window(nullptr), prepared_outputs(0),
           compression_running(0), captured_blocks(0), retired_blocks(0),
           captured_records(0), retired_records(0),
-          launched_output_blocks(0), written_output_blocks(0) {
+          launched_output_blocks(0), written_output_blocks(0),
+          processed_batches(0) {
         memset(&fallback_payload, 0, sizeof(fallback_payload));
         memset(prepared_payload, 0, sizeof(prepared_payload));
         compress_level = 1;
@@ -5516,9 +5520,26 @@ static int MdPostProcessOnePassBatch(
         int progress_tid, int progress_pos,
         uint64_t records_so_far,
         MdExtractBatchView *batch) {
-    (void)records_so_far;
     MdOnePassContext *context = (MdOnePassContext *)opaque;
     if (!context || !context->stats || !context->sink) return -1;
+
+    static const bool diagnostics = MdEnvFlagEnabled("SWBAM_MARKDUP_DIAG");
+    const long long batch_index = context->processed_batches + 1;
+    const bool trace = diagnostics &&
+        (batch_index == 1 || batch_index % 512 == 0 || !batch);
+    const auto mark = [&](const char *stage) {
+        if (!trace) return;
+        fprintf(stderr,
+                "[rank %d] markdup_diag batch=%lld stage=%s progress=%d:%d "
+                "records=%llu pending=%zu captured=%lld retired=%lld "
+                "output_bytes=%llu\n",
+                context->rank, batch_index, stage, progress_tid, progress_pos,
+                (unsigned long long)records_so_far, context->pending.size(),
+                context->captured_blocks, context->retired_blocks,
+                (unsigned long long)context->sink->size());
+        fflush(stderr);
+    };
+    mark("begin");
 
     if (MdOnePassLaunchOutput(context) != 0) return -1;
     int local_ok = MdOnePassInitWindow(context) == 0;
@@ -5526,6 +5547,7 @@ static int MdPostProcessOnePassBatch(
         MdOnePassFinishOutput(context);
         return -1;
     }
+    mark("window-ready");
     double buffer_t0 = GetTime();
     local_ok = MdOnePassCaptureBatch(
         context, batch, *local_candidates) == 0;
@@ -5534,6 +5556,7 @@ static int MdPostProcessOnePassBatch(
         MdOnePassFinishOutput(context);
         return -1;
     }
+    mark("capture-done");
 
     if (context->boundary_plan &&
         context->boundary_plan->MayContainBatch(*local_candidates)) {
@@ -5558,6 +5581,7 @@ static int MdPostProcessOnePassBatch(
     const long long previous_owner_candidates =
         context->stats->owner_candidates;
     const long long previous_qname_bytes = context->stats->qname_bytes;
+    mark("candidate-exchange.begin");
     if (MdExchangeCandidatesByCoordinate(
             local_candidates, local_qnames,
             *context->range_has_records,
@@ -5573,7 +5597,9 @@ static int MdPostProcessOnePassBatch(
     }
     context->stats->owner_candidates += previous_owner_candidates;
     context->stats->qname_bytes += previous_qname_bytes;
+    mark("candidate-exchange.done");
 
+    mark("window-process.begin");
     local_ok = MpiMarkdupStreamingWindowProcessOptimistic(
         context->window, context->owner_candidates,
         context->owner_qnames, progress_tid, progress_pos, context->rank,
@@ -5589,14 +5615,19 @@ static int MdPostProcessOnePassBatch(
         MdOnePassFinishOutput(context);
         return -1;
     }
+    mark("window-process.done");
+    mark("decision-exchange.begin");
     if (MdOnePassRouteDecisions(context) != 0) {
         MdOnePassFinishOutput(context);
         return -1;
     }
+    mark("decision-exchange.done");
     context->owner_candidates.clear();
     context->owner_qnames.clear();
 
+    mark("compress.begin");
     if (MdOnePassFinishOutput(context) != 0) return -1;
+    mark("compress.done");
     if (MdOnePassPrepareOutput(context) != 0) return -1;
 
     const double memcheck_t0 = GetTime();
@@ -5645,7 +5676,10 @@ static int MdPostProcessOnePassBatch(
             context->rank, "one-pass decoded block window") == 0;
     }
     context->stats->t_extract_memcheck += GetTime() - memcheck_t0;
-    return MdAllRanksOk(local_ok) ? 0 : -1;
+    if (!MdAllRanksOk(local_ok)) return -1;
+    ++context->processed_batches;
+    mark("done");
+    return 0;
 }
 
 static int MdDrainOnePassOutput(MdOnePassContext *context) {
@@ -6934,7 +6968,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
     int local_ok = 1;
     swbam::mpi::MpiBamInput input_handle;
     swbam::BamInputBackend *input_backend = nullptr;
-    swbam::MemoryBamInput *memory_input = nullptr;
+    bool memory_input = false;
     swbam::mpi::MpiBamInputPlan input_plan;
     sam_hdr_t *header = nullptr;
     long long body_start = 0;
@@ -7018,13 +7052,12 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                          input_backend->format() != bam)) {
             local_ok = 0;
         }
-        memory_input = dynamic_cast<swbam::MemoryBamInput *>(
-            input_backend);
+        memory_input = input_handle.is_memory();
         if (local_ok && !use_streaming && !memory_input) {
             if (rank == 0) {
                 fprintf(stderr,
                         "ERROR: non-streaming markdup currently requires "
-                        "--io-backend memory; use --stream for POSIX/MPI-IO.\n");
+                        "a memory input backend; use --stream for POSIX/MPI-IO.\n");
             }
             local_ok = 0;
         }
@@ -7088,8 +7121,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
             printf("MPI BAM output compression level=%d\n",
                    cmd_info->compress_level_);
         }
-        if (swbam::mpi::PrepareMpiBamInputPlan(
-                *input_backend, &input_plan) != 0) {
+        if (input_handle.PreparePlan(&input_plan) != 0) {
             local_ok = 0;
         }
         n_blocks = (long long)input_plan.blocks.size();
@@ -7120,19 +7152,16 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                     expected += rank_spans[i].compressed_size;
                 }
             }
-            if (local_ok &&
-                (start > memory_input->size() ||
-                 rank_input_size > memory_input->size() -
-                     (size_t)start)) {
+            reader.base = input_handle.memory_range(start, rank_input_size);
+            if (local_ok && !reader.base) {
                 local_ok = 0;
             }
             if (local_ok) {
-                reader.base = memory_input->data() + (size_t)start;
                 reader.size = rank_input_size;
                 reader.pos = 0;
             }
         }
-        stage41_cost = MdReduceMax(GetTime() - t0);
+        stage41_cost = MdReduceMax(GetTime() - t0 - input_handle.simulation_prepare_cost());
         if (rank == 0 && local_ok) {
             printf("MPI BAM scan complete. data_blocks=%lld "
                    "body_start=%lld\n",
@@ -7590,7 +7619,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
 
     {
         double body_total_cost =
-            MdReduceMax(GetTime() - body_total_t0);
+            MdReduceMax(GetTime() - body_total_t0 - input_handle.simulation_prepare_cost());
         if (rank == 0 && local_ok) {
             printf("444Complete the total body cost %lf\n",
                    body_total_cost);

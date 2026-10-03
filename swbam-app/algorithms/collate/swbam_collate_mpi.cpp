@@ -49,6 +49,7 @@ namespace {
 typedef MpiCollateRecordMetaShared CollateMeta;
 
 const int kCollateCpes = 64;
+const size_t kCollateRawAlignment = 64;
 const size_t kCollateControlReserve = 16ull * 1024 * 1024;
 const size_t kCollateSimScratch = 8ull * 1024 * 1024;
 const size_t kCollateExchangeRaw = 32ull * 1024 * 1024;
@@ -163,12 +164,17 @@ private:
 
 struct CollateRawArena {
     unsigned char *data;
+    // Includes inter-block padding; records retain their unpadded raw_len.
     size_t size;
     size_t capacity;
 
     CollateRawArena() : data(nullptr), size(0), capacity(0) {}
-    ~CollateRawArena() {
+    ~CollateRawArena() { Reset(); }
+
+    void Reset() {
         if (data) aligned_free_custom(data);
+        data = nullptr;
+        size = capacity = 0;
     }
 
 private:
@@ -181,6 +187,23 @@ static int CollateAllRanksOk(int local_ok) {
     MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT,
                   MPI_MIN, MPI_COMM_WORLD);
     return global_ok;
+}
+
+static bool CollateDiagEnabled() {
+    static const bool enabled = []() {
+        const char *value = getenv("SWBAM_COLLATE_DIAG");
+        return value && strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static void CollateDiagStage(int rank, const char *stage,
+                             size_t records, size_t bytes) {
+    if (!CollateDiagEnabled()) return;
+    fprintf(stderr,
+            "[rank %d] collate_diag stage=%s records=%zu bytes=%zu\n",
+            rank, stage, records, bytes);
+    fflush(stderr);
 }
 
 static double CollateReduceMax(double local) {
@@ -200,6 +223,28 @@ static uint32_t CollateReadLe32(const unsigned char *p) {
 static uint32_t CollateBgzfISize(const bam_block &block) {
     if (block.length < 4) return 0;
     return CollateReadLe32(block.data + block.length - 4);
+}
+
+static size_t CollateRawBlockStride(uint32_t isize) {
+    // CPE unaligned stores can read/modify/write an entire machine word.
+    // Isolate concurrent decoders even when the BAM records are block-aligned.
+    return ((size_t)isize + kCollateRawAlignment - 1) &
+           ~(kCollateRawAlignment - 1);
+}
+
+static const char *CollateExtractError(int status) {
+    switch (status) {
+        case 0: return "output-size-or-count";
+        case -3: return "record-capacity";
+        case -4: return "record-boundary";
+        case COLLATE_EXTRACT_BAD_BGZF: return "bgzf-header";
+        case COLLATE_EXTRACT_DECOMP_ALLOC: return "decompressor-allocation";
+        case COLLATE_EXTRACT_INFLATE: return "inflate";
+        case COLLATE_EXTRACT_CRC: return "crc";
+        case COLLATE_EXTRACT_QNAME_LENGTH: return "qname-length";
+        case COLLATE_EXTRACT_QNAME_NUL: return "qname-terminator";
+        default: return "unknown";
+    }
 }
 
 static int CollateOwner(uint32_t bin, int bins, int ranks) {
@@ -439,11 +484,12 @@ static int CollateEstimateRawBytes(
         }
         uint32_t isize =
             CollateReadLe32(src + length - 4);
+        const size_t stride = CollateRawBlockStride(isize);
         if (isize > BGZF_MAX_BLOCK_SIZE ||
-            (size_t)isize > SIZE_MAX - total) {
+            stride > SIZE_MAX - total) {
             return -1;
         }
-        total += (size_t)isize;
+        total += stride;
         pos += (size_t)length;
     }
     *raw_bytes = total;
@@ -528,12 +574,13 @@ static int CollateEstimateRawBytes(
         if (count == 0) break;
         for (int i = 0; i < count; ++i) {
             const uint32_t isize = CollateBgzfISize(blocks.blocks[i]);
+            const size_t stride = CollateRawBlockStride(isize);
             if (isize > BGZF_MAX_BLOCK_SIZE ||
-                (size_t)isize > SIZE_MAX - total) {
+                stride > SIZE_MAX - total) {
                 result = -1;
                 break;
             }
-            total += (size_t)isize;
+            total += stride;
         }
         if (result != 0) break;
     }
@@ -602,14 +649,15 @@ public:
         for (size_t b = 0; b < active; ++b) {
             MpiCollateExtractPara &para = paras_[b];
             const uint32_t isize = CollateBgzfISize(compressed.blocks()[b]);
+            const size_t stride = CollateRawBlockStride(isize);
             if (isize > BGZF_MAX_BLOCK_SIZE ||
                 (raw_ && (raw_pos > raw_->capacity ||
-                          isize > raw_->capacity - raw_pos))) {
+                          stride > raw_->capacity - raw_pos))) {
                 ret = -1;
                 break;
             }
             // App-owned descriptors keep the pipeline's decoded arenas intact.
-            // Memory mode decodes directly into the persistent raw arena.
+            // Memory mode decodes directly into disjoint, aligned arena slots.
             destinations_[b] = decoded->blocks()[b];
             if (raw_ && isize) destinations_[b].data = raw_->data + raw_pos;
             destinations_[b].length = isize;
@@ -622,7 +670,7 @@ public:
             para.record_capacity = MPI_RECORDS_PER_BLOCK;
             para.n_bins = bins_;
             para.global_block_index = global_begin_ + local_block_ + (long long)b;
-            raw_pos += isize;
+            raw_pos += stride;
         }
         if (ret == 0 && raw_) raw_->size = raw_pos;
         stats_->t_extract_setup += GetTime() - t0;
@@ -642,9 +690,11 @@ public:
                 para.n_records < 0 || para.n_records > MPI_RECORDS_PER_BLOCK) {
                 fprintf(stderr,
                         "ERROR: collate extract failed at global block %lld "
-                        "status=%d record=%d.\n",
+                        "status=%d record=%d reason=%s raw=%zu expected=%zu.\n",
                         global_begin_ + local_block_ + (long long)b,
-                        para.status, para.record_index);
+                        para.status, para.record_index,
+                        CollateExtractError(para.status),
+                        para.raw_used, para.raw_capacity);
                 ret = -1;
                 break;
             }
@@ -722,7 +772,9 @@ static int CollateExtractAllImpl(
         MpiCollateStats *stats) {
     const double t0 = GetTime();
     if (raw->data) return -1;
-    if (raw_capacity) raw->data = aligned_alloc_custom(64, raw_capacity);
+    if (raw_capacity) {
+        raw->data = aligned_alloc_custom(kCollateRawAlignment, raw_capacity);
+    }
     stats->t_extract_raw_resize += GetTime() - t0;
     if (raw_capacity && !raw->data) return -1;
     raw->capacity = raw_capacity;
@@ -811,6 +863,21 @@ static int CollatePackRange(
     return 0;
 }
 
+// Each directed edge sends one terminal header, including empty edges.
+// After that, only the unfinished direction participates in Sendrecv.
+static int CollateExchangeHeader(
+        int send_to, const unsigned long long *send_header,
+        bool send_done, int recv_from,
+        unsigned long long *recv_header, bool recv_done) {
+    MPI_Status status;
+    return MPI_Sendrecv(
+        send_header, 3, MPI_UNSIGNED_LONG_LONG,
+        send_done ? MPI_PROC_NULL : send_to, kCollateTagHeader,
+        recv_header, 3, MPI_UNSIGNED_LONG_LONG,
+        recv_done ? MPI_PROC_NULL : recv_from, kCollateTagHeader,
+        MPI_COMM_WORLD, &status) == MPI_SUCCESS ? 0 : -1;
+}
+
 static int CollateSendRecvBytes(
         int send_to, const char *send_data,
         size_t send_size, int recv_from,
@@ -825,11 +892,14 @@ static int CollateSendRecvBytes(
         int recv_count = (int)std::min<size_t>(
             recv_size - received, INT_MAX);
         MPI_Status status;
+        // A zero-count message still needs a matching receive; omit it entirely.
         if (MPI_Sendrecv(
                 send_count ? (void *)(send_data + sent) : nullptr,
-                send_count, MPI_BYTE, send_to, tag,
+                send_count, MPI_BYTE,
+                send_count ? send_to : MPI_PROC_NULL, tag,
                 recv_count ? recv_data + received : nullptr,
-                recv_count, MPI_BYTE, recv_from, tag,
+                recv_count, MPI_BYTE,
+                recv_count ? recv_from : MPI_PROC_NULL, tag,
                 MPI_COMM_WORLD, &status) != MPI_SUCCESS) {
             return -1;
         }
@@ -951,7 +1021,10 @@ static int CollateExchangeMemory(
         }
         bounds[(size_t)owner + 1] = pos;
     }
-    if (pos != records.size()) return -1;
+    if (pos != records.size()) {
+        CollateDiagStage(rank, "exchange_bad_bounds", pos, records.size());
+        return -1;
+    }
 
     std::vector<unsigned long long> send_counts(
         (size_t)comm_size, 0);
@@ -1041,9 +1114,23 @@ static int CollateExchangeMemory(
         size_t send_pos = bounds[(size_t)send_to];
         const size_t send_end =
             bounds[(size_t)send_to + 1];
+        if (CollateDiagEnabled()) {
+            fprintf(stderr,
+                    "[rank %d] collate_diag exchange_step=%d send_to=%d "
+                    "recv_from=%d send_records=%zu recv_records=%llu "
+                    "recv_raw=%llu\n",
+                    rank, step, send_to, recv_from,
+                    send_end - send_pos,
+                    recv_counts[(size_t)recv_from],
+                    recv_raw_bytes_total[(size_t)recv_from]);
+            fflush(stderr);
+        }
         CollateMemorySegment segment;
         if (reserve_segment(recv_from, true,
                             &segment) != 0) {
+            CollateDiagStage(rank, "exchange_reserve_failed",
+                             (size_t)recv_counts[(size_t)recv_from],
+                             (size_t)recv_raw_bytes_total[(size_t)recv_from]);
             return -1;
         }
         if (step == 0) {
@@ -1062,12 +1149,13 @@ static int CollateExchangeMemory(
             if (send_end > send_pos) ++stats->exchange_chunks;
             send_pos = send_end;
         } else {
-            bool send_done = send_pos >= send_end;
+            bool send_done = false;
             bool recv_done = false;
+            size_t chunks = 0;
             while (!send_done || !recv_done) {
                 size_t send_raw_bytes = 0;
                 size_t chunk_end = send_pos;
-                if (!send_done) {
+                if (send_pos < send_end) {
                     chunk_end = CollateChunkEnd(
                         records, send_pos, send_end,
                         meta_capacity, send_raw.size(),
@@ -1097,17 +1185,10 @@ static int CollateExchangeMemory(
                     chunk_end >= send_end ? 1ull : 0ull
                 };
                 unsigned long long recv_header[3] = {};
-                MPI_Status status;
                 double mpi_t0 = GetTime();
-                if (MPI_Sendrecv(
-                        send_header, 3,
-                        MPI_UNSIGNED_LONG_LONG,
-                        send_to, kCollateTagHeader,
-                        recv_header, 3,
-                        MPI_UNSIGNED_LONG_LONG,
-                        recv_from, kCollateTagHeader,
-                        MPI_COMM_WORLD, &status) !=
-                    MPI_SUCCESS) {
+                if (CollateExchangeHeader(
+                        send_to, send_header, send_done,
+                        recv_from, recv_header, recv_done) != 0) {
                     return -1;
                 }
                 size_t recv_count =
@@ -1160,14 +1241,32 @@ static int CollateExchangeMemory(
                 }
                 send_pos = chunk_end;
                 send_done = send_header[2] != 0;
-                recv_done = recv_header[2] != 0;
+                recv_done = recv_done || recv_header[2] != 0;
+                ++chunks;
+                if (CollateDiagEnabled() && chunks % 16 == 0) {
+                    fprintf(stderr,
+                            "[rank %d] collate_diag exchange_step=%d "
+                            "chunks=%zu send_done=%d recv_done=%d\n",
+                            rank, step, chunks,
+                            (int)send_done, (int)recv_done);
+                    fflush(stderr);
+                }
             }
+        }
+        if (segment.records.size() != recv_counts[(size_t)recv_from] ||
+            segment.raw_size != recv_raw_bytes_total[(size_t)recv_from]) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: collate exchange totals mismatch "
+                    "from rank %d.\n", rank, recv_from);
+            return -1;
         }
         if (!segment.records.empty()) {
             stats->received_records +=
                 (long long)segment.records.size();
             segments->push_back(std::move(segment));
         }
+        CollateDiagStage(rank, "exchange_step_done", step,
+                         segments->size());
     }
     stats->t_exchange += GetTime() - exchange_t0;
     return 0;
@@ -1373,6 +1472,13 @@ public:
         int ret = 0;
         for (size_t b = 0; b < count; ++b) {
             if (swbam::AppendBgzfBlock(sink_, blocks + b) != 0) {
+                int rank = -1;
+                MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+                fprintf(stderr,
+                        "[rank %d] ERROR: collate rank body append failed "
+                        "output_bytes=%llu block_bytes=%zu errno=%d (%s).\n",
+                        rank, (unsigned long long)sink_->size(),
+                        (size_t)blocks[b].length, errno, strerror(errno));
                 ret = -1;
                 break;
             }
@@ -1610,7 +1716,8 @@ static int CollateGatherOutput(
         MpiCollateStats *stats,
         CollateOutputStageCosts *costs,
         double stage41_cost, double stage42_cost,
-        double stage43_cost, double body_total_t0) {
+        double stage43_cost, double body_total_t0,
+        double input_prepare_cost = 0.0) {
     memset(costs, 0, sizeof(*costs));
 
     double stage44_t0 = GetTime();
@@ -1808,7 +1915,7 @@ static int CollateGatherOutput(
 
     {
         double body_total_cost =
-            CollateReduceMax(GetTime() - body_total_t0);
+            CollateReduceMax(GetTime() - body_total_t0 - input_prepare_cost);
         if (rank == 0 && local_ok) {
             printf("444Complete the total body cost %lf\n",
                    body_total_cost);
@@ -2523,7 +2630,7 @@ static int CollateExchangeRuns(
             const size_t send_end =
                 bounds[(size_t)send_to + 1];
             CollateSegment segment;
-            bool send_done = send_pos >= send_end;
+            bool send_done = false;
             bool recv_done = false;
             if (step == 0) {
                 while (send_pos < send_end) {
@@ -2572,7 +2679,7 @@ static int CollateExchangeRuns(
                 while (!send_done || !recv_done) {
                     size_t send_raw_bytes = 0;
                     size_t chunk_end = send_pos;
-                    if (!send_done) {
+                    if (send_pos < send_end) {
                         double pack_t0 = GetTime();
                         chunk_end =
                             CollateChunkEndPtr(
@@ -2605,17 +2712,10 @@ static int CollateExchangeRuns(
                             ? 1ull : 0ull
                     };
                     unsigned long long recv_header[3] = {};
-                    MPI_Status status;
                     double mpi_t0 = GetTime();
-                    if (MPI_Sendrecv(
-                            send_header, 3,
-                            MPI_UNSIGNED_LONG_LONG,
-                            send_to, kCollateTagHeader,
-                            recv_header, 3,
-                            MPI_UNSIGNED_LONG_LONG,
-                            recv_from, kCollateTagHeader,
-                            MPI_COMM_WORLD, &status) !=
-                        MPI_SUCCESS) {
+                    if (CollateExchangeHeader(
+                            send_to, send_header, send_done,
+                            recv_from, recv_header, recv_done) != 0) {
                         return -1;
                     }
                     const size_t recv_count =
@@ -2670,7 +2770,7 @@ static int CollateExchangeRuns(
                     }
                     send_pos = chunk_end;
                     send_done = send_header[2] != 0;
-                    recv_done = recv_header[2] != 0;
+                    recv_done = recv_done || recv_header[2] != 0;
                 }
             }
             if (segment.record_count > 0) {
@@ -3359,19 +3459,26 @@ static int OptimizedBamMemoryCollateMPIImpl(
               &records, &raw, stats);
     int local_extract_ok = extract_ret == 0;
     if (!CollateAllRanksOk(local_extract_ok)) {
+        CollateDiagStage(rank, "extract_failed", records.size(), raw.size);
         return -1;
     }
+    CollateDiagStage(rank, "extract_done", records.size(), raw.size);
 
     // 2. 本地排序
     CollateSortRecords(
         &records, raw.data, raw.size, bins, stats);
+    CollateDiagStage(rank, "sort_done", records.size(), raw.size);
 
     // 3. 跨 rank 交换：让相同 QNAME 去同一个 owner rank
     if (CollateExchangeMemory(
             records, raw.data, raw.size, rank, comm_size,
             bins, &segments, stats) != 0) {
+        CollateDiagStage(rank, "exchange_failed", records.size(),
+                         segments.size());
         return -1;
     }
+    CollateDiagStage(rank, "exchange_done", records.size(),
+                     segments.size());
     double memory_track_t0 = GetTime();
 
     // 4. 统计内存占用
@@ -3427,12 +3534,38 @@ static int OptimizedBamMemoryCollateMPIImpl(
 
     stats->segments = (long long)segments.size();
     stats->t_memory_track += GetTime() - memory_track_t0;
+    CollateDiagStage(rank, "memory_track_done", records.size(), tracked);
+    // All segments own their data, including the compact copy of self records.
+    // Keep the exchange peak above, but release the source before output grows.
+    const size_t local_records = records.size();
+    const size_t released_bytes =
+        records.capacity() * sizeof(CollateMeta) + raw.capacity;
+    double release_t0 = GetTime();
+    std::vector<CollateMeta>().swap(records);
+    raw.Reset();
+    stats->t_extract_free += GetTime() - release_t0;
+    CollateDiagStage(rank, "exchange_source_released",
+                     local_records, released_bytes);
     // 6. 合并 segments 并输出
     if (CollateMergeMemory(
             segments, compress_level,
             &body_sink, stats) != 0) {
+        CollateDiagStage(rank, "merge_failed", local_records,
+                         segments.size());
+        if (CollateDiagEnabled()) {
+            fprintf(stderr,
+                    "[rank %d] collate_diag merge_failure_detail "
+                    "output_bytes=%llu bgzf_blocks=%lld "
+                    "fill_s=%.6f compress_s=%.6f write_s=%.6f\n",
+                    rank, (unsigned long long)body_sink.size(),
+                    stats->bgzf_blocks, stats->t_compress_fill,
+                    stats->t_compress, stats->t_write);
+            fflush(stderr);
+        }
         return -1;
     }
+    CollateDiagStage(rank, "merge_done", local_records,
+                     segments.size());
     stats->t_actual = GetTime() - wall_t0;
     stats->t_optimized = stats->t_actual;
     return 0;
@@ -4049,7 +4182,7 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
     int local_ok = 1;
     swbam::mpi::MpiBamInput input_handle;
     swbam::BamInputBackend *input_backend = nullptr;
-    swbam::MemoryBamInput *memory_input = nullptr;
+    bool memory_input = false;
     swbam::mpi::MpiBamInputPlan input_plan;
     sam_hdr_t *header = nullptr;
     long long body_start = 0;
@@ -4138,8 +4271,7 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
                          input_backend->format() != bam)) {
             local_ok = 0;
         }
-        memory_input = dynamic_cast<swbam::MemoryBamInput *>(
-            input_backend);
+        memory_input = input_handle.is_memory();
         double cost = CollateReduceMax(
             input_handle.data_open_cost());
         if (rank == 0 && local_ok) {
@@ -4198,8 +4330,7 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
                 collate_bins,
                 cmd_info->compress_level_);
         }
-        if (swbam::mpi::PrepareMpiBamInputPlan(
-                *input_backend, &input_plan) != 0) {
+        if (input_handle.PreparePlan(&input_plan) != 0) {
             local_ok = 0;
         }
         n_blocks = (long long)input_plan.blocks.size();
@@ -4227,20 +4358,18 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
                     expected += spans[i].compressed_size;
                 }
             }
-            if (local_ok &&
-                (start > memory_input->size() ||
-                 rank_input_size > memory_input->size() - (size_t)start)) {
+            rank_input = input_handle.memory_range(start, rank_input_size);
+            if (local_ok && !rank_input) {
                 local_ok = 0;
             }
             if (local_ok) {
-                rank_input = memory_input->data() + (size_t)start;
                 reader.base = rank_input;
                 reader.size = rank_input_size;
                 reader.pos = 0;
             }
         }
         double cost =
-            CollateReduceMax(GetTime() - t0);
+            CollateReduceMax(GetTime() - t0 - input_handle.simulation_prepare_cost());
         stage41_cost = cost;
         if (rank == 0 && local_ok) {
             printf(
@@ -4250,6 +4379,9 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
             printf(
                 "Complete the 4.1 scan/split/broadcast/select cost %lf\n",
                 cost);
+            if (cmd_info->io_backend_ == "rank-memory") {
+                printf("Rank-local input preparation excluded; scan/index/broadcast remain counted\n");
+            }
         }
     }
     if (!CollateAllRanksOk(local_ok)) goto cleanup;
@@ -4393,7 +4525,8 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
             collate_bins,
             &stats, &output_costs,
             stage41_cost, stage42_cost,
-            stage43_cost, body_total_t0) != 0) {
+            stage43_cost, body_total_t0,
+            input_handle.simulation_prepare_cost()) != 0) {
         local_ok = 0;
     }
     if (!CollateAllRanksOk(local_ok)) goto cleanup;

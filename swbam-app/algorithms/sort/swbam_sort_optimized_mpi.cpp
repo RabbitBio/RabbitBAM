@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fcntl.h>
 #include <limits>
 #include <stdint.h>
@@ -76,6 +77,32 @@ private:
     MpiSortRawBuffer(const MpiSortRawBuffer &);
     MpiSortRawBuffer &operator=(const MpiSortRawBuffer &);
 };
+
+bool MpiSortAllRanksOk(int local_ok) {
+    int global_ok = 0;
+    MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN,
+                  MPI_COMM_WORLD);
+    return global_ok != 0;
+}
+
+void MpiSortMemoryDiag(int rank, const char *stage,
+                       size_t local_meta, size_t local_raw,
+                       size_t send_meta = 0, size_t send_raw = 0,
+                       size_t recv_meta = 0, size_t recv_raw = 0,
+                       size_t indices = 0) {
+    static const bool enabled = []() {
+        const char *value = getenv("SWBAM_SORT_MEMORY_DIAG");
+        return value && strcmp(value, "1") == 0;
+    }();
+    if (!enabled) return;
+    fprintf(stderr,
+            "[rank %d] sort_memory stage=%s local_meta=%zu local_raw=%zu "
+            "send_meta=%zu send_raw=%zu recv_meta=%zu recv_raw=%zu "
+            "indices=%zu (buffer bytes, not process RSS)\n",
+            rank, stage, local_meta, local_raw, send_meta, send_raw,
+            recv_meta, recv_raw, indices);
+    fflush(stderr);
+}
 
 
 uint16_t MpiSortReadLe16(const unsigned char *p) {
@@ -320,10 +347,17 @@ int MpiSortSendRecvBytes(int send_to, const char *send_data, long long send_len,
         if (received < recv_len) {
             recv_chunk = (int)std::min<long long>(recv_len - received, kSortExchangeChunk);
         }
-        MPI_Sendrecv(send_chunk ? (void *)(send_data + sent) : nullptr, send_chunk, MPI_BYTE,
-                     send_to, tag,
-                     recv_chunk ? (void *)(recv_data + received) : nullptr, recv_chunk, MPI_BYTE,
-                     recv_from, tag, MPI_COMM_WORLD, &status);
+        // Zero-count messages still need a peer match. Once a direction is
+        // finished, omit it so unequal chunk counts cannot wait for extra messages.
+        if (MPI_Sendrecv(send_chunk ? (void *)(send_data + sent) : nullptr,
+                         send_chunk, MPI_BYTE,
+                         send_chunk ? send_to : MPI_PROC_NULL, tag,
+                         recv_chunk ? (void *)(recv_data + received) : nullptr,
+                         recv_chunk, MPI_BYTE,
+                         recv_chunk ? recv_from : MPI_PROC_NULL, tag,
+                         MPI_COMM_WORLD, &status) != MPI_SUCCESS) {
+            return -1;
+        }
         sent += send_chunk;
         received += recv_chunk;
     }
@@ -964,8 +998,8 @@ int MpiSortChooseSplitters(const std::vector<MpiSortKey> &local_samples,
 }
 
 // MPI 分布式排序里的数据重分发阶段
-int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
-                           const MpiSortRawBuffer &local_raw,
+int MpiSortExchangeBuckets(std::vector<MpiSortRecordMeta> &local_records,
+                           MpiSortRawBuffer &local_raw,
                            const std::vector<MpiSortKey> &splitters,
                            int rank,
                            int comm_size,
@@ -984,18 +1018,34 @@ int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
     // 第一遍计算每条 record 的 bucket，以及它在目标 bucket 内的精确偏移。
     // 这些 per-record 偏移让第二遍可以由 64 个 CPE 无锁并行写 send buffers。
     double count_t0 = GetTime();
-    std::vector<int> bucket_ids(local_records.size(), 0);
-    std::vector<uint64_t> record_meta_in_bucket(local_records.size(), 0);
-    std::vector<uint64_t> record_raw_in_bucket(local_records.size(), 0);
+    std::vector<int> bucket_ids;
+    std::vector<uint64_t> record_meta_in_bucket;
+    std::vector<uint64_t> record_raw_in_bucket;
     std::vector<long long> send_meta_counts((size_t)comm_size, 0);
     std::vector<long long> recv_meta_counts((size_t)comm_size, 0);
     std::vector<long long> send_raw_counts((size_t)comm_size, 0);
     std::vector<long long> recv_raw_counts((size_t)comm_size, 0);
+    int local_ok = 1;
+    try {
+        bucket_ids.resize(local_records.size());
+        record_meta_in_bucket.resize(local_records.size());
+        record_raw_in_bucket.resize(local_records.size());
+    } catch (const std::exception &error) {
+        fprintf(stderr, "[rank %d] ERROR: sort bucket index allocation "
+                "failed records=%zu: %s.\n", rank, local_records.size(),
+                error.what());
+        local_ok = 0;
+    }
+    if (!MpiSortAllRanksOk(local_ok)) return -1;
     int current_bucket = 0;
     const int n_splitters = (int)splitters.size();
     for (size_t i = 0; i < local_records.size(); ++i) {
         const MpiSortRecordMeta &src = local_records[i];
-        if ((unsigned long long)src.raw_offset + src.raw_len > (unsigned long long)local_raw.size) return -1;
+        if (src.raw_offset > local_raw.size ||
+            src.raw_len > local_raw.size - (size_t)src.raw_offset) {
+            local_ok = 0;
+            break;
+        }
         while (current_bucket < n_splitters &&
                MpiSortCompareMetaKey(src, splitters[(size_t)current_bucket]) > 0) {
             current_bucket++;
@@ -1029,14 +1079,34 @@ int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
     if (total_send_meta < 0 || total_send_raw < 0 ||
         (unsigned long long)total_send_meta > (unsigned long long)(SIZE_MAX / sizeof(MpiSortRecordMeta)) ||
         (unsigned long long)total_send_raw > (unsigned long long)SIZE_MAX) {
-        return -1;
+        local_ok = 0;
     }
 
     // 第二遍写入一次性分配的连续发送缓冲。CPE 负责变长 raw bytes pack；
-    // 从核侧使用安全字节拷贝，允许 BAM record 起点和长度不对齐。
+    // CPEs pack interior records; the MPE copies interval edges after join,
+    // preventing unaligned stores from racing on adjacent machine words.
     double pack_t0 = GetTime();
-    std::vector<MpiSortRecordMeta> send_meta((size_t)total_send_meta);
-    std::vector<unsigned char> send_raw((size_t)total_send_raw);
+    std::vector<MpiSortRecordMeta> send_meta;
+    std::vector<unsigned char> send_raw;
+    const size_t index_bytes = bucket_ids.capacity() * sizeof(int) +
+        (record_meta_in_bucket.capacity() + record_raw_in_bucket.capacity()) *
+            sizeof(uint64_t);
+    MpiSortMemoryDiag(rank, "allocate-send",
+        local_records.capacity() * sizeof(MpiSortRecordMeta), local_raw.capacity,
+        (size_t)total_send_meta * sizeof(MpiSortRecordMeta),
+        (size_t)total_send_raw, 0, 0, index_bytes);
+    if (local_ok) {
+        try {
+            send_meta.resize((size_t)total_send_meta);
+            send_raw.resize((size_t)total_send_raw);
+        } catch (const std::exception &error) {
+            fprintf(stderr, "[rank %d] ERROR: sort send allocation failed "
+                    "records=%lld raw_bytes=%lld: %s.\n", rank,
+                    total_send_meta, total_send_raw, error.what());
+            local_ok = 0;
+        }
+    }
+    if (!MpiSortAllRanksOk(local_ok)) return -1;
     MpiSortBucketPackPara pack_paras[kSortCpeBlocks];
     size_t n_records = local_records.size();
     size_t base_records = n_records / kSortCpeBlocks;
@@ -1093,23 +1163,60 @@ int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
         (unsigned long long)total_raw > (unsigned long long)SIZE_MAX) {
         recv_layout_ok = 0;
     }
-    if (recv_layout_ok) {
-        // 分配接收空间
-        recv_records->assign((size_t)total_meta, MpiSortRecordMeta());
-        recv_raw->assign((size_t)total_raw, 0);
-    }
     athread_join();
-    *bucket_pack_time += GetTime() - pack_t0;
-    if (!recv_layout_ok) return -1;
     for (int c = 0; c < kSortCpeBlocks; ++c) {
         if (pack_paras[c].status != 0) {
             fprintf(stderr,
                     "ERROR: MPI sort bucket pack failed on CPE %d status=%d record=%d actual=%lld limit=%lld.\n",
                     c, pack_paras[c].status, pack_paras[c].record_index,
                     pack_paras[c].actual_value, pack_paras[c].limit_value);
-            return -1;
+            recv_layout_ok = 0;
+            continue;
+        }
+        const size_t first = pack_paras[c].record_begin;
+        const size_t end = pack_paras[c].record_end;
+        if (first == end) continue;
+        const size_t edges[2] = {first, end - 1};
+        for (int edge = 0; edge < (end - first == 1 ? 1 : 2); ++edge) {
+            const size_t i = edges[edge];
+            const MpiSortRecordMeta &src = local_records[i];
+            const int bucket = bucket_ids[i];
+            const uint64_t offset = (uint64_t)send_raw_displs[(size_t)bucket] +
+                                    record_raw_in_bucket[i];
+            memcpy(send_raw.data() + (size_t)offset,
+                   local_raw.data + src.raw_offset, src.raw_len);
         }
     }
+    // The send buffers now own every record. Release the source only after
+    // CPE join and MPE edge copies, before receive buffers add another raw copy.
+    double release_t0 = GetTime();
+    std::vector<MpiSortRecordMeta>().swap(local_records);
+    MpiSortRawRelease(&local_raw);
+    std::vector<int>().swap(bucket_ids);
+    std::vector<uint64_t>().swap(record_meta_in_bucket);
+    std::vector<uint64_t>().swap(record_raw_in_bucket);
+    const double release_cost = GetTime() - release_t0;
+    *cleanup_time += release_cost;
+    MpiSortMemoryDiag(rank, "allocate-receive", 0, 0,
+        send_meta.capacity() * sizeof(MpiSortRecordMeta), send_raw.capacity(),
+        (size_t)total_meta * sizeof(MpiSortRecordMeta), (size_t)total_raw);
+    if (recv_layout_ok) {
+        try {
+            recv_records->assign((size_t)total_meta, MpiSortRecordMeta());
+            recv_raw->assign((size_t)total_raw, 0);
+        } catch (const std::exception &error) {
+            fprintf(stderr, "[rank %d] ERROR: sort receive allocation failed "
+                    "records=%lld raw_bytes=%lld: %s.\n", rank,
+                    total_meta, total_raw, error.what());
+            recv_layout_ok = 0;
+        }
+    }
+    *bucket_pack_time += GetTime() - pack_t0 - release_cost;
+    // All ranks must have receive storage before any rank enters Sendrecv.
+    if (!MpiSortAllRanksOk(recv_layout_ok)) return -1;
+    MpiSortMemoryDiag(rank, "receive-ready", 0, 0,
+        send_meta.capacity() * sizeof(MpiSortRecordMeta), send_raw.capacity(),
+        recv_records->capacity() * sizeof(MpiSortRecordMeta), recv_raw->capacity());
 
     // MPI rank 间交换 metadata 和 raw bytes。counts 交换已在 CPE pack 期间完成，
     // 这里主要记录 self copy + 环形 Sendrecv 的非掩盖时间。
@@ -1159,6 +1266,9 @@ int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
         }
     }
     *exchange_time += GetTime() - exch_t0;
+    MpiSortMemoryDiag(rank, "exchange-done", 0, 0,
+        send_meta.capacity() * sizeof(MpiSortRecordMeta), send_raw.capacity(),
+        recv_records->capacity() * sizeof(MpiSortRecordMeta), recv_raw->capacity());
 
     double offset_t0 = GetTime();
     for (int src = 0; src < comm_size; ++src) {
@@ -1183,7 +1293,6 @@ int MpiSortExchangeBuckets(const std::vector<MpiSortRecordMeta> &local_records,
 
     // 显式释放大容量发送缓冲，使析构/释放成本进入日志，而不是落在未计时区间。
     double cleanup_t0 = GetTime();
-    std::vector<int>().swap(bucket_ids);
     std::vector<MpiSortRecordMeta>().swap(send_meta);
     std::vector<unsigned char>().swap(send_raw);
     *cleanup_time += GetTime() - cleanup_t0;
@@ -3226,6 +3335,8 @@ static int OptimizedBamSortMPIImpl(
         local_records.reserve(compressed_input_size / 64);
     }
     stats->t_setup += GetTime() - setup_t0;
+    MpiSortMemoryDiag(rank, "setup",
+        local_records.capacity() * sizeof(MpiSortRecordMeta), local_raw.capacity);
 
     //2. 把本 rank 负责的 BGZF blocks 解析成：local_records 和 local_raw
     // local_records：record metadata，包括 tid/pos/flag/global_order/raw_offset/raw_len
@@ -3243,6 +3354,8 @@ static int OptimizedBamSortMPIImpl(
     if (extract_ret != 0) {
         return -1;
     }
+    MpiSortMemoryDiag(rank, "extracted",
+        local_records.capacity() * sizeof(MpiSortRecordMeta), local_raw.capacity);
 #if RABBITBAM_SORT_ENABLE_SANITY_CHECKS
     if (MpiSortValidateMetaRawBuffer(local_records, local_raw.data,
                                      local_raw.size, nullptr,
@@ -3330,11 +3443,6 @@ static int OptimizedBamSortMPIImpl(
                                 rank, "exchange") != 0) {
         return -1;
     }
-
-    double cleanup_t0 = GetTime();
-    std::vector<MpiSortRecordMeta>().swap(local_records);
-    MpiSortRawRelease(&local_raw);
-    stats->t_cleanup += GetTime() - cleanup_t0;
 
     //6. 对收到的全局数据再排序
     t0 = GetTime();

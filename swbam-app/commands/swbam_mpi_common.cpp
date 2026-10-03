@@ -745,6 +745,11 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
     bool bam_to_bam = false;
     bool bam_to_sam = false;
     bool sam_to_bam = false;
+    const bool rank_memory_input = cmd_info->io_backend_ == "rank-memory";
+    bool memory_bam_input = false;
+    double input_prepare_cost = 0.0;
+    double sam_header_open_cost = 0.0;
+    uint64_t rank_sam_offset = 0;
     bool backend_bam_input =
         (output_format == bam || output_format == sam) &&
         MpiHasSuffix(cmd_info->in_file_name_, ".bam");
@@ -753,8 +758,14 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         MpiHasSuffix(cmd_info->in_file_name_, ".sam") &&
         (cmd_info->io_backend_ == "posix" ||
          cmd_info->io_backend_ == "mpiio" ||
-         cmd_info->io_backend_ == "auto");
+         cmd_info->io_backend_ == "auto" || rank_memory_input);
     bool mpiio_output = cmd_info->io_output_backend_ == "mpiio";
+
+    if (rank_memory_input && !backend_bam_input && !streaming_sam_input) {
+        if (rank == 0) fprintf(stderr,
+            "ERROR: rank-memory conversion requires .bam or uncompressed .sam input.\n");
+        local_ok = 0;
+    }
 
     if (swbam::ParseByteSize(
             cmd_info->rank_body_memory_limit_,
@@ -792,7 +803,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
     }
 
 
-    //2.把文件加载到所有rank的内存中，一共6份，每个rank一份，后续每个rank从内存中读取自己的部分进行处理；不计入处理时间
+    // Whole-file memory loads here; rank-memory opens metadata and loads after splitting.
     {
         double preload_t0 = GetTime();
         if (backend_bam_input) {
@@ -804,6 +815,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 local_ok = 0;
             } else {
                 backend_input = backend_input_handle.backend();
+                memory_bam_input = backend_input_handle.is_memory();
                 input_file_size = backend_input->size();
                 swbam::MemoryBamInput *memory_input =
                     dynamic_cast<swbam::MemoryBamInput *>(backend_input);
@@ -820,6 +832,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             } else {
                 input_file_size = sam_input->size();
             }
+            if (rank_memory_input) sam_header_open_cost = GetTime() - preload_t0;
         } else if (MpiLoadFileToMemory(
                        cmd_info->in_file_name_, &input_file_mem,
                        &input_file_size) != 0) {
@@ -829,7 +842,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         }
         double preload_cost = backend_bam_input
             ? backend_input_handle.data_open_cost()
-            : GetTime() - preload_t0;
+            : (rank_memory_input ? 0.0 : GetTime() - preload_t0);
         double preload_cost_max = MpiReduceMaxCost(preload_cost);
         if (rank == 0 && local_ok) {
             if (backend_bam_input) {
@@ -838,7 +851,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                        (unsigned long long)backend_input_handle.auto_memory_budget());
             } else if (streaming_sam_input) {
                 printf("MPI SAM input backend=%s\n",
-                       cmd_info->io_backend_ == "mpiio"
+                       rank_memory_input ? "rank-memory" : cmd_info->io_backend_ == "mpiio"
                            ? "mpiio" : "posix");
             }
             printf("222Complete the memory/input open cost %lf--\n", preload_cost_max);
@@ -982,7 +995,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
 
         double header_cost = backend_bam_input
             ? backend_input_handle.header_open_cost()
-            : GetTime() - header_t0;
+            : sam_header_open_cost + GetTime() - header_t0;
         double header_cost_max = MpiReduceMaxCost(header_cost);
         if (rank == 0 && local_ok) {
             // t_total += header_cost_max;
@@ -997,6 +1010,8 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         double body_total_t0 = GetTime();
         double body_t0 = GetTime();
         double stage41_t0 = GetTime();
+        double sam_split_disk_cost = 0.0;
+        if (rank_memory_input && streaming_sam_input) MPI_Barrier(MPI_COMM_WORLD);
         //4.1 rank 0 扫描 BGZF blocks
         if (rank == 0) {
             const char *mode_name = sam_to_bam ? "SAM2BAM" : (bam_to_sam ? "BAM2SAM" : "BAM2BAM");
@@ -1025,7 +1040,10 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                            n_blocks, body_start, (long long)sin->fp.bgzf->block_address);
                 }
             } else if (input_format == sam) {
-                int split_ret = streaming_sam_input
+                int split_ret = rank_memory_input && streaming_sam_input
+                    ? posix_sam_input.SplitRanges(
+                          comm_size, &block_offsets, &block_lengths, &sam_split_disk_cost)
+                    : streaming_sam_input
                     ? sam_input->SplitRanges(
                           comm_size, &block_offsets, &block_lengths)
                     : MpiSplitSamRangesInMemory(
@@ -1044,8 +1062,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         }
 
         if (backend_bam_input) {
-            if (swbam::mpi::PrepareMpiBamInputPlan(
-                    *backend_input, &backend_plan) != 0) {
+            if (backend_input_handle.PreparePlan(&backend_plan) != 0) {
                 fprintf(stderr, "[rank %d] ERROR: failed to prepare MPI BAM input plan.\n", rank);
                 local_ok = 0;
             } else {
@@ -1057,6 +1074,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                            backend_input_handle.selected_backend().c_str());
                 }
             }
+            input_prepare_cost = backend_input_handle.simulation_prepare_cost();
         } else {
             // 把 block 信息广播给所有 rank。
             MPI_Bcast(&local_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -1074,6 +1092,12 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         }
         if (!MpiAllRanksOk(local_ok)) goto cleanup;
 
+        if (rank_memory_input && streaming_sam_input) {
+            MPI_Bcast(&sam_split_disk_cost, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+            input_prepare_cost = sam_split_disk_cost;
+            MPI_Barrier(MPI_COMM_WORLD);
+        }
+
         // 按 rank 切分 block 范围。memory 保留连续窗口快速路径，
         // POSIX 只计算当前 rank 的压缩字节数，4.3 内按 batch 读取。
         size_t rank_input_size = 0;
@@ -1089,7 +1113,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 }
                 rank_input_size += block_size;
             }
-            if (local_ok && input_file_mem &&
+            if (local_ok && memory_bam_input &&
                 backend_plan.rank_begin < backend_plan.rank_end) {
                 const swbam::BgzfBlockSpan &first =
                     backend_plan.blocks[backend_plan.rank_begin];
@@ -1103,7 +1127,8 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                     fprintf(stderr, "[rank %d] ERROR: memory backend assigned BAM blocks are not contiguous.\n", rank);
                     local_ok = 0;
                 } else {
-                    rank_input_mem = input_file_mem + (size_t)first.offset;
+                    rank_input_mem = backend_input_handle.memory_range(first.offset, rank_input_size);
+                    if (!rank_input_mem) local_ok = 0;
                 }
             }
         } else if (input_format == bam) {
@@ -1130,7 +1155,10 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                     local_ok = 0;
                 } else {
                     if (streaming_sam_input) {
-                        if (sam_input->ReadRange(
+                        if (rank_memory_input) {
+                            rank_sam_offset = (uint64_t)start;
+                            rank_input_size = (size_t)len;
+                        } else if (sam_input->ReadRange(
                                 (uint64_t)start, (size_t)len,
                                 &rank_sam_storage) != 0) {
                             fprintf(stderr, "[rank %d] ERROR: failed to read assigned POSIX SAM range.\n", rank);
@@ -1147,23 +1175,52 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 }
             }
         }
-        double stage41_cost = GetTime() - stage41_t0;
+        if (rank_memory_input && streaming_sam_input) {
+            // Every rank validates its range before entering the collective load phase.
+            if (!MpiAllRanksOk(local_ok)) goto cleanup;
+            const double preload_t0 = GetTime();
+            if (sam_input->ReadRange(rank_sam_offset, rank_input_size,
+                                     &rank_sam_storage) != 0) {
+                fprintf(stderr, "[rank %d] ERROR: failed to preload assigned SAM range.\n", rank);
+                local_ok = 0;
+            }
+            const int preload_ok = MpiAllRanksOk(local_ok);
+            const double load_cost = GetTime() - preload_t0;
+            input_prepare_cost += load_cost;
+            if (local_ok) rank_input_mem = rank_sam_storage.empty()
+                ? nullptr : rank_sam_storage.data();
+            fprintf(stderr, "[rank %d] rank-memory SAM preload "
+                    "offset=%llu bytes=%zu load_wait_s=%.6f "
+                    "split_disk_s=%.6f excluded_prepare_s=%.6f ok=%d\n",
+                    rank, (unsigned long long)rank_sam_offset, rank_input_size,
+                    load_cost, sam_split_disk_cost, input_prepare_cost, local_ok);
+            if (!preload_ok) goto cleanup;
+        }
+        double stage41_cost = GetTime() - stage41_t0 - input_prepare_cost;
         double stage41_cost_max = MpiReduceMaxCost(stage41_cost);
         if (rank == 0 && local_ok) {
             printf("Complete the 4.1 scan/split/broadcast/select cost %lf\n", stage41_cost_max);
+        }
+        if (rank_memory_input && streaming_sam_input) {
+            const double prepare_max = MpiReduceMaxCost(input_prepare_cost);
+            if (rank == 0 && local_ok)
+                printf("222Complete the memory/input open cost %lf-- (rank-local preparation)\n", prepare_max);
         }
 
         //4.2 初始化内存 reader 和 writer
         double stage42_t0 = GetTime();
         if (local_ok) {
-            if (!backend_bam_input || input_file_mem) {
+            if (!backend_bam_input || memory_bam_input) {
                 reader.base = rank_input_mem;
                 reader.size = rank_input_size;
                 reader.pos = 0;
             }
             size_t writer_capacity = rank_input_size ? rank_input_size : 64 * 1024 * 1024;
             if (bam_to_sam && rank_input_size > 0) {
-                if (rank_input_size > SIZE_MAX / 5) {
+                if (rank_memory_input) {
+                    // Grow with actual SAM output, rather than reserving 5x the input up front.
+                    writer_capacity = std::min<size_t>(rank_input_size, 64u * 1024u * 1024u);
+                } else if (rank_input_size > SIZE_MAX / 5) {
                     fprintf(stderr, "[rank %d] ERROR: MPI BAM2SAM memory writer estimate overflow.\n", rank);
                     local_ok = 0;
                 } else {
@@ -1200,7 +1257,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                                  (bam_to_sam ? "OptimizedBamToSamMPI" : "OptimizedBamToBamMPI");
         double OptimizedBamToBamMPI_t0 = GetTime();
         if (bam_to_sam) {
-            int ret = backend_bam_input && !input_file_mem
+            int ret = backend_bam_input && !memory_bam_input
                 ? OptimizedBamToSamMPI(
                       *backend_input, backend_plan.rank_spans(),
                       backend_plan.rank_block_count(), body_sink,
@@ -1220,7 +1277,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 local_ok = 0;
             }
         } else {
-            int ret = backend_bam_input && !input_file_mem
+            int ret = backend_bam_input && !memory_bam_input
                 ? OptimizedBamToBamMPI(
                       *backend_input, backend_plan.rank_spans(),
                       backend_plan.rank_block_count(), body_sink,
@@ -1437,7 +1494,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         if (simulated_write_guard == (unsigned long long)-1 && rank < 0) {
             fprintf(stderr, "unused simulated write guard %llu\n", simulated_write_guard);
         }
-        double body_cost = GetTime() - body_t0;
+        double body_cost = GetTime() - body_t0 - input_prepare_cost;
         double body_cost_max = MpiReduceMaxCost(body_cost);
         if (rank == 0 && global_ok) {
             double body_counted_cost = stage41_cost_max + stage42_cost_max +
@@ -1634,7 +1691,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             printf("Complete the 4.7 rank stats reduce/print cost %lf\n", stage47_cost_max);
         }
 
-        double body_total_cost = GetTime() - body_total_t0;
+        double body_total_cost = GetTime() - body_total_t0 - input_prepare_cost;
         double body_total_cost_max = MpiReduceMaxCost(body_total_cost);
         if (rank == 0 && global_ok) {
             printf("444Complete the total body cost %lf\n", body_total_cost_max);

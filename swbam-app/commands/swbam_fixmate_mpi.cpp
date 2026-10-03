@@ -1013,7 +1013,8 @@ static int FmGatherOutput(
         int rank, int comm_size, MpiFixmateStats *stats,
         FmOutputStageCosts *costs,
         double stage41_cost, double stage42_cost,
-        double stage43_cost, double body_total_t0) {
+        double stage43_cost, double body_total_t0,
+        double input_prepare_cost = 0.0) {
     memset(costs, 0, sizeof(*costs));
 
     double stage44_t0 = GetTime();
@@ -1163,7 +1164,7 @@ static int FmGatherOutput(
 
     {
         const double body_total_cost =
-            FmReduceMax(GetTime() - body_total_t0);
+            FmReduceMax(GetTime() - body_total_t0 - input_prepare_cost);
         if (rank == 0 && local_ok) {
             printf("444Complete the total body cost %lf\n",
                    body_total_cost);
@@ -1762,7 +1763,7 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
     int local_ok = 1;
     swbam::mpi::MpiBamInput input_handle;
     swbam::BamInputBackend *input_backend = nullptr;
-    swbam::MemoryBamInput *memory_input = nullptr;
+    bool memory_input = false;
     swbam::mpi::MpiBamInputPlan input_plan;
     sam_hdr_t *header = nullptr;
     long long body_start = 0;
@@ -1828,8 +1829,7 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
                          input_backend->format() != bam)) {
             local_ok = 0;
         }
-        memory_input = dynamic_cast<swbam::MemoryBamInput *>(
-            input_backend);
+        memory_input = input_handle.is_memory();
         const double cost = FmReduceMax(
             input_handle.data_open_cost());
         if (rank == 0 && local_ok) {
@@ -1888,8 +1888,7 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
             printf("MPI BAM output compression level=%d\n",
                    cmd_info->compress_level_);
         }
-        if (swbam::mpi::PrepareMpiBamInputPlan(
-                *input_backend, &input_plan) != 0) {
+        if (input_handle.PreparePlan(&input_plan) != 0) {
             local_ok = 0;
         }
         n_blocks = (long long)input_plan.blocks.size();
@@ -1918,19 +1917,16 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
                     expected += rank_spans[i].compressed_size;
                 }
             }
-            if (local_ok &&
-                (start > memory_input->size() ||
-                 rank_input_size > memory_input->size() -
-                     (size_t)start)) {
+            reader.base = input_handle.memory_range(start, rank_input_size);
+            if (local_ok && !reader.base) {
                 local_ok = 0;
             }
             if (local_ok) {
-                reader.base = memory_input->data() + (size_t)start;
                 reader.size = rank_input_size;
                 reader.pos = 0;
             }
         }
-        stage41_cost = FmReduceMax(GetTime() - t0);
+        stage41_cost = FmReduceMax(GetTime() - t0 - input_handle.simulation_prepare_cost());
         if (rank == 0 && local_ok) {
             printf("MPI BAM scan complete. data_blocks=%lld "
                    "body_start=%lld\n", n_blocks, body_start);
@@ -2058,7 +2054,7 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
             rank, comm_size,
             &stats, &output_stage_costs,
             stage41_cost, stage42_cost, stage43_cost,
-            body_total_t0) != 0) {
+            body_total_t0, input_handle.simulation_prepare_cost()) != 0) {
         local_ok = 0;
     }
     if (!FmAllRanksOk(local_ok)) goto cleanup;

@@ -72,6 +72,10 @@ app 不依赖库源码目录；MPI、athread 和神威工具链仍由部署环�
 
 - `active_blocks <= operator.batch_capacity()`，当前 CPE 标准批容量为 64 blocks。
 - 所有 arena 必须在 launch 前确定容量，CPE 不进行不可控动态扩容。
+- 不同 CPE 并行写入的 arena slice 必须逐片按 64 字节对齐、补齐占用跨度，
+  不能只保证字节区间不重叠：神威未对齐写可能读改写整个机器字，破坏邻片边界。
+  collate 内排按 `align_up(ISIZE, 64)` 分配解压槽，容量/offset 包含 padding，
+  但实际 ISIZE 和 record 长度不变，padding 不进入后续记录打包或 BAM 输出。
 - backend read、kernel status、容量上限、解析和 post-processing 任一失败均终止
   当前 rank；MPI command 再通过 `AllRanksOk` 保证所有 rank 一致退出。
 - 失败 batch 不得向后续处理暴露部分有效结果。
@@ -89,6 +93,49 @@ app 不依赖库源码目录；MPI、athread 和神威工具链仍由部署环�
 - operator 可细分 kernel 内的 decode/parse/business 时间，但不得重复计入 total。
 - MPI scan/partition、跨 rank reduce 和最终打印由 command 单独计时。
 - memory backend 的文件预加载和最终 dump 不计入算法核心时间。
+
+### Rank-local 内存输入
+
+`MpiBamInput::Open(..., "rank-memory", ...)` 只打开文件和 header；随后调用
+`MpiBamInput::PreparePlan()`，由 root 扫描 BGZF 块并广播原有全局计划，再按
+`rank_begin/rank_end` 将每个 rank 的连续压缩块读入独立内存缓存。切分规则、
+全局 block index 与原 memory 路径一致，不按记录切块。空区间不分配 payload。
+
+backend 的 `size()`、`body_offset()`、header 和 `BgzfBlockSpan::offset` 仍指向
+完整文件的全局坐标；`memory_range(offset, size)` 将全局范围映射到本地缓存。
+`ReadBatch()` 只读取驻留缓存，越界返回失败，不在算法核心中偷偷读盘。
+缓存由 `MpiBamInput` 管理，直到 `Close()` 有效；适配器借用缓存构造原有
+`MemReader`，不额外复制本 rank 的整个输入。该输入 slice 本身不是完整 BAM。
+
+计时仍采用模拟 SSD 口径：`simulation_prepare_cost()` 为 root 扫描时的物理
+`pread` 时间（所有 rank 同样扣除）加各 rank 预加载阶段的 allocation/load/wait。
+4.1 与 `444Complete the total body cost` 仅扣除此值；扫描解析、索引分配、
+分区/广播、内存批次读取和正常算法计算保留。日志输出每 rank 的 offset/bytes/
+blocks 和 excluded_prepare_s；实际 load 在 4.1 内发生，因此新的 222 汇总行
+在计划准备完成后输出，不能将整段 4.1 当作排除时间。
+
+四步 standalone 命令、`run_all` 的 BAM 输入及 `dedup-workflow` 使用同一适配器；flagstat/stats 可用于
+大文件重读验证。旧 `memory`、POSIX、MPI-IO、全内存 `dedup-pipeline` 与 SDK
+示例不改变行为。算法 workspace、交换缓冲、rank 输出 body 和模拟输出复制仍
+另占内存；该缓存方式不保证 D3 能进行内排，D3 仍需按容量预算使用外排。
+
+`run_all --io-backend rank-memory` 同时支持 BAM→BAM/filter、BAM→SAM、SAM→BAM。
+BAM 的本地 reader 与完整输入 header 指针分离：分片数据通过 `memory_range()`
+借用，输出 BAM header 通过现有 header writer 构造，不把本地 body 当作 BAM 前缀。
+直通/过滤、SAM 格式化和 SAM 解析 CPE kernels 及四条流水线均保持原实现。
+
+SAM 输入限未压缩 `.sam` 文件。root 通过现有 `PosixSamInput::SplitRanges()`
+将字节边界前进到完整行起点并广播；每 rank 只将所属区间读入
+`rank_sam_storage`，再交给原 SAM read 流水线。新增可选的物理读盘计时，不改变
+旧 POSIX/MPI-IO 行划分规则。新模式在 4.1/444 中排除 root 边界查找的真实读盘
+和本 rank allocation/load/wait，但保留完整行边界解析、分区、广播及内存读取。
+所有 rank 先一致校验区间，再进入预加载完成归约；单 rank 读取失败一致退出。
+
+新模式的 BAM→SAM 将 initial writer capacity 限制为最多 64 MiB，不再按压缩
+分片大小一次预分配五倍。后续输出按原 memory sink 扩容规则增长，扩容及数据搬移
+仍在正常核心计时内。本轮没有引入 discard/bounded sink；大 SAM 输出的完整 rank
+body、扩容瞬时峰值和 4.6 模拟复制仍需容量探测。MPI-IO 最终 dump 可避免 root
+全量收集，但不能减少核心阶段的这些内存需求。
 
 ## Operator 组合原则
 
@@ -305,6 +352,12 @@ arena 指针，避免一次解压后 raw 拷贝；remote receive 直接写最终
 pipeline buffer 的地址。全局稳定序号仍由 `global_block_begin + local_block + b`
 和 block 内记录号生成。
 
+内排 exchange 返回后，self/remote segment 均独立拥有 raw 和 metadata；此时立即
+释放提取阶段的原始 records/raw，再开始 merge 输出，避免原始数据与扩容后的
+rank body 重叠驻留。工作集峰值仍按释放前统计。ring exchange 的收发方向独立
+结束，每条连接发送一次终止 header，结束方向用 `MPI_PROC_NULL`，空 payload
+不发送零长度匹配消息；内排与外排共用该协议，允许各 rank 的 chunk 数不一致。
+
 写端复用 sort 已接入的 `overlap_source=true`，保持 `compress(current)` 与
 `flush(previous) + Fill(next)` 的覆盖。内排 fill 直接调用 loser tree，外排 fill
 保留原 cursor 的延迟 advance 和一条记录 lookahead；batch 切换不改变记录次序。
@@ -315,8 +368,9 @@ pipeline buffer 的地址。全局稳定序号仍由 `global_block_begin + local
 公共读端仍分配 decoded 双缓冲，本轮未扩展自定义 arena 分配接口。
 
 核心 `4.3`、`4.1~4.6` 计时边界保持不变；`compress_pipeline` 含被覆盖的 MPE
-flush/fill，不能把它与 `compress_fill`、`write` 相加。`extract_alloc/free` 现在只
-统计算子 metadata 池，公共 batch 的分配释放仍包含在核心总时间内。
+flush/fill，不能把它与 `compress_fill`、`write` 相加。`extract_alloc` 统计算子
+metadata 池；`extract_free` 还包含内排 exchange 后原始 records/raw 的提前释放。
+公共 batch 的分配释放仍包含在核心总时间内。
 外排保留 `actual - temp_read_actual - temp_write_actual` 的模拟时间模型，模拟
 memcpy 已在 actual 内，不能重复相加。旧 `accounted/unaccounted` 分项未统一扣除
 真实临时 I/O，外排会出现负 unaccounted，不能将其解释为漏计的 CPU 时间。

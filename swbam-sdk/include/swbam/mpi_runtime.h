@@ -94,6 +94,18 @@ public:
     double data_open_cost() const { return data_open_cost_; }
     double header_open_cost() const { return header_open_cost_; }
     uint64_t auto_memory_budget() const { return auto_memory_budget_; }
+    bool is_memory() const {
+        return selected_backend_ == "memory" || selected_backend_ == "rank-memory";
+    }
+    // File-global offsets; nullptr means the range is not resident.
+    char *memory_range(uint64_t offset, size_t size) const;
+    // Collective: scan/partition first, then preload only the assigned BGZF blocks.
+    // Required before ReadBatch/memory_range with rank-memory; all callers must
+    // use the same communicator as Open. Other backends keep the original plan.
+    int PreparePlan(MpiBamInputPlan *plan, int root = 0,
+                    MPI_Comm comm = MPI_COMM_WORLD);
+    // Remove only physical scan reads and rank-cache preparation from body timing.
+    double simulation_prepare_cost() const { return simulation_prepare_cost_; }
 
 private:
     MpiBamInput(const MpiBamInput &);
@@ -104,6 +116,7 @@ private:
     double data_open_cost_;
     double header_open_cost_;
     uint64_t auto_memory_budget_;
+    double simulation_prepare_cost_;
 };
 
 class MpiFileOutput {

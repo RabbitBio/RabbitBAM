@@ -841,7 +841,7 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
     int local_ok = 1;
     swbam::mpi::MpiBamInput input_handle;
     swbam::BamInputBackend *input_backend = nullptr;
-    swbam::MemoryBamInput *memory_input = nullptr;
+    bool memory_input = false;
     swbam::mpi::MpiBamInputPlan input_plan;
     sam_hdr_t *hdr = nullptr;
     char *rank_input_mem = nullptr;
@@ -914,7 +914,7 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
                          MpiSortNormalizeFormat(input_backend->format()) != bam)) {
             local_ok = 0;
         }
-        memory_input = dynamic_cast<swbam::MemoryBamInput *>(input_backend);
+        memory_input = input_handle.is_memory();
         double open_cost_max = MpiSortReduceMaxCost(
             input_handle.data_open_cost());
         if (rank == 0 && local_ok) {
@@ -962,8 +962,7 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
                    comm_size, comm_size * 64);
             printf("MPI BAM output compression level=%d\n", cmd_info->compress_level_);
         }
-        if (swbam::mpi::PrepareMpiBamInputPlan(
-                *input_backend, &input_plan) != 0) {
+        if (input_handle.PreparePlan(&input_plan) != 0) {
             local_ok = 0;
         }
         n_blocks = (long long)input_plan.blocks.size();
@@ -991,19 +990,17 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
                     expected += spans[i].compressed_size;
                 }
             }
-            if (local_ok &&
-                (start > memory_input->size() ||
-                 rank_input_size > memory_input->size() - (size_t)start)) {
+            rank_input_mem = input_handle.memory_range(start, rank_input_size);
+            if (local_ok && !rank_input_mem) {
                 local_ok = 0;
             }
             if (local_ok) {
-                rank_input_mem = memory_input->data() + (size_t)start;
                 reader.base = rank_input_mem;
                 reader.size = rank_input_size;
                 reader.pos = 0;
             }
         }
-        double stage41_cost = GetTime() - stage41_t0;
+        double stage41_cost = GetTime() - stage41_t0 - input_handle.simulation_prepare_cost();
         double stage41_cost_max = MpiSortReduceMaxCost(stage41_cost);
         if (rank == 0 && local_ok) {
             printf("MPI BAM scan complete. data_blocks=%lld body_start=%lld\n",
@@ -1445,7 +1442,7 @@ int ProcessSortMPI(CmdInfo *cmd_info) {
             printf("Complete the 4.7 rank stats reduce/print cost %lf\n", stage47_cost_max);
         }
 
-        double body_total_cost = GetTime() - body_total_t0;
+        double body_total_cost = GetTime() - body_total_t0 - input_handle.simulation_prepare_cost();
         double body_total_cost_max = MpiSortReduceMaxCost(body_total_cost);
         if (rank == 0 && global_ok) {
             printf("444Complete the total body cost %lf\n", body_total_cost_max);

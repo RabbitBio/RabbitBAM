@@ -124,7 +124,9 @@ int BgzfBlockLengthFromHeader(const unsigned char *block,
 
 int ScanBgzfBlocksBuffered(int fd, size_t file_size,
                            uint64_t body_offset,
-                           std::vector<BgzfBlockSpan> *spans) {
+                           std::vector<BgzfBlockSpan> *spans,
+                           double *physical_read_cost) {
+    if (physical_read_cost) *physical_read_cost = 0.0;
     if (fd < 0 || !spans || body_offset > file_size) return -1;
 
     const size_t window_capacity = 8u * 1024u * 1024u;
@@ -157,8 +159,11 @@ int ScanBgzfBlocksBuffered(int fd, size_t file_size,
         const size_t available =
             file_size - static_cast<size_t>(offset);
         const size_t read_size = std::min(window.size(), available);
-        if (read_size < required ||
-            ReadAt(fd, offset, window.data(), read_size) != 0) {
+        if (read_size < required) return -1;
+        const double read_t0 = physical_read_cost ? GetTime() : 0.0;
+        const int ret = ReadAt(fd, offset, window.data(), read_size);
+        if (physical_read_cost) *physical_read_cost += GetTime() - read_t0;
+        if (ret != 0) {
             return -1;
         }
         window_offset = offset;
@@ -663,13 +668,24 @@ uint64_t PosixBamInput::body_offset() const {
 
 int PosixBamInput::ScanBlocks(
         std::vector<BgzfBlockSpan> *spans) const {
+    return ScanBlocks(spans, nullptr);
+}
+
+int PosixBamInput::ScanBlocks(
+        std::vector<BgzfBlockSpan> *spans, double *physical_read_cost) const {
     if (!spans || impl_->fd < 0 || !impl_->header ||
         impl_->bam_body_offset > impl_->file_size) {
         return -1;
     }
     return ScanBgzfBlocksBuffered(
         impl_->fd, impl_->file_size,
-        impl_->bam_body_offset, spans);
+        impl_->bam_body_offset, spans, physical_read_cost);
+}
+
+int PosixBamInput::ReadRange(uint64_t offset, void *data, size_t size) const {
+    if (impl_->fd < 0 || (size && !data) || offset > impl_->file_size ||
+        size > impl_->file_size - (size_t)offset) return -1;
+    return size ? ReadAt(impl_->fd, offset, data, size) : 0;
 }
 
 int PosixBamInput::ReadBatch(
@@ -782,14 +798,18 @@ static int FindSamBodyOffsetAt(int fd, size_t file_size,
 
 static int FindSamLineBoundaryAt(int fd, size_t file_size,
                                  uint64_t target,
-                                 uint64_t *boundary) {
+                                 uint64_t *boundary,
+                                 double *physical_read_cost) {
     if (fd < 0 || !boundary || target > file_size) return -1;
     if (target == 0 || target == file_size) {
         *boundary = target;
         return 0;
     }
     char previous = 0;
-    if (ReadAt(fd, target - 1, &previous, 1) != 0) return -1;
+    double read_t0 = physical_read_cost ? GetTime() : 0.0;
+    int ret = ReadAt(fd, target - 1, &previous, 1);
+    if (physical_read_cost) *physical_read_cost += GetTime() - read_t0;
+    if (ret != 0) return -1;
     if (previous == '\n') {
         *boundary = target;
         return 0;
@@ -801,7 +821,10 @@ static int FindSamLineBoundaryAt(int fd, size_t file_size,
     while (offset < file_size) {
         const size_t length = std::min(
             chunk_size, file_size - static_cast<size_t>(offset));
-        if (ReadAt(fd, offset, buffer.data(), length) != 0) return -1;
+        read_t0 = physical_read_cost ? GetTime() : 0.0;
+        ret = ReadAt(fd, offset, buffer.data(), length);
+        if (physical_read_cost) *physical_read_cost += GetTime() - read_t0;
+        if (ret != 0) return -1;
         for (size_t i = 0; i < length; ++i) {
             if (buffer[i] == '\n') {
                 *boundary = offset + i + 1;
@@ -881,6 +904,13 @@ uint64_t PosixSamInput::body_offset() const { return impl_->sam_body_offset; }
 int PosixSamInput::SplitRanges(
         int range_count, std::vector<long long> *offsets,
         std::vector<long long> *lengths) const {
+    return SplitRanges(range_count, offsets, lengths, nullptr);
+}
+
+int PosixSamInput::SplitRanges(
+        int range_count, std::vector<long long> *offsets,
+        std::vector<long long> *lengths, double *physical_read_cost) const {
+    if (physical_read_cost) *physical_read_cost = 0.0;
     if (impl_->fd < 0 || !impl_->header || range_count <= 0 ||
         !offsets || !lengths ||
         impl_->file_size > static_cast<size_t>(
@@ -900,7 +930,7 @@ int PosixSamInput::SplitRanges(
             remainder * r / static_cast<uint64_t>(range_count);
         if (FindSamLineBoundaryAt(
                 impl_->fd, impl_->file_size, target,
-                &boundaries[static_cast<size_t>(rank)]) != 0) {
+                &boundaries[static_cast<size_t>(rank)], physical_read_cost) != 0) {
             return -1;
         }
     }
