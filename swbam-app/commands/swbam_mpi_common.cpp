@@ -1,6 +1,7 @@
 #include "swbam_mpi.h"
 #include "swbam/io.h"
 #include "swbam/mpi_runtime.h"
+#include "conversion_memory_chunks.h"
 
 #include <algorithm>
 #include <climits>
@@ -723,7 +724,21 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
     const char *sam_header_text = nullptr;
     size_t sam_header_len = 0;
     MemReader reader = {};
-    swbam::AdaptiveRankBodySink body_sink;
+    const char *conversion_chunk_env = getenv("SWBAM_CONVERSION_MEMORY");
+    const bool chunked_conversion = conversion_chunk_env != nullptr;
+    const std::string conversion_config = conversion_chunk_env ? conversion_chunk_env : "";
+    const size_t conversion_separator = conversion_config.find(':');
+    const std::string conversion_size = conversion_config.substr(0, conversion_separator);
+    const std::string conversion_keep = conversion_separator == std::string::npos
+        ? "keep" : conversion_config.substr(conversion_separator + 1);
+    const bool keep_conversion_output = conversion_keep == "keep";
+    uint64_t conversion_chunk_bytes = 0;
+    swbam_app::ConversionChunkTiming conversion_timing;
+    swbam_app::ConversionChunkOutput conversion_output;
+    swbam::AdaptiveRankBodySink adaptive_body_sink;
+    swbam::RankBodySink &body_sink = chunked_conversion
+        ? static_cast<swbam::RankBodySink &>(conversion_output)
+        : static_cast<swbam::RankBodySink &>(adaptive_body_sink);
     uint64_t rank_body_memory_limit = 0;
     MpiBamToBamStats stats = {};
     MpiBamToSamStats sam_stats = {};
@@ -760,6 +775,21 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
          cmd_info->io_backend_ == "mpiio" ||
          cmd_info->io_backend_ == "auto" || rank_memory_input);
     bool mpiio_output = cmd_info->io_output_backend_ == "mpiio";
+
+    if (chunked_conversion &&
+        (swbam::ParseByteSize(conversion_size, &conversion_chunk_bytes) != 0 ||
+         conversion_chunk_bytes < BGZF_MAX_BLOCK_SIZE ||
+         conversion_chunk_bytes > 4ull * 1024 * 1024 * 1024 ||
+         !rank_memory_input || !mpiio_output || filter_requested ||
+         cmd_info->rank_body_backend_ != "memory" ||
+         !(streaming_sam_input || (backend_bam_input && output_format == sam)) ||
+         (conversion_keep != "keep" && conversion_keep != "discard"))) {
+        if (rank == 0) fprintf(stderr,
+            "ERROR: chunked conversion requires BAM/SAM conversion, rank-memory "
+            "input, memory body, mpiio output, no filters, chunk size 64K..4G, "
+            "and SWBAM_CONVERSION_MEMORY=<size>:keep or <size>:discard.\n");
+        local_ok = 0;
+    }
 
     if (rank_memory_input && !backend_bam_input && !streaming_sam_input) {
         if (rank == 0) fprintf(stderr,
@@ -1175,7 +1205,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 }
             }
         }
-        if (rank_memory_input && streaming_sam_input) {
+        if (rank_memory_input && streaming_sam_input && !chunked_conversion) {
             // Every rank validates its range before entering the collective load phase.
             if (!MpiAllRanksOk(local_ok)) goto cleanup;
             const double preload_t0 = GetTime();
@@ -1233,11 +1263,16 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             char spool_prefix[96];
             snprintf(spool_prefix, sizeof(spool_prefix),
                      "rabbitbam-convert-rank-%d.body", rank);
-            if (local_ok && body_sink.Open(
-                    cmd_info->rank_body_backend_,
-                    rank_body_memory_limit, writer_capacity,
-                    spool_prefix,
-                    cmd_info->rank_body_temp_dir_) != 0) {
+            int open_ret = 0;
+            if (local_ok && chunked_conversion) {
+                open_ret = conversion_output.Open(keep_conversion_output,
+                    cmd_info->rank_body_temp_dir_, spool_prefix);
+            } else if (local_ok) {
+                open_ret = adaptive_body_sink.Open(cmd_info->rank_body_backend_,
+                    rank_body_memory_limit, writer_capacity, spool_prefix,
+                    cmd_info->rank_body_temp_dir_);
+            }
+            if (local_ok && open_ret != 0) {
                 fprintf(stderr,
                         "[rank %d] ERROR: failed to open rank body sink.\n",
                         rank);
@@ -1256,7 +1291,33 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         const char *optimized_name = sam_to_bam ? "OptimizedSamToBamMPI" :
                                  (bam_to_sam ? "OptimizedBamToSamMPI" : "OptimizedBamToBamMPI");
         double OptimizedBamToBamMPI_t0 = GetTime();
-        if (bam_to_sam) {
+        if (chunked_conversion) {
+            const int ret = bam_to_sam
+                ? swbam_app::RunChunkedBamToSam(&reader, &conversion_output,
+                      hdr, (size_t)conversion_chunk_bytes, &sam_stats,
+                      &conversion_timing)
+                : swbam_app::RunChunkedSamToBam(*sam_input, rank_sam_offset,
+                      rank_input_size, &conversion_output, hdr,
+                      (size_t)conversion_chunk_bytes, cmd_info->compress_level_,
+                      &sam2bam_stats, &conversion_timing);
+            if (ret != 0) {
+                fprintf(stderr, "[rank %d] ERROR: chunked conversion failed.\n", rank);
+                local_ok = 0;
+            }
+            fprintf(stderr, "[rank %d] conversion_chunks chunks=%zu "
+                    "input_bytes=%llu output_bytes=%llu copied_bytes=%llu "
+                    "max_input=%zu max_output=%zu core_s=%.6f "
+                    "sim_write_s=%.6f preload_s=%.6f persistence_s=%.6f "
+                    "simulation_alloc_s=%.6f keep_output=%d\n",
+                    rank, conversion_timing.chunks,
+                    (unsigned long long)conversion_timing.input_bytes,
+                    (unsigned long long)body_sink.size(),
+                    (unsigned long long)conversion_timing.copied_bytes,
+                    conversion_timing.max_input, conversion_timing.max_output,
+                    conversion_timing.core, conversion_timing.simulated_write,
+                    conversion_timing.preload, conversion_timing.persistence,
+                    conversion_timing.simulation_allocation, keep_conversion_output);
+        } else if (bam_to_sam) {
             int ret = backend_bam_input && !memory_bam_input
                 ? OptimizedBamToSamMPI(
                       *backend_input, backend_plan.rank_spans(),
@@ -1292,7 +1353,8 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         }
 
         int global_ok = MpiAllRanksOk(local_ok);
-        double OptimizedBamToBamMPI_cost = GetTime() - OptimizedBamToBamMPI_t0;
+        double OptimizedBamToBamMPI_cost = chunked_conversion
+            ? conversion_timing.core : GetTime() - OptimizedBamToBamMPI_t0;
         double OptimizedBamToBamMPI_cost_max = MpiReduceMaxCost(OptimizedBamToBamMPI_cost);
         if (rank == 0 && global_ok) {
             printf("Complete the 4.3 %s cost %lf\n", optimized_name, OptimizedBamToBamMPI_cost_max);
@@ -1301,7 +1363,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         if (!global_ok) goto cleanup;
 
         {
-            const int local_spool = body_sink.is_memory() ? 0 : 1;
+            const int local_spool = chunked_conversion ? 0 : (body_sink.is_memory() ? 0 : 1);
             int spool_ranks = 0;
             MPI_Reduce(&local_spool, &spool_ranks, 1, MPI_INT,
                        MPI_SUM, 0, MPI_COMM_WORLD);
@@ -1310,12 +1372,22 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                        "memory_ranks=%d spool_ranks=%d\n",
                        cmd_info->rank_body_backend_.c_str(),
                        comm_size - spool_ranks, spool_ranks);
+                if (chunked_conversion) printf("MPI conversion body uses bounded "
+                    "memory chunks; validation persistence=%d; chunk_bytes=%llu\n",
+                    keep_conversion_output, (unsigned long long)conversion_chunk_bytes);
             }
         }
 
         //4.4 收集每个 rank 的输出大小
+        // Validation storage flush and its synchronization are preparation only.
+        if (chunked_conversion) {
+            const double flush_t0 = GetTime();
+            if (body_sink.Flush() != 0) local_ok = 0;
+            if (!MpiAllRanksOk(local_ok)) goto cleanup;
+            conversion_timing.persistence += GetTime() - flush_t0;
+        }
         double stage44_t0 = GetTime();
-        if (body_sink.Flush() != 0 ||
+        if ((!chunked_conversion && body_sink.Flush() != 0) ||
             body_sink.size() > (uint64_t)LLONG_MAX) {
             local_ok = 0;
         }
@@ -1409,9 +1481,9 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
 
         //4.5b 分配每个 rank 的本地模拟写内存，这部分不计入处理时间
         double stage45_malloc_t0 = GetTime();
-        simulated_write_size = body_sink.is_memory() &&
+        simulated_write_size = !chunked_conversion && body_sink.is_memory() &&
             local_body_size > 0 ? (size_t)local_body_size : 0;
-        if (body_sink.is_memory() && rank == 0) {
+        if ((chunked_conversion || body_sink.is_memory()) && rank == 0) {
             if (output_body_start > SIZE_MAX - simulated_write_size) {
                 fprintf(stderr, "[rank %d] ERROR: simulated output memory estimate overflow.\n", rank);
                 local_ok = 0;
@@ -1428,7 +1500,8 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             }
         }
         int stage45_malloc_ok = MpiAllRanksOk(local_ok);
-        double stage45_malloc_cost = GetTime() - stage45_malloc_t0;
+        double stage45_malloc_cost = GetTime() - stage45_malloc_t0 +
+            (chunked_conversion ? conversion_timing.simulation_allocation : 0.0);
         double stage45_malloc_cost_max = MpiReduceMaxCost(stage45_malloc_cost);
         if (rank == 0 && stage45_malloc_ok) {
             printf("Complete the 4.5b malloc simulated write memory cost %lf\n", stage45_malloc_cost_max);
@@ -1440,7 +1513,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         long long simulated_write_offset = (long long)output_body_start + local_prefix;
         (void)simulated_write_offset;
         size_t simulated_pos = 0;
-        if (body_sink.is_memory() &&
+        if ((chunked_conversion || body_sink.is_memory()) &&
             rank == 0 && output_body_start > 0) {
             if (bam_to_sam) {
                 if (sam_header_len > 0) {
@@ -1463,7 +1536,7 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
                 }
             }
         }
-        if (body_sink.is_memory() && local_body_size > 0) {
+        if (!chunked_conversion && body_sink.is_memory() && local_body_size > 0) {
             if (body_sink.ReadAt(
                     0, simulated_write_mem + simulated_pos,
                     (size_t)local_body_size) != 0) {
@@ -1477,7 +1550,8 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             simulated_write_guard += guard_ptr[0];
             simulated_write_guard += guard_ptr[simulated_pos - 1];
         }
-        double sim_write_cost = GetTime() - sim_write_t0;
+        double sim_write_cost = GetTime() - sim_write_t0 +
+            (chunked_conversion ? conversion_timing.simulated_write : 0.0);
         if (bam_to_sam) {
             sam_stats.t_gather += sim_write_cost;
         } else if (sam_to_bam) {
@@ -1494,7 +1568,16 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
         if (simulated_write_guard == (unsigned long long)-1 && rank < 0) {
             fprintf(stderr, "unused simulated write guard %llu\n", simulated_write_guard);
         }
-        double body_cost = GetTime() - body_t0 - input_prepare_cost;
+        if (chunked_conversion) {
+            const double preload_max = MpiReduceMaxCost(conversion_timing.preload);
+            const double persist_max = MpiReduceMaxCost(conversion_timing.persistence);
+            if (rank == 0) printf("Conversion excluded chunk preparation "
+                "preload_s=%.6f validation_persistence_s=%.6f\n",
+                preload_max, persist_max);
+        }
+        double body_cost = GetTime() - body_t0 - input_prepare_cost -
+            (chunked_conversion ? conversion_timing.preload +
+                conversion_timing.persistence + conversion_timing.simulation_allocation : 0.0);
         double body_cost_max = MpiReduceMaxCost(body_cost);
         if (rank == 0 && global_ok) {
             double body_counted_cost = stage41_cost_max + stage42_cost_max +
@@ -1691,7 +1774,9 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
             printf("Complete the 4.7 rank stats reduce/print cost %lf\n", stage47_cost_max);
         }
 
-        double body_total_cost = GetTime() - body_total_t0 - input_prepare_cost;
+        double body_total_cost = GetTime() - body_total_t0 - input_prepare_cost -
+            (chunked_conversion ? conversion_timing.preload +
+                conversion_timing.persistence + conversion_timing.simulation_allocation : 0.0);
         double body_total_cost_max = MpiReduceMaxCost(body_total_cost);
         if (rank == 0 && global_ok) {
             printf("444Complete the total body cost %lf\n", body_total_cost_max);
@@ -1699,7 +1784,10 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
     }
 
     //5. 输出不计入核心处理时间。MPI-IO 路径跳过 rank0 全量 gather。
-    if (mpiio_output) {
+    if (chunked_conversion && !keep_conversion_output) {
+        if (rank == 0) printf("555Skip validation dump; logical output bytes=%zu\n",
+                              output_file_size);
+    } else if (mpiio_output) {
         double mpiio_t0 = GetTime();
         swbam::mpi::MpiFileOutput output;
         if (output.Open(cmd_info->out_file_name_,
@@ -1904,7 +1992,8 @@ int ProcessSwBamMPI(CmdInfo *cmd_info) {
 cleanup:
     {
         double close_t0 = GetTime();
-        body_sink.Close();
+        if (chunked_conversion) conversion_output.Close();
+        else adaptive_body_sink.Close();
         if (output_file_mem) free(output_file_mem);
         if (bam_header_mem) free(bam_header_mem);
         if (simulated_write_mem) free(simulated_write_mem);

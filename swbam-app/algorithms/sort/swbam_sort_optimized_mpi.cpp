@@ -2146,7 +2146,8 @@ struct MpiSortStrictRunArena {
         size_t meta_bytes = records_count * sizeof(MpiSortRecordMeta);
         if (meta_bytes > meta_begin) return false;
         size_t new_meta_begin = meta_begin - meta_bytes;
-        return raw_bytes <= new_meta_begin - raw_used;
+        return raw_used <= new_meta_begin &&
+               raw_bytes <= new_meta_begin - raw_used;
     }
 };
 
@@ -2711,12 +2712,14 @@ int MpiSortStrictExchangeRuns(const std::vector<MpiSortStrictRun> &runs,
                     send_pos = send_chunk_end;
                 }
             } else {
-                bool send_done = send_pos >= send_end;
+                // Every edge sends one terminal header, even with no records.
+                // Completed directions stop participating in both transfers.
+                bool send_done = false;
                 bool recv_done = false;
                 while (!send_done || !recv_done) {
                     size_t send_raw_bytes = 0;
                     size_t send_chunk_end = send_pos;
-                    if (!send_done) {
+                    if (send_pos < send_end) {
                         send_chunk_end = MpiSortStrictChunkEnd(
                             records, send_pos, send_end, ws->meta_capacity,
                             ws->prefix_capacity, ws->raw_capacity,
@@ -2737,11 +2740,15 @@ int MpiSortStrictExchangeRuns(const std::vector<MpiSortStrictRun> &runs,
                     unsigned long long recv_header[3] = {};
                     MPI_Status mpi_status;
                     double mpi_actual_t0 = GetTime();
-                    MPI_Sendrecv(send_header, 3, MPI_UNSIGNED_LONG_LONG,
-                                 send_to, kSortStrictTagHeader,
-                                 recv_header, 3, MPI_UNSIGNED_LONG_LONG,
-                                 recv_from, kSortStrictTagHeader,
-                                 MPI_COMM_WORLD, &mpi_status);
+                    if (MPI_Sendrecv(send_header, 3, MPI_UNSIGNED_LONG_LONG,
+                                     send_done ? MPI_PROC_NULL : send_to,
+                                     kSortStrictTagHeader,
+                                     recv_header, 3, MPI_UNSIGNED_LONG_LONG,
+                                     recv_done ? MPI_PROC_NULL : recv_from,
+                                     kSortStrictTagHeader,
+                                     MPI_COMM_WORLD, &mpi_status) != MPI_SUCCESS) {
+                        return -1;
+                    }
                     size_t recv_count = (size_t)recv_header[0];
                     size_t recv_raw_bytes = (size_t)recv_header[1];
                     if (recv_count > ws->meta_capacity ||
@@ -2769,11 +2776,15 @@ int MpiSortStrictExchangeRuns(const std::vector<MpiSortStrictRun> &runs,
                     // stalls that otherwise propagate to the peer.
                     unsigned long long sim_recv_header[3] = {};
                     double mpi_sim_t0 = GetTime();
-                    MPI_Sendrecv(send_header, 3, MPI_UNSIGNED_LONG_LONG,
-                                 send_to, kSortStrictTagSimHeader,
-                                 sim_recv_header, 3, MPI_UNSIGNED_LONG_LONG,
-                                 recv_from, kSortStrictTagSimHeader,
-                                 MPI_COMM_WORLD, &mpi_status);
+                    if (MPI_Sendrecv(send_header, 3, MPI_UNSIGNED_LONG_LONG,
+                                     send_done ? MPI_PROC_NULL : send_to,
+                                     kSortStrictTagSimHeader,
+                                     sim_recv_header, 3, MPI_UNSIGNED_LONG_LONG,
+                                     recv_done ? MPI_PROC_NULL : recv_from,
+                                     kSortStrictTagSimHeader,
+                                     MPI_COMM_WORLD, &mpi_status) != MPI_SUCCESS) {
+                        return -1;
+                    }
                     if (sim_recv_header[0] != recv_header[0] ||
                         sim_recv_header[1] != recv_header[1] ||
                         sim_recv_header[2] != recv_header[2]) {
@@ -2806,7 +2817,7 @@ int MpiSortStrictExchangeRuns(const std::vector<MpiSortStrictRun> &runs,
                     }
                     send_pos = send_chunk_end;
                     send_done = send_header[2] != 0;
-                    recv_done = recv_header[2] != 0;
+                    recv_done = recv_done || recv_header[2] != 0;
                 }
             }
             if (round_io_ok && received_segment.record_count > 0) {
@@ -3613,6 +3624,7 @@ static int OptimizedBamExternalSortMPIImpl(
             std::max(0.0,
                      GetTime() - setup_t0 - stats->t_temp_open_actual);
         if (!all_ranks_ok(setup_ok)) break;
+        MpiSortMemoryDiag(rank, "external_setup_done", 0, run_arena.capacity);
 
         int generate_ret = reader
             ? MpiSortStrictGenerateRuns(
@@ -3626,6 +3638,9 @@ static int OptimizedBamExternalSortMPIImpl(
                   sim_scratch.data, sim_scratch.size, &tracker,
                   &runs, &local_samples, stats);
         int generate_ok = generate_ret == 0 ? 1 : 0;
+        MpiSortMemoryDiag(rank, "external_generate_done",
+                          run_arena.record_count * sizeof(MpiSortRecordMeta),
+                          run_arena.raw_used);
         if (!all_ranks_ok(generate_ok)) break;
         stats->external_runs = (long long)runs.size();
 
@@ -3638,6 +3653,9 @@ static int OptimizedBamExternalSortMPIImpl(
         }
         stats->sample_records = (long long)local_samples.size();
         stats->t_sample += GetTime() - sample_t0;
+        MpiSortMemoryDiag(rank, "external_sample_done",
+                          local_samples.capacity() * sizeof(MpiSortKey),
+                          splitters.capacity() * sizeof(MpiSortKey));
 
         const size_t exchange_budget = stage_budget - run_arena_bytes;
         int exchange_setup_ok =
@@ -3650,6 +3668,9 @@ static int OptimizedBamExternalSortMPIImpl(
         }
         exchange_allocated = exchange_setup_ok != 0;
         if (!all_ranks_ok(exchange_setup_ok)) break;
+        MpiSortMemoryDiag(rank, "external_exchange_begin",
+                          run_arena.record_count * sizeof(MpiSortRecordMeta),
+                          run_arena.capacity);
         if (MpiSortStrictExchangeRuns(
                 runs, splitters, &run_arena, &exchange_ws, &temp_store,
                 sim_scratch.data, sim_scratch.size, rank, comm_size,
@@ -3657,6 +3678,9 @@ static int OptimizedBamExternalSortMPIImpl(
             break;
         }
         stats->external_segments = (long long)segments.size();
+        MpiSortMemoryDiag(rank, "external_exchange_done",
+                          segments.capacity() * sizeof(MpiSortStrictSegment),
+                          run_arena.capacity);
         MpiSortStrictFreeExchange(&tracker, &exchange_ws);
         exchange_allocated = false;
         MpiSortStrictFree(&tracker, &run_arena_memory);
@@ -3685,6 +3709,8 @@ static int OptimizedBamExternalSortMPIImpl(
             break;
         }
         stats->external_segments = (long long)segments.size();
+        MpiSortMemoryDiag(rank, "external_consolidate_done",
+                          segments.capacity() * sizeof(MpiSortStrictSegment), 0);
         if (MpiSortStrictMergeCompress(
                 segments, &tracker, &temp_store, sim_scratch.data,
                 sim_scratch.size, body_sink, compress_level,
@@ -3692,6 +3718,9 @@ static int OptimizedBamExternalSortMPIImpl(
             break;
         }
         (void)global_sample_count;
+        MpiSortMemoryDiag(rank, "external_merge_done",
+                          segments.capacity() * sizeof(MpiSortStrictSegment),
+                          (size_t)body_sink.size());
         ret = 0;
     } while (false);
 

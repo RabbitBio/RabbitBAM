@@ -2,8 +2,10 @@
 #include "swbam/mpi_runtime.h"
 #include "swbam/operators/bam_read_batch.h"
 #include "swbam/cpe_record_write_adapter.h"
+#include "simulated_write_buffer.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -409,6 +411,20 @@ static int FmCompressPlans(
     }
     // Finish flushes the final BGZF batch before the caller frees rewritten records.
     if (ret == 0) ret = session->Finish();
+    if (ret != 0) {
+        const int saved_errno = errno;
+        const swbam::AdaptiveRankBodySink *body =
+            dynamic_cast<const swbam::AdaptiveRankBodySink *>(writer);
+        const MemWriter *buffer = body ? body->memory_writer() : nullptr;
+        fprintf(stderr,
+                "[rank %d] ERROR: fixmate record write failed "
+                "records=%zu output_bytes=%llu memory_capacity=%zu "
+                "errno=%d (%s).\n",
+                rank, records.size(),
+                writer ? (unsigned long long)writer->size() : 0ull,
+                buffer ? buffer->capacity : 0, saved_errno,
+                strerror(saved_errno));
+    }
     const swbam::cpe::CpeRecordWriteMetrics &metrics = session->metrics();
     stats->t_compress += metrics.compress;
     stats->t_write += metrics.write;
@@ -1083,16 +1099,27 @@ static int FmGatherOutput(
     }
 
     double stage45_malloc_t0 = GetTime();
-    const size_t simulated_write_size = local_writer.is_memory()
-        ? (size_t)local_writer.size() +
-            (rank == 0 ? header_size + sizeof(kFixmateBgzfEofBlock) : 0)
-        : 0;
-    char *simulated_write_mem =
-        simulated_write_size ? (char *)malloc(simulated_write_size)
-                             : nullptr;
-    if (simulated_write_size && !simulated_write_mem) {
+    const size_t simulation_body_size = local_writer.is_memory()
+        ? (size_t)local_writer.size() : 0;
+    const size_t simulation_envelope_size = local_writer.is_memory() && rank == 0
+        ? header_size + sizeof(kFixmateBgzfEofBlock) : 0;
+    swbam_app::SimulatedWriteBuffer simulated_write;
+    if (simulated_write.Allocate(
+            simulation_body_size, simulation_envelope_size) != 0) {
+        fprintf(stderr,
+                "[rank %d] ERROR: fixmate simulated write allocation failed "
+                "body_bytes=%llu buffer_bytes=%zu errno=%d (%s).\n",
+                rank, (unsigned long long)local_writer.size(),
+                simulated_write.size(), errno, strerror(errno));
         local_ok = 0;
+    } else if (simulated_write.bounded()) {
+        printf("[rank %d] fixmate simulated write fallback "
+               "body_bytes=%llu window_bytes=%zu; all body bytes remain counted\n",
+               rank, (unsigned long long)local_writer.size(),
+               simulated_write.body_capacity());
     }
+    char *simulated_write_mem = simulated_write.data();
+    const size_t simulated_write_size = simulated_write.size();
     costs->stage45_malloc =
         FmReduceMax(GetTime() - stage45_malloc_t0);
     if (rank == 0 && local_ok) {
@@ -1101,7 +1128,6 @@ static int FmGatherOutput(
     }
     if (!FmAllRanksOk(local_ok)) {
         free(header_memory);
-        free(simulated_write_mem);
         return -1;
     }
 
@@ -1114,12 +1140,21 @@ static int FmGatherOutput(
         simulated_pos += header_size;
     }
     if (local_writer.is_memory() && local_writer.size() > 0) {
-        if (local_writer.ReadAt(
-                0, simulated_write_mem + simulated_pos,
-                (size_t)local_writer.size()) != 0) {
+        const int copy_ret = simulated_write.bounded()
+            ? simulated_write.CopyBodyWindowed(
+                  local_writer, simulated_pos, &simulated_guard)
+            : local_writer.ReadAt(
+                  0, simulated_write_mem + simulated_pos,
+                  (size_t)local_writer.size());
+        if (copy_ret != 0) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: fixmate simulated body read failed "
+                    "body_bytes=%llu errno=%d (%s).\n",
+                    rank, (unsigned long long)local_writer.size(),
+                    errno, strerror(errno));
             local_ok = 0;
         } else {
-            simulated_pos += (size_t)local_writer.size();
+            simulated_pos += simulated_write.body_capacity();
         }
     }
     if (local_writer.is_memory() && rank == 0) {
@@ -1140,7 +1175,7 @@ static int FmGatherOutput(
         printf("Complete the 4.6 simulated header/body distributed write cost %lf\n",
                costs->stage46);
     }
-    free(simulated_write_mem);
+    simulated_write.Reset();
 
     if (rank == 0) {
         const double core_total =
@@ -1941,15 +1976,46 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
         char spool_prefix[96];
         snprintf(spool_prefix, sizeof(spool_prefix),
                  "rabbitbam-fixmate-rank-%d.body", rank);
-        if (middle_sink.Open(
+        size_t initial_capacity = rank_input_size
+            ? rank_input_size : 1024 * 1024;
+        // Mate tags can grow the output. Reserve the first growth step before
+        // streaming to avoid the first old/new output allocation overlap.
+        if (memory_input && cmd_info->rank_body_backend_ == "memory" &&
+            rank_input_size != 0) {
+            if (initial_capacity > SIZE_MAX / 2) {
+                fprintf(stderr,
+                        "[rank %d] ERROR: fixmate output reservation overflows "
+                        "for input_bytes=%zu.\n", rank, rank_input_size);
+                local_ok = 0;
+            } else {
+                initial_capacity *= 2;
+            }
+        }
+        if (local_ok && middle_sink.Open(
                 cmd_info->rank_body_backend_,
                 rank_body_memory_limit,
-                rank_input_size ? rank_input_size : 1024 * 1024,
+                initial_capacity,
                 spool_prefix,
-                cmd_info->rank_body_temp_dir_) != 0 ||
-            MpiCommonInitMemWriter(prefix, 1024 * 1024) != 0 ||
-            MpiCommonInitMemWriter(suffix, 1024 * 1024) != 0) {
+                cmd_info->rank_body_temp_dir_) != 0) {
+            const int saved_errno = errno;
+            fprintf(stderr,
+                    "[rank %d] ERROR: fixmate output reservation failed "
+                    "backend=%s input_bytes=%zu capacity=%zu "
+                    "errno=%d (%s).\n",
+                    rank, cmd_info->rank_body_backend_.c_str(),
+                    rank_input_size, initial_capacity, saved_errno,
+                    strerror(saved_errno));
             local_ok = 0;
+        }
+        if (local_ok &&
+            (MpiCommonInitMemWriter(prefix, 1024 * 1024) != 0 ||
+             MpiCommonInitMemWriter(suffix, 1024 * 1024) != 0)) {
+            local_ok = 0;
+        }
+        if (local_ok && middle_sink.is_memory()) {
+            printf("[rank %d] fixmate output reserved input_bytes=%zu "
+                   "capacity=%zu\n", rank, rank_input_size,
+                   middle_sink.memory_writer()->capacity);
         }
         stage42_cost = FmReduceMax(GetTime() - t0);
         if (rank == 0 && local_ok) {

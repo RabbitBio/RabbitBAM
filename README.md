@@ -180,6 +180,12 @@ bsub.py swls -q q_share -I -b -J swbam_check \
   rank body 和模拟输出副本仍需驻留，不能将分片输入等同于有界内存输出。
 - `--rank-body-backend memory|spool|auto` 控制 rank 本地输出缓存；其临时目录
   由 `--rank-body-temp-dir` 指定，与 sort/collate 的 `-T` 外排临时文件独立。
+- standalone fixmate 使用内存输入及显式 memory body 时，初始输出容量预留为
+  本 rank 压缩输入的两倍，避免增加 mate 标签后第一次扩容同时持有旧、新输出。
+  预留仍计入 4.2 初始化，未改变算法；输出超过预留时仍沿用原扩容行为。
+- collate/fixmate 的额外模拟写出副本优先沿用全量分配和单次复制；分配失败时
+  回退到 64 MiB 复用窗口，仍复制全部 body 字节并计入 4.6。实际 rank body、
+  算法和最终输出不变，窗口分配仍属于不计入主成绩的模拟准备。
 - **要求单条 BAM record 不跨 BGZF block**。一般来源的 BAM 不保证满足此条件；
   `io-check` 可检查小输入是否满足当前解析契约，不负责自动重分块。
 - BAM record 长度、批容量和 CPE scratch 有边界限制；不能将流式输入等同于支持

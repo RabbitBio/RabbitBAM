@@ -2,6 +2,7 @@
 #include "swbam/mpi_runtime.h"
 #include "swbam/operators/bam_read_batch.h"
 #include "swbam/cpe_write_pipeline.h"
+#include "simulated_write_buffer.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -1789,11 +1790,8 @@ static int CollateGatherOutput(
         ? (size_t)local_body.size()
         : (size_t)std::min<uint64_t>(
               local_body.size(), 8ull * 1024ull * 1024ull);
-    const size_t simulated_write_size =
-        simulation_body_size +
-        (rank == 0 ? header_size +
-                         sizeof(kCollateBgzfEofBlock)
-                   : 0);
+    const size_t simulation_envelope_size =
+        rank == 0 ? header_size + sizeof(kCollateBgzfEofBlock) : 0;
     std::vector<unsigned char> source_chunk;
     if (!local_body.is_memory() && local_body.size() > 0) {
         try {
@@ -1802,13 +1800,23 @@ static int CollateGatherOutput(
             local_ok = 0;
         }
     }
-    char *simulated_write_mem =
-        simulated_write_size
-            ? (char *)malloc(simulated_write_size)
-            : nullptr;
-    if (simulated_write_size && !simulated_write_mem) {
+    swbam_app::SimulatedWriteBuffer simulated_write;
+    if (simulated_write.Allocate(
+            simulation_body_size, simulation_envelope_size) != 0) {
+        fprintf(stderr,
+                "[rank %d] ERROR: collate simulated write allocation failed "
+                "body_bytes=%llu buffer_bytes=%zu errno=%d (%s).\n",
+                rank, (unsigned long long)local_body.size(),
+                simulated_write.size(), errno, strerror(errno));
         local_ok = 0;
+    } else if (simulated_write.bounded()) {
+        printf("[rank %d] collate simulated write fallback "
+               "body_bytes=%llu window_bytes=%zu; all body bytes remain counted\n",
+               rank, (unsigned long long)local_body.size(),
+               simulated_write.body_capacity());
     }
+    char *simulated_write_mem = simulated_write.data();
+    const size_t simulated_write_size = simulated_write.size();
     costs->stage45_malloc =
         CollateReduceMax(GetTime() - stage45_malloc_t0);
     if (rank == 0 && local_ok) {
@@ -1817,7 +1825,6 @@ static int CollateGatherOutput(
     }
     if (!CollateAllRanksOk(local_ok)) {
         free(header_memory);
-        free(simulated_write_mem);
         return -1;
     }
 
@@ -1835,13 +1842,22 @@ static int CollateGatherOutput(
     if (local_body.size() > 0) {
         if (local_body.is_memory()) {
             double copy_t0 = GetTime();
-            if (local_body.ReadAt(
-                    0, simulated_write_mem + simulated_pos,
-                    (size_t)local_body.size()) != 0) {
+            const int copy_ret = simulated_write.bounded()
+                ? simulated_write.CopyBodyWindowed(
+                      local_body, simulated_pos, &simulated_guard)
+                : local_body.ReadAt(
+                      0, simulated_write_mem + simulated_pos,
+                      (size_t)local_body.size());
+            if (copy_ret != 0) {
+                fprintf(stderr,
+                        "[rank %d] ERROR: collate simulated body read failed "
+                        "body_bytes=%llu errno=%d (%s).\n",
+                        rank, (unsigned long long)local_body.size(),
+                        errno, strerror(errno));
                 local_ok = 0;
             }
             stage46_cost += GetTime() - copy_t0;
-            simulated_pos += (size_t)local_body.size();
+            simulated_pos += simulated_write.body_capacity();
         } else {
             uint64_t copied = 0;
             const size_t destination = simulated_pos;
@@ -1898,7 +1914,8 @@ static int CollateGatherOutput(
         printf("Complete the total (4.1~4.6) cost %lf-----\n",
                core_total);
     }
-    free(simulated_write_mem);
+    // Release the simulation copy before the real output/gather allocation.
+    simulated_write.Reset();
 
     {
         double stage47_t0 = GetTime();

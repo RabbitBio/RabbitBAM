@@ -31,7 +31,7 @@ generic/fused 模式。算子的解压、解析和动作可在一次 CPE kernel 
 | 项目 | D1 | D2 | D3 |
 |---|:---:|:---:|:---:|
 | SDK count / BAM read-write | 是 | 是 | 是，分块内存模式 |
-| 转换、过滤、flagstat、stats --basic | 是 | 是 | 是 |
+| 转换、过滤、flagstat | 是 | 是 | 是 |
 | fixmate、markdup --stream | 是 | 是 | 是 |
 | sort/collate 内排及内排四步流程 | 是 | 是 | 否 |
 | sort/collate 外排及外排四步流程 | 否 | 否 | 是 |
@@ -40,6 +40,10 @@ generic/fused 模式。算子的解压、解析和动作可在一次 CPE kernel 
 
 D1/D2 的 sort/collate 日志必须确认 memory mode，不能将自动 spill 混入内排表格。
 D3 的 sort/collate 只测 external mode；其他命令不因此自动变成“外排算法”。
+2026-10-09 调整：stats 不纳入论文性能比较，不再提交 A4 stats 性能测试；
+`stats --basic` 等正确性复读仍保留。collate 及四步流程中的 collate
+统一使用 66 个 bins（Samtools `-n 66`，SWBAM `-n 66`），旧 `-n 64`
+成绩仅作历史记录，不能改写参数后直接沿用。
 
 ## 3. 版本、计时与资源口径
 
@@ -149,15 +153,16 @@ A3 也需先确认 operator 的固定容量约束，不是任意改一个参数�
 
 | 功能 | 固定输入 | 验证重点 |
 |---|---|---|
-| flagstat、stats --basic | 原始 BAM | 全部 flagstat 项；对应 SN 项及排序状态 |
+| flagstat | 原始 BAM | 全部 flagstat 项 |
 | BAM2SAM、SAM2BAM、BAM2BAM | 对应固定 BAM/SAM | header、record multiset、顺序 |
 | MAPQ >= 30 过滤 | 原始 BAM | 保留集合、kept/dropped |
 | sort、collate | 同一原始 BAM | 坐标顺序 / QNAME 连续性、记录集合 |
 | fixmate -m | 同一 name-collated BAM | mate 字段和 MQ/MC/ms |
 | markdup --stream | 同一 fixmate+sort BAM | duplicate count、标记集合、其他字段 |
 
-SAMtools 完整 `stats` 工作量大于 SWBAM `stats --basic`；可核对对应 SN，但性能
-表必须注明功能范围，不能声称是全功能等价加速。sort/collate 明确实际内排或外排。
+stats 仅用于需要的正确性检查，不进入论文性能图表；A4 复读可使用
+`quickcheck` 和 `view -c`，SWBAM 保留 `stats --basic` 复读。
+sort/collate 明确实际内排或外排。
 
 ### 6.1 配置选择
 
@@ -184,7 +189,7 @@ SAMtools 可沿用当前 A4 的 `-@ 0/2/4/8/16/24/32/47/48/64/96/127`
 ## 7. 普通四步去重流程
 
 ```text
-input BAM -> collate -> fixmate -m -> coordinate sort -> markdup --stream
+input BAM -> collate -n 66 -> fixmate -m -> coordinate sort -> markdup --stream
 ```
 
 主实验使用四条独立命令或 `dedup-workflow`，不依赖全内存 `dedup-pipeline`。

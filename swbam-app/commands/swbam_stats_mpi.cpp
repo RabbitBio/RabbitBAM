@@ -5,6 +5,8 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include <mpi.h>
@@ -364,6 +366,13 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
     int comm_size = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
+    const char *diagnostics = std::getenv("SWBAM_STATS_DIAG");
+    const bool trace_enabled = diagnostics && std::strcmp(diagnostics, "1") == 0;
+    auto trace = [&](const char *stage) {
+        if (!trace_enabled) return;
+        fprintf(stderr, "[rank %d] stats_diag stage=%s\n", rank, stage);
+        fflush(stderr);
+    };
 
     int exit_code = 1;
     int local_ok = 1;
@@ -382,6 +391,7 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
         printf("111Complete the initialization cost %lf-----\n", init_cost_max);
     }
 
+    trace("input_open_begin");
     if (!cmd_info || input_handle.Open(
             cmd_info->in_file_name_, cmd_info->io_backend_,
             cmd_info->io_memory_limit_) != 0) {
@@ -391,6 +401,7 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
     }
     input = input_handle.backend();
     if (local_ok && (!input || input->format() != bam)) local_ok = 0;
+    trace(local_ok ? "input_open_done" : "input_open_failed");
 
     {
         const double preload_cost_max = swbam::mpi::ReduceMaxCost(
@@ -415,12 +426,14 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
             printf("Enable MPI STATS --basic mode (%d MPE + %d CPEs)!!!\n",
                    comm_size, comm_size * 64);
         }
+        trace("input_prepare_begin");
         if (input_handle.PreparePlan(&input_plan) != 0) {
             if (rank == 0) {
                 fprintf(stderr, "ERROR: failed to prepare BGZF input plan for stats.\n");
             }
             local_ok = 0;
         }
+        trace(local_ok ? "input_prepare_done" : "input_prepare_failed");
         if (rank == 0 && local_ok) {
             printf("MPI BAM scan complete. data_blocks=%lld body_start=%lld header_end=%lld\n",
                    (long long)input_plan.blocks.size(),
@@ -443,6 +456,7 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
 
         double stage43_t0 = GetTime();
         const int collect_diag = cmd_info->verbose_ ? 1 : 0;
+        trace("core_begin");
         if (swbam::operators::RunStatsBasicPipeline(
                 *input, input_plan.rank_spans(),
                 input_plan.rank_block_count(),
@@ -450,6 +464,7 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
                 collect_diag != 0) != 0) {
             local_ok = 0;
         }
+        trace(local_ok ? "core_done" : "core_failed");
         double stage43_cost = GetTime() - stage43_t0;
         int global_ok = swbam::mpi::AllRanksOk(local_ok);
         double stage43_cost_max = swbam::mpi::ReduceMaxCost(stage43_cost);

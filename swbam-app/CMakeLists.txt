@@ -18,6 +18,7 @@ add_executable(RabbitBAM-MPI
     main.cpp CmdInfo.cpp
     commands/swbam_bam2bam_mpi.cpp
     commands/swbam_bam2sam_mpi.cpp
+    commands/swbam_conversion_memory_chunks.cpp
     commands/swbam_fixmate_mpi.cpp
     commands/swbam_flagstat_mpi.cpp
     commands/swbam_io_check_mpi.cpp
