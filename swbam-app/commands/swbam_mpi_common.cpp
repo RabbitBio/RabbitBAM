@@ -1,7 +1,6 @@
 #include "swbam_mpi.h"
 #include "swbam/io.h"
 #include "swbam/mpi_runtime.h"
-#include "conversion_memory_chunks.h"
 
 #include <algorithm>
 #include <climits>
@@ -688,1341 +687,141 @@ int MpiWriteBytesToMem(MemWriter &w, const char *data, size_t len) {
 }
 
 int ProcessSwBamMPI(CmdInfo *cmd_info) {
-
-    //1.相关数据的初始化
-    double t_init = GetTime();
-
-    int rank = 0;
-    int comm_size = 1;
+    const double body_start_time = GetTime();
+    int rank = 0, ranks = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &comm_size);
-
-    double init_cost, init_cost_max;
-    double t_total = 0.0;
-    int exit_code = 1;
-    int local_ok = 1;
-    samFile *sin = nullptr;
-    sam_hdr_t *hdr = nullptr;
-    swbam::mpi::MpiBamInput backend_input_handle;
-    swbam::BamInputBackend *backend_input = nullptr;
-    swbam::mpi::MpiBamInputPlan backend_plan;
-    swbam::PosixSamInput posix_sam_input;
-    swbam::mpi::MpiIoSamInput mpiio_sam_input;
+    MPI_Comm_size(MPI_COMM_WORLD, &ranks);
+    swbam::mpi::MpiBamInput input;
+    swbam::mpi::MpiBamInputPlan plan;
+    swbam::PosixSamInput native_sam;
+    swbam::mpi::MpiIoSamInput mpiio_sam;
     swbam::SamInputBackend *sam_input = nullptr;
-    std::vector<char> rank_sam_storage;
-    hFILE *input_mem_hfile = nullptr;
-    char *input_file_mem = nullptr;
-    size_t input_file_size = 0;
-    char *rank_input_mem = nullptr;
-    char *output_file_mem = nullptr;
-    char *bam_header_mem = nullptr;
-    char *simulated_write_mem = nullptr;
-    size_t bam_header_size = 0;
-    size_t output_body_start = 0;
-    size_t output_file_size = 0;
-    size_t simulated_write_size = 0;
-    const char *sam_header_text = nullptr;
-    size_t sam_header_len = 0;
-    MemReader reader = {};
-    const char *conversion_chunk_env = getenv("SWBAM_CONVERSION_MEMORY");
-    const bool chunked_conversion = conversion_chunk_env != nullptr;
-    const std::string conversion_config = conversion_chunk_env ? conversion_chunk_env : "";
-    const size_t conversion_separator = conversion_config.find(':');
-    const std::string conversion_size = conversion_config.substr(0, conversion_separator);
-    const std::string conversion_keep = conversion_separator == std::string::npos
-        ? "keep" : conversion_config.substr(conversion_separator + 1);
-    const bool keep_conversion_output = conversion_keep == "keep";
-    uint64_t conversion_chunk_bytes = 0;
-    swbam_app::ConversionChunkTiming conversion_timing;
-    swbam_app::ConversionChunkOutput conversion_output;
-    swbam::AdaptiveRankBodySink adaptive_body_sink;
-    swbam::RankBodySink &body_sink = chunked_conversion
-        ? static_cast<swbam::RankBodySink &>(conversion_output)
-        : static_cast<swbam::RankBodySink &>(adaptive_body_sink);
-    uint64_t rank_body_memory_limit = 0;
-    MpiBamToBamStats stats = {};
-    MpiBamToSamStats sam_stats = {};
-    MpiSamToBamStats sam2bam_stats = {};
-    BamFilterOptions filter = MpiBuildBamFilterOptions(cmd_info);
-    bool filter_requested = MpiHasBamFilterRequest(cmd_info);
-    std::vector<long long> block_offsets;
-    std::vector<long long> block_lengths;
-    std::vector<long long> body_sizes;
-    std::vector<long long> body_prefixes;
-    long long body_start = 0;
-    long long n_blocks = 0;
-    long long local_body_size = 0;
-    long long local_prefix = 0;
-    long long total_body_size = 0;
-    volatile unsigned long long simulated_write_guard = 0;
-    int input_format = -1;
-    int output_format = MpiOutputFormatFromName(cmd_info->out_file_name_);
-    bool bam_to_bam = false;
-    bool bam_to_sam = false;
-    bool sam_to_bam = false;
-    const bool rank_memory_input = cmd_info->io_backend_ == "rank-memory";
-    bool memory_bam_input = false;
-    double input_prepare_cost = 0.0;
-    double sam_header_open_cost = 0.0;
-    uint64_t rank_sam_offset = 0;
-    bool backend_bam_input =
-        (output_format == bam || output_format == sam) &&
-        MpiHasSuffix(cmd_info->in_file_name_, ".bam");
-    bool streaming_sam_input =
-        output_format == bam &&
-        MpiHasSuffix(cmd_info->in_file_name_, ".sam") &&
-        (cmd_info->io_backend_ == "posix" ||
-         cmd_info->io_backend_ == "mpiio" ||
-         cmd_info->io_backend_ == "auto" || rank_memory_input);
-    bool mpiio_output = cmd_info->io_output_backend_ == "mpiio";
-
-    if (chunked_conversion &&
-        (swbam::ParseByteSize(conversion_size, &conversion_chunk_bytes) != 0 ||
-         conversion_chunk_bytes < BGZF_MAX_BLOCK_SIZE ||
-         conversion_chunk_bytes > 4ull * 1024 * 1024 * 1024 ||
-         !rank_memory_input || !mpiio_output || filter_requested ||
-         cmd_info->rank_body_backend_ != "memory" ||
-         !(streaming_sam_input || (backend_bam_input && output_format == sam)) ||
-         (conversion_keep != "keep" && conversion_keep != "discard"))) {
-        if (rank == 0) fprintf(stderr,
-            "ERROR: chunked conversion requires BAM/SAM conversion, rank-memory "
-            "input, memory body, mpiio output, no filters, chunk size 64K..4G, "
-            "and SWBAM_CONVERSION_MEMORY=<size>:keep or <size>:discard.\n");
-        local_ok = 0;
-    }
-
-    if (rank_memory_input && !backend_bam_input && !streaming_sam_input) {
-        if (rank == 0) fprintf(stderr,
-            "ERROR: rank-memory conversion requires .bam or uncompressed .sam input.\n");
-        local_ok = 0;
-    }
-
-    if (swbam::ParseByteSize(
-            cmd_info->rank_body_memory_limit_,
-            &rank_body_memory_limit) != 0 ||
-        rank_body_memory_limit == 0) {
-        if (rank == 0) {
-            fprintf(stderr,
-                    "ERROR: invalid rank body memory limit '%s'.\n",
-                    cmd_info->rank_body_memory_limit_.c_str());
+    swbam_usage::BodySink body;
+    sam_hdr_t *header = nullptr;
+    char *prefix = nullptr;
+    size_t prefix_size = 0;
+    const int input_format = swbam_usage::InputFormat(cmd_info->in_file_name_);
+    const bool from_bam = MpiIsBamLikeFormat(input_format);
+    const bool to_sam = MpiHasSuffix(cmd_info->out_file_name_, ".sam");
+    int status = 1;
+    const auto run = [&]() -> int {
+        int ok = 1;
+        if (!MpiAllRanksOk(from_bam || MpiIsSamLikeFormat(input_format))) {
+            if (rank == 0) fprintf(stderr, "ERROR: conversion requires BAM or uncompressed SAM input\n");
+            return 1;
         }
-        local_ok = 0;
-    }
-
-    if (cmd_info->validate_bounds_) {
-        if (rank == 0) {
-            fprintf(stderr, "ERROR: --validate-bounds is not supported by RabbitBAM-MPI. Use io-check on a small BAM to validate the current pipelines.\n");
-        }
-        local_ok = 0;
-    }
-    if (cmd_info->min_mapq_ > cmd_info->max_mapq_ && cmd_info->max_mapq_ >= 0) {
-        if (rank == 0) fprintf(stderr, "ERROR: --min-mapq cannot be greater than --max-mapq.\n");
-        local_ok = 0;
-    }
-    if (cmd_info->min_read_len_ > cmd_info->max_read_len_ && cmd_info->max_read_len_ >= 0) {
-        if (rank == 0) fprintf(stderr, "ERROR: --min-read-len cannot be greater than --max-read-len.\n");
-        local_ok = 0;
-    }
-    if (!MpiAllRanksOk(local_ok)) goto cleanup;
-
-    init_cost = GetTime() - t_init;
-    init_cost_max = MpiReduceMaxCost(init_cost);
-    if (rank == 0) {
-        // t_total += init_cost_max;
-        printf("111Complete the initialization cost %lf-----\n", init_cost_max);
-    }
-
-
-    // Whole-file memory loads here; rank-memory opens metadata and loads after splitting.
-    {
-        double preload_t0 = GetTime();
-        if (backend_bam_input) {
-            if (backend_input_handle.Open(
-                    cmd_info->in_file_name_, cmd_info->io_backend_,
-                    cmd_info->io_memory_limit_) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: cannot open BAM input backend for %s\n",
-                        rank, cmd_info->in_file_name_.c_str());
-                local_ok = 0;
-            } else {
-                backend_input = backend_input_handle.backend();
-                memory_bam_input = backend_input_handle.is_memory();
-                input_file_size = backend_input->size();
-                swbam::MemoryBamInput *memory_input =
-                    dynamic_cast<swbam::MemoryBamInput *>(backend_input);
-                if (memory_input) input_file_mem = memory_input->data();
-            }
-        } else if (streaming_sam_input) {
-            sam_input = cmd_info->io_backend_ == "mpiio"
-                ? static_cast<swbam::SamInputBackend *>(&mpiio_sam_input)
-                : static_cast<swbam::SamInputBackend *>(&posix_sam_input);
-            if (sam_input->Open(cmd_info->in_file_name_) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: cannot open streaming SAM input %s\n",
-                        rank, cmd_info->in_file_name_.c_str());
-                local_ok = 0;
-            } else {
-                input_file_size = sam_input->size();
-            }
-            if (rank_memory_input) sam_header_open_cost = GetTime() - preload_t0;
-        } else if (MpiLoadFileToMemory(
-                       cmd_info->in_file_name_, &input_file_mem,
-                       &input_file_size) != 0) {
-            fprintf(stderr, "[rank %d] ERROR: cannot preload input %s into memory\n",
-                    rank, cmd_info->in_file_name_.c_str());
-            local_ok = 0;
-        }
-        double preload_cost = backend_bam_input
-            ? backend_input_handle.data_open_cost()
-            : (rank_memory_input ? 0.0 : GetTime() - preload_t0);
-        double preload_cost_max = MpiReduceMaxCost(preload_cost);
-        if (rank == 0 && local_ok) {
-            if (backend_bam_input) {
-                printf("MPI BAM input backend=%s auto_memory_budget=%llu\n",
-                       backend_input_handle.selected_backend().c_str(),
-                       (unsigned long long)backend_input_handle.auto_memory_budget());
-            } else if (streaming_sam_input) {
-                printf("MPI SAM input backend=%s\n",
-                       rank_memory_input ? "rank-memory" : cmd_info->io_backend_ == "mpiio"
-                           ? "mpiio" : "posix");
-            }
-            printf("222Complete the memory/input open cost %lf--\n", preload_cost_max);
-        }
-    }
-    if (!MpiAllRanksOk(local_ok)) goto cleanup;
-
-
-    //3.从内存创建 HTSlib 输入句柄并读取 BAM header，顺便判断输入输出格式是否合法，记录BAM/SAM body的起始位置
-    {
-        double header_t0 = GetTime();
-
-        if (backend_bam_input) {
-            if (!backend_input || backend_input->format() != bam ||
-                !backend_input->header()) {
-                local_ok = 0;
-            } else {
-                hdr = sam_hdr_dup(backend_input->header());
-                if (!hdr) local_ok = 0;
-                input_format = bam;
-                bam_to_bam = output_format == bam;
-                bam_to_sam = output_format == sam;
-                if (!bam_to_bam && !bam_to_sam) local_ok = 0;
-                if (filter_requested && !bam_to_bam) {
-                    if (rank == 0) {
-                        fprintf(stderr, "ERROR: BAM filtering options are only supported for MPI BAM -> BAM.\n");
-                    }
-                    local_ok = 0;
-                }
-                if (bam_to_sam && cmd_info->compress_level_ != 1 &&
-                    rank == 0) {
-                    printf("NOTE: --compress-level=%d is ignored for MPI BAM2SAM because SAM output is plain text.\n",
-                           cmd_info->compress_level_);
-                }
-                body_start = (long long)backend_input->body_offset();
-            }
-        } else if (streaming_sam_input) {
-            if (!sam_input || !sam_input->header()) {
-                local_ok = 0;
-            } else {
-                hdr = sam_hdr_dup(sam_input->header());
-                if (!hdr) local_ok = 0;
-                input_format = sam;
-                sam_to_bam = true;
-                body_start = (long long)sam_input->body_offset();
-            }
+        if (from_bam) {
+            ok = swbam_usage::OpenInput(input, cmd_info->in_file_name_,
+                cmd_info->io_backend_, cmd_info->io_memory_limit_) == 0;
+            if (ok) header = sam_hdr_dup(input.backend()->header());
         } else {
-            input_mem_hfile = hopen("mem:", "rb:", input_file_mem, input_file_size);
+            sam_input = swbam_usage::IsRam()
+                ? swbam_usage::CurrentSession()->sam_input()
+                : cmd_info->io_backend_ == "mpiio"
+                    ? static_cast<swbam::SamInputBackend *>(&mpiio_sam)
+                    : static_cast<swbam::SamInputBackend *>(&native_sam);
+            ok = sam_input && sam_input->Open(cmd_info->in_file_name_) == 0;
+            if (ok) header = sam_hdr_dup(sam_input->header());
         }
-        if (!input_mem_hfile) {
-            if (!backend_bam_input && !streaming_sam_input) {
-                fprintf(stderr, "[rank %d] ERROR: cannot open preloaded BAM memory for %s\n",
-                        rank, cmd_info->in_file_name_.c_str());
-                local_ok = 0;
-            }
+        if (!MpiAllRanksOk(ok && header)) return 1;
+        if ((!from_bam && to_sam) ||
+            (MpiHasBamFilterRequest(cmd_info) && (!from_bam || to_sam))) {
+            if (rank == 0) fprintf(stderr, "ERROR: filtering requires BAM -> BAM; SAM -> SAM is unsupported\n");
+            return 1;
         }
-        if (local_ok && !backend_bam_input && !streaming_sam_input) {
-            sin = (samFile *)hts_hopen(input_mem_hfile, "data", "rb");
-            if (!sin) {
-                fprintf(stderr, "[rank %d] ERROR: cannot create HTS input handle from memory\n", rank);
-                if (hclose(input_mem_hfile) != 0) {
-                    fprintf(stderr, "[rank %d] ERROR: closing failed HTS memory handle failed.\n", rank);
-                }
-                input_mem_hfile = nullptr;
-                input_file_mem = nullptr;
-                input_file_size = 0;
-                local_ok = 0;
-            } else {
-                input_mem_hfile = nullptr;
-            }
-        }
-
-        if (local_ok && !backend_bam_input && !streaming_sam_input) {
-            hdr = sam_hdr_read(sin);
-            if (!hdr) {
-                fprintf(stderr, "[rank %d] ERROR: cannot read header from %s\n",
-                        rank, cmd_info->in_file_name_.c_str());
-                local_ok = 0;
-            }
-        }
-        if (local_ok && !backend_bam_input && !streaming_sam_input) {
-            input_format = MpiNormalizeFormat(sin->format.format);
-            bam_to_bam = input_format == bam && output_format == bam;
-            bam_to_sam = input_format == bam && output_format == sam;
-            sam_to_bam = input_format == sam && output_format == bam;
-
-            if (!bam_to_bam && !bam_to_sam && !sam_to_bam) {
-                if (rank == 0) {
-                    fprintf(stderr, "Unsupported MPI conversion: input format %d -> output format %d\n",
-                            input_format, output_format);
-                }
-                local_ok = 0;
-            }
-            if (filter_requested && !bam_to_bam) {
-                if (rank == 0) {
-                    fprintf(stderr, "ERROR: BAM filtering options are only supported for MPI BAM -> BAM.\n");
-                }
-                local_ok = 0;
-            }
-            if (local_ok && bam_to_sam && cmd_info->compress_level_ != 1 && rank == 0) {
-                printf("NOTE: --compress-level=%d is ignored for MPI BAM2SAM because SAM output is plain text.\n",
-                       cmd_info->compress_level_);
-            }
-            if (local_ok && bam_to_bam && !cmd_info->ref_name_.empty()) {
-                int ref_tid = sam_hdr_name2tid(hdr, cmd_info->ref_name_.c_str());
-                if (ref_tid < 0) {
-                    fprintf(stderr, "[rank %d] ERROR: reference name '%s' does not exist in the BAM header.\n",
-                            rank, cmd_info->ref_name_.c_str());
-                    local_ok = 0;
-                } else {
-                    filter.ref_tid = ref_tid;
-                }
-            }
-            if (local_ok) {
-                if (input_format == bam) {
-                    body_start = (long long)sin->fp.bgzf->block_address;
-                    if (body_start < 0 ||
-                        (unsigned long long)body_start > (unsigned long long)input_file_size) {
-                        fprintf(stderr, "[rank %d] ERROR: invalid BAM body start offset %lld.\n", rank, body_start);
-                        local_ok = 0;
-                    }
-                } else if (input_format == sam) {
-                    if (MpiFindSamBodyStartInMemory(input_file_mem, input_file_size, &body_start) != 0) {
-                        fprintf(stderr, "[rank %d] ERROR: failed to find SAM body start in memory.\n", rank);
-                        local_ok = 0;
-                    }
-                }
-            }
-        }
-        if (local_ok && backend_bam_input && bam_to_bam &&
-            !cmd_info->ref_name_.empty()) {
-            int ref_tid = sam_hdr_name2tid(hdr, cmd_info->ref_name_.c_str());
-            if (ref_tid < 0) {
-                fprintf(stderr, "[rank %d] ERROR: reference name '%s' does not exist in the BAM header.\n",
-                        rank, cmd_info->ref_name_.c_str());
-                local_ok = 0;
-            } else {
-                filter.ref_tid = ref_tid;
-            }
-        }
-
-        double header_cost = backend_bam_input
-            ? backend_input_handle.header_open_cost()
-            : sam_header_open_cost + GetTime() - header_t0;
-        double header_cost_max = MpiReduceMaxCost(header_cost);
-        if (rank == 0 && local_ok) {
-            // t_total += header_cost_max;
-            printf("333Complete the head cost %lf---\n", header_cost_max);
-        }
-    }
-    if (!MpiAllRanksOk(local_ok)) goto cleanup;
-
-
-    //4.核心处理阶段
-    {
-        double body_total_t0 = GetTime();
-        double body_t0 = GetTime();
-        double stage41_t0 = GetTime();
-        double sam_split_disk_cost = 0.0;
-        if (rank_memory_input && streaming_sam_input) MPI_Barrier(MPI_COMM_WORLD);
-        //4.1 rank 0 扫描 BGZF blocks
-        if (rank == 0) {
-            const char *mode_name = sam_to_bam ? "SAM2BAM" : (bam_to_sam ? "BAM2SAM" : "BAM2BAM");
-            printf("Enable MPI %s mode (%d MPE + %d CPEs)!!!\n",
-                   mode_name, comm_size, comm_size * 64);
-            if (bam_to_bam && filter_requested) printf("Enable MPI BAM filtering options.\n");
-            if (bam_to_bam || sam_to_bam) {
-                printf("MPI BAM output compression level=%d\n", cmd_info->compress_level_);
-            }
-            printf("MPI output backend=%s\n",
-                   mpiio_output ? "mpiio" : "memory");
-
-            if (input_format == bam && !backend_bam_input) {
-                if (MpiScanBgzfBlocksInMemory(input_file_mem, input_file_size, body_start,
-                                              &block_offsets, &block_lengths) != 0) {
-                    fprintf(stderr, "ERROR: failed to scan input BGZF blocks.\n");
-                    local_ok = 0;
-                }
-                n_blocks = (long long)block_offsets.size();
-                if (local_ok && n_blocks > (long long)INT_MAX) {
-                    fprintf(stderr, "ERROR: too many BGZF blocks for MPI_Bcast in RabbitBAM-MPI v1.\n");
-                    local_ok = 0;
-                }
-                if (local_ok) {
-                    printf("MPI BAM scan complete. data_blocks=%lld body_start=%lld header_end=%lld\n",
-                           n_blocks, body_start, (long long)sin->fp.bgzf->block_address);
-                }
-            } else if (input_format == sam) {
-                int split_ret = rank_memory_input && streaming_sam_input
-                    ? posix_sam_input.SplitRanges(
-                          comm_size, &block_offsets, &block_lengths, &sam_split_disk_cost)
-                    : streaming_sam_input
-                    ? sam_input->SplitRanges(
-                          comm_size, &block_offsets, &block_lengths)
-                    : MpiSplitSamRangesInMemory(
-                          input_file_mem, input_file_size, body_start,
-                          comm_size, &block_offsets, &block_lengths);
-                if (split_ret != 0) {
-                    fprintf(stderr, "ERROR: failed to split SAM body ranges for MPI ranks.\n");
-                    local_ok = 0;
-                }
-                n_blocks = (long long)block_offsets.size();
-                if (local_ok) {
-                    printf("MPI SAM split complete. rank_ranges=%lld body_start=%lld file_size=%zu\n",
-                           n_blocks, body_start, input_file_size);
-                }
-            }
-        }
-
-        if (backend_bam_input) {
-            if (backend_input_handle.PreparePlan(&backend_plan) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: failed to prepare MPI BAM input plan.\n", rank);
-                local_ok = 0;
-            } else {
-                body_start = (long long)backend_plan.body_offset;
-                n_blocks = (long long)backend_plan.blocks.size();
-                if (rank == 0) {
-                    printf("MPI BAM scan complete. data_blocks=%lld body_start=%lld header_end=%lld backend=%s\n",
-                           n_blocks, body_start, body_start,
-                           backend_input_handle.selected_backend().c_str());
-                }
-            }
-            input_prepare_cost = backend_input_handle.simulation_prepare_cost();
+        size_t input_bytes = 0;
+        MemReader reader = {};
+        std::vector<char> sam_storage;
+        if (from_bam) {
+            ok = input.PreparePlan(&plan) == 0;
+            if (ok)
+                for (size_t i = plan.rank_begin; i < plan.rank_end; ++i)
+                    input_bytes += plan.blocks[i].compressed_size;
         } else {
-            // 把 block 信息广播给所有 rank。
-            MPI_Bcast(&local_ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
-            if (!local_ok) goto cleanup;
-            MPI_Bcast(&body_start, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-            MPI_Bcast(&n_blocks, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-            if (rank != 0) {
-                block_offsets.resize((size_t)n_blocks);
-                block_lengths.resize((size_t)n_blocks);
+            std::vector<long long> offsets(ranks), lengths(ranks);
+            if (rank == 0) ok = sam_input->SplitRanges(ranks, &offsets, &lengths) == 0;
+            if (!MpiAllRanksOk(ok)) return 1;
+            MPI_Bcast(offsets.data(), ranks, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+            MPI_Bcast(lengths.data(), ranks, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
+            input_bytes = lengths[rank];
+            reader.base = sam_input->ResidentRange(offsets[rank], input_bytes);
+            if (!reader.base && input_bytes) {
+                ok = sam_input->ReadRange(offsets[rank], input_bytes, &sam_storage) == 0;
+                reader.base = sam_storage.empty() ? nullptr : sam_storage.data();
             }
-            if (n_blocks > 0) {
-                MPI_Bcast(block_offsets.data(), (int)n_blocks, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-                MPI_Bcast(block_lengths.data(), (int)n_blocks, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-            }
+            reader.size = input_bytes;
         }
-        if (!MpiAllRanksOk(local_ok)) goto cleanup;
-
-        if (rank_memory_input && streaming_sam_input) {
-            MPI_Bcast(&sam_split_disk_cost, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
-            input_prepare_cost = sam_split_disk_cost;
-            MPI_Barrier(MPI_COMM_WORLD);
+        uint64_t limit = 0;
+        ok = ok && swbam::ParseByteSize(cmd_info->rank_body_memory_limit_, &limit) == 0 &&
+            body.Open(cmd_info->rank_body_backend_, limit,
+                      std::min<size_t>(input_bytes, 64u * 1024u * 1024u),
+                      "swbam-conversion.body", cmd_info->rank_body_temp_dir_) == 0;
+        if (!MpiAllRanksOk(ok)) return 1;
+        BamFilterOptions filter = MpiBuildBamFilterOptions(cmd_info);
+        if (!cmd_info->ref_name_.empty()) {
+            filter.ref_tid = sam_hdr_name2tid(header, cmd_info->ref_name_.c_str());
+            ok = filter.ref_tid >= 0;
         }
-
-        // 按 rank 切分 block 范围。memory 保留连续窗口快速路径，
-        // POSIX 只计算当前 rank 的压缩字节数，4.3 内按 batch 读取。
-        size_t rank_input_size = 0;
-        if (backend_bam_input) {
-            for (size_t i = backend_plan.rank_begin;
-                 i < backend_plan.rank_end; ++i) {
-                const size_t block_size =
-                    (size_t)backend_plan.blocks[i].compressed_size;
-                if (block_size > SIZE_MAX - rank_input_size) {
-                    fprintf(stderr, "[rank %d] ERROR: assigned BAM byte count overflows size_t.\n", rank);
-                    local_ok = 0;
-                    break;
-                }
-                rank_input_size += block_size;
-            }
-            if (local_ok && memory_bam_input &&
-                backend_plan.rank_begin < backend_plan.rank_end) {
-                const swbam::BgzfBlockSpan &first =
-                    backend_plan.blocks[backend_plan.rank_begin];
-                const swbam::BgzfBlockSpan &last =
-                    backend_plan.blocks[backend_plan.rank_end - 1];
-                const uint64_t range_end =
-                    last.offset + (uint64_t)last.compressed_size;
-                if (range_end < first.offset ||
-                    range_end > (uint64_t)input_file_size ||
-                    range_end - first.offset != (uint64_t)rank_input_size) {
-                    fprintf(stderr, "[rank %d] ERROR: memory backend assigned BAM blocks are not contiguous.\n", rank);
-                    local_ok = 0;
-                } else {
-                    rank_input_mem = backend_input_handle.memory_range(first.offset, rank_input_size);
-                    if (!rank_input_mem) local_ok = 0;
-                }
-            }
-        } else if (input_format == bam) {
-            long long begin = n_blocks * rank / comm_size;
-            long long end = n_blocks * (rank + 1) / comm_size;
-            if (MpiSelectBlockRangeFromMemory(input_file_mem, input_file_size,
-                                              block_offsets, block_lengths,
-                                              begin, end, &rank_input_mem, &rank_input_size) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: failed to select assigned BGZF block range [%lld, %lld) from memory.\n",
-                        rank, begin, end);
-                local_ok = 0;
-            }
-        } else {
-            if (rank >= (int)block_offsets.size()) {
-                fprintf(stderr, "[rank %d] ERROR: missing assigned SAM range.\n", rank);
-                local_ok = 0;
-            } else {
-                long long start = block_offsets[(size_t)rank];
-                long long len = block_lengths[(size_t)rank];
-                if (start < 0 || len < 0 ||
-                    (unsigned long long)start + (unsigned long long)len > (unsigned long long)input_file_size) {
-                    fprintf(stderr, "[rank %d] ERROR: invalid assigned SAM range start=%lld len=%lld.\n",
-                            rank, start, len);
-                    local_ok = 0;
-                } else {
-                    if (streaming_sam_input) {
-                        if (rank_memory_input) {
-                            rank_sam_offset = (uint64_t)start;
-                            rank_input_size = (size_t)len;
-                        } else if (sam_input->ReadRange(
-                                (uint64_t)start, (size_t)len,
-                                &rank_sam_storage) != 0) {
-                            fprintf(stderr, "[rank %d] ERROR: failed to read assigned POSIX SAM range.\n", rank);
-                            local_ok = 0;
-                        } else {
-                            rank_input_mem = rank_sam_storage.empty()
-                                ? nullptr : rank_sam_storage.data();
-                            rank_input_size = rank_sam_storage.size();
-                        }
-                    } else {
-                        rank_input_mem = input_file_mem + start;
-                        rank_input_size = (size_t)len;
-                    }
-                }
-            }
+        if (cmd_info->max_mapq_ >= 0 && cmd_info->min_mapq_ > cmd_info->max_mapq_) ok = 0;
+        if (cmd_info->max_read_len_ >= 0 && cmd_info->min_read_len_ > cmd_info->max_read_len_) ok = 0;
+        if (cmd_info->validate_bounds_) ok = 0;
+        if (!MpiAllRanksOk(ok)) {
+            if (rank == 0) fprintf(stderr, "ERROR: invalid filter bounds/reference or unsupported --validate-bounds (use io-check)\n");
+            return 1;
         }
-        if (rank_memory_input && streaming_sam_input && !chunked_conversion) {
-            // Every rank validates its range before entering the collective load phase.
-            if (!MpiAllRanksOk(local_ok)) goto cleanup;
-            const double preload_t0 = GetTime();
-            if (sam_input->ReadRange(rank_sam_offset, rank_input_size,
-                                     &rank_sam_storage) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: failed to preload assigned SAM range.\n", rank);
-                local_ok = 0;
-            }
-            const int preload_ok = MpiAllRanksOk(local_ok);
-            const double load_cost = GetTime() - preload_t0;
-            input_prepare_cost += load_cost;
-            if (local_ok) rank_input_mem = rank_sam_storage.empty()
-                ? nullptr : rank_sam_storage.data();
-            fprintf(stderr, "[rank %d] rank-memory SAM preload "
-                    "offset=%llu bytes=%zu load_wait_s=%.6f "
-                    "split_disk_s=%.6f excluded_prepare_s=%.6f ok=%d\n",
-                    rank, (unsigned long long)rank_sam_offset, rank_input_size,
-                    load_cost, sam_split_disk_cost, input_prepare_cost, local_ok);
-            if (!preload_ok) goto cleanup;
-        }
-        double stage41_cost = GetTime() - stage41_t0 - input_prepare_cost;
-        double stage41_cost_max = MpiReduceMaxCost(stage41_cost);
-        if (rank == 0 && local_ok) {
-            printf("Complete the 4.1 scan/split/broadcast/select cost %lf\n", stage41_cost_max);
-        }
-        if (rank_memory_input && streaming_sam_input) {
-            const double prepare_max = MpiReduceMaxCost(input_prepare_cost);
-            if (rank == 0 && local_ok)
-                printf("222Complete the memory/input open cost %lf-- (rank-local preparation)\n", prepare_max);
-        }
-
-        //4.2 初始化内存 reader 和 writer
-        double stage42_t0 = GetTime();
-        if (local_ok) {
-            if (!backend_bam_input || memory_bam_input) {
-                reader.base = rank_input_mem;
-                reader.size = rank_input_size;
-                reader.pos = 0;
-            }
-            size_t writer_capacity = rank_input_size ? rank_input_size : 64 * 1024 * 1024;
-            if (bam_to_sam && rank_input_size > 0) {
-                if (rank_memory_input) {
-                    // Grow with actual SAM output, rather than reserving 5x the input up front.
-                    writer_capacity = std::min<size_t>(rank_input_size, 64u * 1024u * 1024u);
-                } else if (rank_input_size > SIZE_MAX / 5) {
-                    fprintf(stderr, "[rank %d] ERROR: MPI BAM2SAM memory writer estimate overflow.\n", rank);
-                    local_ok = 0;
-                } else {
-                    writer_capacity = rank_input_size * 5;
-                }
-            } else if (sam_to_bam && rank_input_size > 0) {
-                writer_capacity = rank_input_size / 2;
-                if (writer_capacity == 0) writer_capacity = 64 * 1024 * 1024;
-            }
-            char spool_prefix[96];
-            snprintf(spool_prefix, sizeof(spool_prefix),
-                     "rabbitbam-convert-rank-%d.body", rank);
-            int open_ret = 0;
-            if (local_ok && chunked_conversion) {
-                open_ret = conversion_output.Open(keep_conversion_output,
-                    cmd_info->rank_body_temp_dir_, spool_prefix);
-            } else if (local_ok) {
-                open_ret = adaptive_body_sink.Open(cmd_info->rank_body_backend_,
-                    rank_body_memory_limit, writer_capacity, spool_prefix,
-                    cmd_info->rank_body_temp_dir_);
-            }
-            if (local_ok && open_ret != 0) {
-                fprintf(stderr,
-                        "[rank %d] ERROR: failed to open rank body sink.\n",
-                        rank);
-                local_ok = 0;
-            }
-        }
-        int stage42_ok = MpiAllRanksOk(local_ok);
-        double stage42_cost = GetTime() - stage42_t0;
-        double stage42_cost_max = MpiReduceMaxCost(stage42_cost);
-        if (rank == 0 && stage42_ok) {
-            printf("Complete the 4.2 init reader/writer cost %lf\n", stage42_cost_max);
-        }
-        if (!stage42_ok) goto cleanup;
-
-        //4.3 核心处理：OptimizedBamToBamMPI / OptimizedBamToSamMPI / OptimizedSamToBamMPI
-        const char *optimized_name = sam_to_bam ? "OptimizedSamToBamMPI" :
-                                 (bam_to_sam ? "OptimizedBamToSamMPI" : "OptimizedBamToBamMPI");
-        double OptimizedBamToBamMPI_t0 = GetTime();
-        if (chunked_conversion) {
-            const int ret = bam_to_sam
-                ? swbam_app::RunChunkedBamToSam(&reader, &conversion_output,
-                      hdr, (size_t)conversion_chunk_bytes, &sam_stats,
-                      &conversion_timing)
-                : swbam_app::RunChunkedSamToBam(*sam_input, rank_sam_offset,
-                      rank_input_size, &conversion_output, hdr,
-                      (size_t)conversion_chunk_bytes, cmd_info->compress_level_,
-                      &sam2bam_stats, &conversion_timing);
-            if (ret != 0) {
-                fprintf(stderr, "[rank %d] ERROR: chunked conversion failed.\n", rank);
-                local_ok = 0;
-            }
-            fprintf(stderr, "[rank %d] conversion_chunks chunks=%zu "
-                    "input_bytes=%llu output_bytes=%llu copied_bytes=%llu "
-                    "max_input=%zu max_output=%zu core_s=%.6f "
-                    "sim_write_s=%.6f preload_s=%.6f persistence_s=%.6f "
-                    "simulation_alloc_s=%.6f keep_output=%d\n",
-                    rank, conversion_timing.chunks,
-                    (unsigned long long)conversion_timing.input_bytes,
-                    (unsigned long long)body_sink.size(),
-                    (unsigned long long)conversion_timing.copied_bytes,
-                    conversion_timing.max_input, conversion_timing.max_output,
-                    conversion_timing.core, conversion_timing.simulated_write,
-                    conversion_timing.preload, conversion_timing.persistence,
-                    conversion_timing.simulation_allocation, keep_conversion_output);
-        } else if (bam_to_sam) {
-            int ret = backend_bam_input && !memory_bam_input
-                ? OptimizedBamToSamMPI(
-                      *backend_input, backend_plan.rank_spans(),
-                      backend_plan.rank_block_count(), body_sink,
-                      hdr, &sam_stats)
-                : OptimizedBamToSamMPI(
-                      reader, body_sink, hdr, &sam_stats);
-            if (ret != 0) {
-                fprintf(stderr, "[rank %d] ERROR: MPI bam2sam optimized 1CG body failed.\n", rank);
-                local_ok = 0;
-            }
-        } else if (sam_to_bam) {
-            if (OptimizedSamToBamMPI(
-                    reader, body_sink, hdr,
-                    cmd_info->compress_level_,
-                    &sam2bam_stats) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: MPI sam2bam optimized 1CG body failed.\n", rank);
-                local_ok = 0;
-            }
-        } else {
-            int ret = backend_bam_input && !memory_bam_input
-                ? OptimizedBamToBamMPI(
-                      *backend_input, backend_plan.rank_spans(),
-                      backend_plan.rank_block_count(), body_sink,
-                      filter, cmd_info->compress_level_, &stats)
-                : OptimizedBamToBamMPI(
-                      reader, body_sink, filter,
-                      cmd_info->compress_level_, &stats);
-            if (ret != 0) {
-                fprintf(stderr, "[rank %d] ERROR: MPI bam2bam optimized 1CG body failed.\n", rank);
-                local_ok = 0;
-            }
-        }
-
-        int global_ok = MpiAllRanksOk(local_ok);
-        double OptimizedBamToBamMPI_cost = chunked_conversion
-            ? conversion_timing.core : GetTime() - OptimizedBamToBamMPI_t0;
-        double OptimizedBamToBamMPI_cost_max = MpiReduceMaxCost(OptimizedBamToBamMPI_cost);
-        if (rank == 0 && global_ok) {
-            printf("Complete the 4.3 %s cost %lf\n", optimized_name, OptimizedBamToBamMPI_cost_max);
-        }
-
-        if (!global_ok) goto cleanup;
-
-        {
-            const int local_spool = chunked_conversion ? 0 : (body_sink.is_memory() ? 0 : 1);
-            int spool_ranks = 0;
-            MPI_Reduce(&local_spool, &spool_ranks, 1, MPI_INT,
-                       MPI_SUM, 0, MPI_COMM_WORLD);
-            if (rank == 0) {
-                printf("MPI rank body backend requested=%s "
-                       "memory_ranks=%d spool_ranks=%d\n",
-                       cmd_info->rank_body_backend_.c_str(),
-                       comm_size - spool_ranks, spool_ranks);
-                if (chunked_conversion) printf("MPI conversion body uses bounded "
-                    "memory chunks; validation persistence=%d; chunk_bytes=%llu\n",
-                    keep_conversion_output, (unsigned long long)conversion_chunk_bytes);
-            }
-        }
-
-        //4.4 收集每个 rank 的输出大小
-        // Validation storage flush and its synchronization are preparation only.
-        if (chunked_conversion) {
-            const double flush_t0 = GetTime();
-            if (body_sink.Flush() != 0) local_ok = 0;
-            if (!MpiAllRanksOk(local_ok)) goto cleanup;
-            conversion_timing.persistence += GetTime() - flush_t0;
-        }
-        double stage44_t0 = GetTime();
-        if ((!chunked_conversion && body_sink.Flush() != 0) ||
-            body_sink.size() > (uint64_t)LLONG_MAX) {
-            local_ok = 0;
-        }
-        if (!MpiAllRanksOk(local_ok)) goto cleanup;
-        local_body_size = (long long)body_sink.size();
-        body_sizes.assign((size_t)comm_size, 0);
-        body_prefixes.assign((size_t)comm_size, 0);
-        MPI_Allgather(&local_body_size, 1, MPI_LONG_LONG,
-                      body_sizes.data(), 1, MPI_LONG_LONG, MPI_COMM_WORLD);
-        local_prefix = 0;
-        total_body_size = 0;
-        for (int i = 0; i < comm_size; ++i) {
-            body_prefixes[(size_t)i] = total_body_size;
-            if (i < rank) local_prefix += body_sizes[(size_t)i];
-            total_body_size += body_sizes[(size_t)i];
-        }
-        double stage44_cost = GetTime() - stage44_t0;
-        double stage44_cost_max = MpiReduceMaxCost(stage44_cost);
+        MpiBamToBamStats bm = {};
+        MpiBamToSamStats bs = {};
+        MpiSamToBamStats sb = {};
+        MPI_Barrier(MPI_COMM_WORLD);
+        const double core_start = GetTime();
+        if (!from_bam)
+            ok = OptimizedSamToBamMPI(reader, body, header, cmd_info->compress_level_, &sb) == 0;
+        else if (to_sam)
+            ok = OptimizedBamToSamMPI(*input.backend(), plan.rank_spans(),
+                plan.rank_block_count(), body, header, &bs) == 0;
+        else
+            ok = OptimizedBamToBamMPI(*input.backend(), plan.rank_spans(),
+                plan.rank_block_count(), body, filter, cmd_info->compress_level_, &bm) == 0;
+        const double core = MpiReduceMaxCost(GetTime() - core_start);
+        if (!MpiAllRanksOk(ok && body.Flush() == 0)) return 1;
+        long long local[3] = {
+            from_bam ? to_sam ? bs.total_records : bm.total_records : sb.total_records,
+            from_bam && !to_sam ? bm.kept_records :
+                from_bam ? bs.total_records : sb.total_records,
+            (long long)body.size()
+        }, totals[3] = {};
+        MPI_Reduce(local, totals, 3, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        const char *name = !from_bam ? "OptimizedSamToBamMPI" :
+            to_sam ? "OptimizedBamToSamMPI" : "OptimizedBamToBamMPI";
         if (rank == 0) {
-            printf("Complete the 4.4 gather body sizes cost %lf\n", stage44_cost_max);
+            printf("Complete the 4.3 %s cost %lf\n", name, core);
+            printf("%s finished. ranks=%d total_records=%lld kept_records=%lld body_bytes=%lld\n",
+                   name, ranks, totals[0], totals[1], totals[2]);
+            if (!to_sam) ok = MpiBuildBamHeaderMemory(header, cmd_info->compress_level_, &prefix, &prefix_size) == 0;
         }
-
-        //4.5a 处理输出 header 和整体布局，这部分计入处理时间
-        double stage45_header_t0 = GetTime();
-        long long output_body_start_ll = 0;
-        long long output_file_size_ll = 0;
-        if (rank == 0) {
-            unsigned long long final_size = 0;
-            sam_header_text = nullptr;
-            sam_header_len = 0;
-            if (bam_to_sam) {
-                sam_header_text = sam_hdr_str(hdr);
-                sam_header_len = sam_hdr_length(hdr);
-                if (sam_header_len > 0 && !sam_header_text) {
-                    fprintf(stderr, "ERROR: failed to get SAM header text for MPI BAM2SAM output.\n");
-                    local_ok = 0;
-                }
-                output_body_start = sam_header_len;
-                final_size = (unsigned long long)output_body_start +
-                             (unsigned long long)total_body_size;
-            } else if (sam_to_bam) {
-                if (MpiBuildBamHeaderMemory(hdr, cmd_info->compress_level_, &bam_header_mem, &bam_header_size) != 0) {
-                    fprintf(stderr, "ERROR: failed to build MPI SAM2BAM output BAM header in memory.\n");
-                    local_ok = 0;
-                }
-                output_body_start = bam_header_size;
-                final_size = (unsigned long long)output_body_start +
-                             (unsigned long long)total_body_size +
-                             (unsigned long long)sizeof(kMpiBgzfEofBlock);
-            } else {
-                if (backend_bam_input && !input_file_mem) {
-                    if (MpiBuildBamHeaderMemory(
-                            hdr, cmd_info->compress_level_,
-                            &bam_header_mem, &bam_header_size) != 0) {
-                        fprintf(stderr, "ERROR: failed to build MPI BAM2BAM output header in memory.\n");
-                        local_ok = 0;
-                    }
-                    output_body_start = bam_header_size;
-                } else {
-                    output_body_start = (size_t)body_start;
-                }
-                final_size = (unsigned long long)output_body_start +
-                             (unsigned long long)total_body_size +
-                             (unsigned long long)sizeof(kMpiBgzfEofBlock);
-            }
-            if (final_size > (unsigned long long)SIZE_MAX ||
-                final_size > (unsigned long long)LLONG_MAX ||
-                (unsigned long long)output_body_start > (unsigned long long)LLONG_MAX) {
-                fprintf(stderr, "ERROR: MPI output buffer would exceed addressable memory.\n");
-                local_ok = 0;
-            } else {
-                output_file_size = (size_t)final_size;
-                output_body_start_ll = (long long)output_body_start;
-                output_file_size_ll = (long long)output_file_size;
-            }
-        }
-
-        int stage45_header_ok = MpiAllRanksOk(local_ok);
-        MPI_Bcast(&output_body_start_ll, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        MPI_Bcast(&output_file_size_ll, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
-        if (stage45_header_ok) {
-            output_body_start = (size_t)output_body_start_ll;
-            output_file_size = (size_t)output_file_size_ll;
-        }
-        double stage45_header_cost = GetTime() - stage45_header_t0;
-        double stage45_header_cost_max = MpiReduceMaxCost(stage45_header_cost);
-        if (rank == 0 && stage45_header_ok) {
-            printf("Complete the 4.5a header/layout cost %lf\n", stage45_header_cost_max);
-        }
-        if (!stage45_header_ok) goto cleanup;
-
-        //4.5b 分配每个 rank 的本地模拟写内存，这部分不计入处理时间
-        double stage45_malloc_t0 = GetTime();
-        simulated_write_size = !chunked_conversion && body_sink.is_memory() &&
-            local_body_size > 0 ? (size_t)local_body_size : 0;
-        if ((chunked_conversion || body_sink.is_memory()) && rank == 0) {
-            if (output_body_start > SIZE_MAX - simulated_write_size) {
-                fprintf(stderr, "[rank %d] ERROR: simulated output memory estimate overflow.\n", rank);
-                local_ok = 0;
-            } else {
-                simulated_write_size += output_body_start;
-            }
-        }
-        if (local_ok && simulated_write_size > 0) {
-            simulated_write_mem = (char *)malloc(simulated_write_size);
-            if (!simulated_write_mem) {
-                fprintf(stderr, "[rank %d] ERROR: failed to allocate simulated output memory. size=%zu\n",
-                        rank, simulated_write_size);
-                local_ok = 0;
-            }
-        }
-        int stage45_malloc_ok = MpiAllRanksOk(local_ok);
-        double stage45_malloc_cost = GetTime() - stage45_malloc_t0 +
-            (chunked_conversion ? conversion_timing.simulation_allocation : 0.0);
-        double stage45_malloc_cost_max = MpiReduceMaxCost(stage45_malloc_cost);
-        if (rank == 0 && stage45_malloc_ok) {
-            printf("Complete the 4.5b malloc simulated write memory cost %lf\n", stage45_malloc_cost_max);
-        }
-        if (!stage45_malloc_ok) goto cleanup;
-
-        //4.6 各 rank 根据逻辑偏移模拟写入高速磁盘内存，只统计 memcpy 时间
-        double sim_write_t0 = GetTime();
-        long long simulated_write_offset = (long long)output_body_start + local_prefix;
-        (void)simulated_write_offset;
-        size_t simulated_pos = 0;
-        if ((chunked_conversion || body_sink.is_memory()) &&
-            rank == 0 && output_body_start > 0) {
-            if (bam_to_sam) {
-                if (sam_header_len > 0) {
-                    memcpy(simulated_write_mem + simulated_pos, sam_header_text, sam_header_len);
-                    simulated_pos += sam_header_len;
-                }
-            } else if (sam_to_bam) {
-                if (bam_header_size > 0) {
-                    memcpy(simulated_write_mem + simulated_pos, bam_header_mem, bam_header_size);
-                    simulated_pos += bam_header_size;
-                }
-            } else {
-                const char *header_data =
-                    backend_bam_input && !input_file_mem
-                        ? bam_header_mem : input_file_mem;
-                if (output_body_start > 0) {
-                    memcpy(simulated_write_mem + simulated_pos,
-                           header_data, output_body_start);
-                    simulated_pos += output_body_start;
-                }
-            }
-        }
-        if (!chunked_conversion && body_sink.is_memory() && local_body_size > 0) {
-            if (body_sink.ReadAt(
-                    0, simulated_write_mem + simulated_pos,
-                    (size_t)local_body_size) != 0) {
-                local_ok = 0;
-            } else {
-                simulated_pos += (size_t)local_body_size;
-            }
-        }
-        if (simulated_pos > 0) {
-            unsigned char *guard_ptr = (unsigned char *)simulated_write_mem;
-            simulated_write_guard += guard_ptr[0];
-            simulated_write_guard += guard_ptr[simulated_pos - 1];
-        }
-        double sim_write_cost = GetTime() - sim_write_t0 +
-            (chunked_conversion ? conversion_timing.simulated_write : 0.0);
-        if (bam_to_sam) {
-            sam_stats.t_gather += sim_write_cost;
-        } else if (sam_to_bam) {
-            sam2bam_stats.t_gather += sim_write_cost;
-        } else {
-            stats.t_mpi_write += sim_write_cost;
-        }
-
-        global_ok = MpiAllRanksOk(local_ok);
-        double stage46_cost_max = MpiReduceMaxCost(sim_write_cost);
-        if (rank == 0 && global_ok) {
-            printf("Complete the 4.6 simulated header/body distributed write cost %lf\n", stage46_cost_max);
-        }
-        if (simulated_write_guard == (unsigned long long)-1 && rank < 0) {
-            fprintf(stderr, "unused simulated write guard %llu\n", simulated_write_guard);
-        }
-        if (chunked_conversion) {
-            const double preload_max = MpiReduceMaxCost(conversion_timing.preload);
-            const double persist_max = MpiReduceMaxCost(conversion_timing.persistence);
-            if (rank == 0) printf("Conversion excluded chunk preparation "
-                "preload_s=%.6f validation_persistence_s=%.6f\n",
-                preload_max, persist_max);
-        }
-        double body_cost = GetTime() - body_t0 - input_prepare_cost -
-            (chunked_conversion ? conversion_timing.preload +
-                conversion_timing.persistence + conversion_timing.simulation_allocation : 0.0);
-        double body_cost_max = MpiReduceMaxCost(body_cost);
-        if (rank == 0 && global_ok) {
-            double body_counted_cost = stage41_cost_max + stage42_cost_max +
-                                       OptimizedBamToBamMPI_cost_max + stage44_cost_max +
-                                       stage45_header_cost_max + stage46_cost_max;
-            t_total += body_counted_cost;
-            // printf("Complete the counted body cost %lf\n", body_counted_cost);
-            printf("Complete the total (4.1~4.6) cost %lf-----\n", t_total);
-        }
-        if (!global_ok) goto cleanup;
-
-
-        //4.7 全局同步，统计每个 rank 的处理时间和统计数据，rank 0 汇总并打印最终统计结果
-        double stage47_t0 = GetTime();
-        if (bam_to_sam) {
-            long long local_long_stats[4] = {
-                sam_stats.input_blocks,
-                sam_stats.group_count,
-                sam_stats.total_records,
-                sam_stats.format_tiles
-            };
-            long long global_long_stats[4] = {};
-            MPI_Reduce(local_long_stats, global_long_stats, 4, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-            double local_double_stats[15] = {
-                sam_stats.t_decomp,
-                sam_stats.t_decomp_alloc,
-                sam_stats.t_decomp_inflate,
-                sam_stats.t_decomp_crc,
-                sam_stats.t_decomp_parse,
-                sam_stats.t_decomp_other,
-                sam_stats.t_format,
-                sam_stats.t_collect,
-                sam_stats.t_read,
-                sam_stats.t_write,
-                sam_stats.t_gather,
-                sam_stats.t_optimized_total,
-                sam_stats.t_decomp + sam_stats.t_collect + sam_stats.t_format,
-                sam_stats.t_alloc_init,
-                sam_stats.t_free_workspace
-            };
-            double global_double_stats[15] = {};
-            MPI_Reduce(local_double_stats, global_double_stats, 15, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-
-            MpiPrintRankBamToSamStats(
-                rank, comm_size, sam_stats, (size_t)body_sink.size());
-            if (rank == 0) {
-                printf("OptimizedBamToSamMPI finished. ranks=%d in_blocks=%lld groups=%lld total_records=%lld format_tiles=%lld body_bytes=%lld\n",
-                       comm_size, global_long_stats[0], global_long_stats[1],
-                       global_long_stats[2], global_long_stats[3], total_body_size);
-                printf("  decomp_slave_sum=%.3f  format_slave_sum=%.3f  collect_sum=%.3f  read_sum=%.3f  write_sum=%.3f  gather_sum=%.3f\n",
-                       global_double_stats[0], global_double_stats[6], global_double_stats[7],
-                       global_double_stats[8], global_double_stats[9], global_double_stats[10]);
-                printf("  decomp_detail_sum alloc=%.3f  inflate=%.3f  crc=%.3f  parse=%.3f  other=%.3f\n",
-                       global_double_stats[1], global_double_stats[2], global_double_stats[3],
-                       global_double_stats[4], global_double_stats[5]);
-                printf("  optimized_total_sum=%.3f  core_stage_sum=%.3f  alloc_init_sum=%.3f  free_workspace_sum=%.3f\n",
-                       global_double_stats[11], global_double_stats[12],
-                       global_double_stats[13], global_double_stats[14]);
-            }
-        } else if (sam_to_bam) {
-            long long local_long_stats[7] = {
-                sam2bam_stats.input_chunks,
-                sam2bam_stats.chunk_groups,
-                sam2bam_stats.total_records,
-                sam2bam_stats.compress_groups,
-                sam2bam_stats.bgzf_blocks,
-                sam2bam_stats.parse_fast_records,
-                sam2bam_stats.parse_fallback_records
-            };
-            long long global_long_stats[7] = {};
-            MPI_Reduce(local_long_stats, global_long_stats, 7, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-            double local_double_stats[22] = {
-                sam2bam_stats.t_split,
-                sam2bam_stats.t_copy_count,
-                sam2bam_stats.t_parse,
-                sam2bam_stats.t_parse_core,
-                sam2bam_stats.t_parse_aux,
-                sam2bam_stats.t_parse_cg,
-                sam2bam_stats.t_parse_fallback,
-                sam2bam_stats.t_parse_other,
-                sam2bam_stats.t_pack,
-                sam2bam_stats.t_compress,
-                sam2bam_stats.t_compress_serialize,
-                sam2bam_stats.t_compress_alloc,
-                sam2bam_stats.t_compress_deflate,
-                sam2bam_stats.t_compress_footer,
-                sam2bam_stats.t_compress_other,
-                sam2bam_stats.t_write,
-                sam2bam_stats.t_gather,
-                sam2bam_stats.t_optimized_total,
-                sam2bam_stats.t_setup_reset,
-                sam2bam_stats.t_compress_setup,
-                sam2bam_stats.t_status_check,
-                sam2bam_stats.t_alloc_init + sam2bam_stats.t_free_workspace
-            };
-            double global_double_stats[22] = {};
-            MPI_Reduce(local_double_stats, global_double_stats, 22, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-
-
-            MpiPrintRankSamToBamStats(
-                rank, comm_size, sam2bam_stats, (size_t)body_sink.size());
-            if (rank == 0) {
-                printf("OptimizedSamToBamMPI finished. ranks=%d chunks=%lld chunk_groups=%lld total_records=%lld compress_groups=%lld bgzf_blocks=%lld body_bytes=%lld\n",
-                       comm_size, global_long_stats[0], global_long_stats[1],
-                       global_long_stats[2], global_long_stats[3], global_long_stats[4],
-                       total_body_size);
-                printf("  parse_fast_records=%lld  parse_fallback_records=%lld\n",
-                       global_long_stats[5], global_long_stats[6]);
-                printf("  split_sum=%.3f  copy_count_slave_sum=%.3f  parse_slave_sum=%.3f  pack_sum=%.3f  compress_slave_sum=%.3f  write_sum=%.3f  gather_sum=%.3f\n",
-                       global_double_stats[0], global_double_stats[1], global_double_stats[2],
-                       global_double_stats[8], global_double_stats[9], global_double_stats[15],
-                       global_double_stats[16]);
-                printf("  parse_detail_sum core=%.3f  aux=%.3f  cg=%.3f  fallback=%.3f  other=%.3f\n",
-                       global_double_stats[3], global_double_stats[4], global_double_stats[5],
-                       global_double_stats[6], global_double_stats[7]);
-                printf("  compress_detail_sum serialize=%.3f  alloc=%.3f  deflate=%.3f  footer=%.3f  other=%.3f\n",
-                       global_double_stats[10], global_double_stats[11], global_double_stats[12],
-                       global_double_stats[13], global_double_stats[14]);
-                printf("  optimized_total_sum=%.3f  core_stage_sum=%.3f  setup_reset_sum=%.3f  compress_setup_sum=%.3f  status_check_sum=%.3f  alloc_free_sum=%.3f\n",
-                       global_double_stats[17],
-                       global_double_stats[1] + global_double_stats[2] +
-                       global_double_stats[8] + global_double_stats[9],
-                       global_double_stats[18], global_double_stats[19],
-                       global_double_stats[20], global_double_stats[21]);
-            }
-        } else {
-            long long local_long_stats[7] = {
-                stats.input_blocks,
-                stats.group_count,
-                stats.total_records,
-                stats.kept_records,
-                stats.dropped_records,
-                stats.bgzf_blocks,
-                stats.pack_records
-            };
-            long long global_long_stats[7] = {};
-            MPI_Reduce(local_long_stats, global_long_stats, 7, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-            double local_double_stats[16] = {
-                stats.t_decomp_filter,
-                stats.t_decomp_alloc,
-                stats.t_decomp_inflate,
-                stats.t_decomp_crc,
-                stats.t_decomp_parse,
-                stats.t_decomp_other,
-                stats.t_pack,
-                stats.t_compress,
-                stats.t_compress_serialize,
-                stats.t_compress_alloc,
-                stats.t_compress_deflate,
-                stats.t_compress_footer,
-                stats.t_compress_other,
-                stats.t_read,
-                stats.t_write,
-                stats.t_mpi_write
-            };
-            double global_double_stats[16] = {};
-            MPI_Reduce(local_double_stats, global_double_stats, 16, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-            double local_detail_stats[3] = {
-                stats.t_optimized_total,
-                stats.t_decomp_filter + stats.t_pack + stats.t_compress,
-                stats.t_prepare_decomp,
-            };
-            double global_detail_stats[3] = {};
-            MPI_Reduce(local_detail_stats, global_detail_stats, 3, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
-
-            MpiPrintRankStats(
-                rank, comm_size, stats, (size_t)body_sink.size());
-            if (rank == 0) {
-                double keep_ratio = global_long_stats[2] > 0
-                                    ? (double)global_long_stats[3] / (double)global_long_stats[2]
-                                    : 1.0;
-                printf("OptimizedBamToBamMPI finished. ranks=%d in_blocks=%lld groups=%lld total_records=%lld kept_records=%lld dropped_records=%lld bgzf_blocks=%lld body_bytes=%lld\n",
-                       comm_size, global_long_stats[0], global_long_stats[1], global_long_stats[2],
-                       global_long_stats[3], global_long_stats[4], global_long_stats[5],
-                       total_body_size);
-                printf("  decomp_filter_slave_sum=%.3f  pack_sum=%.3f  compress_slave_sum=%.3f  read_sum=%.3f  write_sum=%.3f  mpi_write_sum=%.3f\n",
-                       global_double_stats[0], global_double_stats[6], global_double_stats[7],
-                       global_double_stats[13], global_double_stats[14], global_double_stats[15]);
-                printf("  decomp_detail_sum alloc=%.3f  inflate=%.3f  crc=%.3f  parse_filter=%.3f  other=%.3f\n",
-                       global_double_stats[1], global_double_stats[2], global_double_stats[3],
-                       global_double_stats[4], global_double_stats[5]);
-                printf("  compress_detail_sum serialize=%.3f  alloc=%.3f  deflate=%.3f  footer=%.3f  other=%.3f\n",
-                       global_double_stats[8], global_double_stats[9], global_double_stats[10],
-                       global_double_stats[11], global_double_stats[12]);
-                printf("  optimized_total_sum=%.3f  core_stage_sum=%.3f  prepare_decomp_sum=%.3f\n",
-                       global_detail_stats[0], global_detail_stats[1], global_detail_stats[2]);
-                printf("  pack_records=%lld  keep_ratio=%.6f  filter_mode=%s\n",
-                       global_long_stats[6], keep_ratio, bam_filter_is_noop(filter) ? "passthrough" : "filtered");
-            }
-        }
-        double stage47_cost = GetTime() - stage47_t0;
-        double stage47_cost_max = MpiReduceMaxCost(stage47_cost);
-        if (rank == 0 && global_ok) {
-            printf("Complete the 4.7 rank stats reduce/print cost %lf\n", stage47_cost_max);
-        }
-
-        double body_total_cost = GetTime() - body_total_t0 - input_prepare_cost -
-            (chunked_conversion ? conversion_timing.preload +
-                conversion_timing.persistence + conversion_timing.simulation_allocation : 0.0);
-        double body_total_cost_max = MpiReduceMaxCost(body_total_cost);
-        if (rank == 0 && global_ok) {
-            printf("444Complete the total body cost %lf\n", body_total_cost_max);
-        }
-    }
-
-    //5. 输出不计入核心处理时间。MPI-IO 路径跳过 rank0 全量 gather。
-    if (chunked_conversion && !keep_conversion_output) {
-        if (rank == 0) printf("555Skip validation dump; logical output bytes=%zu\n",
-                              output_file_size);
-    } else if (mpiio_output) {
-        double mpiio_t0 = GetTime();
-        swbam::mpi::MpiFileOutput output;
-        if (output.Open(cmd_info->out_file_name_,
-                        (uint64_t)output_file_size) != 0) {
-            fprintf(stderr, "[rank %d] ERROR: failed to open MPI-IO output %s.\n",
-                    rank, cmd_info->out_file_name_.c_str());
-            local_ok = 0;
-        }
-        int mpiio_open_ok = MpiAllRanksOk(local_ok);
-        if (mpiio_open_ok) {
-            if (rank == 0 && output_body_start > 0) {
-                const char *header_data = nullptr;
-                if (bam_to_sam) {
-                    header_data = sam_header_text;
-                } else if (sam_to_bam ||
-                           (backend_bam_input && !input_file_mem)) {
-                    header_data = bam_header_mem;
-                } else {
-                    header_data = input_file_mem;
-                }
-                if (output.WriteAt(0, header_data,
-                                   (uint64_t)output_body_start) != 0) {
-                    fprintf(stderr, "ERROR: failed to write MPI-IO output header.\n");
-                    local_ok = 0;
-                }
-            }
-            const size_t chunk_capacity = 8u * 1024u * 1024u;
-            std::vector<unsigned char> chunk;
-            if (local_body_size > 0) {
-                try {
-                    chunk.resize((size_t)std::min<long long>(
-                        local_body_size, (long long)chunk_capacity));
-                } catch (...) {
-                    local_ok = 0;
-                }
-            }
-            uint64_t copied = 0;
-            while (local_ok && copied < (uint64_t)local_body_size) {
-                const size_t count = (size_t)std::min<uint64_t>(
-                    (uint64_t)local_body_size - copied,
-                    chunk.size());
-                if (body_sink.ReadAt(
-                        copied, chunk.data(), count) != 0 ||
-                    output.WriteAt(
-                        (uint64_t)output_body_start +
-                            (uint64_t)local_prefix + copied,
-                        chunk.data(), count) != 0) {
-                    fprintf(stderr,
-                            "[rank %d] ERROR: failed to write MPI-IO "
-                            "output body.\n", rank);
-                    local_ok = 0;
-                }
-                copied += count;
-            }
-            if (rank == 0 && !bam_to_sam &&
-                output.WriteAt(
-                    (uint64_t)output_body_start + (uint64_t)total_body_size,
-                    kMpiBgzfEofBlock,
-                    (uint64_t)sizeof(kMpiBgzfEofBlock)) != 0) {
-                fprintf(stderr, "ERROR: failed to write MPI-IO BGZF EOF.\n");
-                local_ok = 0;
-            }
-        }
-        int mpiio_write_ok = MpiAllRanksOk(local_ok);
-        if (mpiio_write_ok && output.Sync() != 0) {
-            fprintf(stderr, "[rank %d] ERROR: failed to sync MPI-IO output.\n", rank);
-            local_ok = 0;
-        }
-        MpiAllRanksOk(local_ok);
-        if (output.Close() != 0) {
-            fprintf(stderr, "[rank %d] ERROR: failed to close MPI-IO output.\n", rank);
-            local_ok = 0;
-        }
-        int mpiio_close_ok = MpiAllRanksOk(local_ok);
-        double mpiio_cost = GetTime() - mpiio_t0;
-        double mpiio_cost_max = MpiReduceMaxCost(mpiio_cost);
-        if (rank == 0 && mpiio_close_ok) {
-            printf("555Distributed MPI-IO output cost %lf--\n", mpiio_cost_max);
-        }
-        if (!mpiio_open_ok || !mpiio_write_ok || !mpiio_close_ok) goto cleanup;
-    } else {
-        double verify_alloc_t0 = GetTime();
-        if (rank == 0) {
-            output_file_mem = output_file_size ? (char *)malloc(output_file_size) : nullptr;
-            if (output_file_size > 0 && !output_file_mem) {
-                fprintf(stderr, "ERROR: failed to allocate final MPI output buffer.\n");
-                local_ok = 0;
-            }
-            if (local_ok) {
-                if (bam_to_sam) {
-                    if (sam_header_len > 0) memcpy(output_file_mem, sam_header_text, sam_header_len);
-                } else if (sam_to_bam) {
-                    if (bam_header_size > 0) memcpy(output_file_mem, bam_header_mem, bam_header_size);
-                } else {
-                    const char *header_data =
-                        backend_bam_input && !input_file_mem
-                            ? bam_header_mem : input_file_mem;
-                    if (output_body_start > 0) {
-                        memcpy(output_file_mem, header_data,
-                               output_body_start);
-                    }
-                }
-            }
-        }
-        double verify_alloc_cost = GetTime() - verify_alloc_t0;
-        double verify_alloc_cost_max = MpiReduceMaxCost(verify_alloc_cost);
-        if (rank == 0 && local_ok) {
-            printf("555Prepare verification output memory cost %lf--\n", verify_alloc_cost_max);
-        }
-        if (!MpiAllRanksOk(local_ok)) goto cleanup;
-
-        double verify_gather_t0 = GetTime();
-        if (rank == 0) {
-            if (local_body_size > 0) {
-                if (body_sink.ReadAt(
-                        0,
-                        output_file_mem + output_body_start + local_prefix,
-                        (size_t)local_body_size) != 0) {
-                    local_ok = 0;
-                }
-            }
-            for (int src = 1; src < comm_size; ++src) {
-                long long recv_size = body_sizes[(size_t)src];
-                if (recv_size <= 0) continue;
-                long long received = 0;
-                while (received < recv_size) {
-                    const long long count = std::min<long long>(
-                        recv_size - received, 8ll * 1024ll * 1024ll);
-                    if (MpiRecvBytes(
-                            src, 0,
-                            output_file_mem + output_body_start +
-                                body_prefixes[(size_t)src] + received,
-                            count) != 0) {
-                        fprintf(stderr,
-                                "ERROR: failed to gather MPI rank %d "
-                                "body into output memory.\n", src);
-                        local_ok = 0;
-                        break;
-                    }
-                    received += count;
-                }
-                if (!local_ok) break;
-            }
-            if (local_ok && !bam_to_sam) {
-                memcpy(output_file_mem + output_body_start + total_body_size,
-                       kMpiBgzfEofBlock, sizeof(kMpiBgzfEofBlock));
-            }
-        } else if (local_body_size > 0) {
-            std::vector<unsigned char> chunk;
-            try {
-                chunk.resize((size_t)std::min<long long>(
-                    local_body_size, 8ll * 1024ll * 1024ll));
-            } catch (...) {
-                local_ok = 0;
-            }
-            uint64_t sent = 0;
-            while (local_ok && sent < (uint64_t)local_body_size) {
-                const size_t count = (size_t)std::min<uint64_t>(
-                    (uint64_t)local_body_size - sent,
-                    chunk.size());
-                if (body_sink.ReadAt(
-                        sent, chunk.data(), count) != 0 ||
-                    MpiSendBytes(
-                        0, 0,
-                        reinterpret_cast<const char *>(chunk.data()),
-                        count) != 0) {
-                    fprintf(stderr,
-                            "[rank %d] ERROR: failed to send output "
-                            "body to rank 0 for verification dump.\n",
-                            rank);
-                    local_ok = 0;
-                }
-                sent += count;
-            }
-        }
-        double verify_gather_cost = GetTime() - verify_gather_t0;
-        double verify_gather_cost_max = MpiReduceMaxCost(verify_gather_cost);
-        if (rank == 0 && local_ok) {
-            printf("555Gather verification output memory cost %lf--\n", verify_gather_cost_max);
-        }
-        if (!MpiAllRanksOk(local_ok)) goto cleanup;
-
-        double dump_t0 = 0.0;
-        double dump_cost = 0.0;
-        if (rank == 0) {
-            dump_t0 = GetTime();
-            if (MpiDumpMemoryToFile(cmd_info->out_file_name_, output_file_mem, output_file_size) != 0) {
-                fprintf(stderr, "ERROR: failed to dump MPI output memory to %s\n",
-                        cmd_info->out_file_name_.c_str());
-                local_ok = 0;
-            }
-            dump_cost = GetTime() - dump_t0;
-        }
-        double dump_cost_max = MpiReduceMaxCost(dump_cost);
-        if (rank == 0 && local_ok) printf("555Dump memory to output file cost %lf--\n", dump_cost_max);
-        if (!MpiAllRanksOk(local_ok)) goto cleanup;
-    }
-
-    exit_code = 0;
-
-    //6. 清理资源
-cleanup:
-    {
-        double close_t0 = GetTime();
-        if (chunked_conversion) conversion_output.Close();
-        else adaptive_body_sink.Close();
-        if (output_file_mem) free(output_file_mem);
-        if (bam_header_mem) free(bam_header_mem);
-        if (simulated_write_mem) free(simulated_write_mem);
-        if (hdr) sam_hdr_destroy(hdr);
-        if (backend_bam_input) {
-            input_file_mem = nullptr;
-            backend_input = nullptr;
-            backend_input_handle.Close();
-        } else if (streaming_sam_input) {
-            if (sam_input) sam_input->Close();
-            sam_input = nullptr;
-        } else if (sin) {
-            int ret = hts_close(sin);
-            if (ret < 0) fprintf(stderr, "[rank %d] ERROR: closing input failed.\n", rank);
-            input_file_mem = nullptr;
-        } else if (input_mem_hfile) {
-            if (hclose(input_mem_hfile) != 0) {
-                fprintf(stderr, "[rank %d] ERROR: closing memory hFILE failed.\n", rank);
-            }
-            input_file_mem = nullptr;
-        } else if (input_file_mem) {
-            free(input_file_mem);
-            input_file_mem = nullptr;
-        }
-        double close_cost = GetTime() - close_t0;
-        double close_cost_max = MpiReduceMaxCost(close_cost);
-        if (rank == 0) printf("666close the files cost %lf-----\n", close_cost_max);
-    }
-    return exit_code;
+        if (!MpiAllRanksOk(ok)) return 1;
+        const void *header_bytes = to_sam ? sam_hdr_str(header) : prefix;
+        const size_t header_size = to_sam ? sam_hdr_length(header) : prefix_size;
+        const double output_start = GetTime();
+        ok = swbam_usage::WriteOutput(cmd_info->out_file_name_, body,
+            header_size, header_bytes, to_sam ? 0 : sizeof(kMpiBgzfEofBlock),
+            to_sam ? nullptr : kMpiBgzfEofBlock) == 0;
+        const double output_time = MpiReduceMaxCost(GetTime() - output_start);
+        if (rank == 0) printf("Output commit cost %lf\n", output_time);
+        if (!from_bam) MpiPrintRankSamToBamStats(rank, ranks, sb, body.size());
+        else if (to_sam) MpiPrintRankBamToSamStats(rank, ranks, bs, body.size());
+        else MpiPrintRankStats(rank, ranks, bm, body.size());
+        return MpiAllRanksOk(ok) ? 0 : 1;
+    };
+    status = run();
+    free(prefix);
+    if (header) sam_hdr_destroy(header);
+    if (sam_input) sam_input->Close();
+    input.Close();
+    if (body.Close()) status = 1;
+    const double elapsed = MpiReduceMaxCost(GetTime() - body_start_time);
+    if (rank == 0) printf("444Complete the total body cost %lf\n", elapsed);
+    return status;
 }
 
 int ProcessBamToBamMPI(CmdInfo *cmd_info) {

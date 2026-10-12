@@ -392,7 +392,7 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
     }
 
     trace("input_open_begin");
-    if (!cmd_info || input_handle.Open(
+    if (!cmd_info || swbam_usage::OpenInput(input_handle,
             cmd_info->in_file_name_, cmd_info->io_backend_,
             cmd_info->io_memory_limit_) != 0) {
         fprintf(stderr, "[rank %d] ERROR: cannot open BAM input backend for %s\n",
@@ -440,7 +440,7 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
                    (long long)input_plan.body_offset,
                    (long long)input->body_offset());
         }
-        double stage41_cost = GetTime() - stage41_t0 - input_handle.simulation_prepare_cost();
+        double stage41_cost = GetTime() - stage41_t0 - 0.0;
         double stage41_cost_max = swbam::mpi::ReduceMaxCost(stage41_cost);
         if (rank == 0 && local_ok) {
             printf("Complete the 4.1 scan/split/broadcast/select cost %lf\n", stage41_cost_max);
@@ -541,7 +541,7 @@ int ProcessStatsMPI(CmdInfo *cmd_info) {
             printf("Complete the 4.4 stats reduce/print cost %lf\n", stage44_cost_max);
         }
 
-        double body_total_cost = GetTime() - body_total_t0 - input_handle.simulation_prepare_cost();
+        double body_total_cost = GetTime() - body_total_t0 - 0.0;
         double body_total_cost_max = swbam::mpi::ReduceMaxCost(body_total_cost);
         if (rank == 0) {
             printf("444Complete the total body cost %lf\n", body_total_cost_max);

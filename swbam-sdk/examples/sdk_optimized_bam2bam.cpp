@@ -1,114 +1,86 @@
 #include "swbam/swbam.h"
+#ifdef SWBAM_ENABLE_RAM_STORAGE
+#include "storage.h"
+#else
+#include "storage-native.h"
+#endif
 
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <mpi.h>
-#include <unistd.h>
 
 #ifdef PLATFORM_SUNWAY
 #include <athread.h>
 #endif
 
 int main(int argc, char **argv) {
+    swbam_usage::Session storage;
+    if (storage.Prepare(&argc, &argv, true)) return 2;
+    swbam_usage::BeginMpiInterval();
+    const double e2e_start = swbam_usage::WallTime();
     MPI_Init(&argc, &argv);
-    int rank = 0, ranks = 0;
+    int rank = 0, ranks = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
-    const char *diagnostics = std::getenv("SWBAM_DIAGNOSTICS");
-    const bool trace = diagnostics && std::strcmp(diagnostics, "0") != 0;
-    const double diagnostic_start = trace ? MPI_Wtime() : 0.0;
-    const auto mark = [&](const char *stage, int ok = 1, size_t value = 0) {
-        if (!trace) return;
-        fprintf(stderr, "[sdk-diag rank=%d pid=%ld] elapsed=%.6f stage=%s ok=%d value=%zu\n",
-                rank, static_cast<long>(getpid()), MPI_Wtime() - diagnostic_start,
-                stage, ok, value);
-        fflush(stderr);
-    };
-    if (argc != 2) {
-        if (rank == 0) fprintf(stderr, "Usage: %s input.bam\n", argv[0]);
+    const bool layout_ok = swbam::mpi::AllRanksOk(storage.EnterMpi() == 0);
+    if (argc != 2 || storage.output_path().empty() || !layout_ok) {
+        if (rank == 0) fprintf(stderr, "Usage: %s input.bam -o output.bam [--storage ram ...]\n", argv[0]);
         MPI_Finalize();
-        return 2;
+        const double elapsed = swbam_usage::WallTime() - e2e_start;
+        swbam_usage::EndMpiInterval();
+        return storage.Finish(2, elapsed);
     }
 #ifdef PLATFORM_SUNWAY
-    mark("athread_init.begin");
     athread_init();
-    mark("athread_init.done");
 #endif
     int status = 1;
     {
         swbam::mpi::MpiBamInput input;
         swbam::mpi::MpiBamInputPlan plan;
-        swbam::AdaptiveRankBodySink body;
-        mark("open.begin");
-        int ok = input.Open(argv[1], "memory", "", MPI_COMM_WORLD) == 0;
-        mark("open.done", ok);
-        if (swbam::mpi::AllRanksOk(ok, MPI_COMM_WORLD)) {
-            mark("scan_plan.begin");
-            ok = swbam::mpi::PrepareMpiBamInputPlan(
-                *input.backend(), &plan, 0, MPI_COMM_WORLD) == 0;
-            mark("scan_plan.done", ok, plan.rank_block_count());
-            if (swbam::mpi::AllRanksOk(ok, MPI_COMM_WORLD)) {
-                size_t reserve = 0;
-                for (size_t i = plan.rank_begin; i < plan.rank_end; ++i)
-                    reserve += plan.blocks[i].compressed_size;
-                mark("body_reserve.begin", 1, reserve);
-                ok = body.Open("memory", 0, reserve,
-                               "sdk-bam2bam-body", "") == 0;
-                mark("body_reserve.done", ok, reserve);
-                if (!ok) fprintf(stderr, "[rank %d] memory body allocation failed.\n", rank);
-                if (swbam::mpi::AllRanksOk(ok, MPI_COMM_WORLD)) {
-                    swbam::operators::BamTransformMetrics metrics = {};
-                    const swbam::BamFilterOptions filter =
-                        swbam::DefaultBamFilterOptions();
-                    mark("core_barrier.begin");
-                    MPI_Barrier(MPI_COMM_WORLD);
-                    mark("pipeline.begin");
-                    const double start = MPI_Wtime();
-                    ok = swbam::operators::RunBamTransformPipeline(
-                        *input.backend(), plan.rank_spans(),
-                        plan.rank_block_count(), &body, filter, 1,
-                        &metrics) == 0 &&
-                         metrics.kept_records == metrics.total_records;
-                    const double seconds = MPI_Wtime() - start;
-                    mark("pipeline.done", ok, body.size());
-                    mark("result_collectives.begin", ok);
-                    if (swbam::mpi::AllRanksOk(ok, MPI_COMM_WORLD)) {
-                        long long records = 0;
-                        unsigned long long body_bytes = 0;
-                        double core = 0.0;
-                        const unsigned long long local_bytes = body.size();
-                        MPI_Reduce(&metrics.total_records, &records, 1,
-                                   MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-                        MPI_Reduce(&local_bytes, &body_bytes, 1,
-                                   MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0,
-                                   MPI_COMM_WORLD);
-                        MPI_Reduce(&seconds, &core, 1, MPI_DOUBLE,
-                                   MPI_MAX, 0, MPI_COMM_WORLD);
-                        if (rank == 0) {
-                            printf("sdk_bam2bam ranks=%d records=%lld blocks=%zu "
-                                   "input_bytes=%zu body_bytes=%llu core=%.6f\n",
-                                   ranks, records, plan.blocks.size(),
-                                   input.backend()->size(), body_bytes, core);
-                        }
-                        status = 0;
-                        mark("result_collectives.done");
-                    }
-                }
+        swbam_usage::BodySink body;
+        const auto run = [&]() -> int {
+            int ok = swbam_usage::OpenInput(input, argv[1], "posix", "") == 0;
+            if (!swbam::mpi::AllRanksOk(ok)) return 1;
+            if (input.PreparePlan(&plan)) return 1;
+            ok = body.Open("memory", 0, 8u * 1024u * 1024u, "sdk-body", "") == 0;
+            if (!swbam::mpi::AllRanksOk(ok)) return 1;
+            swbam::operators::BamTransformMetrics metrics = {};
+            MPI_Barrier(MPI_COMM_WORLD);
+            const double start = MPI_Wtime();
+            ok = swbam::operators::RunBamTransformPipeline(
+                *input.backend(), plan.rank_spans(), plan.rank_block_count(),
+                &body, swbam::DefaultBamFilterOptions(), 1, &metrics) == 0 &&
+                metrics.kept_records == metrics.total_records && body.Flush() == 0;
+            const double seconds = MPI_Wtime() - start;
+            if (!swbam::mpi::AllRanksOk(ok)) return 1;
+            long long records = 0;
+            unsigned long long bytes = 0, local_bytes = body.size();
+            double core = 0.0;
+            MPI_Reduce(&metrics.total_records, &records, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&local_bytes, &bytes, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&seconds, &core, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            swbam::MemoryBamOutput prefix;
+            if (rank == 0) {
+                ok = swbam_usage::BuildBamPrefix(
+                    const_cast<sam_hdr_t *>(input.backend()->header()), 1, &prefix) == 0;
+                printf("sdk_bam2bam ranks=%d records=%lld blocks=%zu input_bytes=%zu body_bytes=%llu core=%.6f\n",
+                       ranks, records, plan.blocks.size(), input.backend()->size(), bytes, core);
             }
-        }
-        mark("body_close.begin");
-        body.Close();
-        mark("input_close.begin");
+            if (!swbam::mpi::AllRanksOk(ok)) return 1;
+            const unsigned char eof[28] = {31,139,8,4,0,0,0,0,0,255,6,0,66,67,2,0,27,0,3,0,0,0,0,0,0,0,0,0};
+            return swbam_usage::WriteOutput(storage.output_path(), body,
+                prefix.size(), prefix.data(), sizeof(eof), eof) == 0 ? 0 : 1;
+        };
+        status = run();
         input.Close();
-        mark("input_close.done");
+        if (body.Close()) status = 1;
     }
+    storage.LeaveMpi();
 #ifdef PLATFORM_SUNWAY
-    mark("athread_halt.begin");
     athread_halt();
-    mark("athread_halt.done");
 #endif
-    mark("mpi_finalize.begin");
     MPI_Finalize();
-    return status;
+    const double seconds = swbam_usage::WallTime() - e2e_start;
+    swbam_usage::EndMpiInterval();
+    return storage.Finish(status, seconds);
 }

@@ -1,4 +1,9 @@
 #include "swbam/swbam.h"
+#ifdef SWBAM_ENABLE_RAM_STORAGE
+#include "storage.h"
+#else
+#include "storage-native.h"
+#endif
 
 #include <cstdio>
 #include <mpi.h>
@@ -8,14 +13,21 @@
 #endif
 
 int main(int argc, char **argv) {
+    swbam_usage::Session storage;
+    if (storage.Prepare(&argc, &argv, true)) return 2;
+    swbam_usage::BeginMpiInterval();
+    const double e2e_start = swbam_usage::WallTime();
     MPI_Init(&argc, &argv);
     int rank = 0, ranks = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
-    if (argc != 2) {
+    const bool layout_ok = swbam::mpi::AllRanksOk(storage.EnterMpi() == 0);
+    if (argc != 2 || !layout_ok) {
         if (rank == 0) fprintf(stderr, "Usage: %s input.bam\n", argv[0]);
         MPI_Finalize();
-        return 2;
+        const double elapsed = swbam_usage::WallTime() - e2e_start;
+        swbam_usage::EndMpiInterval();
+        return storage.Finish(2, elapsed);
     }
 #ifdef PLATFORM_SUNWAY
     athread_init();
@@ -24,7 +36,7 @@ int main(int argc, char **argv) {
     {
         swbam::mpi::MpiBamInput input;
         swbam::mpi::MpiBamInputPlan plan;
-        int ok = input.Open(argv[1], "memory", "", MPI_COMM_WORLD) == 0;
+        int ok = swbam_usage::OpenInput(input, argv[1], "posix", "") == 0;
         if (swbam::mpi::AllRanksOk(ok, MPI_COMM_WORLD)) {
             ok = swbam::mpi::PrepareMpiBamInputPlan(
                 *input.backend(), &plan, 0, MPI_COMM_WORLD) == 0;
@@ -56,8 +68,11 @@ int main(int argc, char **argv) {
         input.Close();
     }
 #ifdef PLATFORM_SUNWAY
+    storage.LeaveMpi();
     athread_halt();
 #endif
     MPI_Finalize();
-    return status;
+    const double seconds = swbam_usage::WallTime() - e2e_start;
+    swbam_usage::EndMpiInterval();
+    return storage.Finish(status, seconds);
 }

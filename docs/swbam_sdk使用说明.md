@@ -103,7 +103,7 @@ MPE/CPE 参数结构由应用头文件定义。参数字段、对齐与类型必
 `swbam-sdk/examples/sdk_optimized_count.cpp`：
 
 ```text
-MpiBamInput(memory) -> PrepareMpiBamInputPlan
+MpiBamInput(posix or borrowed RAM) -> PrepareMpiBamInputPlan
     -> RunRecordCountPipeline -> RunCpeReadPipeline
     -> CPE decode + parse bam1_t + count
     -> MPI sum(records), max(core time)
@@ -117,16 +117,60 @@ MpiBamInput(memory) -> PrepareMpiBamInputPlan
 `swbam-sdk/examples/sdk_optimized_bam2bam.cpp`：
 
 ```text
-MpiBamInput(memory) -> PrepareMpiBamInputPlan
+MpiBamInput(posix or borrowed RAM) -> PrepareMpiBamInputPlan
     -> RunBamTransformPipeline (no-op filter, level 1)
-    -> BAM read -> pack plan -> BAM write -> AdaptiveRankBodySink(memory)
+    -> BAM read -> pack plan -> BAM write -> rank body storage
     -> MPI sum(records/body bytes), max(core time)
 ```
 
-命令体：`./swbam-sdk-optimized-bam2bam input.bam`。它是库核心微基准，输出 rank body
-到内存，不组装最终 header/EOF、不 dump 文件。需要可用的磁盘 BAM 时用 `run_all`。
-两示例的 `core` 不含输入 open/load、全局 scan/plan、最终归约和磁盘 dump；不要直接
-等同于应用的 `4.1~4.6` 或端到端 wall time。
+命令体：`./swbam-sdk-optimized-bam2bam input.bam -o output.bam`。输出包含完整
+header、body 和 EOF。默认走真实磁盘输入和 MPI-IO 输出；RAM 模式的实际保存发生在
+MPI 结束后。两示例的 `core` 只作为流水线诊断，不代表新端到端成绩。
+
+## RAM 存储与端到端计时
+
+`benchmark-support/` 是 app 和示例共用的私有使用端模块，不安装进 SDK，也不被
+SDK 库反向依赖。独立构建可指定
+`-DSWBAM_BENCHMARK_SUPPORT_DIR=/path/to/benchmark-support`；设为空或该目录不存在时
+仍可构建、运行磁盘模式，RAM 参数会明确报错。
+
+```bash
+./swbam-sdk-optimized-count input.bam \
+  --storage ram --ram-capacity 8G --ram-ranks 6 \
+  --ram-session /absolute/unique-session/count
+./swbam-sdk-optimized-bam2bam input.bam -o output.bam \
+  --storage ram --ram-capacity 8G --ram-ranks 6 \
+  --ram-session /absolute/unique-session/copy
+```
+
+以上命令体必须由匹配的 MPI 启动器启动。例如六节点配置为
+`-N 6 -np 1 -mpecg 6 -cgsp 64 -share_size 100 -cross_size 88000 -cache_size 32 -xmalloc`。
+`--ram-ranks` 必须与实际 rank 数一致；会话目录的父目录须存在，本次目录必须不存在。
+默认就绪超时为 7200 秒，可用 `--ram-ready-timeout` 修改。普通 `malloc` 配合
+`-xmalloc`，禁止直接在 MPI 初始化前调用 `_sw_xmalloc`。
+
+初始化前创建并预触碰固定容量池、装入本 rank 的完整输入分片及原始头/扫描信息、
+用文件标记同步。MPI 内重新解析 header、验证扫描信息并分区，运行原有流水线。
+存储池按 4 MiB 页管理；临时文件实际保存数据，支持位置读写、覆盖、追加、EOF
+和关闭回收。`--ram-capacity` 为每 rank 存储总预算，包含输入、临时文件和完整输出，
+**不包含**算法 `-m` 工作区。容量不足明确报错，绝不落盘或循环覆盖输出；外排中
+容量失败会终止 MPI 作业，避免其他 rank 留在通信中等待。
+
+主成绩取所有 `[swbam-e2e rank=...] seconds=...` 的最大值，边界为 MPI_Init 前
+到 MPI_Finalize 后，包含 athread、正常清理、实际 RAM I/O 及通信。预加载和
+Finalize 后保存不计入；不扣减真实临时 I/O、不累加阶段最大值。
+默认各 rank 按已确定偏移保存完整输出，不再使用 MPI。`--no-dump` 仅允许 RAM 模式，
+仍保留完整输出和 header/EOF，只跳过最终物理保存。普通四步串联的前三步不能使用它。
+
+公共库新增非拥有式 `MpiBamInput::Attach(backend, memory_resident)`：后端需已打开，
+寿命覆盖所有调用；`Close()` 只解除借用，不关闭或删除它，不能 Attach 自己拥有的后端。
+`ResidentRange(offset, size)` 可选地返回文件全局偏移对应的连续驻留地址；不存在时
+返回空指针，使用端不得修改输入，地址在后端关闭/存储释放前有效。
+四条流水线和 CPE kernel 不依赖这套私有 RAM 存储。
+
+可用 `-DSWBAM_RAM_IO_AUDIT=ON` 单独构建诊断版。它在 MPI 区间包装链接进程序的
+POSIX 文件调用，检查输入/输出及内部临时数据路径；`physical_data_io_calls=0`
+与实际 RAM 临时读写计数一起检查。该审计不是全系统 syscall trace，正式性能构建关闭它。
 
 ## 扩展入口
 
@@ -149,8 +193,14 @@ record 层动作通过 `cpe_bam_read_steps.h` / `cpe_bam_write_steps.h` 在 CPE 
 
 `RabbitBAM-MPI io-check -i small.bam` 使用当前 count、transform 和 BGZF 压缩算子，
 检查 memory/POSIX/MPI-IO 输入、CRC/ISIZE、完整 BAM 回环和 MAPQ>=30 过滤。
+RAM 模式仅检查已预加载的 RAM 后端，避免诊断时重新读物理输入。
 诊断包含独立 MPE 校验，耗时不能代表库核心性能。
 
 输入仍要求 record 不跨 BGZF block。内存容量、batch 指针生命周期及 CPE launch
 互斥约束见[流水线契约](swbam流水线数据契约与整体架构.md)。构建与 SWLS 提交示例
 统一放在[根 README](../README.md)。
+
+本轮构建、小数据全字段回归、RAM 外排审计和 D1 六核组探测见
+[RAM 存储与端到端重构验证](results/RAM_存储与端到端重构验证.md)。复测脚本为
+`tools/ram_storage_regression.sh`，D1 单次探测脚本为 `tools/ram_d1_probe.sh`；
+正式矩阵需另行固定版本、容量和轮次，不直接把单次探测写成中位数。

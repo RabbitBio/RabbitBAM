@@ -2,7 +2,6 @@
 #include "swbam/mpi_runtime.h"
 #include "swbam/operators/bam_read_batch.h"
 #include "swbam/cpe_record_write_adapter.h"
-#include "simulated_write_buffer.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -413,8 +412,8 @@ static int FmCompressPlans(
     if (ret == 0) ret = session->Finish();
     if (ret != 0) {
         const int saved_errno = errno;
-        const swbam::AdaptiveRankBodySink *body =
-            dynamic_cast<const swbam::AdaptiveRankBodySink *>(writer);
+        const swbam_usage::BodySink *body =
+            dynamic_cast<const swbam_usage::BodySink *>(writer);
         const MemWriter *buffer = body ? body->memory_writer() : nullptr;
         fprintf(stderr,
                 "[rank %d] ERROR: fixmate record write failed "
@@ -1029,8 +1028,7 @@ static int FmGatherOutput(
         int rank, int comm_size, MpiFixmateStats *stats,
         FmOutputStageCosts *costs,
         double stage41_cost, double stage42_cost,
-        double stage43_cost, double body_total_t0,
-        double input_prepare_cost = 0.0) {
+        double stage43_cost, double body_total_t0) {
     memset(costs, 0, sizeof(*costs));
 
     double stage44_t0 = GetTime();
@@ -1098,93 +1096,12 @@ static int FmGatherOutput(
         return -1;
     }
 
-    double stage45_malloc_t0 = GetTime();
-    const size_t simulation_body_size = local_writer.is_memory()
-        ? (size_t)local_writer.size() : 0;
-    const size_t simulation_envelope_size = local_writer.is_memory() && rank == 0
-        ? header_size + sizeof(kFixmateBgzfEofBlock) : 0;
-    swbam_app::SimulatedWriteBuffer simulated_write;
-    if (simulated_write.Allocate(
-            simulation_body_size, simulation_envelope_size) != 0) {
-        fprintf(stderr,
-                "[rank %d] ERROR: fixmate simulated write allocation failed "
-                "body_bytes=%llu buffer_bytes=%zu errno=%d (%s).\n",
-                rank, (unsigned long long)local_writer.size(),
-                simulated_write.size(), errno, strerror(errno));
-        local_ok = 0;
-    } else if (simulated_write.bounded()) {
-        printf("[rank %d] fixmate simulated write fallback "
-               "body_bytes=%llu window_bytes=%zu; all body bytes remain counted\n",
-               rank, (unsigned long long)local_writer.size(),
-               simulated_write.body_capacity());
-    }
-    char *simulated_write_mem = simulated_write.data();
-    const size_t simulated_write_size = simulated_write.size();
-    costs->stage45_malloc =
-        FmReduceMax(GetTime() - stage45_malloc_t0);
-    if (rank == 0 && local_ok) {
-        printf("Complete the 4.5b malloc simulated write memory cost %lf\n",
-               costs->stage45_malloc);
-    }
-    if (!FmAllRanksOk(local_ok)) {
-        free(header_memory);
-        return -1;
-    }
-
-    double stage46_t0 = GetTime();
-    volatile unsigned long long simulated_guard = 0;
-    size_t simulated_pos = 0;
-    if (local_writer.is_memory() && rank == 0 && header_size > 0) {
-        memcpy(simulated_write_mem + simulated_pos,
-               header_memory, header_size);
-        simulated_pos += header_size;
-    }
-    if (local_writer.is_memory() && local_writer.size() > 0) {
-        const int copy_ret = simulated_write.bounded()
-            ? simulated_write.CopyBodyWindowed(
-                  local_writer, simulated_pos, &simulated_guard)
-            : local_writer.ReadAt(
-                  0, simulated_write_mem + simulated_pos,
-                  (size_t)local_writer.size());
-        if (copy_ret != 0) {
-            fprintf(stderr,
-                    "[rank %d] ERROR: fixmate simulated body read failed "
-                    "body_bytes=%llu errno=%d (%s).\n",
-                    rank, (unsigned long long)local_writer.size(),
-                    errno, strerror(errno));
-            local_ok = 0;
-        } else {
-            simulated_pos += simulated_write.body_capacity();
-        }
-    }
-    if (local_writer.is_memory() && rank == 0) {
-        memcpy(simulated_write_mem + simulated_pos,
-               kFixmateBgzfEofBlock,
-               sizeof(kFixmateBgzfEofBlock));
-        simulated_pos += sizeof(kFixmateBgzfEofBlock);
-    }
-    if (simulated_write_size > 0) {
-        simulated_guard +=
-            (unsigned char)simulated_write_mem[0];
-        simulated_guard +=
-            (unsigned char)simulated_write_mem[simulated_write_size - 1];
-    }
-    (void)simulated_guard;
-    costs->stage46 = FmReduceMax(GetTime() - stage46_t0);
-    if (rank == 0) {
-        printf("Complete the 4.6 simulated header/body distributed write cost %lf\n",
-               costs->stage46);
-    }
-    simulated_write.Reset();
-
-    if (rank == 0) {
-        const double core_total =
-            stage41_cost + stage42_cost + stage43_cost +
-            costs->stage44 + costs->stage45_header +
-            costs->stage46;
-        printf("Complete the total (4.1~4.6) cost %lf-----\n",
-               core_total);
-    }
+    const double output_t0 = GetTime();
+    if (!output_bam && swbam_usage::WriteOutput(
+            output_path, local_writer, header_size, header_memory,
+            sizeof(kFixmateBgzfEofBlock), kFixmateBgzfEofBlock) != 0) local_ok = 0;
+    costs->stage46 = FmReduceMax(GetTime() - output_t0);
+    if (!FmAllRanksOk(local_ok)) { free(header_memory); return -1; }
 
     {
         double stage47_t0 = GetTime();
@@ -1199,76 +1116,14 @@ static int FmGatherOutput(
 
     {
         const double body_total_cost =
-            FmReduceMax(GetTime() - body_total_t0 - input_prepare_cost);
+            FmReduceMax(GetTime() - body_total_t0);
         if (rank == 0 && local_ok) {
             printf("444Complete the total body cost %lf\n",
                    body_total_cost);
         }
     }
 
-    if (!output_bam && mpiio_output) {
-        unsigned long long layout[2] = {0, 0};
-        if (rank == 0) {
-            layout[0] = (unsigned long long)header_size;
-            layout[1] = (unsigned long long)output_size;
-        }
-        MPI_Bcast(layout, 2, MPI_UNSIGNED_LONG_LONG, 0,
-                  MPI_COMM_WORLD);
-
-        double write_t0 = GetTime();
-        swbam::mpi::MpiFileOutput output;
-        if (output.Open(output_path, layout[1]) != 0) {
-            local_ok = 0;
-        }
-        if (FmAllRanksOk(local_ok)) {
-            if (rank == 0 && header_size > 0 &&
-                output.WriteAt(0, header_memory, header_size) != 0) {
-                local_ok = 0;
-            }
-            std::vector<unsigned char> chunk;
-            if (local_writer.size() > 0) {
-                try {
-                    chunk.resize((size_t)std::min<uint64_t>(
-                        local_writer.size(), 8ull * 1024ull * 1024ull));
-                } catch (...) {
-                    local_ok = 0;
-                }
-            }
-            uint64_t copied = 0;
-            while (local_ok && copied < local_writer.size()) {
-                const size_t count = (size_t)std::min<uint64_t>(
-                    local_writer.size() - copied, chunk.size());
-                if (local_writer.ReadAt(
-                        copied, chunk.data(), count) != 0 ||
-                    output.WriteAt(
-                        layout[0] +
-                            (unsigned long long)offsets[(size_t)rank] +
-                            copied,
-                        chunk.data(), count) != 0) {
-                    local_ok = 0;
-                }
-                copied += count;
-            }
-            if (rank == 0 &&
-                output.WriteAt(
-                    layout[0] + (unsigned long long)total_body,
-                    kFixmateBgzfEofBlock,
-                    sizeof(kFixmateBgzfEofBlock)) != 0) {
-                local_ok = 0;
-            }
-        }
-        const int writes_ok = FmAllRanksOk(local_ok);
-        if (writes_ok && output.Sync() != 0) local_ok = 0;
-        if (output.Close() != 0) local_ok = 0;
-        const double write_cost =
-            FmReduceMax(GetTime() - write_t0);
-        if (rank == 0 && local_ok) {
-            printf("555MPI-IO distributed output cost %lf--\n",
-                   write_cost);
-        }
-        free(header_memory);
-        return FmAllRanksOk(local_ok) ? 0 : -1;
-    }
+    if (!output_bam) { free(header_memory); return 0; }
 
     double verify_alloc_t0 = GetTime();
     if (rank == 0) {
@@ -1805,12 +1660,10 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
     long long n_blocks = 0;
     size_t rank_input_size = 0;
     MemReader reader = {};
-    MemWriter prefix = {};
-    MemWriter suffix = {};
-    swbam::AdaptiveRankBodySink middle_sink;
-    swbam::MemoryRankBodySink prefix_sink(&prefix);
-    swbam::MemoryRankBodySink suffix_sink(&suffix);
-    swbam::SegmentedRankBodySource body_source;
+    swbam_usage::BodySink middle_sink;
+    swbam_usage::BodySink prefix_sink;
+    swbam_usage::BodySink suffix_sink;
+    swbam_usage::BodySequence body_source;
     uint64_t rank_body_memory_limit = 0;
     FmStoredGroup leading;
     FmStoredGroup trailing;
@@ -1851,7 +1704,7 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
     }
 
     {
-        if (input_handle.Open(
+        if (swbam_usage::OpenInput(input_handle,
                 cmd_info->in_file_name_, cmd_info->io_backend_,
                 cmd_info->io_memory_limit_) != 0) {
             fprintf(stderr,
@@ -1961,7 +1814,7 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
                 reader.pos = 0;
             }
         }
-        stage41_cost = FmReduceMax(GetTime() - t0 - input_handle.simulation_prepare_cost());
+        stage41_cost = FmReduceMax(GetTime() - t0);
         if (rank == 0 && local_ok) {
             printf("MPI BAM scan complete. data_blocks=%lld "
                    "body_start=%lld\n", n_blocks, body_start);
@@ -2008,11 +1861,11 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
             local_ok = 0;
         }
         if (local_ok &&
-            (MpiCommonInitMemWriter(prefix, 1024 * 1024) != 0 ||
-             MpiCommonInitMemWriter(suffix, 1024 * 1024) != 0)) {
+            (prefix_sink.Open("memory", 0, 1024 * 1024, "fixmate-prefix", "") != 0 ||
+             suffix_sink.Open("memory", 0, 1024 * 1024, "fixmate-suffix", "") != 0)) {
             local_ok = 0;
         }
-        if (local_ok && middle_sink.is_memory()) {
+        if (local_ok && middle_sink.memory_writer()) {
             printf("[rank %d] fixmate output reserved input_bytes=%zu "
                    "capacity=%zu\n", rank, rank_input_size,
                    middle_sink.memory_writer()->capacity);
@@ -2120,7 +1973,7 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
             rank, comm_size,
             &stats, &output_stage_costs,
             stage41_cost, stage42_cost, stage43_cost,
-            body_total_t0, input_handle.simulation_prepare_cost()) != 0) {
+            body_total_t0) != 0) {
         local_ok = 0;
     }
     if (!FmAllRanksOk(local_ok)) goto cleanup;
@@ -2130,8 +1983,8 @@ cleanup:
     if (header) sam_hdr_destroy(header);
     input_handle.Close();
     middle_sink.Close();
-    free(prefix.data);
-    free(suffix.data);
+    prefix_sink.Close();
+    suffix_sink.Close();
     if (rank == 0) {
         printf("666fixmate total process cost %lf-----\n",
                GetTime() - total_t0);

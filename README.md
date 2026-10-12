@@ -47,6 +47,7 @@ swbam-app/              独立依赖 SDK 的应用项目
   slave/               四个应用专用算法 kernel
   include/             CLI 配置、应用接口和算法共享参数
   third_party/         CLI11
+benchmark-support/      app/示例私有的分页 RAM 存储和 MPI 前后准备，不安装进 SDK
 tools/                  正确性验证、内存与 CRC 探测工具
 docs/                   架构契约、实验方案、结果与研究记录
 ext/                    构建 SDK 时使用的 HTSlib/libdeflate 依赖
@@ -152,7 +153,7 @@ bsub.py swls -q q_share -I -b -J swbam_check \
 
 ## SDK 示例
 
-两个示例都默认使用内存输入，由 MPI 分区后调用与应用相同的库入口：
+两个示例默认使用真实磁盘；显式 RAM 模式由 MPI 前准备分片，MPI 内调用相同库入口：
 
 | 示例 | 库入口与行为 |
 | --- | --- |
@@ -160,32 +161,35 @@ bsub.py swls -q q_share -I -b -J swbam_check \
 | [sdk_optimized_bam2bam.cpp](swbam-sdk/examples/sdk_optimized_bam2bam.cpp) | `RunBamTransformPipeline`：BAM read → 打包 → BAM write，压缩 body 写入 memory sink |
 
 命令体分别是 `./swbam-sdk-optimized-count input.bam` 和
-`./swbam-sdk-optimized-bam2bam input.bam`。后者是库读写微基准，**不生成带 header/EOF
-的最终磁盘 BAM**；需要文件输出使用应用 `run_all`。
+`./swbam-sdk-optimized-bam2bam input.bam -o output.bam`。后者生成可解析的完整 BAM。
 
 ## I/O、计时与限制
 
-- 默认 memory 模式先把完整输入加载到各 rank 内存，以内存读写模拟高速 I/O。
-  核心时间不包含预加载和最终文件 dump，不能描述为真实磁盘端到端时间。
+- 默认使用真实磁盘输入/输出。显式 `--storage ram` 使用私有分页存储池，MPI 前
+  预加载本 rank 输入；MPI 内正常处理，MPI 结束后按全局偏移保存完整输出。
+  例如 `--storage ram --ram-capacity 8G --ram-ranks 6 --ram-session /abs/unique-session`。
+  存储容量每 rank 必须显式指定，算法 `-m` 工作区另计；容量不足报错，不自动落盘。
+  `--no-dump` 只跳过 RAM 模式最终保存，不省略完整输出的构建。
+- `[swbam-e2e rank=...]` 从 MPI_Init 前计到 MPI_Finalize 后，取 rank 最大值；
+  包含 MPI/athread、算法、RAM 临时与输出 I/O、正常清理，不扣时间。
+  历史 `core`、`4.3`、`4.1~4.6` 仍是诊断/历史口径，不是该新端到端成绩。
 - Standalone 命令提供 `--io-backend memory|posix|mpiio|auto`，输出可选
   `--io-output-backend memory|mpiio`；具体支持范围以命令帮助为准。
 - `run_all`、`sort`、`collate`、`fixmate`、`markdup`、`flagstat`、`stats` 和
   `dedup-workflow` 还支持 `--io-backend rank-memory`：按全局 BGZF 计划只预加载
   本 rank 的压缩块；`run_all` 的 SAM→BAM 按完整文本行预加载本 rank 区间。
-  计算期间不回退读盘。`memory` 默认行为和 SDK 示例保持不变。
-  物理扫描读盘与分片缓存准备单独排除，索引构建、MPI 分区/广播、内存读写及
-  算法计算仍计入核心时间；该模式不减少算法自身或输出缓存的内存需求。
+  计算期间不回退读盘。这些是磁盘模式的输入缓存选项，不与 `--storage ram` 混用；
+  缓存准备在 MPI 内发生，计入端到端耗时，不再扣减。
   大数据转换建议使用 `--io-output-backend mpiio`，避免最终 root 全量 gather。
-  BAM→SAM 在 rank-memory 模式下最多预分配 64 MiB，再按实际输出扩容；完整
-  rank body 和模拟输出副本仍需驻留，不能将分片输入等同于有界内存输出。
+  磁盘模式转换最多为本地 body 预分配 64 MiB，再按实际输出扩容；完整
+  rank body 仍需驻留，不能将分片输入等同于有界内存输出。
 - `--rank-body-backend memory|spool|auto` 控制 rank 本地输出缓存；其临时目录
   由 `--rank-body-temp-dir` 指定，与 sort/collate 的 `-T` 外排临时文件独立。
 - standalone fixmate 使用内存输入及显式 memory body 时，初始输出容量预留为
   本 rank 压缩输入的两倍，避免增加 mate 标签后第一次扩容同时持有旧、新输出。
   预留仍计入 4.2 初始化，未改变算法；输出超过预留时仍沿用原扩容行为。
-- collate/fixmate 的额外模拟写出副本优先沿用全量分配和单次复制；分配失败时
-  回退到 64 MiB 复用窗口，仍复制全部 body 字节并计入 4.6。实际 rank body、
-  算法和最终输出不变，窗口分配仍属于不计入主成绩的模拟准备。
+- RAM 输出复用 rank body 的存储页，保留 header、完整 body 和 EOF，不创建模拟副本
+  或聚集整份输出到 root。sort/collate 外排临时数据实际存进同一个 RAM 池。
 - **要求单条 BAM record 不跨 BGZF block**。一般来源的 BAM 不保证满足此条件；
   `io-check` 可检查小输入是否满足当前解析契约，不负责自动重分块。
 - BAM record 长度、批容量和 CPE scratch 有边界限制；不能将流式输入等同于支持
@@ -198,6 +202,7 @@ bsub.py swls -q q_share -I -b -J swbam_check \
 - [流水线数据契约与整体架构](docs/swbam流水线数据契约与整体架构.md)
 - [SDK 使用说明](docs/swbam_sdk使用说明.md)
 - [实验方案](docs/swbam实验方案.md)与[结果目录](docs/results/)
+- [RAM 存储与端到端重构验证](docs/results/RAM_存储与端到端重构验证.md)
 - [大共享内存及工具说明](docs/swbam工具使用说明.md)
 
 实验结果与论文草稿包含历史版本信息，应以对应测试记录中的版本、命令和计时口径为准。

@@ -9,8 +9,22 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     find_package(SWBAM 0.1 CONFIG REQUIRED)
 endif()
 
+if(NOT TARGET swbam_benchmark_support)
+    set(SWBAM_BENCHMARK_SUPPORT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../benchmark-support"
+        CACHE PATH "Private RAM storage support directory")
+    if(EXISTS "${SWBAM_BENCHMARK_SUPPORT_DIR}/CMakeLists.txt")
+        add_subdirectory("${SWBAM_BENCHMARK_SUPPORT_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/benchmark-support")
+    else()
+        add_library(swbam_benchmark_support INTERFACE)
+        message(STATUS "Private RAM support unavailable: building disk-only examples")
+    endif()
+endif()
+
 add_executable(swbam-sdk-optimized-count sdk_optimized_count.cpp)
 add_executable(swbam-sdk-optimized-bam2bam sdk_optimized_bam2bam.cpp)
 foreach(target swbam-sdk-optimized-count swbam-sdk-optimized-bam2bam)
-    target_link_libraries(${target} PRIVATE swbam::swbam)
+    target_link_libraries(${target} PRIVATE swbam::swbam swbam_benchmark_support)
+    add_custom_command(TARGET ${target} POST_BUILD
+        COMMAND /bin/sh -c "printf '\\002' | dd of='$<TARGET_FILE:${target}>' bs=1 seek=9 count=1 conv=notrunc status=none"
+        VERBATIM)
 endforeach()

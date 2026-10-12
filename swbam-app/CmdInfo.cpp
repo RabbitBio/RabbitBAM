@@ -14,8 +14,8 @@ CmdInfo::CmdInfo() {
     min_read_len_ = -1;
     max_read_len_ = -1;
     compress_level_ = 1;
-    io_backend_ = "memory";
-    io_output_backend_ = "memory";
+    io_backend_ = "posix";
+    io_output_backend_ = "mpiio";
     io_memory_limit_ = "8G";
     rank_body_backend_ = "memory";
     rank_body_memory_limit_ = "8G";

@@ -1,8 +1,31 @@
 # SWBAM 论文实验方案
 
-更新：2026-09-27，按 `a47c668` 的独立 SDK/app 和四流水线架构整理。
+更新：2026-10-12，采用私有分页 RAM 存储与 MPI 区间端到端计时。
+论文主实验暂只覆盖 D1/D2；D3 已有结果保留为历史/探索记录，不自动续提。
 本方案替代旧 Raw view / MPE `bam1_t` 四项微基准及两路径消融设计。
 历史测量保留在 results 中，不作为当前版本的实测结果。
+当前实现的构建、正确性、RAM 外排与 D1 单次探测记录见
+[RAM 存储与端到端重构验证](results/RAM_存储与端到端重构验证.md)。
+
+**2026-10-11 晚间固定本轮范围：** D1/D2 两项 SDK 加简单 rank 扩展性，
+八项独立 app 加普通四步串联。app 固定六节点六活跃核组；每个正式点三次。
+SDK 扩展性建议 `1/2/4/6/12`，两数据集使用相同点；完整矩阵须待容量探测后启动。
+2026-10-12 已启动 D1 正式半矩阵，66 条性能命令加 8 条输出复读，见
+[D1 正式测试](results/RAM_D1_正式性能测试.md)。
+D2 六 rank 单次容量/功能探测在 sort 分配失败后停止，状态及配置见
+[D1/D2 正式范围与 D2 探测](results/RAM_D1_D2_正式范围与D2探测.md)。
+2026-10-12 已按用户要求部署 D2 缺项关卡及有条件正式矩阵，见
+[D2 关卡与矩阵](results/RAM_D2_容量关卡与正式矩阵.md)：先验证 sort 的 16G
+存储池、markdup、双向转换和 SDK 单 rank 读写；通过且 D1 完成后自动提交。
+版本、输入、计数、排序、重复数或内排条件不符均停止，不自动落盘。
+03:52，D2 缺项容量关卡已全部通过；10:58 检查时仍等待 D1。
+D1 SDK 输出复读 `8506221` 在完成预加载后异常停滞，尚无成功结果，
+两份正式矩阵不能视为完成。需先处理此阻塞，不能继续沿用原先结束时间估算。
+11:21 已取消旧复读并换节点重试 `8513953`，D1 原地续接且保留已完成成绩；
+验证开启既有 stats 阶段诊断并单独设置超时监控，性能命令和冻结程序不变。
+11:24 新复读完整通过，D1 已自动续测两 rank SDK count；D2 仍按计划等待
+D1 完整矩阵结束，不把本轮 D2 探测样本导入正式三次中位数。
+本轮不增加 app 扩展性、消融或大规模外排性能矩阵；外排仅保留正确性回归。
 
 ## 1. 实验要回答的问题
 
@@ -21,7 +44,7 @@ generic/fused 模式。算子的解压、解析和动作可在一次 CPE kernel 
 |---|---|---:|---:|---|
 | D1 | WES | 9,891,133,304（9.89 GB） | 177,798,571 | 除外排外的全部实验，主要扩展性 |
 | D2 | WGS | 35,255,807,945（35.26 GB） | 365,079,492 | 除外排外的全部实验，规模复核 |
-| D3 | WGS | 89,994,058,306（89.99 GB） | 1,210,633,370 | 其他适用功能及外排，不测内排 |
+| D3 | WGS | 89,994,058,306（89.99 GB） | 1,210,633,370 | 历史/探索，不纳入本轮主实验 |
 
 数据来源和现有 SAMtools 环境见 [D1/D2/D3 库基准](results/samtools_D1_D2_D3_库基准.md)。
 目录名 `D2-WGS-25G`、`D3-WGS-85G` 是历史标签，不代表当前实际 GB 大小。
@@ -30,16 +53,16 @@ generic/fused 模式。算子的解压、解析和动作可在一次 CPE kernel 
 
 | 项目 | D1 | D2 | D3 |
 |---|:---:|:---:|:---:|
-| SDK count / BAM read-write | 是 | 是 | 是，分块内存模式 |
-| 转换、过滤、flagstat | 是 | 是 | 是 |
-| fixmate、markdup --stream | 是 | 是 | 是 |
+| SDK count / BAM read-write | 是 | 是 | 历史/探索 |
+| 转换、过滤、flagstat | 是 | 是 | 历史/探索 |
+| fixmate、markdup --stream | 是 | 是 | 历史/探索 |
 | sort/collate 内排及内排四步流程 | 是 | 是 | 否 |
-| sort/collate 外排及外排四步流程 | 否 | 否 | 是 |
-| 消融 | 主要实验 | 关键项复核 | 否 |
-| 扩展性 | 完整 | 资源允许时复核 | 否 |
+| sort/collate 外排及外排四步流程 | 本轮仅小数据正确性 | 本轮不测外排性能 | 历史/探索 |
+| 消融 | 本轮不提交 | 本轮不提交 | 否 |
+| 两项 SDK 简单扩展性 | 是 | 是 | 否 |
 
 D1/D2 的 sort/collate 日志必须确认 memory mode，不能将自动 spill 混入内排表格。
-D3 的 sort/collate 只测 external mode；其他命令不因此自动变成“外排算法”。
+D3 历史 sort/collate 是 external mode；其他命令不因此自动变成“外排算法”。
 2026-10-09 调整：stats 不纳入论文性能比较，不再提交 A4 stats 性能测试；
 `stats --basic` 等正确性复读仍保留。collate 及四步流程中的 collate
 统一使用 66 个 bins（Samtools `-n 66`，SWBAM `-n 66`），旧 `-n 64`
@@ -55,39 +78,48 @@ D3 的 sort/collate 只测 external mode；其他命令不因此自动变成“�
 - 同平台扩展性以最小配置为基线，效率为 `T1 / (p * Tp)`。
 - 神威节点数、MPI ranks、每 rank 64 CPE 分别列出，不等同于 SAMtools `-@`。
 
-### 3.2 两种现有时间分别标注
+### 3.2 当前主口径与历史结果
 
-| 对象 | 当前记录时间 | 排除项 |
+| 对象 | 当前主时间 | 排除项 |
 |---|---|---|
-| SAMtools | bigssd 输入/输出的进程 wall time | 数据准备；不主动清理 page cache |
-| SWBAM SDK | `core`，各 rank 流水线墙钟时间的最大值 | load、scan/plan、初始 body reserve、最终统计归约；示例无最终 gather/dump |
-| SWBAM app | 各命令现有核心时间及 4.3 | 完整输入 load、最终真实 dump；具体额外排除项以日志和源码为准 |
+| SAMtools | A4 bigssd 上进程 wall time | 数据准备；不主动清理 page cache |
+| SWBAM app/SDK | 各 rank 的 MPI_Init 前至 MPI_Finalize 后真实耗时，取最大值 | MPI 前 RAM 池预触碰/输入预加载/就绪同步；Finalize 后实际保存 |
 
-SDK count 的 `core` 包含内存 batch 读取、CPE 解压/解析/计数及 MPE 批次归并。
-SDK bam2bam 的 `core` 包含内存 batch 读取、解析、pack、压缩和本 rank 内存 body 写入。
-它不含完整输出 header/EOF、rank 汇集及全文件输出布局，不能等同于 app 的 4.1~4.6。
-D3 分块模式的 `core` 为每 rank 各段流水线时间之和，再对 rank 取最大值；段间真实
-磁盘预读不计入。额外报告 `simulated_total`，包含轻量 header open、缓存索引的
-内存分区/广播、输出缓冲准备、流水线及结果归约，不包含磁盘建索引、索引文件读取、
-分段预读/缓冲准备及最终 dump。该值也不包含 MPI_Init/Finalize，不能称为进程 wall。
+SWBAM 使用 `--storage ram` 显式启用内存模拟，默认真实磁盘。正常 header 解析、
+扫描分区、MPI/athread 初始化退出、算法工作区管理、RAM 输入、外排临时读写、
+完整输出构建和清理均计入。直接采用 `[swbam-e2e rank=...] seconds=...`，不扣减
+真实临时文件时间，也不累加各阶段最大值。SDK 的 `core`、app 的 `4.3` 和已有
+核心总时间仅作分项诊断；历史表格不能改名为新端到端成绩。
 
-现阶段按已有部署测量，不要求为了本轮实验切换 SAMtools 到 tmpfs。两种时间边界在
-图表中分别写明；如给出 `SAMtools wall / SWBAM core`，标为该口径下的耗时比，
-不称为同 I/O 条件下的端到端加速比。也不要混用早期 fat 和当前 A4 的结果。
+这是 RAM 存储条件下的 MPI 应用端到端时间，不是 SSD 实测，也不是作业提交到结束
+的时间：不含调度排队、launcher 创建进程、预加载和保存。A4 的 bigssd 与神威 RAM
+存储条件不同，图表必须标注，不称为相同 I/O 条件下的端到端加速比。
 
-### 3.3 大数据容量预检查
+### 3.3 容量与启动
 
-默认 memory backend 每 rank 保存完整输入，不能用“文件大小 / ranks”估计输入内存。
-还需容纳本 rank 输出、算法工作区；完整 memory output 在 rank0 汇集时还需整份输出。
-现有大共享配置约 85 GiB 可用堆不意味着约 90 GB 的 D3 能连同输出和工作区装入。
+私有 `benchmark-support` 不安装进 SDK。用固定分页池保存本 rank 完整输入分片、
+实际外排临时文件和完整输出；`--ram-capacity` 必须显式指定，算法 `-m` 另计。
+二者共同占用约 85 GiB 跨核组堆，容量不足报错，禁止落盘或环形覆盖输出。
+输出复用 rank body 页和分布式布局，不聚集整份文件到 rank 0。
 
-D3 SDK 已增加 rank-local BGZF 分段预读和固定容量内存 body sink，默认每段压缩数据
-不超过 2 GiB、输出环形缓冲为 256 MiB。所有核组档位使用同一模式；BGZF 块索引
-可预先建立并缓存，实际磁盘准备时间单列排除，内存中的索引分区/广播计入
-`simulated_total`。这只解决 SDK 的两项基准，不代表所有 app 都已有该能力。
-不同 I/O 策略单列，不能静默切换。外排 run/temp 与 rank body
-spool 是独立开销，记录各自字节数、真实时间、模拟时间；不能把必要临时 I/O 当作
-初始 load/最终 dump 一并删除。当前计划不宣称全部内存状态与输入规模无关。
+BAM 依旧按 BGZF 块数分片，SAM 按完整行分片。MPI 前只存原始头、扫描原始信息和
+本地数据；MPI 内重新解析、校验、分区，不用准备结果替代正常处理。
+六核组配置为六节点、每节点一个 MPI rank、每 rank 64 CPE；其余五核组只贡献内存：
+
+```bash
+-N 6 -np 1 -mpecg 6 -cgsp 64 \
+-share_size 100 -cross_size 88000 -cache_size 32 -xmalloc
+```
+
+启动命令提供匹配的 `--ram-ranks 6` 和唯一绝对 `--ram-session` 路径；父目录需存在，
+会话目录必须不存在。准备失败/超时会阻止进入 MPI。默认保存输出发生在 MPI 结束后，
+`--no-dump` 仅用于已验证的独立性能命令，仍构建完整输出。
+
+先做小数据和 D1 六核组单次探测，确认容量、正确性及核心时间回退，再决定正式矩阵。
+两份完整矩阵已按用户请求授权：D1 已提交，D2 必须先通过缺项容量/正确性关卡，
+且等待 D1 完成后再自动提交正式样本。D2 指定关卡现已通过，
+但其余 SDK 资源点和新版完整四步的正式成绩尚未取得。
+不覆盖历史实验目录或将失败样本记为成功。
 
 ## 4. 公共库微基准：两项
 
@@ -98,20 +130,21 @@ spool 是独立开销，记录各自字节数、真实时间、模拟时间；�
 
 L1 不是完整 flagstat，也不是只读压缩字节或仅扫描记录长度；L2 不过滤、保留全部记录。
 当前 count 不向用户返回 `bam1_t` batch，不能用它证明旧 HTSlib 对象消费接口的性能。
-源文件位于 `swbam-sdk/examples/`，两者均只接收输入文件参数，默认 memory 模式：
+源文件位于 `swbam-sdk/examples/`，默认磁盘模式；写示例必须指定输出路径。RAM 示例命令体如下：
 
 ```bash
-./swbam-sdk-optimized-count "$INPUT"
-./swbam-sdk-optimized-bam2bam "$INPUT"
+./swbam-sdk-optimized-count "$INPUT" --storage ram --ram-capacity 2G \
+  --ram-ranks 6 --ram-session "$UNIQUE_COUNT_SESSION"
+./swbam-sdk-optimized-bam2bam "$INPUT" -o "$OUTPUT" \
+  --storage ram --ram-capacity 8G --ram-ranks 6 \
+  --ram-session "$UNIQUE_COPY_SESSION"
 
 samtools view --no-PG -@ "$THREADS" -c "$INPUT"
 samtools view --no-PG -@ "$THREADS" -O BAM,level=1 -o "$OUTPUT" "$INPUT"
 ```
 
-报告 `records`、`blocks`、`input_bytes`、`core`；L2 另报 `body_bytes`。
-GB 使用十进制：输入 GB/s = `input_bytes / core / 1e9`；M records/s =
-`records / core / 1e6`。L2 可补充 `(input_bytes + body_bytes) / core / 1e9`，
-明确后者只统计输出 body，不称为磁盘带宽。
+报告 `records`、`blocks`、`input_bytes`、`core` 和 MPI 区间主时间；L2 另报完整输出大小。
+GB 使用十进制，主图吞吐量以 MPI 区间主时间为分母。核心吞吐量可另列诊断，不能混用。
 
 ### 4.1 与 app 的关系
 
@@ -119,7 +152,8 @@ SDK 不依赖 app，复用与 app 相同的流水线和 operator。性能诊断�
 `RunBamTransformPipeline` 的范围，而不能拿 SDK `core` 与 app 全核心时间直接
 声称“库化开销为零”。SDK count 与 flagstat 工作量不同，不能当作等价对照。
 
-SDK L2 当前不 dump 完整文件，只检查保留数。正确性另跑 `io-check` 的无过滤
+SDK L2 默认保存完整文件，检查可解析性和记录集合；性能重复可显式 `--no-dump`，
+但仍须构建并驻留完整 RAM 输出。正确性另跑 `io-check` 的无过滤
 回环（独立解压、CRC/ISIZE、记录边界、总字节数及 MAPQ 校验）和 app 输出检查。
 当前 `io-check` 不逐字节对比输入输出记录；完整字段一致性须另做记录比较，不能仅因
 `records` 正确就通过。
@@ -127,6 +161,7 @@ SDK L2 当前不 dump 完整文件，只检查保留数。正确性另跑 `io-ch
 
 ## 5. 消融：优先验证调度设计
 
+本节仅为后续备选，不进入当前 D1/D2 补测任务；先补齐正式主成绩。
 不再测试已删除的 Raw/MPE `bam1_t` 双路径，也不为消融恢复旧实现。
 
 | 优先级 | 实验 | 保持不变 | 唯一改变 |
@@ -154,9 +189,10 @@ A3 也需先确认 operator 的固定容量约束，不是任意改一个参数�
 | 功能 | 固定输入 | 验证重点 |
 |---|---|---|
 | flagstat | 原始 BAM | 全部 flagstat 项 |
-| BAM2SAM、SAM2BAM、BAM2BAM | 对应固定 BAM/SAM | header、record multiset、顺序 |
+| BAM2SAM、SAM2BAM | 对应固定 BAM/SAM | header、record multiset、顺序 |
 | MAPQ >= 30 过滤 | 原始 BAM | 保留集合、kept/dropped |
-| sort、collate | 同一原始 BAM | 坐标顺序 / QNAME 连续性、记录集合 |
+| collate | 原始 BAM | QNAME 连续性、记录集合 |
+| sort | 同一 fixmate BAM | 坐标顺序、记录集合和 mate 标签保持 |
 | fixmate -m | 同一 name-collated BAM | mate 字段和 MQ/MC/ms |
 | markdup --stream | 同一 fixmate+sort BAM | duplicate count、标记集合、其他字段 |
 
@@ -166,7 +202,7 @@ sort/collate 明确实际内排或外排。
 
 ### 6.1 配置选择
 
-- 小回归：单节点 `-N 1 -np 6 -cgsp 64 -share_size 14000 -cache_size 32`。
+- RAM 小回归：两节点各一个 rank，沿用大共享配置，并显式指定 `--ram-ranks 2`。
 - D1 库扩展性沿用已验证的大共享配置，每节点一个 rank，64 个 CPE 参与计算：
 
 ```bash
@@ -174,17 +210,16 @@ sort/collate 明确实际内排或外排。
   -share_size 100 -cross_size 88000 -cache_size 32 -xmalloc
 ```
 
-节点数 `1/2/4/8/16/24/32/48`，以程序打印的实际 MPI ranks 校验放置。
-其余核组提供内存，不计为活跃计算核组。D2 先做容量检查与代表点，再决定是否复核
-全曲线；这里的 D3 应用算法暂不做扩展性。**SDK 两项库基准**另按 D1/D2 已用的
-`1/2/4/6/8/12` 活跃核组，对 D3 也各运行三次并取中位数。D3 的输入/输出采用
-分块有界模式，图表须标注与 D1/D2 全文件 memory 模式的区别。
+SDK 节点数建议 `1/2/4/6/12`，以程序打印的实际 MPI ranks 校验放置。
+其余核组提供内存，不计为活跃计算核组。D2 先做六 rank 容量检查，并补单 rank
+读写容量探测，再启动与 D1 一致的各扩展性点；D3 已有扩展性仅作历史参考，不续提。
+当前版本要求保留完整 RAM 输出，
+不能使用旧分块环形覆盖模式扩充容量。
 SAMtools 可沿用当前 A4 的 `-@ 0/2/4/8/16/24/32/47/48/64/96/127`
 基线；额外线程数不等于实际 CPU 总占用数。
 
-应用扩展性优先选择 sort、collate、markdup 和四步流程；线性应用用代表点确认即可，
-避免每个命令都铺满资源矩阵。根据 D1 预实验预先确定主表配置，不能只挑最快一次；
-最佳吞吐、资源消耗和并行效率分别报告。
+当前八项独立 app 和普通四步流程只测六核组，不增加 app 扩展性矩阵。
+主表固定每点三次，不能只挑最快一次；SDK 扩展性另报告加速比、效率和吞吐量。
 
 ## 7. 普通四步去重流程
 
@@ -192,13 +227,13 @@ SAMtools 可沿用当前 A4 的 `-@ 0/2/4/8/16/24/32/47/48/64/96/127`
 input BAM -> collate -n 66 -> fixmate -m -> coordinate sort -> markdup --stream
 ```
 
-主实验使用四条独立命令或 `dedup-workflow`，不依赖全内存 `dedup-pipeline`。
-D1/D2 两个重排阶段使用内排；D3 两个阶段使用外排。阶段中间文件是工作流输入输出，
+RAM 主实验使用四条独立命令。两个 dedup 包装命令保留磁盘模式，本轮不扩展其 RAM 模式。
+D1/D2 两个重排阶段使用内排；强制外排仅作本轮小数据正确性回归。阶段中间文件是工作流输入输出，
 不等同于排序内部 run/temp。
 
-每阶段保留 4.3、命令核心时间、load/dump 和实际输出大小。四个核心时间之和称为
-“四步核心时间合计”，不是端到端 wall；不把 SAMtools 全流程 wall 和这个合计混作
-相同边界。完整 wall 可另外记录，但不是本轮 memory-core 主指标。
+前三步必须在 Finalize 后保存中间文件，下一条命令重新预加载。每阶段保留 MPI 区间
+最大值、4.3 诊断、准备/保存耗时和输出大小。每轮将四个 MPI 区间最大值相加，三轮
+合计取中位数；同时保留各阶段中位数。不能把历史四步核心时间之和改名为新端到端成绩。
 
 至少验证最终可解析、记录数、坐标有序、duplicate 数和 duplicate 标记集合。
 不同 collate 组间顺序可能导致输出排序和标签排列不同；SAM 文本 MD5 不一致时，
@@ -207,9 +242,10 @@ D1/D2 两个重排阶段使用内排；D3 两个阶段使用外排。阶段中�
 
 ## 8. 正式开测前的最小回归
 
-当前版本已完成一轮，见 [SDK 与四步去重回归结果](results/最终版_SDK与四步去重回归.md)。
+新版已完成一轮小数据回归，见 [RAM 存储与端到端重构验证](results/RAM_存储与端到端重构验证.md)。
+当前 RAM 重构单独记录，不能沿用历史回归来宣称新存储路径正确。
 
-使用 `WES_0.25G.bam`，单节点 6 ranks，每项一次即可，不据此宣称稳定加速比：
+使用 `WES_0.25G.bam`，两节点两 ranks，每项一次即可，不据此宣称稳定加速比：
 
 1. 构建当前 app、SDK count 和 SDK bam2bam；记录 commit 和二进制校验和。
 2. 两个 SDK 均处理 2,668,351 条记录，读写例保留全部记录。
@@ -220,12 +256,13 @@ D1/D2 两个重排阶段使用内排；D3 两个阶段使用外排。阶段中�
 
 ## 9. 图表与后续顺序
 
-1. 两项 SDK 的 D1/D2 吞吐量及 rank 扩展性图，D3 可运行配置单列。
-2. 输入/输出 overlap 消融图及对应流水线时间线；无开关实验前不填写收益。
-3. 应用性能表，明确平台资源、时间边界和功能范围。
-4. 四步流程阶段堆叠图，展示核心时间合计及各阶段占比。
-5. D3 外排的 run/pass、临时空间、实际/模拟 I/O 和峰值内存表。
+1. 两项 SDK 的 D1/D2 RAM MPI 区间吞吐量及 rank 扩展性图。
+2. 八项应用性能表，明确平台资源、时间边界和功能范围。
+3. 四步流程阶段堆叠图，展示逐轮 MPI 区间合计及各阶段占比。
+4. 正确性与容量记录：实际 RAM 临时读写字节数和存储/工作区峰值。
+5. overlap 消融与额外外排性能实验仅作后续备选，不进入本轮补测。
 
-顺序：小回归 -> D1 两项 SDK 与代表配置 -> 受控消融 -> D1/D2 全功能与四步流程
--> 容量可行时 D3 其他功能及外排。遇到性能瓶颈再按分项优化，不为论文预先恢复
+顺序：小回归 -> D1 单次代表探测 -> D2 六核组容量探测 -> 冻结版本及容量 ->
+D1/D2 两项 SDK 简单扩展性、八项六核组 app 和三轮四步流程
+（D1 及通过关卡后的 D2 正式矩阵已授权）。遇到性能瓶颈再按分项优化，不为论文预先恢复
 已退役接口或继续大规模重构。

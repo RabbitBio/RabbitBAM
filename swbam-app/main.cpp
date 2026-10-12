@@ -12,44 +12,28 @@
 #include <string>
 #include <vector>
 
-int main(int argc, char **argv) {
-    double t0 = GetTime();
+static int RunCommand(int argc, char **argv, int my_rank) {
     double t1 = 0.0;
-
-    double mpi_init_t0 = GetTime();
-    MPI_Init(&argc, &argv);
-    double mpi_init_cost = GetTime() - mpi_init_t0;
-
-    int my_rank = 0;
-    MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
-
-#ifndef PLATFORM_SUNWAY
-    if (my_rank == 0) {
-        fprintf(stderr, "RabbitBAM-MPI is only supported on the Sunway platform.\n");
-    }
-    MPI_Finalize();
-    return 1;
-#else
-    athread_init();
-#endif
-
     CmdInfo cmd_info;
     bool stats_basic = false;
     CLI::App app("RabbitBAM-MPI");
+    app.footer("Storage: --storage posix (default), or --storage ram --ram-capacity SIZE "
+               "--ram-ranks N --ram-session UNIQUE_ABSOLUTE_DIR [--ram-ready-timeout SECONDS] [--no-dump]. "
+               "RAM preparation and saving are outside the MPI_Init-to-MPI_Finalize interval.");
 
     CLI::App *run_all = app.add_subcommand("run_all", "Run MPI conversion (BAM -> BAM, BAM -> SAM, and SAM -> BAM implemented)");
     run_all->add_option("-i,--inFile", cmd_info.in_file_name_, "input sam/bam name")->required()->check(CLI::ExistingFile);
     run_all->add_option("-o,--outFile", cmd_info.out_file_name_, "output sam/bam name")->required();
     run_all->add_option("--io-backend", cmd_info.io_backend_,
                         "Input backend: memory, rank-memory (local BAM blocks/plain SAM lines), posix, mpiio, or auto")
-        ->default_val("memory")
+        ->default_val("posix")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     run_all->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                         "Per-rank memory input limit used by --io-backend auto")
         ->default_val("8G");
     run_all->add_option("--io-output-backend", cmd_info.io_output_backend_,
                         "Output backend: memory or mpiio")
-        ->default_val("memory")
+        ->default_val("mpiio")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
     run_all->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
                         "Per-rank body storage: memory, spool, or auto")
@@ -75,7 +59,7 @@ int main(int argc, char **argv) {
     flagstat->add_option("-i,--inFile", cmd_info.in_file_name_, "input bam name")->required()->check(CLI::ExistingFile);
     flagstat->add_option("--io-backend", cmd_info.io_backend_,
                          "Input backend: memory (whole file), rank-memory (local BAM blocks), posix, mpiio, or auto")
-        ->default_val("memory")
+        ->default_val("posix")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     flagstat->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                          "Per-rank memory input limit used by --io-backend auto")
@@ -86,7 +70,7 @@ int main(int argc, char **argv) {
     stats->add_option("-i,--inFile", cmd_info.in_file_name_, "input bam name")->required()->check(CLI::ExistingFile);
     stats->add_option("--io-backend", cmd_info.io_backend_,
                       "Input backend: memory (whole file), rank-memory (local BAM blocks), posix, mpiio, or auto")
-        ->default_val("memory")
+        ->default_val("posix")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     stats->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                       "Per-rank memory input limit used by --io-backend auto")
@@ -104,14 +88,14 @@ int main(int argc, char **argv) {
     sort->add_option("-o,--outFile", cmd_info.out_file_name_, "output bam name")->required();
     sort->add_option("--io-backend", cmd_info.io_backend_,
                      "Input backend: memory (whole file), rank-memory (local BAM blocks), posix, mpiio, or auto")
-        ->default_val("memory")
+        ->default_val("posix")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     sort->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                      "Per-rank memory input limit used by --io-backend auto")
         ->default_val("8G");
     sort->add_option("--io-output-backend", cmd_info.io_output_backend_,
                      "Output backend: memory or mpiio")
-        ->default_val("memory")
+        ->default_val("mpiio")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
     sort->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
                      "Per-rank body storage: memory, spool, or auto")
@@ -133,14 +117,14 @@ int main(int argc, char **argv) {
     collate->add_option("-o,--outFile", cmd_info.out_file_name_, "output BAM name")->required();
     collate->add_option("--io-backend", cmd_info.io_backend_,
                         "Input backend: memory (whole file), rank-memory (local BAM blocks), posix, mpiio, or auto")
-        ->default_val("memory")
+        ->default_val("posix")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     collate->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                         "Per-rank memory input limit used by --io-backend auto")
         ->default_val("8G");
     collate->add_option("--io-output-backend", cmd_info.io_output_backend_,
                         "Output backend: memory or mpiio")
-        ->default_val("memory")
+        ->default_val("mpiio")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
     collate->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
                         "Per-rank body storage: memory, spool, or auto")
@@ -163,14 +147,14 @@ int main(int argc, char **argv) {
     markdup->add_option("-o,--outFile", cmd_info.out_file_name_, "output bam name")->required();
     markdup->add_option("--io-backend", cmd_info.io_backend_,
                         "Input backend: memory (whole file), rank-memory (local BAM blocks), posix, mpiio, or auto")
-        ->default_val("memory")
+        ->default_val("posix")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     markdup->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                         "Per-rank memory input limit used by --io-backend auto")
         ->default_val("8G");
     markdup->add_option("--io-output-backend", cmd_info.io_output_backend_,
                         "Output backend: memory or mpiio")
-        ->default_val("memory")
+        ->default_val("mpiio")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
     markdup->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
                         "Per-rank body storage: memory, spool, or auto")
@@ -195,14 +179,14 @@ int main(int argc, char **argv) {
     fixmate->add_option("-o,--outFile", cmd_info.out_file_name_, "output bam name")->required();
     fixmate->add_option("--io-backend", cmd_info.io_backend_,
                         "Input backend: memory (whole file), rank-memory (local BAM blocks), posix, mpiio, or auto")
-        ->default_val("memory")
+        ->default_val("posix")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     fixmate->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                         "Per-rank memory input limit used by --io-backend auto")
         ->default_val("8G");
     fixmate->add_option("--io-output-backend", cmd_info.io_output_backend_,
                         "Output backend: memory or mpiio")
-        ->default_val("memory")
+        ->default_val("mpiio")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
     fixmate->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
                         "Per-rank body storage: memory, spool, or auto")
@@ -252,7 +236,7 @@ int main(int argc, char **argv) {
         ->default_val(300)->check(CLI::PositiveNumber);
     dedup_workflow->add_option("--io-backend", cmd_info.io_backend_,
                                "Input backend for every stage: memory, rank-memory, posix, mpiio, or auto")
-        ->default_val("memory")
+        ->default_val("posix")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "rank-memory", "posix", "mpiio", "auto"}));
     dedup_workflow->add_option("--io-memory-limit", cmd_info.io_memory_limit_,
                                "Per-rank memory input limit used by --io-backend auto")
@@ -260,7 +244,7 @@ int main(int argc, char **argv) {
     dedup_workflow->add_option("--io-output-backend",
                                cmd_info.io_output_backend_,
                                "Output backend for every stage: memory or mpiio")
-        ->default_val("memory")
+        ->default_val("mpiio")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
     dedup_workflow->add_option("--rank-body-backend",
                                cmd_info.rank_body_backend_,
@@ -284,8 +268,6 @@ int main(int argc, char **argv) {
     dedup_workflow->add_flag("--verbose", cmd_info.verbose_,
                              "Enable verbose logging")->default_val(false);
 
-    CLI11_PARSE(app, argc, argv);
-
     int exit_code = 1;
     CLI::App *selected_command = nullptr;
     bool is_run_all = false;
@@ -298,6 +280,21 @@ int main(int argc, char **argv) {
     bool is_fixmate = false;
     bool is_dedup_pipeline = false;
     bool is_dedup_workflow = false;
+    {
+        int parse_exit = 0, parse_status = 0;
+        try { app.parse(argc, argv); }
+        catch (const CLI::ParseError &error) {
+            parse_exit = 1;
+            parse_status = error.get_exit_code();
+            if (my_rank == 0) app.exit(error);
+        }
+        int any_exit = 0;
+        MPI_Allreduce(&parse_exit, &any_exit, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+        if (any_exit) {
+            MPI_Allreduce(&parse_status, &exit_code, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+            goto cleanup;
+        }
+    }
     if (app.get_subcommands().empty()) {
         if (my_rank == 0) fprintf(stderr, "ERROR: You should input one command.\n");
         goto cleanup;
@@ -367,12 +364,42 @@ int main(int argc, char **argv) {
 
 
 cleanup:
+    return exit_code;
+}
+
+int main(int argc, char **argv) {
+    swbam_usage::Session storage;
+    if (storage.Prepare(&argc, &argv) != 0) return 2;
+    const double t0 = GetTime();
+    swbam_usage::BeginMpiInterval();
+    const double e2e_start = swbam_usage::WallTime();
+    MPI_Init(&argc, &argv);
+    const double mpi_init_cost = GetTime() - t0;
+    int my_rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
+    if (!swbam::mpi::AllRanksOk(storage.EnterMpi() == 0)) {
+        MPI_Finalize();
+        const double elapsed = swbam_usage::WallTime() - e2e_start;
+        swbam_usage::EndMpiInterval();
+        return storage.Finish(2, elapsed);
+    }
+    int exit_code = 1;
+#ifdef PLATFORM_SUNWAY
+    athread_init();
+    exit_code = RunCommand(argc, argv, my_rank);
+#else
+    if (my_rank == 0)
+        fprintf(stderr, "RabbitBAM-MPI is only supported on the Sunway platform.\n");
+#endif
+    storage.LeaveMpi();
 #ifdef PLATFORM_SUNWAY
     athread_halt();
 #endif
 
     double finalize_t0 = GetTime();
     MPI_Finalize();
+    const double e2e_cost = swbam_usage::WallTime() - e2e_start;
+    swbam_usage::EndMpiInterval();
     double finalize_cost = GetTime() - finalize_t0;
 
     if (my_rank == 0) {
@@ -380,5 +407,5 @@ cleanup:
         printf("MPI_Finalize rank0 time %lf\n", finalize_cost);
         printf("TOT TIME %lf\n", GetTime() - t0);
     }
-    return exit_code;
+    return storage.Finish(exit_code, e2e_cost);
 }

@@ -143,6 +143,9 @@ public:
             length > bytes_ - (size_t)(offset - offset_)) return nullptr;
         return data_ + (size_t)(offset - offset_);
     }
+    char *ResidentRange(uint64_t offset, size_t length) const {
+        return memory_range(offset, length);
+    }
 
     int ReadBatch(const BgzfBlockSpan *spans, size_t count,
                   BgzfBlockBatch *batch) const {
@@ -383,8 +386,8 @@ int MpiIoSamInput::ReadRange(uint64_t offset, size_t length,
 }
 
 MpiBamInput::MpiBamInput()
-    : backend_(nullptr), data_open_cost_(0.0), header_open_cost_(0.0),
-      auto_memory_budget_(0), simulation_prepare_cost_(0.0) {}
+    : backend_(nullptr), owns_backend_(true), data_open_cost_(0.0), header_open_cost_(0.0),
+      auto_memory_budget_(0), cache_prepare_cost_(0.0) {}
 
 MpiBamInput::~MpiBamInput() {
     Close();
@@ -497,31 +500,35 @@ int MpiBamInput::Open(const std::string &path,
 
 void MpiBamInput::Close() {
     if (backend_) {
-        backend_->Close();
-        delete backend_;
+        if (owns_backend_) {
+            backend_->Close();
+            delete backend_;
+        }
         backend_ = nullptr;
     }
+    owns_backend_ = true;
     selected_backend_.clear();
     data_open_cost_ = 0.0;
     header_open_cost_ = 0.0;
     auto_memory_budget_ = 0;
-    simulation_prepare_cost_ = 0.0;
+    cache_prepare_cost_ = 0.0;
 }
 
 char *MpiBamInput::memory_range(uint64_t offset, size_t size) const {
-    if (const RankMemoryBamInput *memory =
-            dynamic_cast<const RankMemoryBamInput *>(backend_)) {
-        return memory->memory_range(offset, size);
-    }
-    if (MemoryBamInput *memory = dynamic_cast<MemoryBamInput *>(backend_)) {
-        if (offset <= memory->size() && size <= memory->size() - (size_t)offset)
-            return memory->data() + (size_t)offset;
-    }
-    return nullptr;
+    return backend_ ? backend_->ResidentRange(offset, size) : nullptr;
+}
+
+int MpiBamInput::Attach(BamInputBackend *backend, bool memory_resident) {
+    if (!backend || !backend->header() || backend == backend_) return -1;
+    Close();
+    backend_ = backend;
+    owns_backend_ = false;
+    selected_backend_ = memory_resident ? "borrowed-memory" : "borrowed";
+    return 0;
 }
 
 int MpiBamInput::PreparePlan(MpiBamInputPlan *plan, int root, MPI_Comm comm) {
-    simulation_prepare_cost_ = 0.0;
+    cache_prepare_cost_ = 0.0;
     RankMemoryBamInput *memory = dynamic_cast<RankMemoryBamInput *>(backend_);
     // Start the physical scan only after every rank has entered the timed phase.
     if (memory) MPI_Barrier(comm);
@@ -533,27 +540,26 @@ int MpiBamInput::PreparePlan(MpiBamInputPlan *plan, int root, MPI_Comm comm) {
     MPI_Comm_rank(comm, &rank);
     double scan_read_cost = rank == root ? memory->scan_read_cost() : 0.0;
     MPI_Bcast(&scan_read_cost, 1, MPI_DOUBLE, root, comm);
-    // All ranks wait for the root's physical scan reads. Exclude that same cost
-    // everywhere, but retain header parsing, index construction and broadcasts.
-    simulation_prepare_cost_ = scan_read_cost;
+    // Cache preparation is diagnostic; callers measure the complete elapsed interval.
+    cache_prepare_cost_ = scan_read_cost;
     MPI_Barrier(comm);
     const double load_t0 = GetTime();
     const int local_ok = memory->Load(plan->rank_spans(), plan->rank_block_count()) == 0;
     const int ready = AllRanksOk(local_ok, comm);
     const double load_cost = GetTime() - load_t0;
-    simulation_prepare_cost_ += load_cost;
-    data_open_cost_ = simulation_prepare_cost_;
+    cache_prepare_cost_ += load_cost;
+    data_open_cost_ = cache_prepare_cost_;
     fprintf(stderr,
             "[rank %d] rank-memory preload offset=%llu bytes=%zu blocks=%zu "
-            "load_wait_s=%.6f scan_disk_s=%.6f excluded_prepare_s=%.6f ok=%d\n",
+            "load_wait_s=%.6f scan_disk_s=%.6f cache_prepare_s=%.6f ok=%d\n",
             rank, (unsigned long long)(plan->rank_block_count()
                 ? plan->rank_spans()[0].offset : plan->body_offset),
             plan->rank_block_count() ? (size_t)(plan->rank_spans()[plan->rank_block_count()-1].offset +
                 plan->rank_spans()[plan->rank_block_count()-1].compressed_size - plan->rank_spans()[0].offset) : 0,
             plan->rank_block_count(), load_cost, scan_read_cost,
-            simulation_prepare_cost_, local_ok);
+            cache_prepare_cost_, local_ok);
     fflush(stderr);
-    const double prepare_max = ReduceMaxCost(simulation_prepare_cost_, root, comm);
+    const double prepare_max = ReduceMaxCost(cache_prepare_cost_, root, comm);
     if (rank == root)
         printf("222Complete the input open cost %lf-- (rank-local preparation)\n", prepare_max);
     return ready ? 0 : -1;

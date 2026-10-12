@@ -56,6 +56,8 @@ public:
     virtual int ScanBlocks(std::vector<BgzfBlockSpan> *spans) const = 0;
     virtual int ReadBatch(const BgzfBlockSpan *spans, size_t count,
                           BgzfBlockBatch *batch) const = 0;
+    // Borrowed storage, valid until Close; nullptr means not resident.
+    virtual char *ResidentRange(uint64_t, size_t) const { return nullptr; }
 };
 
 class MemoryBamInput : public BamInputBackend {
@@ -79,6 +81,10 @@ public:
 
     char *data() { return data_; }
     const char *data() const { return data_; }
+    char *ResidentRange(uint64_t offset, size_t length) const {
+        return data_ && offset <= size_ && length <= size_ - offset
+            ? data_ + offset : nullptr;
+    }
 
 private:
     MemoryBamInput(const MemoryBamInput &);
@@ -133,6 +139,7 @@ public:
                             std::vector<long long> *lengths) const = 0;
     virtual int ReadRange(uint64_t offset, size_t length,
                           std::vector<char> *data) const = 0;
+    virtual char *ResidentRange(uint64_t, size_t) const { return nullptr; }
 };
 
 class PosixSamInput : public SamInputBackend {

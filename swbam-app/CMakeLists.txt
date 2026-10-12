@@ -2,11 +2,22 @@ cmake_minimum_required(VERSION 3.13)
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT CMAKE_TOOLCHAIN_FILE)
     message(FATAL_ERROR "Use -DCMAKE_TOOLCHAIN_FILE=<sdk-prefix>/lib/cmake/SWBAM/SunwayToolchain.cmake")
 endif()
+
 project(SWBAMApp LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT TARGET swbam::swbam)
     find_package(SWBAM 0.1 CONFIG REQUIRED)
+endif()
+if(NOT TARGET swbam_benchmark_support)
+    set(SWBAM_BENCHMARK_SUPPORT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../benchmark-support"
+        CACHE PATH "Private RAM storage support directory")
+    if(EXISTS "${SWBAM_BENCHMARK_SUPPORT_DIR}/CMakeLists.txt")
+        add_subdirectory("${SWBAM_BENCHMARK_SUPPORT_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/benchmark-support")
+    else()
+        add_library(swbam_benchmark_support INTERFACE)
+        message(STATUS "Private RAM support unavailable: building disk-only app")
+    endif()
 endif()
 
 add_library(swbam_cpe_algorithm_objects OBJECT
@@ -18,7 +29,6 @@ add_executable(RabbitBAM-MPI
     main.cpp CmdInfo.cpp
     commands/swbam_bam2bam_mpi.cpp
     commands/swbam_bam2sam_mpi.cpp
-    commands/swbam_conversion_memory_chunks.cpp
     commands/swbam_fixmate_mpi.cpp
     commands/swbam_flagstat_mpi.cpp
     commands/swbam_io_check_mpi.cpp
@@ -34,9 +44,13 @@ add_executable(RabbitBAM-MPI
     pipelines/swbam_dedup_workflow_mpi.cpp
     $<TARGET_OBJECTS:swbam_cpe_algorithm_objects>)
 target_compile_definitions(RabbitBAM-MPI PRIVATE ENABLE_MPI_BAM2BAM)
+target_compile_options(RabbitBAM-MPI PRIVATE -Werror=format)
 target_include_directories(RabbitBAM-MPI PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
-target_link_libraries(RabbitBAM-MPI PRIVATE swbam::swbam)
+target_link_libraries(RabbitBAM-MPI PRIVATE swbam::swbam swbam_benchmark_support)
+add_custom_command(TARGET RabbitBAM-MPI POST_BUILD
+    COMMAND /bin/sh -c "printf '\\002' | dd of='$<TARGET_FILE:RabbitBAM-MPI>' bs=1 seek=9 count=1 conv=notrunc status=none"
+    VERBATIM)
 
 option(USE_SWLU "Enable SWLU profiling library" OFF)
 if(USE_SWLU)

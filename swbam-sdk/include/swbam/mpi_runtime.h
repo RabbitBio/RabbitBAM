@@ -86,6 +86,8 @@ public:
              const std::string &requested_backend,
              const std::string &memory_limit,
              MPI_Comm comm = MPI_COMM_WORLD);
+    // backend must already be open and outlive this handle. Close detaches it.
+    int Attach(BamInputBackend *backend, bool memory_resident = false);
     void Close();
 
     BamInputBackend *backend() { return backend_; }
@@ -95,7 +97,8 @@ public:
     double header_open_cost() const { return header_open_cost_; }
     uint64_t auto_memory_budget() const { return auto_memory_budget_; }
     bool is_memory() const {
-        return selected_backend_ == "memory" || selected_backend_ == "rank-memory";
+        return selected_backend_ == "memory" || selected_backend_ == "rank-memory" ||
+               selected_backend_ == "borrowed-memory";
     }
     // File-global offsets; nullptr means the range is not resident.
     char *memory_range(uint64_t offset, size_t size) const;
@@ -104,19 +107,22 @@ public:
     // use the same communicator as Open. Other backends keep the original plan.
     int PreparePlan(MpiBamInputPlan *plan, int root = 0,
                     MPI_Comm comm = MPI_COMM_WORLD);
-    // Remove only physical scan reads and rank-cache preparation from body timing.
-    double simulation_prepare_cost() const { return simulation_prepare_cost_; }
+    // Diagnostic cache preparation cost; do not subtract from elapsed timing.
+    double cache_prepare_cost() const { return cache_prepare_cost_; }
+    // Source compatibility for older clients; diagnostic only, not an exclusion.
+    double simulation_prepare_cost() const { return cache_prepare_cost_; }
 
 private:
     MpiBamInput(const MpiBamInput &);
     MpiBamInput &operator=(const MpiBamInput &);
 
     BamInputBackend *backend_;
+    bool owns_backend_;
     std::string selected_backend_;
     double data_open_cost_;
     double header_open_cost_;
     uint64_t auto_memory_budget_;
-    double simulation_prepare_cost_;
+    double cache_prepare_cost_;
 };
 
 class MpiFileOutput {

@@ -2,7 +2,6 @@
 #include "swbam/mpi_runtime.h"
 #include "swbam/operators/bam_read_batch.h"
 #include "swbam/cpe_write_pipeline.h"
-#include "simulated_write_buffer.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -52,7 +51,6 @@ typedef MpiCollateRecordMetaShared CollateMeta;
 const int kCollateCpes = 64;
 const size_t kCollateRawAlignment = 64;
 const size_t kCollateControlReserve = 16ull * 1024 * 1024;
-const size_t kCollateSimScratch = 8ull * 1024 * 1024;
 const size_t kCollateExchangeRaw = 32ull * 1024 * 1024;
 const size_t kCollateExchangeMeta = 4ull * 1024 * 1024;
 const size_t kCollateCursorMeta = 64ull * 1024;
@@ -1717,8 +1715,7 @@ static int CollateGatherOutput(
         MpiCollateStats *stats,
         CollateOutputStageCosts *costs,
         double stage41_cost, double stage42_cost,
-        double stage43_cost, double body_total_t0,
-        double input_prepare_cost = 0.0) {
+        double stage43_cost, double body_total_t0) {
     memset(costs, 0, sizeof(*costs));
 
     double stage44_t0 = GetTime();
@@ -1785,137 +1782,12 @@ static int CollateGatherOutput(
         return -1;
     }
 
-    double stage45_malloc_t0 = GetTime();
-    const size_t simulation_body_size = local_body.is_memory()
-        ? (size_t)local_body.size()
-        : (size_t)std::min<uint64_t>(
-              local_body.size(), 8ull * 1024ull * 1024ull);
-    const size_t simulation_envelope_size =
-        rank == 0 ? header_size + sizeof(kCollateBgzfEofBlock) : 0;
-    std::vector<unsigned char> source_chunk;
-    if (!local_body.is_memory() && local_body.size() > 0) {
-        try {
-            source_chunk.resize(simulation_body_size);
-        } catch (...) {
-            local_ok = 0;
-        }
-    }
-    swbam_app::SimulatedWriteBuffer simulated_write;
-    if (simulated_write.Allocate(
-            simulation_body_size, simulation_envelope_size) != 0) {
-        fprintf(stderr,
-                "[rank %d] ERROR: collate simulated write allocation failed "
-                "body_bytes=%llu buffer_bytes=%zu errno=%d (%s).\n",
-                rank, (unsigned long long)local_body.size(),
-                simulated_write.size(), errno, strerror(errno));
-        local_ok = 0;
-    } else if (simulated_write.bounded()) {
-        printf("[rank %d] collate simulated write fallback "
-               "body_bytes=%llu window_bytes=%zu; all body bytes remain counted\n",
-               rank, (unsigned long long)local_body.size(),
-               simulated_write.body_capacity());
-    }
-    char *simulated_write_mem = simulated_write.data();
-    const size_t simulated_write_size = simulated_write.size();
-    costs->stage45_malloc =
-        CollateReduceMax(GetTime() - stage45_malloc_t0);
-    if (rank == 0 && local_ok) {
-        printf("Complete the 4.5b malloc simulated write memory cost %lf\n",
-               costs->stage45_malloc);
-    }
-    if (!CollateAllRanksOk(local_ok)) {
-        free(header_memory);
-        return -1;
-    }
-
-    double stage46_cost = 0.0;
-    double source_read_cost = 0.0;
-    volatile unsigned long long simulated_guard = 0;
-    size_t simulated_pos = 0;
-    if (rank == 0 && header_size > 0) {
-        double copy_t0 = GetTime();
-        memcpy(simulated_write_mem + simulated_pos,
-               header_memory, header_size);
-        stage46_cost += GetTime() - copy_t0;
-        simulated_pos += header_size;
-    }
-    if (local_body.size() > 0) {
-        if (local_body.is_memory()) {
-            double copy_t0 = GetTime();
-            const int copy_ret = simulated_write.bounded()
-                ? simulated_write.CopyBodyWindowed(
-                      local_body, simulated_pos, &simulated_guard)
-                : local_body.ReadAt(
-                      0, simulated_write_mem + simulated_pos,
-                      (size_t)local_body.size());
-            if (copy_ret != 0) {
-                fprintf(stderr,
-                        "[rank %d] ERROR: collate simulated body read failed "
-                        "body_bytes=%llu errno=%d (%s).\n",
-                        rank, (unsigned long long)local_body.size(),
-                        errno, strerror(errno));
-                local_ok = 0;
-            }
-            stage46_cost += GetTime() - copy_t0;
-            simulated_pos += simulated_write.body_capacity();
-        } else {
-            uint64_t copied = 0;
-            const size_t destination = simulated_pos;
-            while (local_ok && copied < local_body.size()) {
-                const size_t count = (size_t)std::min<uint64_t>(
-                    local_body.size() - copied, source_chunk.size());
-                double read_t0 = GetTime();
-                if (local_body.ReadAt(
-                        copied, source_chunk.data(), count) != 0) {
-                    local_ok = 0;
-                    break;
-                }
-                source_read_cost += GetTime() - read_t0;
-                double copy_t0 = GetTime();
-                memcpy(simulated_write_mem + destination,
-                       source_chunk.data(), count);
-                stage46_cost += GetTime() - copy_t0;
-                copied += count;
-            }
-            simulated_pos += simulation_body_size;
-        }
-    }
-    if (rank == 0) {
-        double copy_t0 = GetTime();
-        memcpy(simulated_write_mem + simulated_pos,
-               kCollateBgzfEofBlock,
-               sizeof(kCollateBgzfEofBlock));
-        stage46_cost += GetTime() - copy_t0;
-        simulated_pos += sizeof(kCollateBgzfEofBlock);
-    }
-    if (simulated_write_size > 0) {
-        simulated_guard +=
-            (unsigned char)simulated_write_mem[0];
-        simulated_guard +=
-            (unsigned char)
-                simulated_write_mem[simulated_write_size - 1];
-    }
-    (void)simulated_guard;
-    (void)simulated_pos;
-    costs->stage46 = CollateReduceMax(stage46_cost);
-    const double source_read_cost_max =
-        CollateReduceMax(source_read_cost);
-    if (rank == 0) {
-        printf("Complete the 4.6 simulated header/body distributed write cost %lf\n",
-               costs->stage46);
-        if (source_read_cost_max > 0.0) {
-            printf("Rank body source read diagnostic cost %lf\n",
-                   source_read_cost_max);
-        }
-        const double core_total =
-            stage41_cost + stage42_cost + stage43_cost +
-            costs->stage44 + costs->stage45_header +
-            costs->stage46;
-        printf("Complete the total (4.1~4.6) cost %lf-----\n",
-               core_total);
-    }
-    // Release the simulation copy before the real output/gather allocation.
-    simulated_write.Reset();
+    const double output_t0 = GetTime();
+    if (!output_bam && swbam_usage::WriteOutput(
+            output_path, local_body, header_size, header_memory,
+            sizeof(kCollateBgzfEofBlock), kCollateBgzfEofBlock) != 0) local_ok = 0;
+    costs->stage46 = CollateReduceMax(GetTime() - output_t0);
+    if (!CollateAllRanksOk(local_ok)) { free(header_memory); return -1; }
 
     {
         double stage47_t0 = GetTime();
@@ -1932,29 +1804,14 @@ static int CollateGatherOutput(
 
     {
         double body_total_cost =
-            CollateReduceMax(GetTime() - body_total_t0 - input_prepare_cost);
+            CollateReduceMax(GetTime() - body_total_t0);
         if (rank == 0 && local_ok) {
             printf("444Complete the total body cost %lf\n",
                    body_total_cost);
         }
     }
 
-    if (!output_bam && mpiio_output) {
-        double write_t0 = GetTime();
-        if (distributed_output.WriteMpiIo(
-                output_path, local_body, header_memory,
-                kCollateBgzfEofBlock) != 0) {
-            local_ok = 0;
-        }
-        const double write_cost =
-            CollateReduceMax(GetTime() - write_t0);
-        if (rank == 0 && local_ok) {
-            printf("555MPI-IO distributed output cost %lf--\n",
-                   write_cost);
-        }
-        free(header_memory);
-        return CollateAllRanksOk(local_ok) ? 0 : -1;
-    }
+    if (!output_bam) { free(header_memory); return 0; }
 
     double verify_gather_t0 = GetTime();
     if (distributed_output.GatherToRoot(
@@ -2116,7 +1973,7 @@ static int CollatePwriteAll(
     size_t done = 0;
     double t0 = GetTime();
     while (done < size) {
-        ssize_t n = pwrite(
+        ssize_t n = swbam_usage::WriteTemporary(
             fd, src + done, size - done,
             offset + (off_t)done);
         if (n < 0 && errno == EINTR) continue;
@@ -2139,7 +1996,7 @@ static int CollatePreadAll(
     size_t done = 0;
     double t0 = GetTime();
     while (done < size) {
-        ssize_t n = pread(
+        ssize_t n = swbam_usage::ReadTemporary(
             fd, dst + done, size - done,
             offset + (off_t)done);
         if (n < 0 && errno == EINTR) continue;
@@ -2154,37 +2011,11 @@ static int CollatePreadAll(
     return 0;
 }
 
-static void CollateSimulateCopy(
-        const void *data, size_t size,
-        unsigned char *scratch, size_t scratch_size,
-        double *elapsed) {
-    if (!data || !size || !scratch || !scratch_size) return;
-    const unsigned char *src =
-        static_cast<const unsigned char *>(data);
-    volatile unsigned char guard = 0;
-    double t0 = GetTime();
-    size_t done = 0;
-    while (done < size) {
-        size_t n = std::min(scratch_size, size - done);
-        memcpy(scratch, src + done, n);
-        guard ^= scratch[n - 1];
-        done += n;
-    }
-    *elapsed += GetTime() - t0;
-    (void)guard;
-}
 
-static int CollateOpenOneTemp(
-        const std::string &path, int *fd) {
-    int opened = open(
-        path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
-    if (opened < 0) return -1;
-    if (unlink(path.c_str()) != 0) {
-        close(opened);
-        return -1;
-    }
-    *fd = opened;
-    return 0;
+
+static int CollateOpenOneTemp(const std::string &path, int *fd) {
+    *fd = swbam_usage::OpenTemporary(path);
+    return *fd < 0 ? -1 : 0;
 }
 
 static int CollateOpenTemp(
@@ -2222,7 +2053,7 @@ static int CollateOpenTemp(
         }
         if (CollateOpenOneTemp(
                 segments, &store->segments_fd) != 0) {
-            close(store->runs_fd);
+            swbam_usage::CloseTemporary(store->runs_fd);
             store->runs_fd = -1;
             if (errno == EEXIST) continue;
             return -1;
@@ -2233,9 +2064,9 @@ static int CollateOpenTemp(
 }
 
 static void CollateCloseTemp(CollateTempStore *store) {
-    if (store->runs_fd >= 0) close(store->runs_fd);
+    if (store->runs_fd >= 0) swbam_usage::CloseTemporary(store->runs_fd);
     if (store->segments_fd >= 0) {
-        close(store->segments_fd);
+        swbam_usage::CloseTemporary(store->segments_fd);
     }
     store->runs_fd = -1;
     store->segments_fd = -1;
@@ -2245,7 +2076,6 @@ static int CollateAppendExtent(
         int fd, off_t *file_end,
         const CollateMeta *records, size_t count,
         const unsigned char *raw, size_t raw_size,
-        unsigned char *scratch, size_t scratch_size,
         MpiCollateStats *stats,
         CollateExtent *extent) {
     if (count > SIZE_MAX / sizeof(CollateMeta)) return -1;
@@ -2275,12 +2105,8 @@ static int CollateAppendExtent(
             extent->raw_offset, stats) != 0) {
         return -1;
     }
-    CollateSimulateCopy(
-        records, meta_bytes, scratch, scratch_size,
-        &stats->t_temp_write_sim);
-    CollateSimulateCopy(
-        raw, raw_size, scratch, scratch_size,
-        &stats->t_temp_write_sim);
+
+
     *file_end =
         extent->raw_offset + (off_t)raw_size;
     return 0;
@@ -2345,7 +2171,6 @@ static int CollateSpillArena(
         CollateRunArena *arena,
         int bins,
         CollateTempStore *store,
-        unsigned char *scratch, size_t scratch_size,
         MpiCollateStats *stats,
         std::vector<CollateRun> *runs) {
     if (arena->record_count == 0) return 0;
@@ -2355,7 +2180,7 @@ static int CollateSpillArena(
             store->runs_fd, &store->runs_end,
             arena->records(), arena->record_count,
             arena->data, arena->raw_used,
-            scratch, scratch_size, stats,
+            stats,
             &run.extent) != 0) {
         return -1;
     }
@@ -2368,11 +2193,9 @@ class CollateRunExtractOperator : public CollateExtractOperator {
 public:
     CollateRunExtractOperator(long long global_begin, int bins,
                              CollateRunArena *arena, CollateTempStore *store,
-                             unsigned char *scratch, size_t scratch_size,
                              std::vector<CollateRun> *runs, MpiCollateStats *stats)
         : CollateExtractOperator(global_begin, bins, nullptr, stats),
-          arena_(arena), store_(store), scratch_(scratch),
-          scratch_size_(scratch_size), runs_(runs) {}
+          arena_(arena), store_(store), runs_(runs) {}
 
     int PostProcessBatch(size_t active, long long *records_processed) {
         long long count = 0;
@@ -2384,8 +2207,7 @@ public:
                 para.records, (size_t)para.n_records);
             stats_->t_extract_merge += GetTime() - t0;
             if (append == 1) {
-                if (CollateSpillArena(arena_, bins_, store_, scratch_,
-                                     scratch_size_, stats_, runs_) != 0) return -1;
+                if (CollateSpillArena(arena_, bins_, store_, stats_, runs_) != 0) return -1;
                 t0 = GetTime();
                 append = CollateArenaAppendBlock(
                     arena_, para.raw_arena, para.raw_used,
@@ -2424,8 +2246,6 @@ public:
 private:
     CollateRunArena *arena_;
     CollateTempStore *store_;
-    unsigned char *scratch_;
-    size_t scratch_size_;
     std::vector<CollateRun> *runs_;
 };
 
@@ -2434,11 +2254,10 @@ static int CollateExtractRunsImpl(
         long long global_block_begin,
         int bins, CollateRunArena *arena,
         CollateTempStore *store,
-        unsigned char *scratch, size_t scratch_size,
         std::vector<CollateRun> *runs,
         MpiCollateStats *stats) {
     CollateRunExtractOperator op(global_block_begin, bins, arena, store,
-                                 scratch, scratch_size, runs, stats);
+                                 runs, stats);
     return CollateRunReadPipeline(block_reader, &op, stats);
 }
 
@@ -2446,13 +2265,12 @@ static int CollateExtractRuns(
         MemReader &reader, long long global_block_begin,
         int bins, CollateRunArena *arena,
         CollateTempStore *store,
-        unsigned char *scratch, size_t scratch_size,
         std::vector<CollateRun> *runs,
         MpiCollateStats *stats) {
     CollateMemoryBatchReader block_reader(&reader);
     return CollateExtractRunsImpl(
         &block_reader, global_block_begin, bins, arena, store,
-        scratch, scratch_size, runs, stats);
+        runs, stats);
 }
 
 static int CollateExtractRuns(
@@ -2461,19 +2279,17 @@ static int CollateExtractRuns(
         long long global_block_begin,
         int bins, CollateRunArena *arena,
         CollateTempStore *store,
-        unsigned char *scratch, size_t scratch_size,
         std::vector<CollateRun> *runs,
         MpiCollateStats *stats) {
     CollateBackendBatchReader block_reader(&input, spans, span_count);
     return CollateExtractRunsImpl(
         &block_reader, global_block_begin, bins, arena, store,
-        scratch, scratch_size, runs, stats);
+        runs, stats);
 }
 
 static int CollateLoadRun(
         const CollateRun &run,
         CollateRunArena *arena,
-        unsigned char *scratch, size_t scratch_size,
         MpiCollateStats *stats) {
     if (run.resident) return 0;
     const uint64_t meta_bytes =
@@ -2498,14 +2314,8 @@ static int CollateLoadRun(
             run.extent.raw_offset, stats) != 0) {
         return -1;
     }
-    CollateSimulateCopy(
-        arena->records(), (size_t)meta_bytes,
-        scratch, scratch_size,
-        &stats->t_temp_read_sim);
-    CollateSimulateCopy(
-        arena->data, arena->raw_used,
-        scratch, scratch_size,
-        &stats->t_temp_read_sim);
+
+
     return 0;
 }
 
@@ -2561,7 +2371,6 @@ static int CollateAppendSegmentChunk(
         CollateTempStore *store,
         const CollateMeta *records, size_t count,
         const unsigned char *raw, size_t raw_size,
-        unsigned char *scratch, size_t scratch_size,
         MpiCollateStats *stats,
         CollateSegment *segment) {
     CollateExtent extent;
@@ -2569,7 +2378,7 @@ static int CollateAppendSegmentChunk(
             store->segments_fd,
             &store->segments_end,
             records, count, raw, raw_size,
-            scratch, scratch_size, stats,
+            stats,
             &extent) != 0) {
         return -1;
     }
@@ -2586,7 +2395,6 @@ static int CollateExchangeRuns(
         int rank, int comm_size, int bins,
         size_t exchange_raw_capacity,
         size_t exchange_meta_bytes,
-        unsigned char *scratch, size_t scratch_size,
         std::vector<CollateSegment> *segments,
         MpiCollateStats *stats) {
     unsigned long long local_runs = runs.size();
@@ -2610,7 +2418,7 @@ static int CollateExchangeRuns(
         if (has_run &&
             CollateLoadRun(
                 runs[(size_t)round], arena,
-                scratch, scratch_size, stats) != 0) {
+                stats) != 0) {
             return -1;
         }
         const CollateMeta *records =
@@ -2678,7 +2486,6 @@ static int CollateExchangeRuns(
                             store, send_meta.data(),
                             chunk_end - send_pos,
                             send_raw.data(), raw_bytes,
-                            scratch, scratch_size,
                             stats, &segment) != 0) {
                         return -1;
                     }
@@ -2773,7 +2580,6 @@ static int CollateExchangeRuns(
                             recv_count,
                             recv_raw.data(),
                             recv_raw_bytes,
-                            scratch, scratch_size,
                             stats, &segment) != 0) {
                             return -1;
                         }
@@ -2831,7 +2637,6 @@ struct CollateFileCursor {
 
 static int CollateCursorLoadMeta(
         CollateFileCursor *cursor,
-        unsigned char *scratch, size_t scratch_size,
         MpiCollateStats *stats) {
     cursor->active = false;
     while (cursor->extent_index <
@@ -2859,10 +2664,7 @@ static int CollateCursorLoadMeta(
                 bytes, offset, stats) != 0) {
             return -1;
         }
-        CollateSimulateCopy(
-            cursor->meta_buffer, bytes,
-            scratch, scratch_size,
-            &stats->t_temp_read_sim);
+
         cursor->meta_count = count;
         cursor->meta_pos = 0;
         cursor->active = true;
@@ -2878,7 +2680,6 @@ static const CollateMeta &CollateCursorMeta(
 
 static int CollateCursorRaw(
         CollateFileCursor *cursor,
-        unsigned char *scratch, size_t scratch_size,
         MpiCollateStats *stats,
         const unsigned char **raw) {
     const CollateMeta &meta =
@@ -2910,11 +2711,7 @@ static int CollateCursorRaw(
                 stats) != 0) {
             return -1;
         }
-        CollateSimulateCopy(
-            cursor->raw_buffer,
-            cursor->raw_size,
-            scratch, scratch_size,
-            &stats->t_temp_read_sim);
+
     }
     *raw = cursor->raw_buffer +
         (size_t)(meta.raw_offset -
@@ -2929,7 +2726,6 @@ static int CollateCursorRaw(
 
 static int CollateCursorAdvance(
         CollateFileCursor *cursor,
-        unsigned char *scratch, size_t scratch_size,
         MpiCollateStats *stats) {
     ++cursor->meta_pos;
     ++cursor->extent_record_pos;
@@ -2938,7 +2734,7 @@ static int CollateCursorAdvance(
         return 0;
     }
     return CollateCursorLoadMeta(
-        cursor, scratch, scratch_size, stats);
+        cursor, stats);
 }
 
 class CollateFileLoserTree {
@@ -3019,7 +2815,6 @@ static int CollateBuildCursors(
         const std::vector<CollateSegment> &segments,
         size_t begin, size_t end,
         unsigned char *cursor_memory,
-        unsigned char *scratch, size_t scratch_size,
         MpiCollateStats *stats,
         std::vector<CollateFileCursor> *cursors) {
     const size_t meta_capacity =
@@ -3042,15 +2837,13 @@ static int CollateBuildCursors(
             base + kCollateCursorMeta;
         cursor.raw_capacity = kCollateCursorRaw;
         if (CollateCursorLoadMeta(
-                &cursor, scratch, scratch_size,
-                stats) != 0) {
+                &cursor, stats) != 0) {
             return -1;
         }
         if (cursor.active) {
             const unsigned char *raw = nullptr;
             if (CollateCursorRaw(
-                    &cursor, scratch, scratch_size,
-                    stats, &raw) != 0) {
+                    &cursor, stats, &raw) != 0) {
                 return -1;
             }
             (void)raw;
@@ -3067,13 +2860,12 @@ static int CollateMergeGroupToTemp(
         std::vector<CollateMeta> *out_meta,
         std::vector<unsigned char> *out_raw,
         CollateTempStore *store,
-        unsigned char *scratch, size_t scratch_size,
         MpiCollateStats *stats,
         CollateSegment *output) {
     std::vector<CollateFileCursor> cursors;
     if (CollateBuildCursors(
             segments, begin, end, cursor_memory,
-            scratch, scratch_size, stats,
+            stats,
             &cursors) != 0) {
         return -1;
     }
@@ -3085,7 +2877,7 @@ static int CollateMergeGroupToTemp(
         int ret = CollateAppendSegmentChunk(
             store, out_meta->data(), meta_count,
             out_raw->data(), raw_used,
-            scratch, scratch_size, stats, output);
+            stats, output);
         meta_count = 0;
         raw_used = 0;
         return ret;
@@ -3099,8 +2891,7 @@ static int CollateMergeGroupToTemp(
             CollateCursorMeta(cursor);
         const unsigned char *raw = nullptr;
         if (CollateCursorRaw(
-                &cursor, scratch, scratch_size,
-                stats, &raw) != 0) {
+                &cursor, stats, &raw) != 0) {
             return -1;
         }
         if (meta_count == out_meta->size() ||
@@ -3117,14 +2908,12 @@ static int CollateMergeGroupToTemp(
         raw_used += meta.raw_len;
         ++meta_count;
         if (CollateCursorAdvance(
-                &cursor, scratch, scratch_size,
-                stats) != 0) {
+                &cursor, stats) != 0) {
             return -1;
         }
         if (cursor.active) {
             if (CollateCursorRaw(
-                    &cursor, scratch,
-                    scratch_size, stats,
+                    &cursor, stats,
                     &raw) != 0) {
                 return -1;
             }
@@ -3138,7 +2927,6 @@ static int CollateConsolidate(
         std::vector<CollateSegment> *segments,
         size_t fan_in,
         CollateTempStore *store,
-        unsigned char *scratch, size_t scratch_size,
         MpiCollateStats *stats) {
     if (segments->size() <= fan_in) return 0;
     const size_t stride =
@@ -3167,7 +2955,6 @@ static int CollateConsolidate(
                     *segments, begin, end,
                     cursor_memory.data(),
                     &out_meta, &out_raw, store,
-                    scratch, scratch_size,
                     stats, &merged) != 0) {
                 return -1;
             }
@@ -3183,7 +2970,6 @@ static int CollateConsolidate(
 static int CollateMergeExternal(
         const std::vector<CollateSegment> &segments,
         int compress_level, size_t fan_in,
-        unsigned char *scratch, size_t scratch_size,
         swbam::RankBodySink *body_sink,
         MpiCollateStats *stats) {
     const size_t stride =
@@ -3193,8 +2979,7 @@ static int CollateMergeExternal(
     std::vector<CollateFileCursor> cursors;
     if (CollateBuildCursors(
             segments, 0, segments.size(),
-            cursor_memory.data(), scratch,
-            scratch_size, stats, &cursors) != 0) {
+            cursor_memory.data(), stats, &cursors) != 0) {
         return -1;
     }
     CollateFileLoserTree tree(&cursors);
@@ -3207,15 +2992,13 @@ static int CollateMergeExternal(
             CollateFileCursor &cursor =
                 cursors[(size_t)pending];
             if (CollateCursorAdvance(
-                    &cursor, scratch, scratch_size,
-                    stats) != 0) {
+                    &cursor, stats) != 0) {
                 return -1;
             }
             const unsigned char *unused = nullptr;
             if (cursor.active &&
                 CollateCursorRaw(
-                    &cursor, scratch,
-                    scratch_size, stats,
+                    &cursor, stats,
                     &unused) != 0) {
                 return -1;
             }
@@ -3229,8 +3012,7 @@ static int CollateMergeExternal(
         const CollateMeta &meta =
             CollateCursorMeta(cursor);
         if (CollateCursorRaw(
-                &cursor, scratch, scratch_size,
-                stats, raw) != 0) {
+                &cursor, stats, raw) != 0) {
             return -1;
         }
         CollateCountGroup(
@@ -3266,7 +3048,7 @@ static int OptimizedBamExternalCollateMPIImpl(
         2ull * kCollateExchangeRaw +
         2ull * kCollateExchangeMeta;
     const size_t common_fixed =
-        kCollateControlReserve + kCollateSimScratch;
+        kCollateControlReserve;
     const size_t full_phase_workspace = std::max(
         CollateExtractWorkspaceBytes(),
         std::max(full_exchange_workspace,
@@ -3292,7 +3074,6 @@ static int OptimizedBamExternalCollateMPIImpl(
                  CollateCompressWorkspaceBytes()));
     const size_t fixed =
         kCollateControlReserve +
-        kCollateSimScratch +
         phase_workspace;
     if (memory_limit <= fixed + minimum_arena) {
         if (rank == 0) {
@@ -3310,17 +3091,14 @@ static int OptimizedBamExternalCollateMPIImpl(
     CollateRunArena arena;
     std::vector<CollateRun> runs;
     std::vector<CollateSegment> segments;
-    unsigned char *scratch = nullptr;
     int result = -1;
     double wall_t0 = GetTime();
     arena.capacity = memory_limit - fixed;
     arena.capacity &= ~(size_t)63;
     arena.data = (unsigned char *)aligned_alloc_custom(
         64, arena.capacity);
-    scratch = (unsigned char *)aligned_alloc_custom(
-        64, kCollateSimScratch);
     int local_ready =
-        arena.data && scratch &&
+        arena.data &&
         CollateOpenTemp(
             temp_prefix, rank, &store) == 0;
     if (!CollateAllRanksOk(local_ready)) {
@@ -3342,13 +3120,11 @@ static int OptimizedBamExternalCollateMPIImpl(
         int extract_ret = reader
             ? CollateExtractRuns(
                   *reader, global_block_begin, bins,
-                  &arena, &store, scratch,
-                  kCollateSimScratch, &runs, stats)
+                  &arena, &store, &runs, stats)
             : CollateExtractRuns(
                   *input, spans, span_count,
                   global_block_begin, bins,
-                  &arena, &store, scratch,
-                  kCollateSimScratch, &runs, stats);
+                  &arena, &store, &runs, stats);
         int local_extract_ok = extract_ret == 0;
         if (!CollateAllRanksOk(local_extract_ok)) {
             goto cleanup;
@@ -3359,7 +3135,6 @@ static int OptimizedBamExternalCollateMPIImpl(
             rank, comm_size, bins,
             exchange_raw_capacity,
             exchange_meta_bytes,
-            scratch, kCollateSimScratch,
             &segments, stats) != 0) {
         goto cleanup;
     }
@@ -3371,7 +3146,6 @@ static int OptimizedBamExternalCollateMPIImpl(
             kCollateCursorMeta + kCollateCursorRaw;
         const size_t merge_fixed =
             kCollateControlReserve +
-            kCollateSimScratch +
             CollateCompressWorkspaceBytes() +
             kCollateConsolidateMeta +
             kCollateConsolidateRaw;
@@ -3392,11 +3166,9 @@ static int OptimizedBamExternalCollateMPIImpl(
                             fan_in * stride));
         if (CollateConsolidate(
                 &segments, fan_in, &store,
-                scratch, kCollateSimScratch,
                 stats) != 0 ||
             CollateMergeExternal(
                 segments, compress_level, fan_in,
-                scratch, kCollateSimScratch,
                 &body_sink, stats) != 0) {
             goto cleanup;
         }
@@ -3405,17 +3177,10 @@ static int OptimizedBamExternalCollateMPIImpl(
 
 cleanup:
     stats->t_actual = GetTime() - wall_t0;
-    // Real temp I/O is removed; CollateSimulateCopy runs outside the
-    // measured syscalls, so its memory-copy cost remains in t_optimized.
-    stats->t_optimized =
-        stats->t_actual -
-        stats->t_temp_read_actual -
-        stats->t_temp_write_actual;
-    if (stats->t_optimized < 0.0) stats->t_optimized = 0.0;
+    stats->t_optimized = stats->t_actual;
     CollateCloseTemp(&store);
     if (arena.data) aligned_free_custom(arena.data);
-    if (scratch) aligned_free_custom(scratch);
-    return result;
+        return result;
 }
 
 static int OptimizedBamExternalCollateMPI(
@@ -3654,9 +3419,7 @@ static void CollatePrintStats(
         stats.t_local_sort +
         stats.t_exchange +
         stats.t_memory_track +
-        stats.t_merge +
-        stats.t_temp_write_sim +
-        stats.t_temp_read_sim;
+        stats.t_merge;
     const double unaccounted =
         stats.t_optimized - accounted;
     char local[8192] = {};
@@ -3678,7 +3441,7 @@ static void CollatePrintStats(
         "self_records=%lld remote_records=%lld "
         "self_raw=%lld remote_raw=%lld chunks=%lld\n"
         "[rank %d] collate_temp write_actual=%.3f "
-        "read_actual=%.3f write_sim=%.3f read_sim=%.3f "
+        "read_actual=%.3f "
         "write_bytes=%lld read_bytes=%lld\n"
         "[rank %d] collate_memory resident_records=%lld "
         "resident_raw=%lld peak=%lld arena=%lld fan_in=%lld "
@@ -3717,8 +3480,6 @@ static void CollatePrintStats(
         stats.exchange_chunks,
         rank, stats.t_temp_write_actual,
         stats.t_temp_read_actual,
-        stats.t_temp_write_sim,
-        stats.t_temp_read_sim,
         stats.temp_write_bytes,
         stats.temp_read_bytes,
         rank, stats.resident_run_records,
@@ -3758,7 +3519,7 @@ static void CollatePrintStats(
         local_long, max_long, 19, MPI_LONG_LONG,
         MPI_MAX, 0, MPI_COMM_WORLD);
 
-    double local_double[29] = {
+    double local_double[27] = {
         stats.t_extract,
         stats.t_extract_alloc,
         stats.t_extract_read,
@@ -3782,20 +3543,18 @@ static void CollatePrintStats(
         stats.t_write,
         stats.t_temp_write_actual,
         stats.t_temp_read_actual,
-        stats.t_temp_write_sim,
-        stats.t_temp_read_sim,
         stats.t_optimized,
         stats.t_actual,
         accounted,
         unaccounted
     };
-    double global_double[29] = {};
-    double max_double[29] = {};
+    double global_double[27] = {};
+    double max_double[27] = {};
     MPI_Reduce(
-        local_double, global_double, 29, MPI_DOUBLE,
+        local_double, global_double, 27, MPI_DOUBLE,
         MPI_SUM, 0, MPI_COMM_WORLD);
     MPI_Reduce(
-        local_double, max_double, 29, MPI_DOUBLE,
+        local_double, max_double, 27, MPI_DOUBLE,
         MPI_MAX, 0, MPI_COMM_WORLD);
 
     const int width = 8192;
@@ -3839,8 +3598,8 @@ static void CollatePrintStats(
             global_double[9], global_double[10],
             global_double[17], global_double[18],
             global_double[19], global_double[20],
-            global_double[27], global_double[28],
-            global_double[25], global_double[26]);
+            global_double[25], global_double[26],
+            global_double[23], global_double[24]);
         printf(
             "  extract_detail_sum alloc=%.3f read=%.3f "
             "raw_resize=%.3f setup=%.3f cpe=%.3f status=%.3f "
@@ -3859,8 +3618,8 @@ static void CollatePrintStats(
             max_double[9], max_double[10],
             max_double[17], max_double[18],
             max_double[19], max_double[20],
-            max_double[27], max_double[28],
-            max_double[25], max_double[26]);
+            max_double[25], max_double[26],
+            max_double[23], max_double[24]);
         printf(
             "  extract_detail_max alloc=%.3f read=%.3f "
             "raw_resize=%.3f setup=%.3f cpe=%.3f status=%.3f "
@@ -3885,20 +3644,16 @@ static void CollatePrintStats(
         printf(
             "  external_sum runs=%lld segments=%lld "
             "temp_write_actual=%.3f temp_read_actual=%.3f "
-            "temp_write_sim=%.3f temp_read_sim=%.3f "
             "temp_write_bytes=%lld temp_read_bytes=%lld "
             "resident_records=%lld resident_raw=%lld "
             "tracked_peak_max=%lld run_arena_max=%lld\n",
             global_long[6], global_long[7],
             global_double[21], global_double[22],
-            global_double[23], global_double[24],
             global_long[9], global_long[8],
             global_long[15], global_long[16],
             max_long[17], max_long[18]);
         if (stats.mode) {
-            printf("  external_time_model per-rank simulated="
-                   "actual-temp_write_actual-temp_read_actual; "
-                   "memory-copy simulation remains included\n");
+            printf("  external_time_model actual storage I/O included\n");
         }
         fflush(stdout);
     }
@@ -3920,8 +3675,6 @@ int MpiCollateMemoryToMemory(CmdInfo *cmd_info,
     int exit_code = 1;
     int local_ok = 1;
     char *input_memory = const_cast<char *>(input_memory_const);
-    hFILE *input_hfile = nullptr;
-    samFile *input = nullptr;
     sam_hdr_t *header = nullptr;
     long long body_start = 0;
     std::vector<long long> block_offsets;
@@ -3973,34 +3726,13 @@ int MpiCollateMemoryToMemory(CmdInfo *cmd_info,
 
     {
         double t0 = GetTime();
-        input_hfile = hopen("mem:", "rb:",
-                            input_memory, input_size);
-        if (input_hfile) {
-            input = (samFile *)hts_hopen(
-                input_hfile, "data", "rb");
-            if (input) input_hfile = nullptr;
-        }
-        if (!input) local_ok = 0;
-        if (local_ok) header = sam_hdr_read(input);
-        if (!header) local_ok = 0;
-        if (local_ok &&
-            input->format.format != bam &&
-            input->format.format != binary_format) {
-            if (rank == 0) {
-                fprintf(stderr,
-                        "ERROR: RabbitBAM-MPI collate only supports BAM input.\n");
-            }
+        // The pipeline owns this input; hFILE mem: would free it on close.
+        if (rank == 0 && MpiCommonReadBamHeaderFromMemory(
+                input_memory, input_size, &header, &body_start) != 0) {
+            fprintf(stderr, "ERROR: failed to parse collate pipeline BAM header\n");
             local_ok = 0;
         }
-        if (local_ok) {
-            body_start =
-                (long long)input->fp.bgzf->block_address;
-            if (body_start < 0 ||
-                (unsigned long long)body_start >
-                    input_size) {
-                local_ok = 0;
-            }
-        }
+        MPI_Bcast(&body_start, 1, MPI_LONG_LONG, 0, MPI_COMM_WORLD);
         double cost =
             CollateReduceMax(GetTime() - t0);
         if (rank == 0 && local_ok) {
@@ -4171,14 +3903,6 @@ int MpiCollateMemoryToMemory(CmdInfo *cmd_info,
     exit_code = 0;
 
 cleanup:
-    if (input) {
-        if (sam_close(input) < 0) exit_code = 1;
-        input = nullptr;
-    }
-    if (input_hfile &&
-        hclose(input_hfile) != 0) {
-        exit_code = 1;
-    }
     if (header) sam_hdr_destroy(header);
     free(writer.data);
     if (rank == 0) {
@@ -4209,7 +3933,7 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
     char *rank_input = nullptr;
     size_t rank_input_size = 0;
     MemReader reader = {};
-    swbam::AdaptiveRankBodySink rank_body_sink;
+    swbam_usage::BodySink rank_body_sink;
     MpiCollateStats stats = {};
     CollateOutputStageCosts output_costs = {};
     size_t memory_limit = 0;
@@ -4273,7 +3997,7 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
     }
 
     {
-        if (input_handle.Open(
+        if (swbam_usage::OpenInput(input_handle,
                 cmd_info->in_file_name_, cmd_info->io_backend_,
                 cmd_info->io_memory_limit_) != 0) {
             fprintf(
@@ -4386,7 +4110,7 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
             }
         }
         double cost =
-            CollateReduceMax(GetTime() - t0 - input_handle.simulation_prepare_cost());
+            CollateReduceMax(GetTime() - t0);
         stage41_cost = cost;
         if (rank == 0 && local_ok) {
             printf(
@@ -4397,7 +4121,7 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
                 "Complete the 4.1 scan/split/broadcast/select cost %lf\n",
                 cost);
             if (cmd_info->io_backend_ == "rank-memory") {
-                printf("Rank-local input preparation excluded; scan/index/broadcast remain counted\n");
+                printf("Rank-local input preparation included in MPI interval\n");
             }
         }
     }
@@ -4542,8 +4266,7 @@ int ProcessCollateMPI(CmdInfo *cmd_info) {
             collate_bins,
             &stats, &output_costs,
             stage41_cost, stage42_cost,
-            stage43_cost, body_total_t0,
-            input_handle.simulation_prepare_cost()) != 0) {
+            stage43_cost, body_total_t0) != 0) {
         local_ok = 0;
     }
     if (!CollateAllRanksOk(local_ok)) goto cleanup;

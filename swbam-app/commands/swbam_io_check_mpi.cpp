@@ -146,12 +146,14 @@ struct ReferenceCounts {
 
 // Independent MPE validation, not part of the performance measurement. Check
 // CRC, record boundaries and MAPQ against the new CPE count/filter pipelines.
-int ScanReference(const swbam::MemoryBamInput &input,
+int ScanReference(const swbam::BamInputBackend &input,
                   const swbam::BgzfBlockSpan *spans, size_t count,
                   ReferenceCounts *counts) {
     struct libdeflate_decompressor *decoder = libdeflate_alloc_decompressor();
     if (!decoder) return -1;
     std::vector<unsigned char> raw(BGZF_MAX_BLOCK_SIZE);
+    swbam::BgzfBlockBatch compressed;
+    if (compressed.Allocate(1)) { libdeflate_free_decompressor(decoder); return -1; }
     int status = 0;
     for (size_t i = 0; i < count && status == 0; ++i) {
         if (spans[i].offset > input.size() ||
@@ -160,8 +162,8 @@ int ScanReference(const swbam::MemoryBamInput &input,
             status = -1;
             break;
         }
-        const unsigned char *block = reinterpret_cast<const unsigned char *>(
-            input.data()) + spans[i].offset;
+        if (input.ReadBatch(spans + i, 1, &compressed)) { status = -1; break; }
+        const unsigned char *block = compressed.blocks()[0].data;
         const size_t length = spans[i].compressed_size;
         size_t size = 0;
         if (libdeflate_deflate_decompress(decoder, block + BLOCK_HEADER_LENGTH,
@@ -189,10 +191,10 @@ int ScanReference(const swbam::MemoryBamInput &input,
     return status;
 }
 
-int CheckRoundtrip(const swbam::MemoryBamInput &input,
+int CheckRoundtrip(const swbam::BamInputBackend &input,
                    const swbam::mpi::MpiBamInputPlan &plan,
                    const ReferenceCounts &expected, bool filter, int rank) {
-    swbam::AdaptiveRankBodySink body;
+    swbam_usage::BodySink body;
     size_t reserve = 1024 * 1024;
     for (size_t i = plan.rank_begin; i < plan.rank_end; ++i)
         reserve += plan.blocks[i].compressed_size;
@@ -258,10 +260,11 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
     int rank = 0, ranks = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
-    swbam::MemoryBamInput input;
+    swbam::mpi::MpiBamInput input_handle;
     swbam::mpi::MpiBamInputPlan plan;
-    int ok = input.Open(cmd_info->in_file_name_) == 0 && input.format() == bam;
+    int ok = swbam_usage::OpenInput(input_handle, cmd_info->in_file_name_, "memory", "") == 0;
     if (!swbam::mpi::AllRanksOk(ok)) return 1;
+    swbam::BamInputBackend &input = *input_handle.backend();
     if (swbam::mpi::PrepareMpiBamInputPlan(input, &plan) != 0) return 1;
     ReferenceCounts expected;
     ok = ScanReference(input, plan.rank_spans(), plan.rank_block_count(), &expected) == 0;
@@ -271,7 +274,7 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
     swbam::mpi::MpiIoBamInput mpiio_input;
     swbam::BamInputBackend *backends[] = {&input, &posix_input, &mpiio_input};
     const char *names[] = {"memory", "posix", "mpiio"};
-    for (size_t b = 0; b < 3; ++b) {
+    for (size_t b = 0; b < (swbam_usage::IsRam() ? 1u : 3u); ++b) {
         swbam::BamInputBackend &backend = *backends[b];
         ok = b == 0 || backend.Open(cmd_info->in_file_name_) == 0;
         if (!swbam::mpi::AllRanksOk(ok)) return 1;
@@ -318,6 +321,7 @@ int ProcessIoCheckMPI(CmdInfo *cmd_info) {
     if (rank == 0) printf("SWBAM BAM write/compress check PASS. blocks_per_rank=128\n");
     if (CheckRoundtrip(input, plan, expected, false, rank) != 0 ||
         CheckRoundtrip(input, plan, expected, true, rank) != 0) return 1;
-    if (rank == 0) printf("io-check: PASS (BAM read/write, count/filter, memory/POSIX/MPI-IO)\n");
+    if (rank == 0) printf("io-check: PASS (BAM read/write, count/filter, %s)\n",
+                          swbam_usage::IsRam() ? "resident RAM input" : "memory/POSIX/MPI-IO");
     return 0;
 }

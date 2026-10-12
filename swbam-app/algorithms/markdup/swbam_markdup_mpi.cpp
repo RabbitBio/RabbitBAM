@@ -5965,12 +5965,6 @@ static int MdPrepareOutputMemory(
     size_t header_size = 0;
     int local_ok = 1;
     double stage45_header_t0 = 0.0;
-    double stage45_malloc_t0 = 0.0;
-    double sim_write_t0 = 0.0;
-    char *simulated_write_mem = nullptr;
-    size_t simulated_write_size = 0;
-    size_t simulated_pos = 0;
-    volatile unsigned long long simulated_write_guard = 0;
 
     // 4.5a header/layout
     stage45_header_t0 = GetTime();
@@ -6017,82 +6011,11 @@ static int MdPrepareOutputMemory(
     }
     if (!local_ok) goto fail;
 
-    // 4.5b 分配各 rank 的本地模拟写内存，这部分不计入核心处理时间
-    stage45_malloc_t0 = GetTime();
-    simulated_write_size = local_body.is_memory()
-        ? (size_t)local_body.size() : 0;
-    if (local_body.is_memory() && rank == 0) {
-        if (output->header_size > SIZE_MAX - simulated_write_size) {
-            fprintf(stderr,
-                    "[rank %d] ERROR: simulated markdup output memory "
-                    "estimate overflow.\n", rank);
-            local_ok = 0;
-        } else {
-            simulated_write_size += output->header_size;
-        }
-    }
-    if (local_ok && simulated_write_size > 0) {
-        simulated_write_mem = (char *)malloc(simulated_write_size);
-        if (!simulated_write_mem) {
-            fprintf(stderr,
-                    "[rank %d] ERROR: failed to allocate markdup "
-                    "simulated output memory. size=%zu\n",
-                    rank, simulated_write_size);
-            local_ok = 0;
-        }
-    }
-    local_ok = MdAllRanksOk(local_ok);
-    costs->stage45_malloc =
-        MdReduceMax(GetTime() - stage45_malloc_t0);
-    if (rank == 0 && local_ok) {
-        printf("Complete the 4.5b malloc simulated write memory cost %lf\n",
-               costs->stage45_malloc);
-    }
-    if (!local_ok) goto fail;
 
-    // 4.6 各 rank 根据逻辑偏移模拟写入高速磁盘内存，只统计 memcpy 时间
-    sim_write_t0 = GetTime();
-    simulated_pos = 0;
-    if (local_body.is_memory() &&
-        rank == 0 && output->header_size > 0) {
-        memcpy(simulated_write_mem + simulated_pos,
-               output->header_data, output->header_size);
-        simulated_pos += output->header_size;
-    }
-    if (local_body.is_memory() && local_body.size() > 0) {
-        if (local_body.size() > SIZE_MAX ||
-            local_body.ReadAt(
-                0, simulated_write_mem + simulated_pos,
-                (size_t)local_body.size()) != 0) {
-            local_ok = 0;
-        } else {
-            simulated_pos += (size_t)local_body.size();
-        }
-    }
-    if (simulated_pos > 0) {
-        unsigned char *guard_ptr =
-            (unsigned char *)simulated_write_mem;
-        simulated_write_guard += guard_ptr[0];
-        simulated_write_guard += guard_ptr[simulated_pos - 1];
-    }
-    {
-        double sim_write_cost = GetTime() - sim_write_t0;
-        costs->stage46 = MdReduceMax(sim_write_cost);
-    }
-    if (rank == 0 && local_ok) {
-        printf("Complete the 4.6 simulated header/body distributed write cost %lf\n",
-               costs->stage46);
-    }
-    if (simulated_write_guard == (unsigned long long)-1 && rank < 0) {
-        fprintf(stderr, "unused markdup simulated write guard %llu\n",
-                simulated_write_guard);
-    }
-    if (simulated_write_mem) free(simulated_write_mem);
     if (header_memory) free(header_memory);
     return MdAllRanksOk(local_ok) ? 0 : -1;
 
 fail:
-    if (simulated_write_mem) free(simulated_write_mem);
     if (header_memory) free(header_memory);
     if (output->data) {
         free(output->data);
@@ -6124,6 +6047,10 @@ static int MdWriteOutputMpiio(
         const MdOutputMemory &layout,
         const std::string &output_path,
         int rank) {
+    if (swbam_usage::IsRam())
+        return swbam_usage::WriteOutput(output_path, local_body,
+            layout.header_size, layout.header_data,
+            sizeof(kMarkdupBgzfEofBlock), kMarkdupBgzfEofBlock);
     unsigned long long sizes[2] = {0, 0};
     if (rank == 0) {
         sizes[0] = (unsigned long long)layout.header_size;
@@ -6977,7 +6904,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
     long long local_block_end = 0;
     size_t rank_input_size = 0;
     MemReader reader = {};
-    swbam::AdaptiveRankBodySink rank_body_sink;
+    swbam_usage::BodySink rank_body_sink;
     swbam::RankBodySink *body_sink = &rank_body_sink;
     uint64_t rank_body_memory_limit = 0;
     size_t memory_limit = 0;
@@ -7039,7 +6966,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
 
     // 2. 通过公共 backend 打开 BAM；memory 仍是默认快速路径。
     {
-        if (input_handle.Open(
+        if (swbam_usage::OpenInput(input_handle,
                 cmd_info->in_file_name_, cmd_info->io_backend_,
                 cmd_info->io_memory_limit_) != 0) {
             fprintf(stderr,
@@ -7161,7 +7088,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
                 reader.pos = 0;
             }
         }
-        stage41_cost = MdReduceMax(GetTime() - t0 - input_handle.simulation_prepare_cost());
+        stage41_cost = MdReduceMax(GetTime() - t0);
         if (rank == 0 && local_ok) {
             printf("MPI BAM scan complete. data_blocks=%lld "
                    "body_start=%lld\n",
@@ -7619,7 +7546,7 @@ int ProcessMarkdupMPI(CmdInfo *cmd_info) {
 
     {
         double body_total_cost =
-            MdReduceMax(GetTime() - body_total_t0 - input_handle.simulation_prepare_cost());
+            MdReduceMax(GetTime() - body_total_t0);
         if (rank == 0 && local_ok) {
             printf("444Complete the total body cost %lf\n",
                    body_total_cost);

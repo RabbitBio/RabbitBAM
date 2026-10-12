@@ -3,6 +3,11 @@
 
 #include "algorithm_types.h"
 #include "CmdInfo.h"
+#ifdef SWBAM_ENABLE_RAM_STORAGE
+#include "storage.h"
+#else
+#include "storage-native.h"
+#endif
 
 #include <algorithm>
 #include <functional>
@@ -55,7 +60,6 @@ struct MpiSortStats {
     long long run_arena_bytes;
     long long merge_fan_in;
     long long consolidation_passes;
-    long long cpe_calibration_cycles;
     double t_setup;
     double t_extract;
     double t_extract_read;
@@ -74,11 +78,8 @@ struct MpiSortStats {
     double t_bucket_pack;
     double t_exchange;
     double t_mpi_exchange;
-    double t_mpi_simulated;
     double t_offset_fix;
     double t_final_sort;
-    double t_temp_write_sim;
-    double t_temp_read_sim;
     double t_temp_write_actual;
     double t_temp_read_actual;
     double t_temp_open_actual;
@@ -87,13 +88,7 @@ struct MpiSortStats {
     double t_run_exchange;
     double t_run_merge;
     double t_merge_unhidden;
-    double t_merge_simulated;
-    double t_merge_temp_read_sim;
-    double t_consolidation_simulated;
-    double t_consolidation_temp_read_sim;
-    double t_consolidation_temp_write_sim;
     double t_compress;
-    double t_compress_simulated;
     double t_compress_pack;
     double t_compress_alloc;
     double t_compress_deflate;
@@ -104,7 +99,6 @@ struct MpiSortStats {
     double t_cleanup;
     double t_optimized_total;
     double t_optimized_actual;
-    double t_cpe_calibration_wall;
 };
 
 struct MpiCollateStats {
@@ -153,8 +147,6 @@ struct MpiCollateStats {
     double t_write;
     double t_temp_read_actual;
     double t_temp_write_actual;
-    double t_temp_read_sim;
-    double t_temp_write_sim;
     double t_optimized;
     double t_actual;
 };
