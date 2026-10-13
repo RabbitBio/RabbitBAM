@@ -24,7 +24,8 @@ class D2MatrixTest(unittest.TestCase):
         self.assertEqual(files['state'], 'COMPLETE\n')
         self.assertIn('GATES PASSED', files['capacity_gate.txt'])
         self.assertEqual(len(files['prior_probes.tsv'].splitlines()), 8)
-        self.assertEqual(files['workflow_summary.txt'], 'workflow_e2e_median_s=60.000000\n')
+        self.assertEqual(files['workflow_summary.txt'],
+                         'workflow_e2e_median_s=60.000000\nworkflow_processing_median_s=52.000000\n')
         self.assertIn('probe\tsort\t1\t6\t100\t16G', files['results.tsv'])
         self.assertIn('probe\tbam2bam\t1\t1\t100\t76G', files['results.tsv'])
         self.assertNotIn('--no-dump', files['commands.sh'].splitlines()[0])

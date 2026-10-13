@@ -6,17 +6,28 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
+#include <algorithm>
+#include <cstdlib>
 namespace swbam_usage {
+inline size_t &WorkMemoryValue() { static size_t bytes = 0; return bytes; }
+inline size_t WorkMemoryLimit() { return WorkMemoryValue(); }
+inline size_t CacheMemoryLimit() {
+    return std::min<size_t>(256u << 20, std::max<size_t>(8u << 20, WorkMemoryLimit() / 16));
+}
 typedef swbam::AdaptiveRankBodySink BodySink;
 typedef swbam::SegmentedRankBodySource BodySequence;
 class Session {
 public:
-    Session() : rank_(0) {}
+    Session() : rank_(0), requested_(0) {}
     int Prepare(int *argc, char ***argv, bool example = false) {
         int n = 1;
         for (int i = 1; i < *argc; ++i) {
             const char *arg = (*argv)[i];
-            if (!strcmp(arg, "--storage")) {
+            if (!strcmp(arg, "--work-memory")) {
+                if (++i >= *argc || swbam::ParseByteSize((*argv)[i], &requested_) || !requested_) return -1;
+            } else if (!strncmp(arg, "--work-memory=", 14)) {
+                if (swbam::ParseByteSize(arg + 14, &requested_) || !requested_) return -1;
+            } else if (!strcmp(arg, "--storage")) {
                 if (++i >= *argc || strcmp((*argv)[i], "posix")) return Unsupported();
             } else if (!strcmp(arg, "--storage=posix")) {
             } else if (!strncmp(arg, "--ram-", 6) || !strcmp(arg, "--no-dump") || !strncmp(arg, "--storage=", 10)) {
@@ -31,9 +42,19 @@ public:
         }
         *argc = n; (*argv)[n] = nullptr; return 0;
     }
-    int EnterMpi() { return MPI_Comm_rank(MPI_COMM_WORLD, &rank_) == MPI_SUCCESS ? 0 : -1; }
+    int EnterMpi() {
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank_);
+        uint64_t node = 0;
+        const char *text = getenv("SWBAM_NODE_MEMORY");
+        int ok = !text || (swbam::ParseByteSize(text, &node) == 0 && node);
+        if (!swbam::mpi::AllRanksOk(ok)) return -1;
+        return swbam::mpi::ResolveWorkMemory(0, requested_, node, &WorkMemoryValue());
+    }
     void LeaveMpi() {}
-    int Finish(int status, double seconds) {
+    int Finish(int status, double seconds, double processing_seconds = -1) {
+        if (processing_seconds >= 0)
+            printf("[swbam-processing rank=%d] storage=posix seconds=%.6f status=%d\n",
+                   rank_, processing_seconds, status);
         printf("[swbam-e2e rank=%d] storage=posix seconds=%.6f status=%d\n", rank_, seconds, status);
         return status;
     }
@@ -47,6 +68,7 @@ private:
         return -1;
     }
     int rank_;
+    uint64_t requested_;
     std::string input_, output_;
 };
 inline bool IsRam() { return false; }
@@ -72,7 +94,7 @@ inline int WriteOutput(const std::string &path, const swbam::RankBodySource &bod
                         size_t prefix_size, const void *prefix, size_t suffix_size, const void *suffix) {
     swbam::mpi::DistributedBamOutput output;
     return output.Prepare(body, prefix_size, suffix_size) ||
-        output.WriteMpiIo(path, body, prefix, suffix) ? -1 : 0;
+        output.WriteMpiIo(path, body, prefix, suffix, true) ? -1 : 0;
 }
 inline int BuildBamPrefix(sam_hdr_t *header, int level, swbam::MemoryBamOutput *prefix) {
     if (!header || !prefix) return -1;

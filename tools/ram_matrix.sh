@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export SWBAM_NODE_MEMORY=${SWBAM_NODE_MEMORY:-88000M}
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Frozen RAM binaries, independent performance samples, and real four-step rounds.
@@ -44,11 +45,11 @@ if [[ ${BENCH_RESUME:-0} == 1 ]]; then
     sha256sum -c binaries.sha256
 else
     [[ ! -e results.tsv && ! -e commands.sh ]] || exit 1
-    printf 'kind\tapp\trepeat\tranks\tjob_id\tcapacity\te2e_max_s\tcore_s\tprepare_max_s\tpool_peak_max_bytes\toutput_bytes\n' > results.tsv
-    printf 'repeat\tcollate_s\tfixmate_s\tsort_s\tmarkdup_s\ttotal_s\n' > workflows.tsv
+    printf 'kind\tapp\trepeat\tranks\tjob_id\tcapacity\te2e_max_s\tcore_s\tprepare_max_s\tpool_peak_max_bytes\toutput_bytes\tprocessing_max_s\n' > results.tsv
+    printf 'repeat\tcollate_s\tfixmate_s\tsort_s\tmarkdup_s\ttotal_s\tcollate_processing_s\tfixmate_processing_s\tsort_processing_s\tmarkdup_processing_s\tprocessing_total_s\n' > workflows.tsv
     sha256sum bin/RabbitBAM-MPI bin/swbam-sdk-optimized-count bin/swbam-sdk-optimized-bam2bam > binaries.sha256
     stat -c '%n\t%s bytes\tmtime=%Y' "$INPUT" "$SAM" "$COLLATED" "$FIXMATE" "$SORTED" > inputs.txt
-    printf 'dataset=%s sdk_ranks=1/2/4/6/12 app_ranks=6 repeats=3 bins=66 level=1 min_mapq=30\n' "$DATASET" > configuration.txt
+    printf 'dataset=%s sdk_ranks=1/2/4/6/12 app_ranks=6 repeats=3 bins=66 level=1 min_mapq=30 timing=mpi-interval/processing/core\n' "$DATASET" > configuration.txt
     printf 'sort_pool=%s sort_memory=%s collate_pool=%s collate_memory=%s baseline=%s wait_for=%s\n' \
         "$SORT_POOL" "$SORT_MEMORY" "$COLLATE_POOL" "$COLLATE_MEMORY" \
         "${BENCH_D2_BASELINE_ROOT:-none}" "${BENCH_WAIT_FOR:-none}" >> configuration.txt
@@ -142,7 +143,7 @@ if [[ "$DATASET" == D2 ]]; then
     cmp binaries.sha256 "$baseline/binaries.sha256"
     diff <(tail -n +2 "$baseline/configuration.txt") \
          <(stat -c '%n\t%s bytes' "$INPUT" "$SAM" "$COLLATED" "$FIXMATE" "$SORTED")
-    printf 'app\tjob_id\tverified_log\te2e_max_s\tcore_s\tprepare_max_s\tpool_peak_max_bytes\toutput_bytes\n' > prior_probes.tsv
+    printf 'app\tjob_id\tverified_log\te2e_max_s\tcore_s\tprepare_max_s\tpool_peak_max_bytes\toutput_bytes\tprocessing_max_s\n' > prior_probes.tsv
     for name in count sdk_copy sdk_validate flagstat filter collate fixmate; do
         check=any
         case "$name" in
@@ -261,11 +262,11 @@ for repeat in 1 2 3; do
     run validation workflow_markdup "$repeat" 6 "$VERIFY_POOL" duplicates "$APP" stats --basic -i "$round/markdup.bam"
     if ! awk -F '\t' -v r="$repeat" '$1==r{found=1}END{exit !found}' workflows.tsv; then
         awk -F '\t' -v r="$repeat" '
-          $1=="workflow" && $3==r{t[$2]=$7+0;n++}
-          END{if(n!=4)exit 1;printf "%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\n",r,t["collate"],t["fixmate"],t["sort"],t["markdup"],t["collate"]+t["fixmate"]+t["sort"]+t["markdup"]}' \
+          $1=="workflow" && $3==r{t[$2]=$7+0;p[$2]=$12+0;n++}
+          END{if(n!=4)exit 1;printf "%d\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\n",r,t["collate"],t["fixmate"],t["sort"],t["markdup"],t["collate"]+t["fixmate"]+t["sort"]+t["markdup"],p["collate"],p["fixmate"],p["sort"],p["markdup"],p["collate"]+p["fixmate"]+p["sort"]+p["markdup"]}' \
           results.tsv >> workflows.tsv
     fi
 done
-awk -F '\t' 'NR>1{t[++n]=$6+0}END{if(n!=3)exit 1;for(i=1;i<=n;i++)for(j=i+1;j<=n;j++)if(t[i]>t[j]){v=t[i];t[i]=t[j];t[j]=v};printf "workflow_e2e_median_s=%.6f\n",t[2]}' workflows.tsv > workflow_summary.txt
+awk -F '\t' 'NR>1{t[++n]=$6+0;p[n]=$11+0}END{if(n!=3)exit 1;for(i=1;i<=n;i++)for(j=i+1;j<=n;j++){if(t[i]>t[j]){v=t[i];t[i]=t[j];t[j]=v};if(p[i]>p[j]){v=p[i];p[i]=p[j];p[j]=v}};printf "workflow_e2e_median_s=%.6f\nworkflow_processing_median_s=%.6f\n",t[2],p[2]}' workflows.tsv > workflow_summary.txt
 printf 'COMPLETE\n' > state
 printf '%s %s RAM MATRIX COMPLETED\n' "$(date -Is)" "$DATASET"

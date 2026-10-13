@@ -33,6 +33,14 @@ lines = [f'{prefix} ranks={ranks} total_records={records} kept_records={kept} co
          'SN\tis sorted:\t1', f'SN\treads duplicated:\t{duplicated}\t# mock']
 for rank in range(ranks):
     index = 0 if os.environ.get('DUPLICATE_RANKS') == label else rank
+    processing = 8 + rank
+    if os.environ.get('PROCESSING_MAX_OTHER_RANK') == label:
+        processing = 9.5 if rank == 0 else 6.0
+    if os.environ.get('BAD_PROCESSING') == label:
+        processing = 999.0
+    if os.environ.get('OMIT_PROCESSING') != label:
+        processing_rank = 0 if os.environ.get('DUPLICATE_PROCESSING') == label else rank
+        lines += [f'[swbam-processing rank={processing_rank}] storage=ram seconds={processing} status=0']
     lines += [f'[swbam-e2e rank={index}] storage=ram seconds={10 + rank}.0 status=0',
               f'[ram-prepare rank={rank}] seconds={100 + rank}.0',
               f'[ram-storage rank={rank}] peak={1000 + rank} output_bytes=2000 temp_read_bytes=0 '
@@ -130,10 +138,14 @@ class MatrixTest(unittest.TestCase):
         for kind, count in (('sdk', 30), ('app', 24), ('workflow', 12), ('validation', 8)):
             self.assertEqual(sum(row[0] == kind for row in rows), count)
         self.assertEqual(files['commands.sh'].count('--no-dump'), 34)
-        self.assertEqual(files['workflow_summary.txt'], 'workflow_e2e_median_s=60.000000\n')
+        self.assertEqual(files['workflow_summary.txt'],
+                         'workflow_e2e_median_s=60.000000\nworkflow_processing_median_s=52.000000\n')
         workflow_rows = [line.split('\t') for line in files['workflows.tsv'].splitlines()[1:]]
         self.assertEqual(len(workflow_rows), 3)
-        self.assertTrue(all(float(row[-1]) == 60.0 for row in workflow_rows))
+        self.assertTrue(all(float(row[5]) == 60.0 for row in workflow_rows))
+        self.assertTrue(all(float(row[-1]) == 52.0 for row in workflow_rows))
+        self.assertTrue(all(len(row) == 12 for row in rows))
+        self.assertIn('processing_max_s', files['results.tsv'].splitlines()[0])
         for repeat, points in (('1', ['1', '2', '4', '6', '12']),
                                ('2', ['12', '6', '4', '2', '1']),
                                ('3', ['1', '2', '4', '6', '12'])):
@@ -161,6 +173,29 @@ class MatrixTest(unittest.TestCase):
         status, files = self.run_matrix({'DUPLICATE_RANKS': 'sdk_count_n2_r1'})
         self.assertNotEqual(status, 0)
         self.assertIn('FAILED sdk_count_n2_r1', files['state'])
+
+    def test_processing_max_is_independent_of_e2e_max(self):
+        status, files = self.run_matrix({'PROCESSING_MAX_OTHER_RANK': 'sdk_count_n2_r1'})
+        self.assertEqual(status, 0, files['diagnostic'])
+        rows = [line.split('\t') for line in files['results.tsv'].splitlines()[1:]]
+        sample = next(row for row in rows if row[:4] == ['sdk', 'count', '1', '2'])
+        self.assertEqual(float(sample[6]), 11.0)
+        self.assertEqual(float(sample[11]), 9.5)
+
+    def test_missing_processing_timer_rejected(self):
+        status, files = self.run_matrix({'OMIT_PROCESSING': 'sdk_count_n1_r1'})
+        self.assertNotEqual(status, 0)
+        self.assertIn('FAILED sdk_count_n1_r1', files['state'])
+
+    def test_duplicate_processing_rank_rejected(self):
+        status, files = self.run_matrix({'DUPLICATE_PROCESSING': 'sdk_count_n2_r1'})
+        self.assertNotEqual(status, 0)
+        self.assertIn('FAILED sdk_count_n2_r1', files['state'])
+
+    def test_processing_longer_than_e2e_rejected(self):
+        status, files = self.run_matrix({'BAD_PROCESSING': 'sdk_count_n1_r1'})
+        self.assertNotEqual(status, 0)
+        self.assertIn('FAILED sdk_count_n1_r1', files['state'])
 
     def test_external_sort_not_imported(self):
         status, files = self.run_matrix({'BAD_MODE': 'app_sort_n6_r1'})

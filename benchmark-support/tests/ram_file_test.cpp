@@ -59,5 +59,28 @@ int main() {
         assert(actual == data);
     }
     assert(pool.used() == 0);
+    {
+        // Assembly fits in the same pool as the original body: every byte is
+        // read and written, while consumed source pages become reusable.
+        RamFile source(&pool), output(&pool);
+        std::vector<char> block(RamPool::kPage, 0);
+        for (int i = 0; i < 8; ++i) {
+            std::fill(block.begin(), block.end(), char(i + 1));
+            assert(source.WriteAt((uint64_t)i * block.size(), block.data(), block.size()) == 0);
+        }
+        for (int i = 0; i < 8; ++i) {
+            const uint64_t pos = (uint64_t)i * block.size();
+            assert(source.ReadAt(pos, block.data(), block.size()) == 0);
+            assert(source.ReleaseBefore(pos + block.size()) == 0);
+            assert(output.WriteAt(pos, block.data(), block.size()) == 0);
+        }
+        assert(source.size() == output.size());
+        assert(source.ReadAt(0, block.data(), 1) != 0);
+        for (int i = 0; i < 8; ++i) {
+            assert(output.ReadAt((uint64_t)i * block.size(), block.data(), block.size()) == 0);
+            for (char c : block) assert(c == i + 1);
+        }
+    }
+    assert(pool.used() == 0);
     puts("RAM file tests PASS");
 }

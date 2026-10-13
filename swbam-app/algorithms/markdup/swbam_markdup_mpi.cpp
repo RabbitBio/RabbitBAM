@@ -1,4 +1,5 @@
 #include "swbam_mpi.h"
+#include "bounded-cache.h"
 #include "swbam/mpi_runtime.h"
 #include "swbam/operators/bam_read_batch.h"
 #include "swbam/cpe_write_pipeline.h"
@@ -4680,6 +4681,7 @@ static int MdFindDuplicatesStreamingBatches(
 
 struct MdOnePassBlockInfo {
     uint64_t ordinal_base;
+    uint64_t spool_offset;
     int n_records;
     int unresolved;
 };
@@ -4688,6 +4690,7 @@ struct MdOnePassPendingBatch {
     MdBlockSet blocks;
     std::vector<MdOnePassBlockInfo> infos;
     std::vector<uint8_t> states;
+    std::shared_ptr<swbam_usage::CachedTemporary> spool;
     uint64_t ordinal_base;
     uint64_t ordinal_end;
     int n_blocks;
@@ -4705,6 +4708,7 @@ struct MdOnePassPendingBatch {
     MdOnePassPendingBatch(MdOnePassPendingBatch &&other)
         : blocks(other.blocks), infos(std::move(other.infos)),
           states(std::move(other.states)),
+          spool(std::move(other.spool)),
           ordinal_base(other.ordinal_base), ordinal_end(other.ordinal_end),
           n_blocks(other.n_blocks), next_block(other.next_block) {
         memset(&other.blocks, 0, sizeof(other.blocks));
@@ -4718,6 +4722,7 @@ struct MdOnePassPendingBatch {
             blocks = other.blocks;
             infos = std::move(other.infos);
             states = std::move(other.states);
+            spool = std::move(other.spool);
             ordinal_base = other.ordinal_base;
             ordinal_end = other.ordinal_end;
             n_blocks = other.n_blocks;
@@ -4848,6 +4853,9 @@ struct MdOnePassContext {
     long long launched_output_blocks;
     long long written_output_blocks;
     long long processed_batches;
+    size_t resident_pending = 0;
+    size_t spilled_batches = 0;
+    std::weak_ptr<swbam_usage::CachedTemporary> spill_file;
 
     MdOnePassContext()
         : rank(0), comm_size(1), max_read_length(300), memory_limit(0),
@@ -4867,6 +4875,9 @@ struct MdOnePassContext {
 
 static void MdOnePassCleanup(MdOnePassContext *context) {
     if (!context) return;
+    if (context->spilled_batches)
+        fprintf(stderr, "[rank %d] markdup deferred payload spill batches=%zu\n",
+                context->rank, context->spilled_batches);
     // Session destruction joins an in-flight CPE before any borrowed arena dies.
     context->write_session.reset();
     context->compression_running = 0;
@@ -4905,6 +4916,52 @@ static int MdOnePassAcquireBlockSet(MdOnePassContext *context,
         return 0;
     }
     return MdAllocateBlockSet(blocks, kMarkdupNB);
+}
+
+static int MdOnePassSpillPending(MdOnePassContext *context) {
+    const size_t limit = swbam_usage::CacheMemoryLimit();
+    if (context->resident_pending <= limit) return 0;
+    for (auto &batch : context->pending) {
+        if (context->resident_pending <= limit / 2) break;
+        if (!batch.blocks.data) continue;
+        bool borrowed = false;
+        for (const auto &ready : context->prepared_inputs)
+            if (ready.batch == &batch) borrowed = true;
+        if (borrowed) continue;
+        std::shared_ptr<swbam_usage::CachedTemporary> spool = context->spill_file.lock();
+        // Rotate files so retired batches do not pin every earlier spill byte.
+        if (!spool || spool->size() >= (64ull << 20)) {
+            spool = std::make_shared<swbam_usage::CachedTemporary>();
+            context->spill_file = spool;
+        }
+        for (int b = batch.next_block; b < batch.n_blocks; ++b) {
+            batch.infos[b].spool_offset = spool->size();
+            const bam_block &block = batch.blocks.blocks[b];
+            if (spool->Append(block.data, block.length)) return -1;
+        }
+        aligned_free_custom(batch.blocks.data);
+        batch.blocks.data = nullptr;
+        for (int b = 0; b < batch.blocks.n; ++b) batch.blocks.blocks[b].data = nullptr;
+        context->resident_pending -= (size_t)batch.blocks.n * BGZF_MAX_BLOCK_SIZE;
+        batch.spool = std::move(spool);
+        ++context->spilled_batches;
+    }
+    return 0;
+}
+
+static int MdOnePassLoadPending(MdOnePassContext *context, MdOnePassPendingBatch *batch) {
+    if (!batch->spool) return 0;
+    batch->blocks.data = aligned_alloc_custom(64, (size_t)batch->blocks.n * BGZF_MAX_BLOCK_SIZE);
+    if (!batch->blocks.data) return -1;
+    context->resident_pending += (size_t)batch->blocks.n * BGZF_MAX_BLOCK_SIZE;
+    for (int b = 0; b < batch->blocks.n; ++b) {
+        bam_block &block = batch->blocks.blocks[b];
+        block.data = batch->blocks.data + (size_t)b * BGZF_MAX_BLOCK_SIZE;
+        if (b >= batch->next_block && b < batch->n_blocks &&
+            batch->spool->ReadAt(batch->infos[b].spool_offset, block.data, block.length)) return -1;
+    }
+    batch->spool.reset();
+    return 0;
 }
 
 static int MdOnePassFindRecord(
@@ -5068,6 +5125,25 @@ static int MdOnePassCaptureBatch(
         return -1;
     }
     context->extract_workspace_bytes = view->fixed_workspace_bytes;
+    if (MdOnePassSpillPending(context)) return -1;
+    // Metadata remains necessary for late decisions, even after payload spill.
+    // Reject before allocating another batch when that irreducible state fills
+    // its share of the budget; never silently drop candidates or records.
+    size_t metadata = 0;
+    for (const auto &entry : context->pending) {
+        const size_t n = sizeof(entry) + entry.infos.capacity() * sizeof(MdOnePassBlockInfo) +
+            entry.states.capacity() + (size_t)entry.blocks.n * sizeof(bam_block);
+        if (n > SIZE_MAX - metadata) return -1;
+        metadata += n;
+    }
+    const size_t next_metadata = sizeof(MdOnePassPendingBatch) +
+        (size_t)view->n_blocks * (sizeof(MdOnePassBlockInfo) + sizeof(bam_block)) +
+        (size_t)(view->ordinal_end - view->ordinal_base);
+    if (context->memory_limit && (metadata > context->memory_limit / 4 ||
+        next_metadata > context->memory_limit / 4 - metadata)) {
+        fprintf(stderr, "[rank %d] ERROR: markdup deferred decision metadata exceeds work budget.\n", context->rank);
+        return -1;
+    }
 
     MdBlockSet replacement = {};
     if (MdOnePassAcquireBlockSet(context, &replacement) != 0) {
@@ -5085,6 +5161,7 @@ static int MdOnePassCaptureBatch(
     }
     MdOnePassPendingBatch &batch = context->pending.back();
     batch.blocks = retained;
+    context->resident_pending += (size_t)retained.n * BGZF_MAX_BLOCK_SIZE;
     batch.ordinal_base = view->ordinal_base;
     batch.ordinal_end = view->ordinal_end;
     batch.n_blocks = view->n_blocks;
@@ -5184,7 +5261,7 @@ static int MdOnePassPendingBytes(MdOnePassContext *context,
          it != context->pending.end(); ++it) {
         const size_t block_bytes =
             (size_t)it->blocks.n *
-            (sizeof(bam_block) + BGZF_MAX_BLOCK_SIZE);
+            (sizeof(bam_block) + (it->blocks.data ? BGZF_MAX_BLOCK_SIZE : 0));
         const size_t info_bytes =
             it->infos.capacity() * sizeof(MdOnePassBlockInfo);
         const size_t state_bytes = it->states.capacity();
@@ -5276,6 +5353,7 @@ static int MdOnePassPrepareOutput(MdOnePassContext *context) {
             if (info.unresolved != 0) {
                 return commit_prepared();
             }
+            if (MdOnePassLoadPending(context, &*it)) return -1;
             bam_block *source = it->blocks.blocks + b;
             if (source->length == 0 && info.n_records == 0) {
                 MdOnePassReadyBlock ready = {&*it, b};
@@ -5370,6 +5448,8 @@ static int MdOnePassFinishOutput(MdOnePassContext *context) {
             (uint64_t)front.infos[(size_t)ready.block_index].n_records;
         front.next_block++;
         if (front.next_block == front.n_blocks) {
+            if (front.blocks.data)
+                context->resident_pending -= (size_t)front.blocks.n * BGZF_MAX_BLOCK_SIZE;
             MdBlockSet recycled = front.blocks;
             memset(&front.blocks, 0, sizeof(front.blocks));
             context->pending.pop_front();
@@ -5628,6 +5708,7 @@ static int MdPostProcessOnePassBatch(
     mark("compress.begin");
     if (MdOnePassFinishOutput(context) != 0) return -1;
     mark("compress.done");
+    if (MdOnePassSpillPending(context)) return -1;
     if (MdOnePassPrepareOutput(context) != 0) return -1;
 
     const double memcheck_t0 = GetTime();

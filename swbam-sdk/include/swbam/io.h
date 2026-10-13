@@ -249,6 +249,9 @@ public:
     virtual int ReadAt(uint64_t offset, void *data,
                        size_t size) const = 0;
     virtual bool is_memory() const = 0;
+    // Optional destructive consumption, only after bytes have been read for
+    // final assembly. size() and offsets stay stable; old bytes may disappear.
+    virtual int ReleaseBefore(uint64_t) const { return 0; }
 };
 
 class RankBodySink : public RankBodySource {
@@ -290,13 +293,14 @@ public:
     uint64_t size() const;
     int ReadAt(uint64_t offset, void *data, size_t size) const;
     bool is_memory() const { return false; }
+    int ReleaseBefore(uint64_t offset) const;
     const std::string &path() const { return path_; }
 
 private:
     SpoolRankBodySink(const SpoolRankBodySink &);
     SpoolRankBodySink &operator=(const SpoolRankBodySink &);
 
-    int fd_;
+    mutable int fd_;
     uint64_t size_;
     std::string path_;
     bool remove_on_close_;
@@ -317,6 +321,7 @@ public:
     uint64_t size() const;
     int ReadAt(uint64_t offset, void *data, size_t size) const;
     bool is_memory() const;
+    int ReleaseBefore(uint64_t offset) const;
 
     const std::string &requested_backend() const {
         return requested_backend_;
@@ -355,6 +360,7 @@ public:
     uint64_t size() const { return total_size_; }
     int ReadAt(uint64_t offset, void *data, size_t size) const;
     bool is_memory() const;
+    int ReleaseBefore(uint64_t offset) const;
     size_t segment_count() const { return segments_.size(); }
 
 private:

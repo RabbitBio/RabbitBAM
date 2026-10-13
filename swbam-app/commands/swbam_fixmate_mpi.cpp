@@ -1,4 +1,6 @@
 #include "swbam_mpi.h"
+#include "bounded-cache.h"
+#include "fixmate_steps.h"
 #include "swbam/mpi_runtime.h"
 #include "swbam/operators/bam_read_batch.h"
 #include "swbam/cpe_record_write_adapter.h"
@@ -78,6 +80,10 @@ struct FmStoredGroup {
     std::vector<uint32_t> offsets;
     std::vector<uint32_t> lengths;
     std::vector<unsigned char> data;
+    std::unique_ptr<swbam_usage::CachedTemporary> spool;
+    uint64_t spooled_records = 0;
+
+    uint64_t count() const { return spool ? spooled_records : cores.size(); }
 
     void clear() {
         qname.clear();
@@ -86,10 +92,12 @@ struct FmStoredGroup {
         offsets.clear();
         lengths.clear();
         data.clear();
+        spool.reset();
+        spooled_records = 0;
     }
 
     bool empty() const {
-        return cores.empty();
+        return count() == 0;
     }
 };
 
@@ -265,7 +273,34 @@ static int FmAppendStoredRecord(FmStoredGroup *group,
     } else if (group->qname != qname) {
         return -1;
     }
-    if (record->l_data < 0 ||
+    if (record->l_data < 0) return -1;
+    const size_t limit = swbam_usage::CacheMemoryLimit() / 8;
+    if (!group->spool &&
+        group->data.size() + (size_t)record->l_data +
+        (group->cores.size() + 1) * (sizeof(bam1_core_t) + 16) > limit) {
+        group->spool.reset(new swbam_usage::CachedTemporary);
+        for (size_t i = 0; i < group->cores.size(); ++i) {
+            FmWireRecordHeader h = {};
+            h.core = group->cores[i]; h.id = group->ids[i]; h.l_data = group->lengths[i];
+            if (group->spool->Append(&h, sizeof(h)) || group->spool->Append(
+                    group->data.data() + group->offsets[i], h.l_data)) return -1;
+        }
+        group->spooled_records = group->cores.size();
+        std::vector<bam1_core_t>().swap(group->cores);
+        std::vector<uint64_t>().swap(group->ids);
+        std::vector<uint32_t>().swap(group->offsets);
+        std::vector<uint32_t>().swap(group->lengths);
+        std::vector<unsigned char>().swap(group->data);
+    }
+    if (group->spool) {
+        FmWireRecordHeader h = {};
+        h.core = record->core; h.id = record->id; h.l_data = record->l_data;
+        if (group->spool->Append(&h, sizeof(h)) ||
+            group->spool->Append(record->data, record->l_data)) return -1;
+        ++group->spooled_records;
+        return 0;
+    }
+    if (
         group->data.size() >
             (size_t)UINT32_MAX - (size_t)record->l_data) {
         return -1;
@@ -307,63 +342,52 @@ static int FmBuildStoredViews(
     return 0;
 }
 
-static int FmSerializeStoredGroup(
-        const FmStoredGroup &group,
-        std::vector<unsigned char> *wire) {
-    const uint64_t count = group.cores.size();
-    size_t total = sizeof(count);
-    for (size_t i = 0; i < group.cores.size(); ++i) {
-        if (total > SIZE_MAX - sizeof(FmWireRecordHeader) ||
-            total + sizeof(FmWireRecordHeader) >
-                SIZE_MAX - group.lengths[i]) {
-            return -1;
+static int FmReadWireRecord(const swbam_usage::CachedTemporary &wire,
+        uint64_t *offset, bam1_t *record, std::vector<unsigned char> *data) {
+    FmWireRecordHeader h;
+    if (wire.ReadAt(*offset, &h, sizeof(h)) || h.l_data > BGZF_MAX_BLOCK_SIZE) return -1;
+    *offset += sizeof(h);
+    data->resize(h.l_data);
+    if (wire.ReadAt(*offset, data->data(), data->size())) return -1;
+    *offset += data->size();
+    memset(record, 0, sizeof(*record));
+    record->core = h.core; record->id = h.id;
+    record->l_data = h.l_data; record->m_data = h.l_data;
+    record->data = data->data(); record->mempolicy = BAM_USER_OWNS_DATA;
+    return 0;
+}
+
+static int FmSerializeStoredGroup(const FmStoredGroup &group,
+        swbam_usage::CachedTemporary *wire) {
+    const uint64_t count = group.count();
+    if (wire->Append(&count, sizeof(count))) return -1;
+    if (group.spool) {
+        std::vector<char> buffer(1u << 20);
+        for (uint64_t pos = 0; pos < group.spool->size();) {
+            const size_t n = std::min<uint64_t>(buffer.size(), group.spool->size() - pos);
+            if (group.spool->ReadAt(pos, buffer.data(), n) || wire->Append(buffer.data(), n)) return -1;
+            pos += n;
         }
-        total += sizeof(FmWireRecordHeader) + group.lengths[i];
-    }
-    wire->resize(total);
-    unsigned char *out = wire->data();
-    memcpy(out, &count, sizeof(count));
-    out += sizeof(count);
-    for (size_t i = 0; i < group.cores.size(); ++i) {
-        FmWireRecordHeader header;
-        memset(&header, 0, sizeof(header));
-        header.core = group.cores[i];
-        header.id = group.ids[i];
-        header.l_data = group.lengths[i];
-        memcpy(out, &header, sizeof(header));
-        out += sizeof(header);
-        memcpy(out, group.data.data() + group.offsets[i],
-               group.lengths[i]);
-        out += group.lengths[i];
+    } else for (size_t i = 0; i < group.cores.size(); ++i) {
+        FmWireRecordHeader h = {};
+        h.core = group.cores[i]; h.id = group.ids[i]; h.l_data = group.lengths[i];
+        if (wire->Append(&h, sizeof(h)) ||
+            wire->Append(group.data.data() + group.offsets[i], h.l_data)) return -1;
     }
     return 0;
 }
 
-static int FmAppendSerializedGroup(
-        FmStoredGroup *group,
-        const unsigned char *wire, size_t wire_size) {
-    if (!wire || wire_size < sizeof(uint64_t)) return -1;
-    uint64_t count = 0;
-    memcpy(&count, wire, sizeof(count));
-    size_t pos = sizeof(count);
+static int FmAppendSerializedGroup(FmStoredGroup *group,
+        const swbam_usage::CachedTemporary &wire) {
+    uint64_t count = 0, pos = sizeof(count);
+    if (wire.ReadAt(0, &count, sizeof(count))) return -1;
+    std::vector<unsigned char> data;
     for (uint64_t i = 0; i < count; ++i) {
-        if (wire_size - pos < sizeof(FmWireRecordHeader)) return -1;
-        FmWireRecordHeader header;
-        memcpy(&header, wire + pos, sizeof(header));
-        pos += sizeof(header);
-        if (header.l_data > wire_size - pos) return -1;
         bam1_t record;
-        memset(&record, 0, sizeof(record));
-        record.core = header.core;
-        record.id = header.id;
-        record.data = (uint8_t *)(wire + pos);
-        record.l_data = (int)header.l_data;
-        record.m_data = header.l_data;
-        record.mempolicy = BAM_USER_OWNS_DATA;
-        if (FmAppendStoredRecord(group, &record) != 0) return -1;
-        pos += header.l_data;
+        if (FmReadWireRecord(wire, &pos, &record, &data) ||
+            FmAppendStoredRecord(group, &record)) return -1;
     }
-    return pos == wire_size ? 0 : -1;
+    return pos == wire.size() ? 0 : -1;
 }
 
 static int FmCompressPlans(
@@ -593,10 +617,105 @@ static int FmProcessGroups(
     return ret;
 }
 
+// Large groups keep the same first-primary pairing state as the CPE planner.
+// Persist plans, then replay bounded output batches; never reload the whole group.
+static int FmProcessSpooledGroup(FmStoredGroup *group, int level,
+        swbam::RankBodySink *writer, int rank, MpiFixmateStats *stats) {
+    fprintf(stderr, "[rank %d] fixmate deferred group replay records=%llu bytes=%llu\n",
+            rank, (unsigned long long)group->count(),
+            (unsigned long long)group->spool->size());
+    using namespace swbam_fixmate_steps;
+    swbam_usage::CachedTemporary plans(swbam_usage::CacheMemoryLimit() / 8);
+    std::vector<unsigned char> data, first_data, last_data;
+    bam1_t first = {}, last = {};
+    MpiFixmateRecordPlanShared first_plan = {};
+    uint64_t first_index = UINT64_MAX, pos = 0;
+    bool paired = false;
+    const double start = GetTime();
+    for (uint64_t i = 0; i < group->count(); ++i) {
+        bam1_t record;
+        if (FmReadWireRecord(*group->spool, &pos, &record, &data)) return -1;
+        MpiFixmateRecordPlanShared plan = {};
+        plan.core = record.core; plan.mate_index = -1;
+        plan.output_data_len = record.l_data;
+        if (record.core.flag & BAM_FSECONDARY) ++stats->secondary_records;
+        else if (record.core.flag & BAM_FSUPPLEMENTARY) ++stats->supplementary_records;
+        else if (first_index == UINT64_MAX) {
+            first_index = i; first_data = data;
+            first = record; first.data = first_data.data(); first_plan = plan;
+        } else {
+            bam1_t *records[2] = {&first, &record};
+            MpiFixmateRecordPlanShared pair[2] = {first_plan, plan};
+            fm_pair_records(records, pair, 0, 1);
+            first_plan = pair[0]; plan = pair[1];
+            if (fm_plan_output_length(&record, &plan, records, 2)) return -1;
+            last_data = data; last = record; last.data = last_data.data();
+            paired = true;
+        }
+        bam1_t *mates[2] = {&first, &record};
+        if (fm_plan_output_length(&record, &plan, mates, 2) ||
+            plans.Append(&plan, sizeof(plan))) return -1;
+        stats->mq_updates += plan.update_mq;
+        stats->mc_updates += plan.update_mc;
+        stats->ms_updates += plan.update_ms;
+    }
+    if (first_index != UINT64_MAX) {
+        if (!paired) {
+            first_plan.core.mtid = -1; first_plan.core.mpos = -1;
+            first_plan.core.isize = 0;
+            first_plan.core.flag &= (uint16_t)~(BAM_FMREVERSE | BAM_FPROPER_PAIR);
+            ++stats->singleton_groups;
+        } else ++stats->paired_groups;
+        bam1_t *mates[2] = {&first, &last};
+        if (fm_plan_output_length(&first, &first_plan, mates, 2) ||
+            plans.WriteAt(first_index * sizeof(first_plan), &first_plan, sizeof(first_plan))) return -1;
+        stats->mq_updates += first_plan.update_mq;
+        stats->mc_updates += first_plan.update_mc;
+        stats->ms_updates += first_plan.update_ms;
+    }
+    ++stats->group_count;
+    stats->t_plan += GetTime() - start;
+    std::vector<bam1_t *> output;
+    std::vector<uint32_t> lengths;
+    size_t bytes = 0;
+    auto flush = [&]() -> int {
+        const int ret = FmCompressPlans(output, lengths, level, writer, rank, stats);
+        for (bam1_t *record : output) bam_destroy1(record);
+        output.clear(); lengths.clear(); bytes = 0;
+        return ret;
+    };
+    pos = 0;
+    int ret = 0;
+    for (uint64_t i = 0; i < group->count(); ++i) {
+        bam1_t record;
+        MpiFixmateRecordPlanShared plan;
+        if (FmReadWireRecord(*group->spool, &pos, &record, &data) ||
+            plans.ReadAt(i * sizeof(plan), &plan, sizeof(plan))) { ret = -1; break; }
+        if ((bytes + plan.output_data_len > (4u << 20) || output.size() == 4096) &&
+            !output.empty() && flush()) { ret = -1; break; }
+        bam1_t *out = bam_init1();
+        if (!out) { ret = -1; break; }
+        out->core = plan.core; out->id = record.id;
+        out->l_data = plan.output_data_len; out->m_data = plan.output_data_len;
+        out->data = (uint8_t *)malloc(out->m_data ? out->m_data : 1);
+        bam1_t *mates[2] = {&first, &last};
+        if (!out->data || fm_copy_aux_and_append(&record, out, &plan, mates)) {
+            bam_destroy1(out); ret = -1; break;
+        }
+        output.push_back(out);
+        lengths.push_back(out->l_data - out->core.l_extranul + 32);
+        bytes += out->l_data;
+    }
+    if (!ret) ret = flush();
+    else for (bam1_t *record : output) bam_destroy1(record);
+    return ret;
+}
+
 static int FmProcessStoredGroup(
         FmStoredGroup *group, int compress_level,
         swbam::RankBodySink *writer, int rank,
         MpiFixmateStats *stats) {
+    if (group->spool) return FmProcessSpooledGroup(group, compress_level, writer, rank, stats);
     double setup_t0 = GetTime();
     std::vector<bam1_t> records;
     std::vector<bam1_t *> ptrs;
@@ -931,7 +1050,7 @@ static int FmExchangeBoundaryGroups(
         local.has_records && owners[(size_t)rank] != rank;
 
     int local_ok = 1;
-    std::vector<unsigned char> local_wire;
+    swbam_usage::CachedTemporary local_wire(swbam_usage::CacheMemoryLimit() / 8);
     if (*continues_previous &&
         FmSerializeStoredGroup(*leading, &local_wire) != 0) {
         local_ok = 0;
@@ -945,6 +1064,7 @@ static int FmExchangeBoundaryGroups(
 
     double t0 = GetTime();
     int received_fragment = 0;
+    std::vector<unsigned char> buffer(1u << 20);
     for (int source = 0; source < comm_size; ++source) {
         const int owner = owners[(size_t)source];
         if (owner == source) continue;
@@ -953,30 +1073,33 @@ static int FmExchangeBoundaryGroups(
             unsigned long long sent = 0;
             while (sent < size) {
                 const int chunk = (int)std::min(
-                    (unsigned long long)kFixmateExchangeChunk,
+                    (unsigned long long)buffer.size(),
                     size - sent);
-                MPI_Send(local_wire.data() + sent, chunk, MPI_BYTE,
+                if (local_wire.ReadAt(sent, buffer.data(), chunk)) {
+                    MPI_Abort(MPI_COMM_WORLD, 1); return -1;
+                }
+                MPI_Send(buffer.data(), chunk, MPI_BYTE,
                          owner, 5100 + source,
                          MPI_COMM_WORLD);
                 sent += (unsigned long long)chunk;
             }
             stats->boundary_bytes += (long long)size;
         } else if (rank == owner) {
-            std::vector<unsigned char> wire((size_t)size);
+            swbam_usage::CachedTemporary wire(swbam_usage::CacheMemoryLimit() / 8);
             unsigned long long received = 0;
             while (received < size) {
                 const int chunk = (int)std::min(
-                    (unsigned long long)kFixmateExchangeChunk,
+                    (unsigned long long)buffer.size(),
                     size - received);
-                MPI_Recv(wire.data() + received, chunk, MPI_BYTE,
+                MPI_Recv(buffer.data(), chunk, MPI_BYTE,
                          source, 5100 + source,
                          MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                if (local_ok && wire.Append(buffer.data(), chunk)) local_ok = 0;
                 received += (unsigned long long)chunk;
             }
             FmStoredGroup *target =
                 single_group ? leading : trailing;
-            if (FmAppendSerializedGroup(
-                    target, wire.data(), wire.size()) != 0) {
+            if (local_ok && FmAppendSerializedGroup(target, wire) != 0) {
                 local_ok = 0;
             }
             received_fragment = 1;
@@ -1861,8 +1984,8 @@ int ProcessFixmateMPI(CmdInfo *cmd_info) {
             local_ok = 0;
         }
         if (local_ok &&
-            (prefix_sink.Open("memory", 0, 1024 * 1024, "fixmate-prefix", "") != 0 ||
-             suffix_sink.Open("memory", 0, 1024 * 1024, "fixmate-suffix", "") != 0)) {
+            (prefix_sink.Open("spool", 0, 1024 * 1024, "fixmate-prefix", cmd_info->rank_body_temp_dir_) != 0 ||
+             suffix_sink.Open("spool", 0, 1024 * 1024, "fixmate-suffix", cmd_info->rank_body_temp_dir_) != 0)) {
             local_ok = 0;
         }
         if (local_ok && middle_sink.memory_writer()) {

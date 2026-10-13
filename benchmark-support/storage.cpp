@@ -18,6 +18,7 @@ Session *current = nullptr;
 std::map<int, std::shared_ptr<RamFile> > temporary;
 int next_handle = 0x40000000;
 uint64_t temp_read_bytes = 0, temp_write_bytes = 0;
+size_t work_memory = 0;
 
 double Now() {
     timespec t;
@@ -191,6 +192,7 @@ struct Session::Impl {
     bool ram = false, no_dump = false, invalid_layout = false;
     int rank = 0, ranks = 1;
     size_t capacity = 0;
+    uint64_t requested_work = 0, node_allowance = 0;
     double timeout = 7200;
     std::string directory, input, output;
     RamPool pool;
@@ -371,6 +373,10 @@ RamPool *Session::pool() { return &impl_->pool; }
 Session *CurrentSession() { return current; }
 bool IsRam() { return current && current->ram(); }
 double WallTime() { return Now(); }
+size_t WorkMemoryLimit() { return work_memory; }
+size_t CacheMemoryLimit() {
+    return std::min<size_t>(256u << 20, std::max<size_t>(8u << 20, work_memory / 16));
+}
 
 int Session::Prepare(int *argc, char ***argv, bool example) {
     current = this;
@@ -382,7 +388,7 @@ int Session::Prepare(int *argc, char ***argv, bool example) {
         std::string arg = (*argv)[i];
         const size_t eq = arg.find('=');
         const std::string key = arg.substr(0, eq);
-        const bool common = key == "--storage" || key == "--ram-capacity" ||
+        const bool common = key == "--storage" || key == "--work-memory" || key == "--ram-capacity" ||
             key == "--ram-ranks" || key == "--ram-session" || key == "--ram-ready-timeout";
         if (common || (example && (key == "-o" || key == "--output"))) {
             if (key.find("--ram-") == 0) ram_option = true;
@@ -391,6 +397,9 @@ int Session::Prepare(int *argc, char ***argv, bool example) {
             else if (++i < *argc) value = (*argv)[i];
             else { fprintf(stderr, "ERROR: missing value for %s\n", key.c_str()); return -1; }
             if (key == "--storage") storage = value;
+            else if (key == "--work-memory") {
+                if (swbam::ParseByteSize(value, &impl_->requested_work) || !impl_->requested_work) return -1;
+            }
             else if (key == "--ram-capacity") capacity = value;
             else if (key == "--ram-session") impl_->directory = value;
             else if (key == "--ram-ranks") {
@@ -417,6 +426,9 @@ int Session::Prepare(int *argc, char ***argv, bool example) {
     }
     if (storage != "posix" && storage != "ram") { fprintf(stderr, "ERROR: --storage must be posix or ram\n"); return -1; }
     impl_->ram = storage == "ram";
+    const char *node_memory = getenv("SWBAM_NODE_MEMORY");
+    if (node_memory && (swbam::ParseByteSize(node_memory, &impl_->node_allowance) ||
+                        !impl_->node_allowance)) return -1;
     for (size_t i = 0; i < keep.size(); ++i) (*argv)[i] = keep[i];
     *argc = keep.size(); (*argv)[*argc] = nullptr;
     if (!ram()) {
@@ -466,12 +478,14 @@ int Session::Prepare(int *argc, char ***argv, bool example) {
 int Session::EnterMpi() {
     int rank = 0, ranks = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank); MPI_Comm_size(MPI_COMM_WORLD, &ranks);
-    if (ram() && (rank != impl_->rank || ranks != impl_->ranks)) {
+    const int matches = !ram() || (rank == impl_->rank && ranks == impl_->ranks);
+    if (!swbam::mpi::AllRanksOk(matches)) {
         impl_->invalid_layout = true;
         fprintf(stderr, "ERROR: preloaded rank layout does not match MPI communicator\n"); return -1;
     }
     impl_->rank = rank; impl_->ranks = ranks;
-    return 0;
+    return swbam::mpi::ResolveWorkMemory(impl_->capacity, impl_->requested_work,
+                                         impl_->node_allowance, &work_memory);
 }
 void Session::LeaveMpi() { impl_->bam.reset(); impl_->sam.reset(); temporary.clear(); }
 swbam::BamInputBackend *Session::bam_input() {
@@ -507,7 +521,9 @@ int BodySink::Open(const std::string &backend, uint64_t limit, size_t reserve,
         catch (...) { errno = ENOMEM; return -1; }
         return 0;
     }
-    return native_.Open(backend, limit, reserve, prefix, directory);
+    const char *tmp = getenv("TMPDIR");
+    return native_.Open(backend, limit, reserve, prefix,
+                        directory.empty() ? (tmp ? tmp : "/tmp") : directory);
 }
 int BodySink::Close() { file_.reset(); return native_.Close(); }
 int BodySink::Append(const void *data, size_t bytes) {
@@ -524,6 +540,9 @@ int BodySink::ReadAt(uint64_t offset, void *data, size_t bytes) const {
 }
 uint64_t BodySink::size() const { return file_ ? file_->size() : native_.size(); }
 bool BodySink::is_memory() const { return file_ || native_.is_memory(); }
+int BodySink::ReleaseBefore(uint64_t offset) const {
+    return file_ ? file_->ReleaseBefore(offset) : native_.ReleaseBefore(offset);
+}
 int BodySequence::Add(BodySink *body) {
     if (!body || native_.Add(body)) return -1;
     if (IsRam()) {
@@ -539,18 +558,10 @@ int Session::RetainOutput(const std::string &path, const swbam::RankBodySource &
                           size_t suffix_size, const void *suffix) {
     swbam::mpi::DistributedBamOutput layout;
     if (layout.Prepare(body, prefix_size, suffix_size)) return -1;
-    const BodySink *sink = dynamic_cast<const BodySink *>(&body);
-    const BodySequence *sequence = dynamic_cast<const BodySequence *>(&body);
-    int ok = impl_->final_parts.empty() &&
-        ((sink && sink->file()) || (sequence && !sequence->files().empty()));
+    int ok = impl_->final_parts.empty();
     try { if (ok) {
-        if (sink) impl_->final_parts.push_back(sink->file());
-        else impl_->final_parts = sequence->files();
+        impl_->final_parts.push_back(std::make_shared<RamFile>(pool()));
         impl_->envelope.reset(new RamFile(pool()));
-        if (impl_->rank == 0) {
-            ok = impl_->envelope->WriteAt(0, prefix, prefix_size) == 0 &&
-                 impl_->envelope->WriteAt(prefix_size, suffix, suffix_size) == 0;
-        }
         impl_->output = path;
         impl_->prefix_bytes = layout.layout().prefix_size;
         impl_->suffix_bytes = layout.layout().suffix_size;
@@ -558,7 +569,31 @@ int Session::RetainOutput(const std::string &path, const swbam::RankBodySource &
         impl_->suffix_offset = impl_->prefix_bytes + layout.layout().total_body_size;
         impl_->output_size = layout.layout().total_size;
     } } catch (...) { errno = ENOMEM; ok = 0; }
-    return swbam::mpi::AllRanksOk(ok) ? 0 : -1;
+    if (!swbam::mpi::AllRanksOk(ok)) return -1;
+    class RamOutput : public swbam::mpi::PositionedOutput {
+    public:
+        explicit RamOutput(Impl *impl, uint64_t bytes) : p_(impl), bytes_(bytes) {}
+        int WriteAt(uint64_t offset, const void *data, uint64_t bytes) {
+            if (bytes > SIZE_MAX) return -1;
+            if (p_->rank == 0 && offset == 0 && bytes == p_->prefix_bytes && bytes)
+                return p_->envelope->WriteAt(0, data, bytes);
+            if (p_->rank == 0 && offset == p_->suffix_offset && bytes == p_->suffix_bytes)
+                return p_->envelope->WriteAt(p_->prefix_bytes, data, bytes);
+            if (offset < p_->body_offset || offset - p_->body_offset > bytes_ ||
+                bytes > bytes_ - (offset - p_->body_offset)) return -1;
+            return p_->final_parts[0]->WriteAt(offset - p_->body_offset, data, bytes);
+        }
+        int Sync() { return 0; }
+    private:
+        Impl *p_;
+        uint64_t bytes_;
+    } output(impl_.get(), body.size());
+    const double start = Now();
+    const int result = layout.Write(&output, body, prefix, suffix, true);
+    fprintf(stdout, "[final-output rank=%d] body_read_bytes=%llu body_write_bytes=%llu seconds=%.6f\n",
+            impl_->rank, (unsigned long long)body.size(),
+            (unsigned long long)impl_->final_parts[0]->size(), Now() - start);
+    return result;
 }
 int WriteOutput(const std::string &path, const swbam::RankBodySource &body,
                 size_t prefix_size, const void *prefix,
@@ -566,7 +601,7 @@ int WriteOutput(const std::string &path, const swbam::RankBodySource &body,
     if (IsRam()) return current->RetainOutput(path, body, prefix_size, prefix, suffix_size, suffix);
     swbam::mpi::DistributedBamOutput output;
     return output.Prepare(body, prefix_size, suffix_size) ||
-           output.WriteMpiIo(path, body, prefix, suffix) ? -1 : 0;
+           output.WriteMpiIo(path, body, prefix, suffix, true) ? -1 : 0;
 }
 int BuildBamPrefix(sam_hdr_t *header, int level, swbam::MemoryBamOutput *prefix) {
     if (!header || !prefix) return -1;
@@ -601,12 +636,16 @@ int BuildBamPrefix(sam_hdr_t *header, int level, swbam::MemoryBamOutput *prefix)
     }
     return 0;
 }
-int Session::Finish(int status, double seconds) {
+int Session::Finish(int status, double seconds, double processing_seconds) {
     if (PhysicalDataIoCalls()) status = 1;
 #ifdef SWBAM_RAM_IO_AUDIT
     fprintf(stdout, "[ram-io-audit rank=%d] physical_data_io_calls=%d\n", impl_->rank, PhysicalDataIoCalls());
 #endif
     // MPI is finalized: the cached rank and control-file rendezvous are intentional.
+    if (processing_seconds >= 0) {
+        fprintf(stdout, "[swbam-processing rank=%d] storage=%s seconds=%.6f status=%d\n",
+                impl_->rank, ram() ? "ram" : "posix", processing_seconds, status);
+    }
     fprintf(stdout, "[swbam-e2e rank=%d] storage=%s seconds=%.6f status=%d\n",
             impl_->rank, ram() ? "ram" : "posix", seconds, status);
     fflush(stdout);

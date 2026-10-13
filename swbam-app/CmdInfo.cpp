@@ -17,7 +17,7 @@ CmdInfo::CmdInfo() {
     io_backend_ = "posix";
     io_output_backend_ = "mpiio";
     io_memory_limit_ = "8G";
-    rank_body_backend_ = "memory";
+    rank_body_backend_ = "spool";
     rank_body_memory_limit_ = "8G";
     rank_body_temp_dir_ = "";
     sort_memory_ = "";

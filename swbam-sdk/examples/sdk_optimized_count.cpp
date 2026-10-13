@@ -18,16 +18,18 @@ int main(int argc, char **argv) {
     swbam_usage::BeginMpiInterval();
     const double e2e_start = swbam_usage::WallTime();
     MPI_Init(&argc, &argv);
+    const double processing_start = swbam_usage::WallTime();
     int rank = 0, ranks = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     const bool layout_ok = swbam::mpi::AllRanksOk(storage.EnterMpi() == 0);
     if (argc != 2 || !layout_ok) {
         if (rank == 0) fprintf(stderr, "Usage: %s input.bam\n", argv[0]);
+        const double processing_seconds = swbam_usage::WallTime() - processing_start;
         MPI_Finalize();
         const double elapsed = swbam_usage::WallTime() - e2e_start;
         swbam_usage::EndMpiInterval();
-        return storage.Finish(2, elapsed);
+        return storage.Finish(2, elapsed, processing_seconds);
     }
 #ifdef PLATFORM_SUNWAY
     athread_init();
@@ -71,8 +73,9 @@ int main(int argc, char **argv) {
     storage.LeaveMpi();
     athread_halt();
 #endif
+    const double processing_seconds = swbam_usage::WallTime() - processing_start;
     MPI_Finalize();
     const double seconds = swbam_usage::WallTime() - e2e_start;
     swbam_usage::EndMpiInterval();
-    return storage.Finish(status, seconds);
+    return storage.Finish(status, seconds, processing_seconds);
 }

@@ -61,7 +61,14 @@ void RamPool::Release(size_t first, size_t count) {
 char *RamPool::Address(size_t page) const { return data_ + page * kPage; }
 RamFile::RamFile(RamPool *pool) : pool_(pool), size_(0) {}
 RamFile::~RamFile() {
-    for (size_t page : pages_) pool_->Release(page, 1);
+    for (size_t i = released_pages_; i < pages_.size(); ++i)
+        pool_->Release(pages_[i], 1);
+}
+int RamFile::ReleaseBefore(uint64_t offset) {
+    if (offset > size_) { errno = EINVAL; return -1; }
+    const size_t end = offset == size_ ? pages_.size() : offset / RamPool::kPage;
+    while (released_pages_ < end) pool_->Release(pages_[released_pages_++], 1);
+    return 0;
 }
 int RamFile::ReserveContiguous(size_t bytes) {
     if (!pages_.empty() || bytes > SIZE_MAX - RamPool::kPage + 1) {
@@ -106,6 +113,7 @@ void RamFile::Copy(uint64_t offset, void *buffer, size_t bytes, bool write) cons
     }
 }
 int RamFile::Resize(uint64_t size) {
+    if (released_pages_) { errno = EINVAL; return -1; }
     if (Grow(size)) return -1;
     if (size > size_) {
         uint64_t pos = size_;
@@ -124,6 +132,7 @@ int RamFile::Resize(uint64_t size) {
     return 0;
 }
 int RamFile::WriteAt(uint64_t offset, const void *data, size_t bytes) {
+    if (released_pages_) { errno = EINVAL; return -1; }
     if ((!data && bytes) || offset > UINT64_MAX - bytes) { errno = EINVAL; return -1; }
     if (!bytes) return 0;
     if (Grow(offset + bytes)) return -1;
@@ -140,6 +149,7 @@ int RamFile::WriteAt(uint64_t offset, const void *data, size_t bytes) {
     return 0;
 }
 int RamFile::ReadAt(uint64_t offset, void *data, size_t bytes) const {
+    if (offset < released_pages_ * RamPool::kPage) { errno = EINVAL; return -1; }
     if ((!data && bytes) || offset > size_ || bytes > size_ - offset) {
         errno = EIO; return -1;
     }
@@ -147,6 +157,7 @@ int RamFile::ReadAt(uint64_t offset, void *data, size_t bytes) const {
     return 0;
 }
 char *RamFile::Range(uint64_t offset, size_t bytes) const {
+    if (offset < released_pages_ * RamPool::kPage) return nullptr;
     if (offset > size_ || bytes > size_ - offset || pages_.empty()) return nullptr;
     if (bytes) {
         const size_t first = offset / RamPool::kPage;

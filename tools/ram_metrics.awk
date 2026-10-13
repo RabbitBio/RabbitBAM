@@ -6,11 +6,26 @@
     ok = 0
     for (i = 1; i <= NF; i++) {
         split($i, a, "=")
+        if (a[1] == "seconds") e_by_rank[rank] = a[2]+0
         if (a[1] == "seconds" && a[2] > e) e = a[2]
         if (a[1] == "status" && a[2] == 0) ok = 1
     }
     if (!ok) bad = 1
     ne++
+}
+/\[swbam-processing rank=/ {
+    rank = $2; sub(/^rank=/, "", rank); sub(/\]$/, "", rank)
+    if (rank !~ /^[0-9]+$/ || rank+0 >= ranks+0 || pids[rank]++) bad = 1
+    ok = 0; seconds = ""
+    for (i = 1; i <= NF; i++) {
+        split($i, a, "=")
+        if (a[1] == "seconds") seconds = a[2]
+        if (a[1] == "status" && a[2] == 0) ok = 1
+    }
+    if (!ok || seconds !~ /^[0-9]+([.][0-9]+)?$/ || seconds+0 <= 0) bad = 1
+    processing_by_rank[rank] = seconds+0
+    if (seconds+0 > processing) processing = seconds+0
+    np++
 }
 /\[ram-storage rank=/ {
     rank = $2; sub(/^rank=/, "", rank); sub(/\]$/, "", rank)
@@ -49,12 +64,14 @@
 /^SN\tis sorted:\t1/ { sorted = 1 }
 /^SN\treads duplicated:\t/ { split($0, a, "\t"); if (a[3] == marked) have_dup = 1 }
 END {
-    if (bad || ne != ranks || ns != ranks || !have_records || !have_ranks || e <= 0 || core <= 0) exit 1
+    for (rank in processing_by_rank)
+        if (processing_by_rank[rank] > e_by_rank[rank] + 0.000002) bad = 1
+    if (bad || ne != ranks || np != ranks || ns != ranks || !have_records || !have_ranks || e <= 0 || core <= 0) exit 1
     if (check == "filter" && (!have_kept || bytes <= 0)) exit 1
     if (check == "memory" && (!memory || bytes <= 0)) exit 1
     if (check == "markdup" && (!have_marked || bytes <= 0)) exit 1
     if (check == "write" && bytes <= 0) exit 1
     if ((check == "sorted" || check == "duplicates") && !sorted) exit 1
     if (check == "duplicates" && !have_dup) exit 1
-    printf "%.6f\t%.6f\t%.6f\t%.0f\t%.0f", e, core, prepare, peak, bytes
+    printf "%.6f\t%.6f\t%.6f\t%.0f\t%.0f\t%.6f", e, core, prepare, peak, bytes, processing
 }

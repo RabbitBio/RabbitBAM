@@ -125,7 +125,14 @@ private:
     double cache_prepare_cost_;
 };
 
-class MpiFileOutput {
+class PositionedOutput {
+public:
+    virtual ~PositionedOutput() {}
+    virtual int WriteAt(uint64_t offset, const void *data, uint64_t size) = 0;
+    virtual int Sync() = 0;
+};
+
+class MpiFileOutput : public PositionedOutput {
 public:
     MpiFileOutput();
     ~MpiFileOutput();
@@ -175,7 +182,12 @@ public:
                      int mpi_tag = 5700) const;
     int WriteMpiIo(const std::string &path,
                    const RankBodySource &local_body,
-                   const void *prefix, const void *suffix) const;
+                   const void *prefix, const void *suffix,
+                   bool consume = false) const;
+    // Both file and resident storage execute the same complete data transfer.
+    // consume permits the source to reclaim bytes after copying into scratch.
+    int Write(PositionedOutput *output, const RankBodySource &local_body,
+              const void *prefix, const void *suffix, bool consume = false) const;
 
     const DistributedBamLayout &layout() const { return layout_; }
     uint64_t local_body_offset() const;
@@ -194,6 +206,11 @@ private:
 int AllRanksOk(int local_ok, MPI_Comm comm = MPI_COMM_WORLD);
 double ReduceMaxCost(double local_cost, int root = 0,
                      MPI_Comm comm = MPI_COMM_WORLD);
+// Node-local budget, excluding resident storage. An explicit node allowance
+// is useful on systems whose cross-core heap is not reported by sysconf.
+int ResolveWorkMemory(uint64_t resident_bytes, uint64_t requested_bytes,
+                      uint64_t node_allowance, size_t *work_bytes,
+                      MPI_Comm comm = MPI_COMM_WORLD);
 int PrepareMpiBamInputPlan(const BamInputBackend &input,
                            MpiBamInputPlan *plan,
                            int root = 0,

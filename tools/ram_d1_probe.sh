@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export SWBAM_NODE_MEMORY=${SWBAM_NODE_MEMORY:-88000M}
 ROOT=${1:?Usage: ram_d1_probe.sh ABS_ROOT D1_BAM}
 INPUT=${2:?D1 BAM required}
 APP="$ROOT/bin/RabbitBAM-MPI"

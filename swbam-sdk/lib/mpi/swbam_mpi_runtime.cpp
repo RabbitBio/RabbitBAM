@@ -847,7 +847,7 @@ int DistributedBamOutput::GatherToRoot(
 int DistributedBamOutput::WriteMpiIo(
         const std::string &path,
         const RankBodySource &local_body,
-        const void *prefix, const void *suffix) const {
+        const void *prefix, const void *suffix, bool consume) const {
     if (!prepared_ || path.empty() ||
         local_body.size() !=
             layout_.body_sizes[static_cast<size_t>(rank_)] ||
@@ -863,8 +863,21 @@ int DistributedBamOutput::WriteMpiIo(
         return -1;
     }
 
+    const int result = Write(&output, local_body, prefix, suffix, consume);
+    if (output.Close() != 0) local_ok = 0;
+    return AllRanksOk(local_ok && result == 0, comm_) ? 0 : -1;
+}
+
+int DistributedBamOutput::Write(PositionedOutput *output,
+        const RankBodySource &local_body, const void *prefix,
+        const void *suffix, bool consume) const {
+    int local_ok = prepared_ && output &&
+        local_body.size() == layout_.body_sizes[rank_] &&
+        (rank_ != root_ || ((!layout_.prefix_size || prefix) &&
+                           (!layout_.suffix_size || suffix)));
+    if (!AllRanksOk(local_ok, comm_)) return -1;
     if (rank_ == root_ && layout_.prefix_size > 0 &&
-        output.WriteAt(0, prefix, layout_.prefix_size) != 0) {
+        output->WriteAt(0, prefix, layout_.prefix_size) != 0) {
         local_ok = 0;
     }
     const size_t chunk_capacity = 8u * 1024u * 1024u;
@@ -882,7 +895,8 @@ int DistributedBamOutput::WriteMpiIo(
         const size_t count = static_cast<size_t>(std::min<uint64_t>(
             local_body.size() - copied, chunk.size()));
         if (local_body.ReadAt(copied, chunk.data(), count) != 0 ||
-            output.WriteAt(
+            (consume && local_body.ReleaseBefore(copied + count) != 0) ||
+            output->WriteAt(
                 layout_.prefix_size + local_body_offset() + copied,
                 chunk.data(), count) != 0) {
             local_ok = 0;
@@ -891,14 +905,13 @@ int DistributedBamOutput::WriteMpiIo(
         copied += count;
     }
     if (rank_ == root_ && layout_.suffix_size > 0 &&
-        output.WriteAt(
+        output->WriteAt(
             layout_.prefix_size + layout_.total_body_size,
             suffix, layout_.suffix_size) != 0) {
         local_ok = 0;
     }
     const int writes_ok = AllRanksOk(local_ok, comm_);
-    if (writes_ok && output.Sync() != 0) local_ok = 0;
-    if (output.Close() != 0) local_ok = 0;
+    if (writes_ok && output->Sync() != 0) local_ok = 0;
     return AllRanksOk(local_ok, comm_) ? 0 : -1;
 }
 
@@ -906,6 +919,52 @@ int AllRanksOk(int local_ok, MPI_Comm comm) {
     int global_ok = 0;
     MPI_Allreduce(&local_ok, &global_ok, 1, MPI_INT, MPI_MIN, comm);
     return global_ok;
+}
+
+int ResolveWorkMemory(uint64_t resident, uint64_t requested,
+                      uint64_t allowance, size_t *bytes, MPI_Comm comm) {
+    int rank = 0, ranks = 0, length = 0;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &ranks);
+    char host[MPI_MAX_PROCESSOR_NAME] = {};
+    MPI_Get_processor_name(host, &length);
+    std::vector<char> hosts((size_t)ranks * sizeof(host));
+    std::vector<unsigned long long> reserved(ranks);
+    unsigned long long local = resident;
+    MPI_Allgather(host, sizeof(host), MPI_CHAR, hosts.data(), sizeof(host), MPI_CHAR, comm);
+    MPI_Allgather(&local, 1, MPI_UNSIGNED_LONG_LONG, reserved.data(), 1,
+                  MPI_UNSIGNED_LONG_LONG, comm);
+    size_t local_ranks = 0;
+    uint64_t node_reserved = 0;
+    for (int r = 0; r < ranks; ++r) {
+        if (strcmp(host, hosts.data() + (size_t)r * sizeof(host))) continue;
+        ++local_ranks;
+        if (reserved[r] > UINT64_MAX - node_reserved) return -1;
+        node_reserved += reserved[r];
+    }
+    const char *source = "node-allowance";
+    if (!allowance) {
+        const long pages = sysconf(_SC_AVPHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+        if (pages <= 0 || page <= 0) return -1;
+        // Available memory is sampled after resident storage was allocated.
+        // Cross-CG heaps need a launcher-supplied allowance instead.
+        allowance = (uint64_t)pages * page;
+        node_reserved = 0;
+        source = "available-memory";
+    }
+    const uint64_t reserve = std::max<uint64_t>(256ull << 20, allowance / 10);
+    uint64_t available = allowance > reserve && node_reserved < allowance - reserve
+        ? (allowance - reserve - node_reserved) / local_ranks : 0;
+    if (!bytes || !available || (requested && requested > available) ||
+        (requested ? requested : available) > SIZE_MAX) {
+        fprintf(stderr, "[rank %d] ERROR: work memory exceeds allowance: requested=%llu available=%llu; set SWBAM_NODE_MEMORY to the job's node allowance for cross-CG heaps.\n",
+                rank, (unsigned long long)requested, (unsigned long long)available);
+        return -1;
+    }
+    *bytes = requested ? requested : available;
+    fprintf(stdout, "[work-memory rank=%d] budget=%zu resident=%llu local_ranks=%zu source=%s\n",
+            rank, *bytes, (unsigned long long)resident, local_ranks, source);
+    return 0;
 }
 
 double ReduceMaxCost(double local_cost, int root, MPI_Comm comm) {

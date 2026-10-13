@@ -18,7 +18,7 @@ public:
     int Prepare(int *argc, char ***argv, bool sdk_example = false);
     int EnterMpi();
     void LeaveMpi();
-    int Finish(int status, double seconds);
+    int Finish(int status, double seconds, double processing_seconds = -1);
     bool ram() const;
     const std::string &input_path() const;
     const std::string &output_path() const;
@@ -38,6 +38,8 @@ private:
 Session *CurrentSession();
 bool IsRam();
 double WallTime();
+size_t WorkMemoryLimit();
+size_t CacheMemoryLimit();
 int InputFormat(const std::string &path);
 #ifdef SWBAM_RAM_IO_AUDIT
 void BeginMpiInterval();
@@ -65,6 +67,7 @@ public:
     int ReadAt(uint64_t offset, void *data, size_t size) const;
     uint64_t size() const;
     bool is_memory() const;
+    int ReleaseBefore(uint64_t offset) const;
     MemWriter *memory_writer() { return file_ ? nullptr : native_.memory_writer(); }
     const MemWriter *memory_writer() const { return file_ ? nullptr : native_.memory_writer(); }
     std::shared_ptr<RamFile> file() const { return file_; }
@@ -79,6 +82,7 @@ public:
     int ReadAt(uint64_t offset, void *data, size_t size) const { return native_.ReadAt(offset, data, size); }
     uint64_t size() const { return native_.size(); }
     bool is_memory() const { return native_.is_memory(); }
+    int ReleaseBefore(uint64_t offset) const { return native_.ReleaseBefore(offset); }
     const std::vector<std::shared_ptr<RamFile> > &files() const { return files_; }
 private:
     swbam::SegmentedRankBodySource native_;

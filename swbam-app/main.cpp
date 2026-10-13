@@ -19,7 +19,9 @@ static int RunCommand(int argc, char **argv, int my_rank) {
     CLI::App app("RabbitBAM-MPI");
     app.footer("Storage: --storage posix (default), or --storage ram --ram-capacity SIZE "
                "--ram-ranks N --ram-session UNIQUE_ABSOLUTE_DIR [--ram-ready-timeout SECONDS] [--no-dump]. "
-               "RAM preparation and saving are outside the MPI_Init-to-MPI_Finalize interval.");
+               "RAM preparation and saving are outside the MPI_Init-to-MPI_Finalize interval. "
+               "Work memory is automatic; --work-memory SIZE overrides the per-rank budget. "
+               "SWBAM_NODE_MEMORY supplies the job's node memory allowance.");
 
     CLI::App *run_all = app.add_subcommand("run_all", "Run MPI conversion (BAM -> BAM, BAM -> SAM, and SAM -> BAM implemented)");
     run_all->add_option("-i,--inFile", cmd_info.in_file_name_, "input sam/bam name")->required()->check(CLI::ExistingFile);
@@ -37,7 +39,7 @@ static int RunCommand(int argc, char **argv, int my_rank) {
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
     run_all->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
                         "Per-rank body storage: memory, spool, or auto")
-        ->default_val("memory")
+        ->default_val("spool")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "spool", "auto"}));
     run_all->add_option("--rank-body-memory-limit", cmd_info.rank_body_memory_limit_,
                         "Per-rank body memory limit used by --rank-body-backend auto")
@@ -99,7 +101,7 @@ static int RunCommand(int argc, char **argv, int my_rank) {
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
     sort->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
                      "Per-rank body storage: memory, spool, or auto")
-        ->default_val("memory")
+        ->default_val("spool")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "spool", "auto"}));
     sort->add_option("--rank-body-memory-limit", cmd_info.rank_body_memory_limit_,
                      "Per-rank body memory limit used by --rank-body-backend auto")
@@ -128,7 +130,7 @@ static int RunCommand(int argc, char **argv, int my_rank) {
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
     collate->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
                         "Per-rank body storage: memory, spool, or auto")
-        ->default_val("memory")
+        ->default_val("spool")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "spool", "auto"}));
     collate->add_option("--rank-body-memory-limit", cmd_info.rank_body_memory_limit_,
                         "Per-rank body memory limit used by --rank-body-backend auto")
@@ -158,7 +160,7 @@ static int RunCommand(int argc, char **argv, int my_rank) {
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
     markdup->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
                         "Per-rank body storage: memory, spool, or auto")
-        ->default_val("memory")
+        ->default_val("spool")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "spool", "auto"}));
     markdup->add_option("--rank-body-memory-limit", cmd_info.rank_body_memory_limit_,
                         "Per-rank body memory limit used by --rank-body-backend auto")
@@ -190,7 +192,7 @@ static int RunCommand(int argc, char **argv, int my_rank) {
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "mpiio"}));
     fixmate->add_option("--rank-body-backend", cmd_info.rank_body_backend_,
                         "Per-rank body storage: memory, spool, or auto")
-        ->default_val("memory")
+        ->default_val("spool")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "spool", "auto"}));
     fixmate->add_option("--rank-body-memory-limit", cmd_info.rank_body_memory_limit_,
                         "Per-rank body memory limit used by --rank-body-backend auto")
@@ -249,7 +251,7 @@ static int RunCommand(int argc, char **argv, int my_rank) {
     dedup_workflow->add_option("--rank-body-backend",
                                cmd_info.rank_body_backend_,
                                "Per-rank body storage: memory, spool, or auto")
-        ->default_val("memory")
+        ->default_val("spool")
         ->check(CLI::IsMember(std::vector<std::string>{"memory", "spool", "auto"}));
     dedup_workflow->add_option("--rank-body-memory-limit",
                                cmd_info.rank_body_memory_limit_,
@@ -339,6 +341,25 @@ static int RunCommand(int argc, char **argv, int my_rank) {
         goto cleanup;
     }
 
+    if (!is_dedup_pipeline && !is_dedup_workflow) {
+        // Reserve fixed pipeline/communication space outside algorithm -m.
+        const size_t work = swbam_usage::WorkMemoryLimit();
+        const size_t reserve = std::max<size_t>(256u << 20, work / 8);
+        std::string *limit = is_sort ? &cmd_info.sort_memory_ :
+            is_collate ? &cmd_info.collate_memory_ :
+            is_markdup ? &cmd_info.markdup_memory_ : nullptr;
+        uint64_t requested = 0;
+        int ok = work > reserve;
+        if (limit) {
+            if (limit->empty() && ok) *limit = std::to_string(work - reserve);
+            ok = ok && swbam::ParseByteSize(*limit, &requested) == 0 &&
+                requested <= work - reserve;
+        }
+        if (!swbam::mpi::AllRanksOk(ok)) {
+            if (my_rank == 0) fprintf(stderr, "ERROR: algorithm -m exceeds work budget; adjust --work-memory or SWBAM_NODE_MEMORY.\n");
+            goto cleanup;
+        }
+    }
     t1 = GetTime();
     exit_code = is_io_check ? ProcessIoCheckMPI(&cmd_info)
                          : (is_dedup_workflow ? ProcessDedupWorkflowMPI(&cmd_info)
@@ -374,14 +395,16 @@ int main(int argc, char **argv) {
     swbam_usage::BeginMpiInterval();
     const double e2e_start = swbam_usage::WallTime();
     MPI_Init(&argc, &argv);
+    const double processing_start = swbam_usage::WallTime();
     const double mpi_init_cost = GetTime() - t0;
     int my_rank = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
     if (!swbam::mpi::AllRanksOk(storage.EnterMpi() == 0)) {
+        const double processing_cost = swbam_usage::WallTime() - processing_start;
         MPI_Finalize();
         const double elapsed = swbam_usage::WallTime() - e2e_start;
         swbam_usage::EndMpiInterval();
-        return storage.Finish(2, elapsed);
+        return storage.Finish(2, elapsed, processing_cost);
     }
     int exit_code = 1;
 #ifdef PLATFORM_SUNWAY
@@ -397,6 +420,7 @@ int main(int argc, char **argv) {
 #endif
 
     double finalize_t0 = GetTime();
+    const double processing_cost = swbam_usage::WallTime() - processing_start;
     MPI_Finalize();
     const double e2e_cost = swbam_usage::WallTime() - e2e_start;
     swbam_usage::EndMpiInterval();
@@ -407,5 +431,5 @@ int main(int argc, char **argv) {
         printf("MPI_Finalize rank0 time %lf\n", finalize_cost);
         printf("TOT TIME %lf\n", GetTime() - t0);
     }
-    return storage.Finish(exit_code, e2e_cost);
+    return storage.Finish(exit_code, e2e_cost, processing_cost);
 }

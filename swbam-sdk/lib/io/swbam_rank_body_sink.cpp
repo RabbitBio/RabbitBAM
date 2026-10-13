@@ -206,6 +206,16 @@ AdaptiveRankBodySink::AdaptiveRankBodySink()
     memset(&memory_, 0, sizeof(memory_));
 }
 
+int SpoolRankBodySink::ReleaseBefore(uint64_t offset) const {
+    if (offset > size_) return -1;
+    if (offset == size_ && fd_ >= 0) {
+        const int fd = fd_;
+        fd_ = -1;
+        return close(fd);
+    }
+    return 0;
+}
+
 AdaptiveRankBodySink::~AdaptiveRankBodySink() {
     Close();
 }
@@ -216,13 +226,6 @@ int AdaptiveRankBodySink::Open(
         const std::string &spool_prefix,
         const std::string &spool_directory) {
     Close();
-    if (requested_backend != "memory" && spool_directory.empty()) {
-        fprintf(stderr,
-                "ERROR: --rank-body-temp-dir is required when rank "
-                "body backend is '%s'.\n",
-                requested_backend.c_str());
-        return -1;
-    }
     if ((requested_backend != "memory" &&
          requested_backend != "spool" &&
          requested_backend != "auto") ||
@@ -234,7 +237,8 @@ int AdaptiveRankBodySink::Open(
     selected_backend_ = requested_backend == "spool"
         ? "spool" : "memory";
     spool_prefix_ = spool_prefix;
-    spool_directory_ = spool_directory;
+    const char *tmp = getenv("TMPDIR");
+    spool_directory_ = spool_directory.empty() ? (tmp ? tmp : "/tmp") : spool_directory;
     memory_limit_ = memory_limit;
     opened_ = true;
 
@@ -351,6 +355,11 @@ bool AdaptiveRankBodySink::is_memory() const {
     return opened_ && selected_backend_ == "memory";
 }
 
+int AdaptiveRankBodySink::ReleaseBefore(uint64_t offset) const {
+    return selected_backend_ == "spool" ? spool_sink_.ReleaseBefore(offset)
+                                       : (offset <= memory_.size ? 0 : -1);
+}
+
 MemWriter *AdaptiveRankBodySink::memory_writer() {
     return is_memory() ? &memory_ : nullptr;
 }
@@ -411,6 +420,15 @@ bool SegmentedRankBodySource::is_memory() const {
         if (!segments_[i]->is_memory()) return false;
     }
     return true;
+}
+
+int SegmentedRankBodySource::ReleaseBefore(uint64_t offset) const {
+    if (offset > total_size_) return -1;
+    for (size_t i = 0; i < segments_.size() && offsets_[i] < offset; ++i) {
+        if (segments_[i]->ReleaseBefore(std::min<uint64_t>(
+                offset - offsets_[i], segments_[i]->size())) != 0) return -1;
+    }
+    return 0;
 }
 
 int AppendBgzfBlock(RankBodySink *sink, const bam_block *block) {

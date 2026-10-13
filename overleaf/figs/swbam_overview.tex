@@ -1,0 +1,13 @@
+% Insert in the Overview subsection. Paths are relative to overleaf/SWBAM/.
+\begin{figure*}[!t]
+    \centering
+    \includegraphics[width=\textwidth]{../figs/swbam_overview.pdf}
+    \caption{SWBAM architecture and pipeline composition.
+    (a) Applications reuse four batch-based processing pipelines, a common
+    MPE--CPE execution runtime, and I/O and MPI support. Application-specific
+    grouping, ordering, communication, and cross-record state remain in the
+    application layer. (b) Representative operations connect read pipelines,
+    MPE-side batch post-processing, and write pipelines or MPI reduction.
+    Arrows show batch-level dependencies, not concurrent CPE kernel execution.}
+    \label{fig:swbam_overview}
+\end{figure*}

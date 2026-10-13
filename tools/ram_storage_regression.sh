@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export SWBAM_NODE_MEMORY=${SWBAM_NODE_MEMORY:-88000M}
 
 # Run on the SWLS login host, with binaries already copied into ROOT/bin.
 ROOT=${1:?Usage: ram_storage_regression.sh ABS_ROOT INPUT_BAM [RANKS]}

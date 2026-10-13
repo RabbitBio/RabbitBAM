@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export SWBAM_NODE_MEMORY=${SWBAM_NODE_MEMORY:-88000M}
 
 # One capacity/functional probe per command, not a performance matrix.
 # Run on SWLS with frozen binaries in ROOT/bin and existing intermediate inputs.
@@ -14,9 +15,11 @@ RANKS=6
 RECORDS=365079492
 NODE_RANGE=${NODE_RANGE:-auto}
 READY_TIMEOUT=${READY_TIMEOUT:-5400}
+PROBE_SDK_SINGLE_RANK=${PROBE_SDK_SINGLE_RANK:-0}
 CURRENT=initialization
 CURRENT_JOB=
 [[ "$ROOT" = /* && "$READY_TIMEOUT" =~ ^[1-9][0-9]*$ ]]
+[[ "$PROBE_SDK_SINGLE_RANK" == 0 || "$PROBE_SDK_SINGLE_RANK" == 1 ]]
 for input in "$INPUT" "$SAM" "$COLLATED" "$FIXMATE" "$SORTED"; do
     [[ "$input" = /* && -s "$input" ]] || { printf 'Invalid input: %s\n' "$input" >&2; exit 1; }
 done
@@ -32,9 +35,10 @@ if [[ ${PROBE_RESUME:-0} == 1 ]]; then
     sha256sum -c binaries.sha256
 else
     [[ ! -e results.tsv && ! -e commands.sh ]] || exit 1
-    printf 'name\tjob_id\tcapacity\te2e_max_s\tprepare_max_s\tpool_peak_max_bytes\toutput_bytes\n' > results.tsv
+    printf 'name\tjob_id\tcapacity\te2e_max_s\tprepare_max_s\tpool_peak_max_bytes\toutput_bytes\tprocessing_max_s\n' > results.tsv
     sha256sum bin/RabbitBAM-MPI bin/swbam-sdk-optimized-count bin/swbam-sdk-optimized-bam2bam > binaries.sha256
-    printf 'ranks=%s node_range=%s ready_timeout=%s\n' "$RANKS" "$NODE_RANGE" "$READY_TIMEOUT" > configuration.txt
+    printf 'ranks=%s node_range=%s ready_timeout=%s sdk_single_rank=%s\n' \
+        "$RANKS" "$NODE_RANGE" "$READY_TIMEOUT" "$PROBE_SDK_SINGLE_RANK" > configuration.txt
     stat -c '%n\t%s bytes' "$INPUT" "$SAM" "$COLLATED" "$FIXMATE" "$SORTED" >> configuration.txt
 fi
 NODE_ARGS=(-health 1)
@@ -46,6 +50,7 @@ fi
 run() {
     local name=$1 capacity=$2 expected=$3 mode=$4
     shift 4
+    local ranks=${PROBE_RANKS:-$RANKS}
     local log="$ROOT/logs/$name.log" submission job metrics scheduler_status=
     if [[ ${PROBE_RESUME:-0} == 1 ]]; then
         if awk -F '\t' -v name="$name" '$1==name{found=1}END{exit !found}' results.tsv; then
@@ -61,10 +66,10 @@ run() {
     if [[ -z "$job" ]]; then
         [[ ! -e "$log" && ! -e "$ROOT/sessions/$name" ]] || return 1
         printf '%s START %s capacity=%s\n' "$(date -Is)" "$name" "$capacity"
-        local command=(bsub -N "$RANKS" -np 1 "${NODE_ARGS[@]}" -mpecg 6 -cgsp 64
+        local command=(bsub -N "$ranks" -np 1 "${NODE_ARGS[@]}" -mpecg 6 -cgsp 64
             -share_size 100 -cross_size 88000 -cache_size 32 -xmalloc
             -a mpi -b -K -q q_share -timelimit 03:00:00 -J "ram_D2_$name" -o "$log"
-            "$@" --storage ram --ram-capacity "$capacity" --ram-ranks "$RANKS"
+            "$@" --storage ram --ram-capacity "$capacity" --ram-ranks "$ranks"
             --ram-session "$ROOT/sessions/$name" --ram-ready-timeout "$READY_TIMEOUT")
         printf '%q ' "${command[@]}" >> commands.sh
         printf '\n' >> commands.sh
@@ -88,7 +93,7 @@ run() {
         if [[ -s "$log" ]]; then
             grep -Eq '(ERROR:|RAM preparation failed|Segmentation fault|MPI_ABORT)' "$log" && break
             if [[ "$scheduler_status" == DONE ]] || grep -q "Job $job has been finished" "$log"; then
-                [[ $(awk '/\[ram-storage rank=/{n++}END{print n+0}' "$log") == "$RANKS" ]] && break
+                [[ $(awk '/\[ram-storage rank=/{n++}END{print n+0}' "$log") == "$ranks" ]] && break
             fi
         fi
         sleep 3
@@ -99,8 +104,8 @@ run() {
         tail -60 "$log"
         return 1
     fi
-    [[ $(awk '/\[swbam-e2e rank=[0-9]+\].* status=0/{n++}END{print n+0}' "$log") == "$RANKS" ]] || return 1
-    [[ $(awk '/\[ram-storage rank=/{n++}END{print n+0}' "$log") == "$RANKS" ]] || return 1
+    [[ $(awk '/\[swbam-e2e rank=[0-9]+\].* status=0/{n++}END{print n+0}' "$log") == "$ranks" ]] || return 1
+    [[ $(awk '/\[ram-storage rank=/{n++}END{print n+0}' "$log") == "$ranks" ]] || return 1
     grep -Eq "(total_records=|records=)$expected([[:space:]]|$)" "$log" || return 1
     if [[ "$mode" == memory ]]; then grep -q 'selected mode=memory' "$log" || return 1; fi
     if [[ "$name" == filter ]]; then grep -q 'kept_records=328059484' "$log" || return 1; fi
@@ -108,15 +113,31 @@ run() {
     if [[ "$name" == sdk_validate ]]; then
         awk -F '\t' '$1=="SN" && $2=="is sorted:" && $3==1{ok=1}END{exit !ok}' "$log" || return 1
     fi
-    metrics=$(awk '
-      /\[swbam-e2e rank=/{for(i=1;i<=NF;i++)if($i~/^seconds=/){split($i,a,"=");if(a[2]>e)e=a[2]}}
+    metrics=$(awk -v ranks="$ranks" '
+      /\[swbam-e2e rank=/{rank=$2;sub(/^rank=/,"",rank);sub(/\]$/,"",rank);for(i=1;i<=NF;i++)if($i~/^seconds=/){split($i,a,"=");et[rank]=a[2]+0;if(a[2]>e)e=a[2]}}
+      /\[swbam-processing rank=/{
+        rank=$2;sub(/^rank=/,"",rank);sub(/\]$/,"",rank)
+        if(rank !~ /^[0-9]+$/ || rank+0>=ranks+0 || ids[rank]++)bad=1
+        ok=0;seconds=""
+        for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]=="seconds")seconds=a[2];if(a[1]=="status" && a[2]==0)ok=1}
+        if(!ok || seconds !~ /^[0-9]+([.][0-9]+)?$/ || seconds+0<=0)bad=1
+        pt[rank]=seconds+0;if(seconds+0>processing)processing=seconds+0;n++
+      }
       /\[ram-prepare rank=/{for(i=1;i<=NF;i++)if($i~/^seconds=/){split($i,a,"=");if(a[2]>p)p=a[2]}}
       /\[ram-storage rank=/{for(i=1;i<=NF;i++){split($i,a,"=");if(a[1]=="peak" && a[2]>k)k=a[2];if(a[1]=="output_bytes" && a[2]>o)o=a[2]}}
-      END{printf "%.6f\t%.6f\t%.0f\t%.0f",e,p,k,o}' "$log")
+      END{for(rank in pt)if(pt[rank]>et[rank]+0.000002)bad=1;if(bad || n!=ranks)exit 1;printf "%.6f\t%.6f\t%.0f\t%.0f\t%.6f",e,p,k,o,processing}' "$log")
     printf '%s\t%s\t%s\t%s\n' "$name" "$job" "$capacity" "$metrics" >> results.tsv
+    awk -v name="$name" '/\[work-memory rank=|\[ram-storage rank=|tracked_peak|stream_pending_peak|collate_memory/ {print name "\t" $0}' \
+        "$log" >> memory_observations.log
     printf '%s DONE %s metrics=%s\n' "$(date -Is)" "$name" "$metrics"
     CURRENT_JOB=
 }
+
+if [[ "$PROBE_SDK_SINGLE_RANK" == 1 ]]; then
+    PROBE_RANKS=1 run count_n1 36G "$RECORDS" any "$ROOT/bin/swbam-sdk-optimized-count" "$INPUT"
+    PROBE_RANKS=1 run sdk_copy_n1 76G "$RECORDS" any "$ROOT/bin/swbam-sdk-optimized-bam2bam" \
+        "$INPUT" -o "$ROOT/out/D2.sdk.n1.bam" --no-dump
+fi
 
 run count 8G "$RECORDS" any "$ROOT/bin/swbam-sdk-optimized-count" "$INPUT"
 run sdk_copy 16G "$RECORDS" any "$ROOT/bin/swbam-sdk-optimized-bam2bam" "$INPUT" -o "$ROOT/out/D2.sdk.bam"
@@ -126,8 +147,8 @@ run flagstat 8G "$RECORDS" any "$APP" flagstat -i "$INPUT"
 run filter 16G "$RECORDS" any "$APP" run_all -i "$INPUT" -o "$ROOT/out/D2.filter.bam" --min-mapq 30 --no-dump
 run collate 16G "$RECORDS" memory "$APP" collate -i "$INPUT" -o "$ROOT/out/D2.collate.bam" -n 66 -m 48G --no-dump
 run fixmate 24G "$RECORDS" any "$APP" fixmate -i "$COLLATED" -o "$ROOT/out/D2.fixmate.bam" -m --no-dump
-run sort 24G "$RECORDS" memory "$APP" sort -i "$FIXMATE" -o "$ROOT/out/D2.sort.bam" -m 48G --no-dump
-run markdup 24G "$RECORDS" any "$APP" markdup -i "$SORTED" -o "$ROOT/out/D2.markdup.bam" --stream -m 8G --no-dump
+run sort 16G "$RECORDS" memory "$APP" sort -i "$FIXMATE" -o "$ROOT/out/D2.sort.bam" -m 48G --no-dump
+run markdup 24G "$RECORDS" any "$APP" markdup -i "$SORTED" -o "$ROOT/out/D2.markdup.bam" --stream -l 300 -m 8G --no-dump
 run bam2sam 40G "$RECORDS" any "$APP" run_all -i "$INPUT" -o "$ROOT/out/D2.records.sam" --no-dump
 run sam2bam 40G "$RECORDS" any "$APP" run_all -i "$SAM" -o "$ROOT/out/D2.roundtrip.bam" --no-dump
 for name in filter collate fixmate sort markdup records.sam roundtrip; do

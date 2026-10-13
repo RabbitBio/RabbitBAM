@@ -37,6 +37,7 @@ public:
     int Resize(uint64_t size);
     char *Range(uint64_t offset, size_t bytes) const;
     uint64_t size() const { return size_; }
+    int ReleaseBefore(uint64_t offset);
 private:
     RamFile(const RamFile &);
     RamFile &operator=(const RamFile &);
@@ -45,6 +46,7 @@ private:
     RamPool *pool_;
     std::vector<size_t> pages_;
     uint64_t size_;
+    size_t released_pages_ = 0;
 };
 }
 #endif

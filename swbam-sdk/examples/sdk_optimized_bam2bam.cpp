@@ -19,16 +19,18 @@ int main(int argc, char **argv) {
     swbam_usage::BeginMpiInterval();
     const double e2e_start = swbam_usage::WallTime();
     MPI_Init(&argc, &argv);
+    const double processing_start = swbam_usage::WallTime();
     int rank = 0, ranks = 1;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &ranks);
     const bool layout_ok = swbam::mpi::AllRanksOk(storage.EnterMpi() == 0);
     if (argc != 2 || storage.output_path().empty() || !layout_ok) {
         if (rank == 0) fprintf(stderr, "Usage: %s input.bam -o output.bam [--storage ram ...]\n", argv[0]);
+        const double processing_seconds = swbam_usage::WallTime() - processing_start;
         MPI_Finalize();
         const double elapsed = swbam_usage::WallTime() - e2e_start;
         swbam_usage::EndMpiInterval();
-        return storage.Finish(2, elapsed);
+        return storage.Finish(2, elapsed, processing_seconds);
     }
 #ifdef PLATFORM_SUNWAY
     athread_init();
@@ -42,7 +44,7 @@ int main(int argc, char **argv) {
             int ok = swbam_usage::OpenInput(input, argv[1], "posix", "") == 0;
             if (!swbam::mpi::AllRanksOk(ok)) return 1;
             if (input.PreparePlan(&plan)) return 1;
-            ok = body.Open("memory", 0, 8u * 1024u * 1024u, "sdk-body", "") == 0;
+            ok = body.Open("spool", 0, 8u * 1024u * 1024u, "sdk-body", "") == 0;
             if (!swbam::mpi::AllRanksOk(ok)) return 1;
             swbam::operators::BamTransformMetrics metrics = {};
             MPI_Barrier(MPI_COMM_WORLD);
@@ -79,8 +81,9 @@ int main(int argc, char **argv) {
 #ifdef PLATFORM_SUNWAY
     athread_halt();
 #endif
+    const double processing_seconds = swbam_usage::WallTime() - processing_start;
     MPI_Finalize();
     const double seconds = swbam_usage::WallTime() - e2e_start;
     swbam_usage::EndMpiInterval();
-    return storage.Finish(status, seconds);
+    return storage.Finish(status, seconds, processing_seconds);
 }

@@ -1,0 +1,217 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="178mm" height="111.25000mm" viewBox="0 0 1440 900">
+<title>SWBAM architecture and pipeline composition</title>
+<desc>Library/application separation and batch-level composition. Blue: reading; green: writing; amber: MPE work.</desc>
+<rect width="1440" height="900" fill="white"/>
+<g id="Panel A">
+<text x="28.000" y="44.450" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="27" font-weight="700" fill="#222B33">(a) SWBAM architecture</text>
+</g>
+<g id="Application layer">
+<rect x="28" y="69" width="1384" height="83" rx="0" fill="#F4F3F7" stroke="#8C8495" stroke-width="1.5"/>
+</g>
+<g id="Application heading">
+<text x="49.000" y="106.750" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="25" font-weight="700" fill="#222B33">SWBAM applications</text>
+</g>
+<g id="Application interface role">
+<text x="49.000" y="135.850" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">Batch-level composition</text>
+</g>
+<g id="Streaming applications">
+<text x="377.000" y="106.050" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">Statistics / filtering / conversion</text>
+</g>
+<g id="Streaming state">
+<text x="377.000" y="134.850" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">Batch-local processing and aggregation</text>
+</g>
+<g id="Stateful applications">
+<text x="867.000" y="106.050" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">Sort / collate / fixmate / markdup</text>
+</g>
+<g id="Stateful responsibilities">
+<text x="867.000" y="134.850" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">Ordering / grouping / cross-record state / MPI</text>
+</g>
+<g id="Uses library">
+<line x1="720" y1="152" x2="720.0" y2="179.0" stroke="#6F7B84" stroke-width="1.8" stroke-dasharray="5 4"/>
+<polygon points="720,188 716.3,179.0 723.7,179.0" fill="#6F7B84"/>
+</g>
+<g id="Uses batch interfaces">
+<text x="741.000" y="178.850" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Batch-level interfaces</text>
+</g>
+<g id="SWBAM library boundary">
+<rect x="28" y="192" width="1384" height="347" rx="0" fill="#FFFFFF" stroke="#79838B" stroke-width="1.5" stroke-dasharray="7 5"/>
+</g>
+<g id="Library heading">
+<text x="49.000" y="229.750" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="25" font-weight="700" fill="#222B33">SWBAM library</text>
+</g>
+<g id="Library rank scope">
+<text x="1390.000" y="229.350" text-anchor="end" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Reusable execution within each MPI rank</text>
+</g>
+<g id="BAM read pipeline">
+<rect x="49" y="254" width="306" height="84" rx="7" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.7"/>
+<text x="202.000" y="289.240" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">BAM read</text>
+<text x="202.000" y="319.380" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">CPE: decode + parse + op</text>
+</g>
+<g id="BAM write pipeline">
+<rect x="394" y="254" width="306" height="84" rx="7" fill="#E1F2EA" stroke="#217957" stroke-width="1.7"/>
+<text x="547.000" y="289.240" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">BAM write</text>
+<text x="547.000" y="319.380" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">CPE: serialize + compress</text>
+</g>
+<g id="SAM read pipeline">
+<rect x="739" y="254" width="306" height="84" rx="7" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.7"/>
+<text x="892.000" y="289.240" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">SAM read</text>
+<text x="892.000" y="319.380" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">CPE: parse text into records</text>
+</g>
+<g id="SAM write pipeline">
+<rect x="1084" y="254" width="306" height="84" rx="7" fill="#E1F2EA" stroke="#217957" stroke-width="1.7"/>
+<text x="1237.000" y="289.240" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">SAM write</text>
+<text x="1237.000" y="319.380" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">CPE: format records as text</text>
+</g>
+<g id="Runtime heading">
+<text x="49.000" y="405.550" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">Batch runtime</text>
+</g>
+<g id="MPE preparation">
+<rect x="249" y="370" width="245" height="65" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="371.500" y="395.040" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="700" fill="#222B33">MPE preparation</text>
+<text x="371.500" y="424.660" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Buffers + parameters</text>
+</g>
+<g id="Launch">
+<line x1="494" y1="401" x2="534.0" y2="401.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="543,401 534.0,404.7 534.0,397.3" fill="#222B33"/>
+</g>
+<g id="CPE execution">
+<rect x="543" y="370" width="211" height="65" rx="7" fill="#EEE9F6" stroke="#735396" stroke-width="1.7"/>
+<text x="648.500" y="395.040" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="700" fill="#222B33">CPE execution</text>
+<text x="648.500" y="424.660" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Selected kernel</text>
+</g>
+<g id="Complete and join">
+<line x1="754" y1="401" x2="794.0" y2="401.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="803,401 794.0,404.7 794.0,397.3" fill="#222B33"/>
+</g>
+<g id="MPE post-processing">
+<rect x="803" y="370" width="305" height="65" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="955.500" y="395.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">MPE post-processing</text>
+<text x="955.500" y="425.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Validate batch, then process</text>
+</g>
+<g id="Buffer reuse">
+<text x="1262.500" y="393.850" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="700" fill="#222B33">Reusable buffers</text>
+</g>
+<g id="Pipeline overlap">
+<text x="1262.500" y="423.850" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">Overlap I/O + CPE work</text>
+</g>
+<g id="I/O heading">
+<text x="49.000" y="495.700" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">I/O and MPI support</text>
+</g>
+<g id="Input and partitioning">
+<rect x="306" y="459" width="517" height="63" rx="7" fill="#F2F4F6" stroke="#737D86" stroke-width="1.7"/>
+<text x="564.500" y="483.040" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="700" fill="#222B33">Input backend + rank partitioning</text>
+<text x="564.500" y="512.660" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Memory / POSIX / MPI-IO</text>
+</g>
+<g id="Output and layout">
+<rect x="863" y="459" width="527" height="63" rx="7" fill="#F2F4F6" stroke="#737D86" stroke-width="1.7"/>
+<text x="1126.500" y="483.040" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="700" fill="#222B33">Rank body sink + distributed output</text>
+<text x="1126.500" y="512.660" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Memory / spool  →  Memory / MPI-IO</text>
+</g>
+<g id="Panel B">
+<text x="28.000" y="587.450" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="27" font-weight="700" fill="#222B33">(b) Example batch-level compositions</text>
+</g>
+<g id="Record counting heading">
+<text x="49.000" y="633.050" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">Record counting</text>
+</g>
+<g id="Record counting / BAM read">
+<rect x="49" y="649" width="188" height="72" rx="7" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.7"/>
+<text x="143.000" y="677.890" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">BAM read</text>
+<text x="143.000" y="707.770" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Count (CPE)</text>
+</g>
+<g id="Record counting / batch 0">
+<line x1="237" y1="685" x2="266.0" y2="685.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="275,685 266.0,688.7 266.0,681.3" fill="#222B33"/>
+</g>
+<g id="Record counting / Aggregate">
+<rect x="275" y="649" width="188" height="72" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="369.000" y="677.890" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Aggregate</text>
+<text x="369.000" y="707.770" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">MPE</text>
+</g>
+<g id="Record counting / batch 1">
+<line x1="463" y1="685" x2="492.0" y2="685.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="501,685 492.0,688.7 492.0,681.3" fill="#222B33"/>
+</g>
+<g id="Record counting / MPI reduce">
+<rect x="501" y="649" width="188" height="72" rx="7" fill="#F2F4F6" stroke="#737D86" stroke-width="1.7"/>
+<text x="595.000" y="677.890" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">MPI reduce</text>
+<text x="595.000" y="707.770" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Global count</text>
+</g>
+<g id="BAM filtering / rewriting heading">
+<text x="753.000" y="633.050" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">BAM filtering / rewriting</text>
+</g>
+<g id="BAM filtering / rewriting / BAM read">
+<rect x="753" y="649" width="188" height="72" rx="7" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.7"/>
+<text x="847.000" y="677.890" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">BAM read</text>
+<text x="847.000" y="707.770" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Filter / retain</text>
+</g>
+<g id="BAM filtering / rewriting / batch 0">
+<line x1="941" y1="685" x2="970.0" y2="685.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="979,685 970.0,688.7 970.0,681.3" fill="#222B33"/>
+</g>
+<g id="BAM filtering / rewriting / Packing plan">
+<rect x="979" y="649" width="188" height="72" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="1073.000" y="677.890" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Packing plan</text>
+<text x="1073.000" y="707.770" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">MPE</text>
+</g>
+<g id="BAM filtering / rewriting / batch 1">
+<line x1="1167" y1="685" x2="1196.0" y2="685.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="1205,685 1196.0,688.7 1196.0,681.3" fill="#222B33"/>
+</g>
+<g id="BAM filtering / rewriting / BAM write">
+<rect x="1205" y="649" width="188" height="72" rx="7" fill="#E1F2EA" stroke="#217957" stroke-width="1.7"/>
+<text x="1299.000" y="677.890" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">BAM write</text>
+<text x="1299.000" y="707.770" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Encode (CPE)</text>
+</g>
+<g id="BAM-to-SAM conversion heading">
+<text x="49.000" y="772.050" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">BAM-to-SAM conversion</text>
+</g>
+<g id="BAM-to-SAM conversion / BAM read">
+<rect x="49" y="788" width="188" height="72" rx="7" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.7"/>
+<text x="143.000" y="816.890" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">BAM read</text>
+<text x="143.000" y="846.770" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Decode + parse</text>
+</g>
+<g id="BAM-to-SAM conversion / batch 0">
+<line x1="237" y1="824" x2="266.0" y2="824.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="275,824 266.0,827.7 266.0,820.3" fill="#222B33"/>
+</g>
+<g id="BAM-to-SAM conversion / Batch handoff">
+<rect x="275" y="788" width="188" height="72" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="369.000" y="816.890" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Batch handoff</text>
+<text x="369.000" y="846.770" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">MPE</text>
+</g>
+<g id="BAM-to-SAM conversion / batch 1">
+<line x1="463" y1="824" x2="492.0" y2="824.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="501,824 492.0,827.7 492.0,820.3" fill="#222B33"/>
+</g>
+<g id="BAM-to-SAM conversion / SAM write">
+<rect x="501" y="788" width="188" height="72" rx="7" fill="#E1F2EA" stroke="#217957" stroke-width="1.7"/>
+<text x="595.000" y="816.890" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">SAM write</text>
+<text x="595.000" y="846.770" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Format (CPE)</text>
+</g>
+<g id="SAM-to-BAM conversion heading">
+<text x="753.000" y="772.050" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">SAM-to-BAM conversion</text>
+</g>
+<g id="SAM-to-BAM conversion / SAM read">
+<rect x="753" y="788" width="188" height="72" rx="7" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.7"/>
+<text x="847.000" y="816.890" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">SAM read</text>
+<text x="847.000" y="846.770" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Parse (CPE)</text>
+</g>
+<g id="SAM-to-BAM conversion / batch 0">
+<line x1="941" y1="824" x2="970.0" y2="824.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="979,824 970.0,827.7 970.0,820.3" fill="#222B33"/>
+</g>
+<g id="SAM-to-BAM conversion / Packing plan">
+<rect x="979" y="788" width="188" height="72" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="1073.000" y="816.890" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Packing plan</text>
+<text x="1073.000" y="846.770" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">MPE</text>
+</g>
+<g id="SAM-to-BAM conversion / batch 1">
+<line x1="1167" y1="824" x2="1196.0" y2="824.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="1205,824 1196.0,827.7 1196.0,820.3" fill="#222B33"/>
+</g>
+<g id="SAM-to-BAM conversion / BAM write">
+<rect x="1205" y="788" width="188" height="72" rx="7" fill="#E1F2EA" stroke="#217957" stroke-width="1.7"/>
+<text x="1299.000" y="816.890" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">BAM write</text>
+<text x="1299.000" y="846.770" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Encode (CPE)</text>
+</g>
+</svg>

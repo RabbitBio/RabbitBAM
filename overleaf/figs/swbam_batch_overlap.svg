@@ -1,0 +1,186 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="178mm" height="111.25000mm" viewBox="0 0 1440 900">
+<title>Batch-level overlap between MPE and CPE execution</title>
+<desc>Batch-level overlap between MPE and CPE execution. Academic method schematic.</desc>
+<rect width="1440" height="900" fill="white"/>
+<g id="Read title">
+<text x="28.000" y="45.100" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="26" font-weight="700" fill="#222B33">(a) BAM read: next-batch input overlaps current CPE work</text>
+</g>
+<g id="Read time">
+<line x1="180" y1="87" x2="1391.0" y2="87.0" stroke="#6F7B84" stroke-width="1.8"/>
+<polygon points="1400,87 1391.0,90.7 1391.0,83.3" fill="#6F7B84"/>
+</g>
+<g id="Read time label">
+<text x="1294.000" y="75.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Time (schematic)</text>
+</g>
+<g id="Read MPE lane">
+<text x="32.000" y="185.600" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="26" font-weight="700" fill="#222B33">MPE</text>
+</g>
+<g id="Read CPE lane">
+<text x="32.000" y="316.600" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="26" font-weight="700" fill="#222B33">CPEs</text>
+</g>
+<g id="Read prepare i">
+<rect x="180" y="145" width="160" height="65" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="260.000" y="170.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Prepare i</text>
+<text x="260.000" y="200.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">input A</text>
+</g>
+<g id="Read i+1">
+<rect x="340" y="145" width="305" height="65" rx="7" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.7"/>
+<text x="492.500" y="170.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Read batch i+1</text>
+<text x="492.500" y="200.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">next input: B</text>
+</g>
+<g id="Read join i">
+<rect x="645" y="145" width="125" height="65" rx="7" fill="#F2F4F6" stroke="#737D86" stroke-width="1.7"/>
+<text x="707.500" y="170.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Wait</text>
+<text x="707.500" y="200.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">join</text>
+</g>
+<g id="Read post i">
+<rect x="770" y="145" width="240" height="65" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="890.000" y="170.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Post-process i</text>
+<text x="890.000" y="200.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">after validation</text>
+</g>
+<g id="Read prepare i+1">
+<rect x="1010" y="145" width="140" height="65" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="1080.000" y="170.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Prepare</text>
+<text x="1080.000" y="200.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">i+1</text>
+</g>
+<g id="Read i+2">
+<rect x="1150" y="145" width="250" height="65" rx="7" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.7"/>
+<text x="1275.000" y="170.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Read batch i+2</text>
+<text x="1275.000" y="200.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">next input: A</text>
+</g>
+<g id="Read kernel i">
+<rect x="340" y="275" width="430" height="65" rx="7" fill="#EEE9F6" stroke="#735396" stroke-width="1.7"/>
+<text x="555.000" y="300.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Decode + parse + op</text>
+<text x="555.000" y="330.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">batch i / input A</text>
+</g>
+<g id="Read kernel i+1">
+<rect x="1150" y="275" width="250" height="65" rx="7" fill="#EEE9F6" stroke="#735396" stroke-width="1.7"/>
+<text x="1275.000" y="300.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Same kernel</text>
+<text x="1275.000" y="330.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">batch i+1 / input B</text>
+</g>
+<g id="Read launch i">
+<line x1="340" y1="212" x2="340.0" y2="264.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="340,273 336.3,264.0 343.7,264.0" fill="#222B33"/>
+</g>
+<g id="Read launch label">
+<text x="396.500" y="251.000" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="20" font-weight="400" fill="#4E5B64">launch</text>
+</g>
+<g id="Read complete i">
+<line x1="770" y1="273" x2="770.0" y2="221.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="770,212 773.7,221.0 766.3,221.0" fill="#222B33"/>
+</g>
+<g id="Read complete label">
+<text x="860.000" y="251.000" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="20" font-weight="400" fill="#4E5B64">CPE complete</text>
+</g>
+<g id="Read launch i+1">
+<line x1="1150" y1="212" x2="1150.0" y2="264.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="1150,273 1146.3,264.0 1153.7,264.0" fill="#222B33"/>
+</g>
+<g id="Read overlap / 0">
+<line x1="340" y1="345" x2="340" y2="352" stroke="#2873AC" stroke-width="1.8"/>
+</g>
+<g id="Read overlap / 1">
+<line x1="340" y1="352" x2="645" y2="352" stroke="#2873AC" stroke-width="1.8"/>
+</g>
+<g id="Read overlap / 2">
+<line x1="645" y1="352" x2="645" y2="345" stroke="#2873AC" stroke-width="1.8"/>
+</g>
+<g id="Read overlap label">
+<text x="492.500" y="379.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#2873AC">Input / CPE overlap</text>
+</g>
+<g id="Read post dependency">
+<text x="1050.000" y="376.700" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="400" fill="#4E5B64">Post-processing starts after join and validation.</text>
+</g>
+<g id="Write title">
+<text x="28.000" y="465.100" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="26" font-weight="700" fill="#222B33">(b) BAM write: previous output overlaps current compression</text>
+</g>
+<g id="Write time">
+<line x1="180" y1="507" x2="1391.0" y2="507.0" stroke="#6F7B84" stroke-width="1.8"/>
+<polygon points="1400,507 1391.0,510.7 1391.0,503.3" fill="#6F7B84"/>
+</g>
+<g id="Write time label">
+<text x="1294.000" y="495.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Time (schematic)</text>
+</g>
+<g id="Write MPE lane">
+<text x="32.000" y="608.600" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="26" font-weight="700" fill="#222B33">MPE</text>
+</g>
+<g id="Write CPE lane">
+<text x="32.000" y="734.600" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="26" font-weight="700" fill="#222B33">CPEs</text>
+</g>
+<g id="Write prepare i">
+<rect x="180" y="567" width="160" height="65" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="260.000" y="592.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Prepare i</text>
+<text x="260.000" y="622.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">output A</text>
+</g>
+<g id="Write previous">
+<rect x="340" y="567" width="260" height="65" rx="7" fill="#E1F2EA" stroke="#217957" stroke-width="1.7"/>
+<text x="470.000" y="592.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Write batch i-1</text>
+<text x="470.000" y="622.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">pending output: B</text>
+</g>
+<g id="Write prefetch">
+<rect x="600" y="567" width="225" height="65" rx="7" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.7"/>
+<text x="712.500" y="592.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Prefetch i+1</text>
+<text x="712.500" y="622.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">optional input</text>
+</g>
+<g id="Write validate">
+<rect x="825" y="567" width="185" height="65" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="917.500" y="592.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Join / validate</text>
+<text x="917.500" y="622.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">pending A</text>
+</g>
+<g id="Write prepare next">
+<rect x="1010" y="567" width="140" height="65" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="1080.000" y="592.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Prepare</text>
+<text x="1080.000" y="622.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">i+1</text>
+</g>
+<g id="Write current">
+<rect x="1150" y="567" width="250" height="65" rx="7" fill="#E1F2EA" stroke="#217957" stroke-width="1.7"/>
+<text x="1275.000" y="592.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Write batch i</text>
+<text x="1275.000" y="622.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">pending output: A</text>
+</g>
+<g id="Write kernel i">
+<rect x="340" y="694" width="485" height="65" rx="7" fill="#EEE9F6" stroke="#735396" stroke-width="1.7"/>
+<text x="582.500" y="719.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Serialize + compress</text>
+<text x="582.500" y="749.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">batch i / output A</text>
+</g>
+<g id="Write kernel i+1">
+<rect x="1150" y="694" width="250" height="65" rx="7" fill="#EEE9F6" stroke="#735396" stroke-width="1.7"/>
+<text x="1275.000" y="719.390" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="700" fill="#222B33">Same kernel</text>
+<text x="1275.000" y="749.270" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">batch i+1 / output B</text>
+</g>
+<g id="Write launch i">
+<line x1="340" y1="634" x2="340.0" y2="683.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="340,692 336.3,683.0 343.7,683.0" fill="#222B33"/>
+</g>
+<g id="Write launch label">
+<text x="396.500" y="670.000" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="20" font-weight="400" fill="#4E5B64">launch</text>
+</g>
+<g id="Write complete i">
+<line x1="825" y1="692" x2="825.0" y2="643.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="825,634 828.7,643.0 821.3,643.0" fill="#222B33"/>
+</g>
+<g id="Write complete label">
+<text x="915.000" y="670.000" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="20" font-weight="400" fill="#4E5B64">CPE complete</text>
+</g>
+<g id="Write launch next">
+<line x1="1150" y1="634" x2="1150.0" y2="683.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="1150,692 1146.3,683.0 1153.7,683.0" fill="#222B33"/>
+</g>
+<g id="Write overlap / 0">
+<line x1="340" y1="765" x2="340" y2="772" stroke="#217957" stroke-width="1.8"/>
+</g>
+<g id="Write overlap / 1">
+<line x1="340" y1="772" x2="825" y2="772" stroke="#217957" stroke-width="1.8"/>
+</g>
+<g id="Write overlap / 2">
+<line x1="825" y1="772" x2="825" y2="765" stroke="#217957" stroke-width="1.8"/>
+</g>
+<g id="Write overlap label">
+<text x="582.500" y="799.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#217957">Output / prefetch overlaps CPE work</text>
+</g>
+<g id="Write raw payload option">
+<text x="1135.000" y="797.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Raw BGZF payloads: compression only.</text>
+</g>
+<g id="Schedule scope">
+<text x="720.000" y="874.700" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="400" fill="#4E5B64">Independent read/write schedules for one core group; CPE kernels are not concurrent.</text>
+</g>
+</svg>

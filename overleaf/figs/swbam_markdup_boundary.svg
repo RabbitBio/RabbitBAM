@@ -1,0 +1,312 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="178mm" height="111.25000mm" viewBox="0 0 1440 900">
+<title>Boundary resolution and ordered emission in distributed markdup</title>
+<desc>Boundary resolution and ordered emission in distributed markdup. Academic method schematic.</desc>
+<rect width="1440" height="900" fill="white"/>
+<g id="Boundary panel">
+<text x="28.000" y="45.100" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="26" font-weight="700" fill="#222B33">(a) Boundary pre-resolution before the main stream</text>
+</g>
+<g id="Left rank">
+<text x="390.000" y="83.400" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="24" font-weight="400" fill="#222B33">Rank r-1</text>
+</g>
+<g id="Right rank">
+<text x="1030.000" y="83.400" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="24" font-weight="400" fill="#222B33">Rank r</text>
+</g>
+<g id="Edge BGZF 0">
+<rect x="70" y="110" width="124" height="52" rx="0" fill="#F2F4F6" stroke="#737D86" stroke-width="1.5"/>
+</g>
+<g id="Edge BGZF label 0">
+<text x="132.000" y="144.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">BGZF</text>
+</g>
+<g id="Edge BGZF 1">
+<rect x="198" y="110" width="124" height="52" rx="0" fill="#F2F4F6" stroke="#737D86" stroke-width="1.5"/>
+</g>
+<g id="Edge BGZF label 1">
+<text x="260.000" y="144.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">BGZF</text>
+</g>
+<g id="Edge BGZF 2">
+<rect x="326" y="110" width="124" height="52" rx="0" fill="#F2F4F6" stroke="#737D86" stroke-width="1.5"/>
+</g>
+<g id="Edge BGZF label 2">
+<text x="388.000" y="144.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">BGZF</text>
+</g>
+<g id="Edge BGZF 3">
+<rect x="454" y="110" width="124" height="52" rx="0" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.5"/>
+</g>
+<g id="Edge BGZF label 3">
+<text x="516.000" y="144.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">BGZF</text>
+</g>
+<g id="Edge BGZF 4">
+<rect x="582" y="110" width="124" height="52" rx="0" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.5"/>
+</g>
+<g id="Edge BGZF label 4">
+<text x="644.000" y="144.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">BGZF</text>
+</g>
+<g id="Edge BGZF 5">
+<rect x="710" y="110" width="124" height="52" rx="0" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.5"/>
+</g>
+<g id="Edge BGZF label 5">
+<text x="772.000" y="144.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">BGZF</text>
+</g>
+<g id="Edge BGZF 6">
+<rect x="838" y="110" width="124" height="52" rx="0" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.5"/>
+</g>
+<g id="Edge BGZF label 6">
+<text x="900.000" y="144.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">BGZF</text>
+</g>
+<g id="Edge BGZF 7">
+<rect x="966" y="110" width="124" height="52" rx="0" fill="#F2F4F6" stroke="#737D86" stroke-width="1.5"/>
+</g>
+<g id="Edge BGZF label 7">
+<text x="1028.000" y="144.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">BGZF</text>
+</g>
+<g id="Edge BGZF 8">
+<rect x="1094" y="110" width="124" height="52" rx="0" fill="#F2F4F6" stroke="#737D86" stroke-width="1.5"/>
+</g>
+<g id="Edge BGZF label 8">
+<text x="1156.000" y="144.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">BGZF</text>
+</g>
+<g id="Edge BGZF 9">
+<rect x="1222" y="110" width="124" height="52" rx="0" fill="#F2F4F6" stroke="#737D86" stroke-width="1.5"/>
+</g>
+<g id="Edge BGZF label 9">
+<text x="1284.000" y="144.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">BGZF</text>
+</g>
+<g id="Tail probe / 0">
+<line x1="454" y1="167" x2="454" y2="174" stroke="#2873AC" stroke-width="1.8"/>
+</g>
+<g id="Tail probe / 1">
+<line x1="454" y1="174" x2="706" y2="174" stroke="#2873AC" stroke-width="1.8"/>
+</g>
+<g id="Tail probe / 2">
+<line x1="706" y1="174" x2="706" y2="167" stroke="#2873AC" stroke-width="1.8"/>
+</g>
+<g id="Tail probe label">
+<text x="580.000" y="201.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#2873AC">Tail probe</text>
+</g>
+<g id="Head probe / 0">
+<line x1="714" y1="167" x2="714" y2="174" stroke="#2873AC" stroke-width="1.8"/>
+</g>
+<g id="Head probe / 1">
+<line x1="714" y1="174" x2="962" y2="174" stroke="#2873AC" stroke-width="1.8"/>
+</g>
+<g id="Head probe / 2">
+<line x1="962" y1="174" x2="962" y2="167" stroke="#2873AC" stroke-width="1.8"/>
+</g>
+<g id="Head probe label">
+<text x="838.000" y="201.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#2873AC">Head probe</text>
+</g>
+<g id="Rank cut">
+<line x1="710" y1="100" x2="710" y2="239" stroke="#222B33" stroke-width="1.8" stroke-dasharray="5 4"/>
+</g>
+<g id="Coordinate axis">
+<line x1="70" y1="239" x2="1343.0" y2="239.0" stroke="#6F7B84" stroke-width="1.8"/>
+<polygon points="1352,239 1343.0,242.7 1343.0,235.3" fill="#6F7B84"/>
+</g>
+<g id="Tick b-L">
+<line x1="542" y1="229" x2="542" y2="245" stroke="#222B33" stroke-width="1.8"/>
+</g>
+<g id="Coordinate b-L">
+<text x="542.000" y="268.700" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="400" fill="#222B33">b-L</text>
+</g>
+<g id="Tick b">
+<line x1="710" y1="229" x2="710" y2="245" stroke="#222B33" stroke-width="1.8"/>
+</g>
+<g id="Coordinate b">
+<text x="710.000" y="268.700" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="400" fill="#222B33">b</text>
+</g>
+<g id="Tick b+L">
+<line x1="878" y1="229" x2="878" y2="245" stroke="#222B33" stroke-width="1.8"/>
+</g>
+<g id="Coordinate b+L">
+<text x="878.000" y="268.700" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="400" fill="#222B33">b+L</text>
+</g>
+<g id="Coordinate meaning">
+<text x="1215.000" y="226.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Genomic coordinate</text>
+</g>
+<g id="Probe extract">
+<rect x="40" y="301" width="248" height="70" rx="7" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.7"/>
+<text x="164.000" y="329.240" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">Probe + extract</text>
+<text x="164.000" y="359.380" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">CPE: head/tail blocks</text>
+</g>
+<g id="Coverage check">
+<rect x="337" y="301" width="290" height="70" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="482.000" y="329.240" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">Coverage check</text>
+<text x="482.000" y="359.380" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Collective over all ranks</text>
+</g>
+<g id="Resolve boundary">
+<rect x="692" y="301" width="339" height="70" rx="7" fill="#EEE9F6" stroke="#735396" stroke-width="1.7"/>
+<text x="861.500" y="329.240" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">Select / route / resolve</text>
+<text x="861.500" y="359.380" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">At coordinate owners</text>
+</g>
+<g id="Build boundary plan">
+<rect x="1090" y="301" width="310" height="70" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="1245.000" y="329.240" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">Boundary plan H_r</text>
+<text x="1245.000" y="359.380" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Source-local decisions</text>
+</g>
+<g id="Probe to coverage">
+<line x1="288" y1="336" x2="328.0" y2="336.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="337,336 328.0,339.7 328.0,332.3" fill="#222B33"/>
+</g>
+<g id="Covered branch">
+<line x1="627" y1="336" x2="683.0" y2="336.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="692,336 683.0,339.7 683.0,332.3" fill="#222B33"/>
+</g>
+<g id="Covered branch label">
+<text x="684.000" y="292.000" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="20" font-weight="400" fill="#4E5B64">Covered</text>
+</g>
+<g id="Return boundary decisions">
+<line x1="1031" y1="336" x2="1081.0" y2="336.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="1090,336 1081.0,339.7 1081.0,332.3" fill="#222B33"/>
+</g>
+<g id="Return decisions label">
+<text x="1061.000" y="292.000" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="20" font-weight="400" fill="#4E5B64">Return</text>
+</g>
+<g id="Fallback branch / 0">
+<line x1="483" y1="371" x2="483" y2="400" stroke="#AB691B" stroke-width="1.8" stroke-dasharray="5 4"/>
+</g>
+<g id="Fallback branch / 1">
+<line x1="483" y1="400" x2="523.0" y2="400.0" stroke="#AB691B" stroke-width="1.8" stroke-dasharray="5 4"/>
+<polygon points="532,400 523.0,403.7 523.0,396.3" fill="#AB691B"/>
+</g>
+<g id="Fallback explanation">
+<text x="540.000" y="407.350" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#AB691B">Not covered: retain boundary candidates in the conservative window.</text>
+</g>
+<g id="Candidate-only exchange">
+<text x="243.000" y="412.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Exchange metadata, not BAM records.</text>
+</g>
+<g id="Pending panel">
+<text x="28.000" y="468.100" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="26" font-weight="700" fill="#222B33">(b) Resolve decisions, then emit only the ready prefix</text>
+</g>
+<g id="Cached plan reference">
+<rect x="60" y="500" width="310" height="75" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="215.000" y="531.090" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="24" font-weight="700" fill="#222B33">Cached H_r</text>
+<text x="215.000" y="561.490" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Pre-resolved KEEP / DUP</text>
+</g>
+<g id="Candidate window">
+<rect x="500" y="500" width="400" height="75" rx="7" fill="#EEE9F6" stroke="#735396" stroke-width="1.7"/>
+<text x="700.000" y="531.090" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="24" font-weight="700" fill="#222B33">Candidate window W_r</text>
+<text x="700.000" y="561.490" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Local + remote owner decisions</text>
+</g>
+<g id="Main batch extraction">
+<rect x="1055" y="500" width="345" height="75" rx="7" fill="#E4EFFA" stroke="#2873AC" stroke-width="1.7"/>
+<text x="1227.500" y="531.090" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="24" font-weight="700" fill="#222B33">Decode + extract</text>
+<text x="1227.500" y="561.490" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">CPE: current batch</text>
+</g>
+<g id="Main candidates">
+<line x1="1055" y1="537" x2="909.0" y2="537.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="900,537 909.0,533.3 909.0,540.7" fill="#222B33"/>
+</g>
+<g id="Main candidate label">
+<text x="977.500" y="494.000" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="20" font-weight="400" fill="#4E5B64">Candidates</text>
+</g>
+<g id="Drop already resolved">
+<text x="977.500" y="572.000" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="20" font-weight="400" fill="#4E5B64">exclude H_r</text>
+</g>
+<g id="Cached decisions to queue">
+<line x1="215" y1="575" x2="215.0" y2="638.0" stroke="#AB691B" stroke-width="1.8" stroke-dasharray="5 4"/>
+<polygon points="215,647 211.3,638.0 218.7,638.0" fill="#AB691B"/>
+</g>
+<g id="Window decisions to queue / 0">
+<line x1="700" y1="575" x2="700" y2="622" stroke="#735396" stroke-width="1.8" stroke-dasharray="5 4"/>
+</g>
+<g id="Window decisions to queue / 1">
+<line x1="700" y1="622" x2="885" y2="622" stroke="#735396" stroke-width="1.8" stroke-dasharray="5 4"/>
+</g>
+<g id="Window decisions to queue / 2">
+<line x1="885" y1="622" x2="885.0" y2="638.0" stroke="#735396" stroke-width="1.8" stroke-dasharray="5 4"/>
+<polygon points="885,647 881.3,638.0 888.7,638.0" fill="#735396"/>
+</g>
+<g id="Decoded blocks to tail">
+<line x1="1228" y1="575" x2="1228.0" y2="638.0" stroke="#2873AC" stroke-width="1.8"/>
+<polygon points="1228,647 1224.3,638.0 1231.7,638.0" fill="#2873AC"/>
+</g>
+<g id="Append decoded label">
+<text x="1321.000" y="621.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Decoded B</text>
+</g>
+<g id="Queue label">
+<text x="20.000" y="635.350" text-anchor="start" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#222B33">Q_r: head</text>
+</g>
+<g id="Queue B_0">
+<rect x="60" y="651" width="290" height="75" rx="7" fill="#E1F2EA" stroke="#217957" stroke-width="1.7"/>
+<text x="205.000" y="681.480" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="24" font-weight="700" fill="#222B33">B_0</text>
+<text x="205.000" y="712.840" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="400" fill="#4E5B64">Ready</text>
+</g>
+<g id="Queue B_1">
+<rect x="400" y="651" width="290" height="75" rx="7" fill="#E1F2EA" stroke="#217957" stroke-width="1.7"/>
+<text x="545.000" y="681.480" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="24" font-weight="700" fill="#222B33">B_1</text>
+<text x="545.000" y="712.840" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="400" fill="#4E5B64">Ready</text>
+</g>
+<g id="Queue B_2">
+<rect x="740" y="651" width="290" height="75" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="885.000" y="681.480" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="24" font-weight="700" fill="#222B33">B_2</text>
+<text x="885.000" y="712.840" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="400" fill="#4E5B64">Pending</text>
+</g>
+<g id="Queue B_3">
+<rect x="1080" y="651" width="290" height="75" rx="7" fill="#F2F4F6" stroke="#737D86" stroke-width="1.7"/>
+<text x="1225.000" y="681.480" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="24" font-weight="700" fill="#222B33">B_3</text>
+<text x="1225.000" y="712.840" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="400" fill="#4E5B64">Ready, but blocked</text>
+</g>
+<g id="Queue order 350">
+<line x1="350" y1="688" x2="391.0" y2="688.0" stroke="#6F7B84" stroke-width="1.8"/>
+<polygon points="400,688 391.0,691.7 391.0,684.3" fill="#6F7B84"/>
+</g>
+<g id="Queue order 690">
+<line x1="690" y1="688" x2="731.0" y2="688.0" stroke="#6F7B84" stroke-width="1.8"/>
+<polygon points="740,688 731.0,691.7 731.0,684.3" fill="#6F7B84"/>
+</g>
+<g id="Queue order 1030">
+<line x1="1030" y1="688" x2="1071.0" y2="688.0" stroke="#6F7B84" stroke-width="1.8"/>
+<polygon points="1080,688 1071.0,691.7 1071.0,684.3" fill="#6F7B84"/>
+</g>
+<g id="Ready prefix / 0">
+<line x1="60" y1="735" x2="60" y2="742" stroke="#217957" stroke-width="1.8"/>
+</g>
+<g id="Ready prefix / 1">
+<line x1="60" y1="742" x2="690" y2="742" stroke="#217957" stroke-width="1.8"/>
+</g>
+<g id="Ready prefix / 2">
+<line x1="690" y1="742" x2="690" y2="735" stroke="#217957" stroke-width="1.8"/>
+</g>
+<g id="Ready prefix label">
+<text x="375.000" y="769.350" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#217957">Consecutive ready prefix</text>
+</g>
+<g id="Blocked suffix">
+<text x="1058.500" y="769.700" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="22" font-weight="400" fill="#AB691B">No block may pass the first unresolved block.</text>
+</g>
+<g id="Prefix to patch">
+<line x1="205" y1="744" x2="205.0" y2="779.0" stroke="#217957" stroke-width="1.8"/>
+<polygon points="205,788 201.3,779.0 208.7,779.0" fill="#217957"/>
+</g>
+<g id="Patch duplicate flags">
+<rect x="60" y="790" width="290" height="74" rx="7" fill="#FFF0DC" stroke="#AB691B" stroke-width="1.7"/>
+<text x="205.000" y="820.240" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">Patch duplicate flags</text>
+<text x="205.000" y="850.380" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">MPE: decoded records</text>
+</g>
+<g id="Patch to writer">
+<line x1="350" y1="827" x2="391.0" y2="827.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="400,827 391.0,830.7 391.0,823.3" fill="#222B33"/>
+</g>
+<g id="Compress ready prefix">
+<rect x="400" y="790" width="290" height="74" rx="7" fill="#E1F2EA" stroke="#217957" stroke-width="1.7"/>
+<text x="545.000" y="820.240" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">BAM write pipeline</text>
+<text x="545.000" y="850.380" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">CPE: BGZF compression</text>
+</g>
+<g id="Writer to sink">
+<line x1="690" y1="827" x2="731.0" y2="827.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="740,827 731.0,830.7 731.0,823.3" fill="#222B33"/>
+</g>
+<g id="Commit ready output">
+<rect x="740" y="790" width="290" height="74" rx="7" fill="#E1F2EA" stroke="#217957" stroke-width="1.7"/>
+<text x="885.000" y="820.240" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">Append rank body</text>
+<text x="885.000" y="850.380" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">After CPE completion</text>
+</g>
+<g id="Retire block storage">
+<line x1="1030" y1="827" x2="1071.0" y2="827.0" stroke="#222B33" stroke-width="1.8"/>
+<polygon points="1080,827 1071.0,830.7 1071.0,823.3" fill="#222B33"/>
+</g>
+<g id="Recycle storage">
+<rect x="1080" y="790" width="290" height="74" rx="7" fill="#F2F4F6" stroke="#737D86" stroke-width="1.7"/>
+<text x="1225.000" y="820.240" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="23" font-weight="700" fill="#222B33">Retire / recycle</text>
+<text x="1225.000" y="850.380" text-anchor="middle" font-family="Arial, Liberation Sans, sans-serif" font-size="21" font-weight="400" fill="#4E5B64">Decoded block storage</text>
+</g>
+</svg>
