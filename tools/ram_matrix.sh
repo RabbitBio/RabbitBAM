@@ -11,6 +11,7 @@ COLLATED=${4:?Name-collated BAM required}
 FIXMATE=${5:?Fixmate BAM required}
 SORTED=${6:?Coordinate-sorted fixmate BAM required}
 APP="$ROOT/bin/RabbitBAM-MPI"
+MARKDUP_APP=${BENCH_MARKDUP_APP:-$APP}
 COUNT="$ROOT/bin/swbam-sdk-optimized-count"
 COPY="$ROOT/bin/swbam-sdk-optimized-bam2bam"
 DATASET=${BENCH_DATASET:-D1}
@@ -28,7 +29,8 @@ case "$DATASET" in
     *) printf 'Unsupported dataset: %s\n' "$DATASET" >&2; exit 1 ;;
 esac
 STAGE=${BENCH_STAGE:-all}
-[[ "$STAGE" == all || ("$DATASET" == D2 && "$STAGE" == capacity) ]]
+[[ "$STAGE" == all || ("$DATASET" == D2 && "$STAGE" == capacity) ||
+   ("$DATASET" == D1 && "$STAGE" == markdup-workflow) ]]
 CURRENT=initialization
 CURRENT_JOB=
 [[ "$ROOT" = /* ]]
@@ -36,6 +38,7 @@ for input in "$INPUT" "$SAM" "$COLLATED" "$FIXMATE" "$SORTED"; do
     [[ "$input" = /* && -s "$input" ]] || exit 1
 done
 for binary in "$APP" "$COUNT" "$COPY"; do [[ -x "$binary" ]] || exit 1; done
+[[ "$MARKDUP_APP" = /* && -x "$MARKDUP_APP" ]]
 mkdir -p "$ROOT/logs" "$ROOT/out" "$ROOT/sessions"
 mkdir "$ROOT/driver.lock"
 trap 'rc=$?; if ((rc)); then printf "FAILED %s job=%s\n" "$CURRENT" "$CURRENT_JOB" > "$ROOT/state"; fi; rmdir "$ROOT/driver.lock"' EXIT
@@ -53,6 +56,15 @@ else
     printf 'sort_pool=%s sort_memory=%s collate_pool=%s collate_memory=%s baseline=%s wait_for=%s\n' \
         "$SORT_POOL" "$SORT_MEMORY" "$COLLATE_POOL" "$COLLATE_MEMORY" \
         "${BENCH_D2_BASELINE_ROOT:-none}" "${BENCH_WAIT_FOR:-none}" >> configuration.txt
+fi
+if [[ "$MARKDUP_APP" != "$APP" ]]; then
+    if [[ -s markdup.sha256 ]]; then
+        [[ $(awk '{print $2}' markdup.sha256) == "$MARKDUP_APP" ]]
+        sha256sum -c markdup.sha256
+    else
+        sha256sum "$MARKDUP_APP" > markdup.sha256
+        printf 'markdup_binary=%s stage=%s\n' "$MARKDUP_APP" "$STAGE" >> configuration.txt
+    fi
 fi
 
 metrics_from_log() {
@@ -195,6 +207,7 @@ if [[ -n ${BENCH_WAIT_FOR:-} ]]; then
 fi
 
 for repeat in 1 2 3; do
+    if [[ "$STAGE" == all ]]; then
     points=(1 2 4 6 12)
     if ((repeat == 2)); then points=(12 6 4 2 1); fi
     for ranks in "${points[@]}"; do
@@ -231,8 +244,11 @@ for repeat in 1 2 3; do
         -o "$ROOT/out/fixmate_r${repeat}.bam" -m "${common[@]}"
     run app sort "$repeat" 6 "$SORT_POOL" memory "$APP" sort -i "$FIXMATE" \
         -o "$ROOT/out/sort_r${repeat}.bam" -m "$SORT_MEMORY" "${common[@]}"
-    run app markdup "$repeat" 6 "$MARKDUP_POOL" markdup "$APP" markdup -i "$SORTED" \
+    fi
+    common=(--compress-level 1 --no-dump)
+    run app markdup "$repeat" 6 "$MARKDUP_POOL" markdup "$MARKDUP_APP" markdup -i "$SORTED" \
         -o "$ROOT/out/markdup_r${repeat}.bam" --stream -l 300 -m 8G "${common[@]}"
+    if [[ "$STAGE" == all ]]; then
     run app bam2sam "$repeat" 6 "$SAM_POOL" write "$APP" run_all -i "$INPUT" \
         -o "$ROOT/out/bam2sam_r${repeat}.sam" "${common[@]}"
     save=(--no-dump)
@@ -242,6 +258,7 @@ for repeat in 1 2 3; do
     if ((repeat == 1)); then
         [[ -s "$ROOT/out/sam2bam_r1.bam" ]]
         run validation sam2bam "$repeat" 6 "$VERIFY_POOL" sorted "$APP" stats --basic -i "$ROOT/out/sam2bam_r1.bam"
+    fi
     fi
 
     round="$ROOT/out/workflow_r${repeat}"
@@ -256,7 +273,7 @@ for repeat in 1 2 3; do
         -o "$round/fixmate.sorted.bam" -m "$SORT_MEMORY" --compress-level 1
     [[ -s "$round/fixmate.sorted.bam" ]]
     run validation workflow_sort "$repeat" 6 "$VERIFY_POOL" sorted "$APP" stats --basic -i "$round/fixmate.sorted.bam"
-    run workflow markdup "$repeat" 6 "$MARKDUP_POOL" markdup "$APP" markdup -i "$round/fixmate.sorted.bam" \
+    run workflow markdup "$repeat" 6 "$MARKDUP_POOL" markdup "$MARKDUP_APP" markdup -i "$round/fixmate.sorted.bam" \
         -o "$round/markdup.bam" --stream -l 300 -m 8G --compress-level 1
     [[ -s "$round/markdup.bam" ]]
     run validation workflow_markdup "$repeat" 6 "$VERIFY_POOL" duplicates "$APP" stats --basic -i "$round/markdup.bam"

@@ -35,7 +35,10 @@
         split($i, a, "=")
         if (a[1] == "peak" && a[2] > peak) peak = a[2]
         if (a[1] == "output_bytes" && a[2] > bytes) bytes = a[2]
-        if ((a[1] == "temp_read_bytes" || a[1] == "temp_write_bytes") && a[2] != 0) bad = 1
+        # Markdup's bounded deferred payload may spill into actual RAM files.
+        # Sort/collate still must remain in memory mode for this matrix.
+        if ((a[1] == "temp_read_bytes" || a[1] == "temp_write_bytes") &&
+            a[2] != 0 && check != "markdup") bad = 1
     }
 }
 /\[ram-prepare rank=/ {

@@ -79,6 +79,23 @@ class D2MatrixTest(unittest.TestCase):
         self.assertNotEqual(status, 0)
         self.assertEqual(len(files['commands.sh'].splitlines()), 1)
 
+    def test_markdup_ram_deferred_temp_data_allowed(self):
+        for label in ('probe_markdup_n6_r1', 'app_markdup_n6_r1',
+                      'workflow_markdup_n6_r1'):
+            with self.subTest(label=label):
+                status, files = self.run_matrix({'BAD_TEMP': label})
+                self.assertEqual(status, 0, files['diagnostic'])
+                self.assertEqual(files['state'], 'COMPLETE\n')
+                self.assertEqual(len(files['results.tsv'].splitlines()), 85)
+
+    def test_markdup_temp_data_does_not_bypass_output_validation(self):
+        status, files = self.run_matrix({
+            'BAD_TEMP': 'probe_markdup_n6_r1',
+            'BAD_DUPLICATES': 'probe_validation_markdup_n6_r1',
+        })
+        self.assertNotEqual(status, 0)
+        self.assertEqual(len(files['commands.sh'].splitlines()), 4)
+
     def test_wrong_duplicate_count_rejected(self):
         status, files = self.run_matrix({'BAD_DUPLICATES': 'probe_validation_markdup_n6_r1'})
         self.assertNotEqual(status, 0)
@@ -95,6 +112,16 @@ class D2MatrixTest(unittest.TestCase):
         self.assertEqual(status, 0, files['diagnostic'])
         self.assertEqual(len(files['commands.sh'].splitlines()), 84)
         self.assertEqual(len(files['results.tsv'].splitlines()), 85)
+
+    def test_separate_markdup_keeps_baseline_and_other_commands(self):
+        status, files = self.run_matrix({'BENCH_MARKDUP_APP': 'separate'})
+        self.assertEqual(status, 0, files['diagnostic'])
+        self.assertEqual(len(files['results.tsv'].splitlines()), 85)
+        commands = files['commands.sh'].splitlines()
+        self.assertEqual(sum('RabbitBAM-MPI-markdup markdup' in line for line in commands), 6)
+        self.assertIn('RabbitBAM-MPI markdup', commands[2])
+        self.assertEqual(sum('RabbitBAM-MPI sort' in line for line in commands), 7)
+        self.assertIn('RabbitBAM-MPI-markdup', files['markdup.sha256'])
 
 
 if __name__ == '__main__':

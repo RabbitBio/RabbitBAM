@@ -83,6 +83,11 @@ class MatrixTest(unittest.TestCase):
                 inputs.append(str(path))
             env = dict(os.environ, PATH=str(scheduler) + ':' + os.environ['PATH'])
             env.update(overrides)
+            if env.get('BENCH_MARKDUP_APP') == 'separate':
+                markdup = root / 'bin' / 'RabbitBAM-MPI-markdup'
+                markdup.write_text('#!/bin/sh\n# New markdup scheduler\nexit 0\n')
+                markdup.chmod(0o700)
+                env['BENCH_MARKDUP_APP'] = str(markdup)
             if dataset == 'D2':
                 baseline = base / 'prior_probe'
                 (baseline / 'logs').mkdir(parents=True)
@@ -120,12 +125,14 @@ class MatrixTest(unittest.TestCase):
                 log = root / 'logs' / (label + '.log')
                 log.write_text(log.read_text().replace('ERROR: mock capacity failure\n', ''))
                 env.pop('FAIL_LABEL')
+                if env.pop('CHANGE_MARKDUP_BINARY', False):
+                    markdup.write_text('#!/bin/sh\n# Changed after freezing\nexit 0\n')
                 env['BENCH_RESUME'] = '1'
                 result = subprocess.run(command, env=env, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
             files = {name: (root / name).read_text() if (root / name).exists() else ''
                      for name in ('state', 'commands.sh', 'results.tsv', 'workflows.tsv', 'workflow_summary.txt',
-                                  'capacity_gate.txt', 'prior_probes.tsv')}
+                                  'capacity_gate.txt', 'prior_probes.tsv', 'markdup.sha256')}
             files['diagnostic'] = result.stdout + result.stderr
             return result.returncode, files
 
@@ -207,6 +214,31 @@ class MatrixTest(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(len(files['commands.sh'].splitlines()), 74)
         self.assertEqual(len(files['results.tsv'].splitlines()), 75)
+
+    def test_markdup_and_workflow_only_scope(self):
+        status, files = self.run_matrix({'BENCH_STAGE': 'markdup-workflow',
+                                         'BENCH_MARKDUP_APP': 'separate'})
+        self.assertEqual(status, 0, files['diagnostic'])
+        rows = [line.split('\t') for line in files['results.tsv'].splitlines()[1:]]
+        self.assertEqual(len(rows), 21)
+        self.assertEqual(sum(row[0] == 'app' for row in rows), 3)
+        self.assertTrue(all(row[1] == 'markdup' for row in rows if row[0] == 'app'))
+        self.assertEqual(sum(row[0] == 'workflow' for row in rows), 12)
+        self.assertEqual(sum(row[0] == 'validation' for row in rows), 6)
+        commands = files['commands.sh'].splitlines()
+        self.assertEqual(sum('RabbitBAM-MPI-markdup markdup' in line for line in commands), 6)
+        self.assertEqual(sum('RabbitBAM-MPI collate' in line for line in commands), 3)
+        self.assertEqual(files['state'], 'COMPLETE\n')
+        self.assertIn('RabbitBAM-MPI-markdup', files['markdup.sha256'])
+        self.assertIn('workflow_processing_median_s=52.000000', files['workflow_summary.txt'])
+
+    def test_markdup_version_change_rejected_on_resume(self):
+        status, files = self.run_matrix({'BENCH_MARKDUP_APP': 'separate',
+                                         'FAIL_LABEL': 'sdk_count_n1_r1',
+                                         'RECOVER': True, 'CHANGE_MARKDUP_BINARY': '1'})
+        self.assertNotEqual(status, 0)
+        self.assertEqual(len(files['commands.sh'].splitlines()), 1)
+        self.assertIn('FAILED', files['diagnostic'])
 
 
 if __name__ == '__main__':

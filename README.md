@@ -158,7 +158,7 @@ bsub.py swls -q q_share -I -b -J swbam_check \
 | 示例 | 库入口与行为 |
 | --- | --- |
 | [sdk_optimized_count.cpp](swbam-sdk/examples/sdk_optimized_count.cpp) | `RunRecordCountPipeline`：CPE 解压、解析为可复用 `bam1_t` 并计数，不执行完整 flagstat |
-| [sdk_optimized_bam2bam.cpp](swbam-sdk/examples/sdk_optimized_bam2bam.cpp) | `RunBamTransformPipeline`：BAM read → 打包 → BAM write，压缩 body 写入 memory sink |
+| [sdk_optimized_bam2bam.cpp](swbam-sdk/examples/sdk_optimized_bam2bam.cpp) | `RunBamTransformPipeline`：BAM read → 打包 → BAM write，压缩 body 写入 rank body sink；磁盘默认 spool，RAM 模式使用分页 RAM 文件 |
 
 命令体分别是 `./swbam-sdk-optimized-count input.bam` 和
 `./swbam-sdk-optimized-bam2bam input.bam -o output.bam`。后者生成可解析的完整 BAM。
@@ -172,6 +172,8 @@ bsub.py swls -q q_share -I -b -J swbam_check \
   `--no-dump` 只跳过 RAM 模式最终保存，不省略完整输出的构建。
 - `[swbam-e2e rank=...]` 从 MPI_Init 前计到 MPI_Finalize 后，取 rank 最大值；
   包含 MPI/athread、算法、RAM 临时与输出 I/O、正常清理，不扣时间。
+  `[swbam-processing rank=...]` 从 MPI_Init 返回后计到 MPI_Finalize 调用前，
+  包含正常处理与清理，排除 MPI 初始化和退出；两种区间分别取 rank 最大值。
   历史 `core`、`4.3`、`4.1~4.6` 仍是诊断/历史口径，不是该新端到端成绩。
 - Standalone 命令提供 `--io-backend memory|posix|mpiio|auto`，输出可选
   `--io-output-backend memory|mpiio`；具体支持范围以命令帮助为准。
@@ -181,15 +183,17 @@ bsub.py swls -q q_share -I -b -J swbam_check \
   计算期间不回退读盘。这些是磁盘模式的输入缓存选项，不与 `--storage ram` 混用；
   缓存准备在 MPI 内发生，计入端到端耗时，不再扣减。
   大数据转换建议使用 `--io-output-backend mpiio`，避免最终 root 全量 gather。
-  磁盘模式转换最多为本地 body 预分配 64 MiB，再按实际输出扩容；完整
-  rank body 仍需驻留，不能将分片输入等同于有界内存输出。
+  rank body 默认分批写入 spool；显式选择 memory body 时，完整 body 仍需驻留，
+  不能将分片输入等同于有界内存输出。
 - `--rank-body-backend memory|spool|auto` 控制 rank 本地输出缓存；其临时目录
   由 `--rank-body-temp-dir` 指定，与 sort/collate 的 `-T` 外排临时文件独立。
 - standalone fixmate 使用内存输入及显式 memory body 时，初始输出容量预留为
   本 rank 压缩输入的两倍，避免增加 mate 标签后第一次扩容同时持有旧、新输出。
   预留仍计入 4.2 初始化，未改变算法；输出超过预留时仍沿用原扩容行为。
-- RAM 输出复用 rank body 的存储页，保留 header、完整 body 和 EOF，不创建模拟副本
-  或聚集整份输出到 root。sort/collate 外排临时数据实际存进同一个 RAM 池。
+- RAM 和磁盘最终输出均完整读取 rank body，再按全局偏移写入最终文件，保留
+  header、完整 body 和 EOF；每次至多使用 8 MiB 工作缓冲，消费后回收源存储，
+  不聚集整份输出到 root，也不以页引用代替最终读写。
+  sort/collate 外排及边界/延后缓存的临时数据在 RAM 模式中实际存进同一个 RAM 池。
 - **要求单条 BAM record 不跨 BGZF block**。一般来源的 BAM 不保证满足此条件；
   `io-check` 可检查小输入是否满足当前解析契约，不负责自动重分块。
 - BAM record 长度、批容量和 CPE scratch 有边界限制；不能将流式输入等同于支持

@@ -92,7 +92,12 @@ app 不依赖库源码目录；MPI、athread 和神威工具链仍由部署环�
 - pipeline 统一记录 `read`、`kernel`、`post_process` 和 `total`。
 - operator 可细分 kernel 内的 decode/parse/business 时间，但不得重复计入 total。
 - MPI scan/partition、跨 rank reduce 和最终打印由 command 单独计时。
-- memory backend 的文件预加载和最终 dump 不计入算法核心时间。
+- `[swbam-e2e]` 为 MPI_Init 前到 MPI_Finalize 后的真实区间；
+  `[swbam-processing]` 为 Init 返回后到 Finalize 调用前的完整处理区间。
+  两种区间分别取 rank 最大值，不扣临时 I/O，也不累加阶段最大值代替实测。
+- `--storage ram` 的池准备、输入预加载及 MPI 后保存在上述区间外；
+  磁盘模式下的输入缓存准备和输出读写发生在 MPI 内，计入相应区间。
+  历史算法核心时间仅保留为诊断，不能改名为完整处理成绩。
 
 ### Rank-local 内存输入
 
@@ -107,17 +112,20 @@ backend 的 `size()`、`body_offset()`、header 和 `BgzfBlockSpan::offset` 仍�
 缓存由 `MpiBamInput` 管理，直到 `Close()` 有效；适配器借用缓存构造原有
 `MemReader`，不额外复制本 rank 的整个输入。该输入 slice 本身不是完整 BAM。
 
-计时仍采用模拟 SSD 口径：`simulation_prepare_cost()` 为 root 扫描时的物理
-`pread` 时间（所有 rank 同样扣除）加各 rank 预加载阶段的 allocation/load/wait。
-4.1 与 `444Complete the total body cost` 仅扣除此值；扫描解析、索引分配、
-分区/广播、内存批次读取和正常算法计算保留。日志输出每 rank 的 offset/bytes/
-blocks 和 excluded_prepare_s；实际 load 在 4.1 内发生，因此新的 222 汇总行
-在计划准备完成后输出，不能将整段 4.1 当作排除时间。
+`--io-backend rank-memory` 是磁盘模式的输入缓存策略。上述扫描、分区、
+预加载及等待发生在 MPI 区间内，全部计入完整处理；`cache_prepare_cost()`
+只作诊断，不再减去准备成本。
+
+显式 `--storage ram` 使用私有 `benchmark-support` 在 MPI_Init 前预触碰池、
+装载本 rank 输入并同步就绪。MPI 内通过非拥有式 `MpiBamInput::Attach` 接入
+驻留后端，重新完成 header 解析、扫描及分区；借用后端必须活到处理结束。
+最终完整输出读写计入 MPI 区间，物理保存发生在 MPI_Finalize 后。
+RAM 模式不与旧 I/O backend 覆盖选项混用。
 
 四步 standalone 命令、`run_all` 的 BAM 输入及 `dedup-workflow` 使用同一适配器；flagstat/stats 可用于
 大文件重读验证。旧 `memory`、POSIX、MPI-IO、全内存 `dedup-pipeline` 与 SDK
-示例不改变行为。算法 workspace、交换缓冲、rank 输出 body 和模拟输出复制仍
-另占内存；该缓存方式不保证 D3 能进行内排，D3 仍需按容量预算使用外排。
+示例复用相同库入口。算法 workspace、交换缓冲和完整 rank 输出仍占用内存/存储；
+分页 RAM 池与算法工作预算分别管理，不能将分片输入等同于所有算法都可内排。
 
 `run_all --io-backend rank-memory` 同时支持 BAM→BAM/filter、BAM→SAM、SAM→BAM。
 BAM 的本地 reader 与完整输入 header 指针分离：分片数据通过 `memory_range()`
@@ -127,15 +135,14 @@ BAM 的本地 reader 与完整输入 header 指针分离：分片数据通过 `m
 SAM 输入限未压缩 `.sam` 文件。root 通过现有 `PosixSamInput::SplitRanges()`
 将字节边界前进到完整行起点并广播；每 rank 只将所属区间读入
 `rank_sam_storage`，再交给原 SAM read 流水线。新增可选的物理读盘计时，不改变
-旧 POSIX/MPI-IO 行划分规则。新模式在 4.1/444 中排除 root 边界查找的真实读盘
-和本 rank allocation/load/wait，但保留完整行边界解析、分区、广播及内存读取。
+旧 POSIX/MPI-IO 行划分规则。磁盘模式的边界查找、分区、预加载和等待均计入
+完整处理。RAM 模式将物理预加载放到 MPI 前，MPI 内仍执行正常完整行划分。
 所有 rank 先一致校验区间，再进入预加载完成归约；单 rank 读取失败一致退出。
 
-新模式的 BAM→SAM 将 initial writer capacity 限制为最多 64 MiB，不再按压缩
-分片大小一次预分配五倍。后续输出按原 memory sink 扩容规则增长，扩容及数据搬移
-仍在正常核心计时内。本轮没有引入 discard/bounded sink；大 SAM 输出的完整 rank
-body、扩容瞬时峰值和 4.6 模拟复制仍需容量探测。MPI-IO 最终 dump 可避免 root
-全量收集，但不能减少核心阶段的这些内存需求。
+默认磁盘 rank body 分批写入 spool，RAM 模式写入分页 RAM 文件。
+最终统一按全局偏移执行完整读取/写入，至多使用 8 MiB 工作缓冲，消费后回收源存储；
+不创建额外模拟副本或将完整输出聚集到 root。显式 memory body 仍可能整体扩容，
+完整 SAM 输出也仍需足够的 RAM 存储容量。
 
 ## Operator 组合原则
 
@@ -322,8 +329,8 @@ Prepare -> spawn compress(current)
 
 外排预算现在覆盖两套 compressed、两套 decoded batch 和提取 metadata；约增加
 8 MiB/rank 的读 workspace 会从 run arena 可用预算扣除。写端仍为两套 payload 加
-两套压缩结果。外排模拟时间沿用实际临时 I/O 扣除与压缩周期估算模型；`source`、
-`kernel`、`post_process` 有重叠，不能相加当作核心 wall time。
+两套压缩结果。外排计入所选存储后端的实际临时读写，不再扣时或用模拟复制替代。
+`source`、`kernel`、`post_process` 有重叠，不能相加当作核心 wall time。
 
 迁移验证见 [sort 流水线迁移验证](results/sort_流水线迁移验证.md)。
 
@@ -371,9 +378,9 @@ rank body 重叠驻留。工作集峰值仍按释放前统计。ring exchange �
 flush/fill，不能把它与 `compress_fill`、`write` 相加。`extract_alloc` 统计算子
 metadata 池；`extract_free` 还包含内排 exchange 后原始 records/raw 的提前释放。
 公共 batch 的分配释放仍包含在核心总时间内。
-外排保留 `actual - temp_read_actual - temp_write_actual` 的模拟时间模型，模拟
-memcpy 已在 actual 内，不能重复相加。旧 `accounted/unaccounted` 分项未统一扣除
-真实临时 I/O，外排会出现负 unaccounted，不能将其解释为漏计的 CPU 时间。
+外排 `t_optimized = t_actual`，包含所选后端的实际临时读写；RAM 模式实际保存全部
+临时数据，不自动落盘。`temp_*_actual` 字段仅为分项诊断，不用于扣减总时间。
+旧 `accounted/unaccounted` 不能代替独立测量的 MPI 区间或完整处理区间。
 
 迁移验证见 [collate 流水线迁移验证](results/collate_流水线迁移验证.md)。
 
@@ -434,7 +441,7 @@ MdInputPass (MemReader / backend spans)
      -> passthrough decode/parse
      -> app candidate extract CPE / candidate merge
   -> app owner exchange / sliding window / boundary halo
-  -> app decoded-block pending ring / final decisions / flag patch
+  -> app decoded-block waiting/ready queues / final decisions / flag patch
   -> CpeWritePipelineSession + MdOnePassCompressOperator
      -> 原 payload compress CPE -> MdOnePassOutput -> RankBodySink
 ```

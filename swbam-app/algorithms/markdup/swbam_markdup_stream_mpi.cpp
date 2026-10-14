@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <vector>
@@ -730,6 +732,47 @@ static int MdStreamingWindowProcessImpl(
     }
     window->carry.swap(window->next_carry);
     window->carry_qnames.swap(window->next_qnames);
+    static const bool pending_diagnostics = []() {
+        const char *value = getenv("SWBAM_MARKDUP_PENDING_DIAG");
+        return value && strcmp(value, "1") == 0;
+    }();
+    if (pending_diagnostics && optimistic &&
+        (stats->group_count == 1 || stats->group_count % 256 == 0)) {
+        const MpiMarkdupCandidateShared *first = nullptr;
+        size_t local_pending = 0, remote_pending = 0;
+        for (const auto &candidate : window->carry) {
+            if (!MdIsDecisionCandidate(candidate)) continue;
+            if (candidate.source_rank != optimistic_local_rank) {
+                ++remote_pending;
+                continue;
+            }
+            ++local_pending;
+            if (!first || candidate.ordinal < first->ordinal) first = &candidate;
+        }
+        fprintf(stderr, "[md-window rank=%d] batch=%lld progress=%d:%d "
+                "carry=%zu local_pending=%zu remote_pending=%zu "
+                "boundary_first=%d:%lld boundary_last=%d:%lld\n",
+                optimistic_local_rank, stats->group_count, progress_tid, progress_pos,
+                window->carry.size(), local_pending, remote_pending,
+                window->first_ref, (long long)window->first_coord,
+                window->last_ref, (long long)window->last_coord);
+        if (first) {
+            const char *reason = MdWindowBoundaryKey(window, first->key) ? "boundary" :
+                (first->key.this_ref > progress_tid + 1 ? "future-ref" : "window");
+            fprintf(stderr, "[md-window-first rank=%d] batch=%lld ordinal=%llu "
+                    "global_block=%llu record=%u key=%d:%lld other=%d:%lld "
+                    "single=%u leftmost=%u orientation=%u reason=%s\n",
+                    optimistic_local_rank, stats->group_count,
+                    (unsigned long long)first->ordinal,
+                    (unsigned long long)(first->global_order >> 32),
+                    (unsigned)(first->global_order & 0xffffffffu),
+                    first->key.this_ref, (long long)first->key.this_coord,
+                    first->key.other_ref, (long long)first->key.other_coord,
+                    (unsigned)first->key.single, (unsigned)first->key.leftmost,
+                    (unsigned)first->key.orientation, reason);
+        }
+        fflush(stderr);
+    }
     const double finalize_dt = GetTime() - finalize_t0;
     stats->t_flat_finalize += finalize_dt;
     stats->t_group_scan += finalize_dt;
