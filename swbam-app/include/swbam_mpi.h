@@ -324,6 +324,10 @@ int MpiMarkdupStreamingWindowFinalizeOptimistic(
     MpiMarkdupLocalDecisionFn apply_local, void *local_opaque,
     std::vector<std::vector<MpiMarkdupDecisionShared> >
         *remote_decisions_by_source);
+int MpiMarkdupStreamingWindowReleaseBoundaryOptimistic(
+    MpiMarkdupStreamingWindow *window, bool first, bool last, int local_rank,
+    MpiMarkdupLocalDecisionFn apply_local, void *local_opaque,
+    std::vector<std::vector<MpiMarkdupDecisionShared> > *remote_decisions_by_source);
 size_t MpiMarkdupStreamingWindowMemory(
     const MpiMarkdupStreamingWindow *window);
 

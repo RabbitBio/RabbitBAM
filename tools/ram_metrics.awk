@@ -36,9 +36,10 @@
         if (a[1] == "peak" && a[2] > peak) peak = a[2]
         if (a[1] == "output_bytes" && a[2] > bytes) bytes = a[2]
         # Markdup's bounded deferred payload may spill into actual RAM files.
-        # Sort/collate still must remain in memory mode for this matrix.
+        # The ordinary matrix forbids sort/collate temps; the external driver
+        # validates its runs and actual RAM temp traffic separately.
         if ((a[1] == "temp_read_bytes" || a[1] == "temp_write_bytes") &&
-            a[2] != 0 && check != "markdup") bad = 1
+            a[2] != 0 && check != "markdup" && check != "external") bad = 1
     }
 }
 /\[ram-prepare rank=/ {
@@ -74,6 +75,7 @@ END {
     if (check == "memory" && (!memory || bytes <= 0)) exit 1
     if (check == "markdup" && (!have_marked || bytes <= 0)) exit 1
     if (check == "write" && bytes <= 0) exit 1
+    if (check == "external" && bytes <= 0) exit 1
     if ((check == "sorted" || check == "duplicates") && !sorted) exit 1
     if (check == "duplicates" && !have_dup) exit 1
     printf "%.6f\t%.6f\t%.6f\t%.0f\t%.0f\t%.6f", e, core, prepare, peak, bytes, processing

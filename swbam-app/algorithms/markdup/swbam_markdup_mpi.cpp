@@ -1,4 +1,6 @@
 #include "swbam_mpi.h"
+#include "markdup-pending-index.h"
+#include "markdup-boundary-progress.h"
 #include "bounded-cache.h"
 #include "ordered-body.h"
 #include "swbam/mpi_runtime.h"
@@ -4850,6 +4852,12 @@ struct MdOnePassContext {
     std::vector<unsigned char> owner_qnames;
     std::vector<std::vector<MpiMarkdupDecisionShared> > decisions_by_source;
     std::list<MdOnePassPendingBatch> pending;
+    bool use_pending_index = false;
+    size_t pending_index_peak = 0;
+    swbam_markdup::PendingIndex<MdOnePassPendingBatch> pending_index;
+    std::vector<long long> boundary_progress;
+    bool release_first_boundary = false;
+    bool release_last_boundary = false;
     std::map<uint64_t, MdOnePassReadyBlock> ready;
     std::vector<MdOnePassReadyBlock> dirty_blocks;
     swbam_usage::OrderedBody *ordered_body = nullptr;
@@ -4926,11 +4934,12 @@ static void MdOnePassCleanup(MdOnePassContext *context) {
         fflush(stderr);
     }
     fprintf(stderr, "[md-scheduler rank=%d] catchup_batches=%zu reordered=%d raw_spills=%zu "
-            "raw_write_bytes=%llu raw_read_bytes=%llu\n",
+            "raw_write_bytes=%llu raw_read_bytes=%llu lookup=%s index_peak=%zu\n",
             context->rank, context->catchup_batches, (int)context->reordered,
             context->spilled_batches,
             (unsigned long long)context->diagnostic_spill_bytes,
-            (unsigned long long)context->diagnostic_reload_bytes);
+            (unsigned long long)context->diagnostic_reload_bytes,
+            context->use_pending_index ? "indexed" : "linear", context->pending_index_peak);
     // Session destruction joins an in-flight CPE before any borrowed arena dies.
     context->write_session.reset();
     context->compression_running = 0;
@@ -4938,6 +4947,7 @@ static void MdOnePassCleanup(MdOnePassContext *context) {
         MpiMarkdupStreamingWindowDestroy(context->window);
         context->window = nullptr;
     }
+    context->pending_index.Clear();
     context->pending.clear();
     for (size_t i = 0; i < context->free_block_sets.size(); ++i) {
         MdFreeBlockSet(&context->free_block_sets[i]);
@@ -5108,6 +5118,27 @@ static int MdOnePassFindRecord(
         MdOnePassContext *context, uint64_t ordinal,
         MdOnePassPendingBatch **batch_out,
         MdOnePassBlockInfo **info_out, uint8_t **state_out) {
+    if (context->use_pending_index) {
+        MdOnePassPendingBatch *batch = context->pending_index.Find(ordinal);
+        if (!batch) return -1;
+        auto info = std::upper_bound(batch->infos.begin(), batch->infos.end(), ordinal,
+            [](uint64_t value, const MdOnePassBlockInfo &block) {
+                return value < block.ordinal_base;
+            });
+        if (info == batch->infos.begin()) return -1;
+        --info;
+        if (ordinal - info->ordinal_base >= (uint64_t)info->n_records) return -1;
+        if (info->phase != MdOnePassBlockInfo::Waiting) {
+            fprintf(stderr, "[rank %d] ERROR: late markdup decision for sealed block=%llu.\n",
+                    context->rank, (unsigned long long)info->block_order);
+            return -1;
+        }
+        *batch_out = batch;
+        *info_out = &*info;
+        *state_out = &batch->states[(size_t)(ordinal - batch->ordinal_base)];
+        MdOnePassTouchBlock(context, batch, &*info);
+        return 0;
+    }
     for (std::list<MdOnePassPendingBatch>::iterator it =
              context->pending.begin();
          it != context->pending.end(); ++it) {
@@ -5281,9 +5312,16 @@ static int MdOnePassCaptureBatch(
         if (n > SIZE_MAX - metadata) return -1;
         metadata += n;
     }
+    if (context->use_pending_index) {
+        const size_t index_bytes = context->pending_index.memory_bytes();
+        if (index_bytes > SIZE_MAX - metadata) return -1;
+        metadata += index_bytes;
+    }
     const size_t next_metadata = sizeof(MdOnePassPendingBatch) +
         (size_t)view->n_blocks * (sizeof(MdOnePassBlockInfo) + sizeof(bam_block)) +
-        (size_t)(view->ordinal_end - view->ordinal_base);
+        (size_t)(view->ordinal_end - view->ordinal_base) +
+        (context->use_pending_index
+            ? swbam_markdup::PendingIndex<MdOnePassPendingBatch>::EntryBytes() : 0);
     if (context->memory_limit && (metadata > context->memory_limit / 4 ||
         next_metadata > context->memory_limit / 4 - metadata)) {
         fprintf(stderr, "[rank %d] ERROR: markdup deferred decision metadata exceeds work budget.\n", context->rank);
@@ -5334,6 +5372,15 @@ static int MdOnePassCaptureBatch(
         ordinal += (uint64_t)info.n_records;
     }
     if (ordinal != view->ordinal_end) return -1;
+    if (context->use_pending_index) {
+        try {
+            if (!context->pending_index.Insert(&batch)) return -1;
+            context->pending_index_peak = std::max(context->pending_index_peak,
+                                                   context->pending_index.size());
+        } catch (const std::bad_alloc &) {
+            return -1;
+        }
+    }
     context->captured_blocks += view->n_blocks;
     context->captured_records += view->ordinal_end - view->ordinal_base;
 
@@ -5431,7 +5478,7 @@ static int MdOnePassPendingBytes(MdOnePassContext *context,
     const size_t queue_bytes = context->ready.size() *
         (sizeof(std::pair<const uint64_t, MdOnePassReadyBlock>) + 4 * sizeof(void *)) +
         context->dirty_blocks.capacity() * sizeof(MdOnePassReadyBlock) +
-        context->ordered_body->memory_bytes();
+        context->ordered_body->memory_bytes() + context->pending_index.memory_bytes();
     if (queue_bytes > SIZE_MAX - total) return -1;
     total += queue_bytes;
     const size_t pool_block_bytes =
@@ -5629,8 +5676,10 @@ static int MdOnePassFinishOutput(MdOnePassContext *context) {
     }
     context->prepared_inputs.clear();
     context->prepared_outputs = 0;
-    context->pending.remove_if([](const MdOnePassPendingBatch &batch) {
-        return batch.remaining == 0;
+    context->pending.remove_if([context](const MdOnePassPendingBatch &batch) {
+        if (batch.remaining != 0) return false;
+        if (context->use_pending_index) context->pending_index.Erase(&batch);
+        return true;
     });
     return 0;
 }
@@ -5756,6 +5805,7 @@ static int MdOnePassInitWindow(MdOnePassContext *context) {
     }
     const bool have_boundary_plan =
         context->boundary_plan && context->boundary_plan->enabled;
+    context->use_pending_index = !have_boundary_plan;
     if (have_boundary_plan) {
         context->boundaries = context->boundary_plan->boundaries;
     } else if (MdBuildFirstCoordBoundaries(
@@ -5782,6 +5832,33 @@ static int MdOnePassInitWindow(MdOnePassContext *context) {
         have_boundary_plan ? -1 : *context->range_first_pos,
         window_last_tid, window_last_pos);
     return context->window ? 0 : -1;
+}
+
+static int MdOnePassGatherBoundaryProgress(MdOnePassContext *context, int local_ok,
+                                          bool active, int tid, int pos) {
+    const long long local[4] = {local_ok, active ? 1ll : 0ll,
+                               (long long)tid + 1, (long long)pos + 1};
+    context->boundary_progress.resize((size_t)context->comm_size * 4);
+    const double t0 = GetTime();
+    const int ret = MPI_Allgather(local, 4, MPI_LONG_LONG,
+        context->boundary_progress.data(), 4, MPI_LONG_LONG, MPI_COMM_WORLD);
+    context->stats->t_rank_sync += GetTime() - t0;
+    if (ret != MPI_SUCCESS) return 0;
+    for (int r = 0; r < context->comm_size; ++r)
+        if (!context->boundary_progress[(size_t)r * 4]) return 0;
+    const MdCoordBoundary &first = context->boundaries[(size_t)context->rank];
+    context->release_first_boundary = swbam_markdup::BoundaryIsComplete(
+        first.first_ref, first.first_coord, context->max_read_length,
+        context->boundaries, context->boundary_progress);
+    for (int r = context->rank + 1; r < context->comm_size; ++r) {
+        const MdCoordBoundary &last = context->boundaries[(size_t)r];
+        if (!last.has_records) continue;
+        context->release_last_boundary = swbam_markdup::BoundaryIsComplete(
+            last.first_ref, last.first_coord, context->max_read_length,
+            context->boundaries, context->boundary_progress);
+        break;
+    }
+    return 1;
 }
 
 static int MdPostProcessOnePassBatch(
@@ -5823,7 +5900,12 @@ static int MdPostProcessOnePassBatch(
     local_ok = MdOnePassCaptureBatch(
         context, batch, *local_candidates) == 0;
     context->stats->t_stream_buffer += GetTime() - buffer_t0;
-    if (!MdAllRanksOk(local_ok)) {
+    // Replace this existing status collective only on fallback. Exchange and
+    // process the current candidates before applying the certified watermark.
+    const int capture_ok = context->use_pending_index
+        ? MdOnePassGatherBoundaryProgress(context, local_ok, batch != nullptr, progress_tid, progress_pos)
+        : MdAllRanksOk(local_ok);
+    if (!capture_ok) {
         MdOnePassFinishOutput(context);
         return -1;
     }
@@ -5876,6 +5958,13 @@ static int MdPostProcessOnePassBatch(
         context->owner_qnames, progress_tid, progress_pos, context->rank,
         MdOnePassApplyLocalAction, context,
         &context->decisions_by_source, context->stats) == 0;
+    if (local_ok && context->use_pending_index) {
+        const double t0 = GetTime();
+        local_ok = MpiMarkdupStreamingWindowReleaseBoundaryOptimistic(
+            context->window, context->release_first_boundary, context->release_last_boundary,
+            context->rank, MdOnePassApplyLocalAction, context, &context->decisions_by_source) == 0;
+        context->stats->t_stream_finalize += GetTime() - t0;
+    }
     if (!local_ok) {
         fprintf(stderr,
                 "[rank %d] ERROR: one-pass optimistic window failed "
@@ -5917,10 +6006,10 @@ static int MdPostProcessOnePassBatch(
     const size_t output_workspace_bytes =
         (size_t)3 * kMarkdupNB *
         (sizeof(bam_block) + BGZF_MAX_BLOCK_SIZE);
-    size_t boundary_plan_bytes = 0;
+    size_t boundary_plan_bytes = context->boundary_progress.capacity() * sizeof(long long);
     if (context->boundary_plan && context->boundary_plan->enabled) {
         const MdOnePassBoundaryPlan &plan = *context->boundary_plan;
-        boundary_plan_bytes =
+        boundary_plan_bytes +=
             plan.candidates.bucket_count() * sizeof(void *) +
             plan.decisions.bucket_count() * sizeof(void *) +
             plan.candidates.size() *

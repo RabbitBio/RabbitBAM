@@ -66,7 +66,7 @@ extern "C" void slave_mpi_fixmate_plan(MpiFixmatePlanPara paras[64]) {
             plan->core.mpos = -1;
             plan->core.isize = 0;
             plan->core.flag &=
-                (uint16_t)~(BAM_FMREVERSE | BAM_FPROPER_PAIR);
+                (uint16_t)~(BAM_FPAIRED | BAM_FMREVERSE | BAM_FPROPER_PAIR);
             para->singleton_groups++;
         } else if (cur >= 0) {
             para->paired_groups++;

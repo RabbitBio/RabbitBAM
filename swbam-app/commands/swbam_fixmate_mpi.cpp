@@ -663,7 +663,7 @@ static int FmProcessSpooledGroup(FmStoredGroup *group, int level,
         if (!paired) {
             first_plan.core.mtid = -1; first_plan.core.mpos = -1;
             first_plan.core.isize = 0;
-            first_plan.core.flag &= (uint16_t)~(BAM_FMREVERSE | BAM_FPROPER_PAIR);
+            first_plan.core.flag &= (uint16_t)~(BAM_FPAIRED | BAM_FMREVERSE | BAM_FPROPER_PAIR);
             ++stats->singleton_groups;
         } else ++stats->paired_groups;
         bam1_t *mates[2] = {&first, &last};
