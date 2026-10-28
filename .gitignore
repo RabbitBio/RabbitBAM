@@ -10,6 +10,10 @@ performance_test/
 # Resources directory
 resources/
 
+# Auxiliary manuscript material
+/overleaf/others/
+/overleaf/SWBAM/figs/
+
 # Common build artifacts
 build*/
 CMakeFiles/
