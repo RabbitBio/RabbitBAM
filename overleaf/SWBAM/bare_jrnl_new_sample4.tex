@@ -140,15 +140,19 @@ Timings and data sizes are schematic.}
 \subsubsection{BAM/SAM input and output}
 %总结+分布式输入 → 分布式输出 √
 SWBAM provides reusable BAM/SAM I/O components so that applications do not need to implement data access separately.
-The same processing pipelines support different I/O methods.
-SWBAM partitions BAM input into contiguous BGZF block ranges for rank-local access.
-The root rank scans the data region using an 8-MiB buffer, records each block's file offset and compressed size, and broadcasts the ordered index to all ranks.
+Applications can use the same processing pipelines with different I/O methods.
+For BAM input, SWBAM divides BGZF blocks into contiguous ranges and assigns each range to an MPI rank.
+The root rank scans the data region and builds an ordered index of block offsets and compressed sizes.
+It reads compressed data into an 8-MiB buffer and examines successive BGZF headers in memory, reducing small file reads during block-boundary detection.
+The root rank then broadcasts the index to all ranks.
 The blocks are divided into contiguous ranges with approximately equal block counts.
 During processing, each rank reads only its assigned blocks through POSIX or MPI-IO.
-For each contiguous batch, the POSIX backend uses \texttt{preadv} to read data directly into individual block buffers, while the MPI-IO backend uses a derived datatype to place data in the same buffers.
-Both paths avoid an intermediate buffer copy before pipeline execution.
-SWBAM partitions uncompressed SAM input into line-aligned text ranges to preserve complete records across ranks.
-After identifying the end of the header, it divides the body into approximately equal byte ranges and adjusts the boundaries to line ends.
+Within each contiguous batch, the BGZF blocks are read directly into separate destination buffers for CPE processing.
+The POSIX path uses \texttt{preadv} to read a contiguous file region into a list of buffers.
+The MPI-IO path uses a derived datatype to place each block in its corresponding destination buffer.
+Both paths avoid an intermediate buffer and the subsequent copy of individual blocks.
+For SAM input, SWBAM divides the text after the header into approximately equal byte ranges.
+It adjusts partition boundaries to line ends so that each record remains intact within a single rank.
 Each rank reads its assigned range through POSIX or MPI-IO.
 
 SWBAM writes distributed output in two stages because each rank produces a different amount of data.
@@ -163,161 +167,235 @@ The SAM output consists of one text header followed by the rank-local text bodie
 File-backed staging allows SWBAM to handle outputs larger than the available staging memory without keeping the entire output in memory.
 
 \subsubsection{Batch-based MPE-CPE pipelines}
-%为什么以batch为核心 -> 介绍4条流水线 -> 介绍每一条流水线 -> 介绍双缓冲优化
-SWBAM adopts batch-based MPE-CPE pipelines to reduce fine-grained scheduling and synchronization overhead and to improve CPE utilization. Launching CPE tasks at the granularity of individual BAM or SAM records would introduce frequent MPE-CPE coordination and make it difficult to fully utilize the many-core architecture. SWBAM therefore increases the processing granularity from individual records to batches. For BAM processing, multiple BGZF blocks are grouped and processed together, while SAM processing uses batches of text chunks or BAM records according to the direction of conversion. In this way, CPE execution, synchronization, and buffer management are performed at batch boundaries rather than for each individual record.
+%总结+为什么以batch为核心 -> 介绍4条流水线 -> 介绍双缓冲优化 √
+SWBAM provides four batch-based MPE--CPE pipelines for BAM reading, BAM writing, SAM reading, and SAM writing.
+Batch-based execution reduces the kernel launch and synchronization overhead associated with per-record processing.
+The MPE prepares input batches and manages task execution, while the CPEs perform the corresponding processing kernels.
 
-SWBAM provides four batch-based pipelines for BAM reading, BAM writing, SAM reading, and SAM writing. The BAM read pipeline accepts compressed BGZF batches and invokes a CPE operator that performs decompression and, when required, BAM parsing and application-specific processing. The BAM write pipeline accepts either uncompressed BGZF data or batches of BAM records and performs BGZF compression or record serialization followed by compression. The SAM read pipeline processes text chunks aligned to record boundaries and parses them into BAM records, while the SAM write pipeline formats batches of BAM records into SAM text. Although these pipelines operate on different data representations, they follow a common batch-oriented execution model and provide reusable processing components for upper-level applications.
+The BAM read pipeline processes batches of compressed BGZF blocks.
+The CPEs decompress the blocks and, when required, parse BAM records or perform application-specific operations.
+The BAM write pipeline accepts uncompressed data blocks or batches of BAM records.
+The CPEs compress the input blocks directly or serialize the records before compression.
+Both pipelines produce or consume batches of BGZF blocks and support rank-local data processing.
+The SAM read pipeline converts rank-local SAM text into batches of \texttt{bam1\_t} records.
+The MPE divides the text into chunks aligned to record boundaries.
+The CPEs first copy the text and count records, then parse the SAM fields in a separate kernel.
+The SAM write pipeline converts batches of \texttt{bam1\_t} records into SAM text.
+The CPEs format records into separate text buffers, and the MPE appends the results in record order.
 
-For each batch, the MPE prepares the input buffers and operator parameters before launching the corresponding CPE kernel. After CPE execution is completed, SWBAM validates the processing status before exposing the results to MPE-side post-processing. The post-processing stage can aggregate batch-level results, submit records to another pipeline, or store application-specific intermediate data. The pipeline owns and reuses its working buffers, while data that need to remain valid across batches are stored in application-owned memory. This design defines clear data ownership and allows different BAM and SAM operations to share the same scheduling framework.
-
-SWBAM further uses reusable alternating buffers to overlap MPE-side work with CPE execution, as illustrated by the BAM read schedule in Fig.~\ref{fig:swbam_overview}. In the BAM read pipeline, while the CPEs process the current batch, the MPE reads the next compressed batch into another buffer. MPE-side post-processing starts after the current CPE kernel has completed and its results have been validated. In the BAM write pipeline, the MPE can write the previously compressed batch while the CPEs compress the current batch, and the next input batch can also be prepared during CPE execution when required. The SAM write pipeline similarly keeps current and pending output batches, while the SAM read pipeline uses separate CPE stages for text copy/count and record parsing and overlaps MPE-side output handling where possible. These pipeline-specific overlap strategies reduce idle time and reuse allocated buffers across batches without requiring multiple CPE kernels to execute concurrently within the same core group.
+SWBAM uses alternating buffers to overlap MPE-side work with CPE execution, as illustrated by the BAM read schedule in Fig.~\ref{fig:swbam_overview}.
+For BAM reading, the MPE reads the next compressed batch while the CPEs process the current batch.
+For BAM writing, the MPE writes the previous compressed batch while the CPEs compress the current batch.
+Similar overlap is used in SAM processing, depending on the pipeline stages and data dependencies.
+These strategies reduce idle time and reuse allocated buffers across batches without requiring multiple CPE kernels to execute concurrently within the same core group.
 
 \subsubsection{Pipeline composition and operators}
-%怎么组合流水线 -> 从核内的operator如何组合 -> 介绍两个SDK示例 -> 一些优化
-SWBAM supports flexible BAM and SAM processing by composing pipelines at batch boundaries and integrating record-level operations within CPE kernels. The four processing pipelines provide the common mechanisms for I/O, buffer management, CPE scheduling, and synchronization, while operators define the processing performed on each batch. For the BAM read pipeline, an operator prepares the batch parameters, selects the corresponding CPE kernel, validates the processing results, and performs batch-level post-processing on the MPE. These operator interfaces are invoked once for each batch rather than for each BAM record, avoiding fine-grained dispatch overhead in record processing.
+% 总结+简单解释流水线和operators -> CPE记录级组合 -> 两个sdk组合示例 -> 介绍数据所有权与生命周期管理 √
+SWBAM composes processing at two levels: record-level operations within CPE kernels and batch-level stages through MPE-side post-processing.
+This design reuses common pipeline mechanisms while allowing applications to combine different operations without per-record dispatch overhead.
+The pipeline runtimes manage batch buffers, launch and join CPE kernels, and invoke MPE-side hooks.
+For each batch, an MPE-side operator provides the kernel entry and task-specific parameters, binds data buffers, validates the results, and performs batch-level post-processing.
+These operators are invoked once per batch rather than once per record.
 
-Within a CPE kernel, SWBAM further combines common BAM processing steps with different record-level operations. The BAM read implementation reuses the same decompression and record traversal framework for operations such as record counting, flag statistics, basic statistics, filtering, and passthrough processing. The selected record operation is determined when the CPE kernel is built, so decompression, parsing, and the required record processing can be completed within a single CPE launch. This avoids per-record virtual calls and reduces intermediate processing between separate kernels. The operator can then return batch-level records, statistics, or application-specific metadata to the MPE for subsequent processing.
+Within CPE kernels, SWBAM combines common BAM record traversal with task-specific operations, including record counting, flag statistics, basic statistics, filtering, and passthrough processing.
+C++ templates determine the record operation when the kernel is compiled.
+At runtime, the MPE selects among prebuilt kernels and passes task-specific options, such as filter parameters.
+The record traversal invokes the selected operation directly, avoiding per-record virtual or function-pointer dispatch.
 
-Different pipelines can be further connected through MPE-side batch post-processing to construct complete BAM and SAM operations. For example, record counting only uses the BAM read pipeline with a counting operator and aggregates the batch results on the MPE. BAM-to-BAM processing connects a BAM read operator with the BAM write pipeline. The read operator performs decompression, parsing, and optional filtering, after which the MPE builds record packing plans and submits them to the write pipeline for serialization and BGZF compression. Similarly, BAM-to-SAM processing connects the BAM read pipeline with the SAM write pipeline, while SAM-to-BAM processing connects the SAM read pipeline with the BAM write pipeline. In these cases, records are exchanged between pipelines at batch boundaries rather than through a new record-level dispatch layer.
+Batch-level composition connects pipelines through MPE-side post-processing after kernel completion and result validation.
+For record counting, the BAM read pipeline parses records into reusable \texttt{bam1\_t} objects, and the MPE aggregates the per-block counts.
+For BAM-to-BAM processing, the MPE groups retained records into BGZF packing plans and submits them to the BAM write pipeline for serialization and compression.
+These plans reference existing records and do not copy record payloads or transfer ownership.
+BAM-to-SAM and SAM-to-BAM processing similarly connect the corresponding read and write pipelines.
 
-SWBAM also defines clear ownership rules for data shared between pipelines. Pipeline buffers are reused across batches and are valid only during their corresponding processing stage. Records or intermediate data that must remain valid across batch boundaries are explicitly copied to application-owned memory. This design allows the same pipelines and operators to be reused by different applications while keeping the record-processing hot path on CPEs. As a result, SWBAM improves code reuse without introducing additional per-record abstraction overhead.
+SWBAM also defines data ownership and lifetime across pipeline stages.
+Pipeline-owned data remain valid only until their buffers are reused or released.
+In BAM-to-BAM processing, parsed records remain in the read operator's storage until the downstream write call finishes consuming them.
+The write call completes serialization and compression before returning, although compressed output may remain buffered for later writing.
+Applications that retain data across batches manage its lifetime through their operators or algorithm-specific storage, copying data or directing kernel output to longer-lived storage when needed.
 
-\subsubsection{CPE kernel optimizations}
-%压缩解压侧的优化 -> 输入侧的融合优化 -> 输出侧的融合优化 -> sam的相关从核优化 
-SWBAM further optimizes the major BAM and SAM processing kernels executed on CPEs to reduce computation, memory allocation, and intermediate data movement. BGZF compression and decompression are repeatedly invoked during continuous BAM processing, and repeatedly creating the corresponding codec objects introduces unnecessary overhead. SWBAM therefore maintains reusable libdeflate compressor and decompressor objects for individual CPEs. A decompressor is created when first used and is then reused by the same CPE across subsequent batches. Compressors are similarly cached according to the compression level and recreated only when the required level changes. For the performance-oriented level-1 compression path, SWBAM further adjusts the match-search strategy to reduce the work spent on compression while retaining valid BGZF output.
+\subsubsection{CPE kernel optimizations} 
+%总结 -> BAM相关优化 -> SAM相关优化 √
+SWBAM optimizes CPE kernels to reduce repeated allocation, compression overhead, and intermediate data movement.
+It reuses codec objects and working buffers, and combines related processing steps within a single kernel execution.
 
-BAM parsing is also performed directly on CPEs and is integrated with record-level processing. After a BGZF block is decompressed, SWBAM traverses the BAM records in the decoded block using a common parser. Frequently used record operations, including counting, flag statistics, basic statistics, filtering, and passthrough processing, reuse the same traversal framework. The selected operation is resolved when the CPE kernel is built and is executed directly during record traversal. Thus, BGZF decompression, BAM parsing, and the required record operation can be completed within one CPE launch without per-record runtime dispatch. SWBAM also reuses preallocated record buffers and scratch spaces across records and batches, reducing repeated memory allocation during parsing.
+SWBAM reuses libdeflate compressor and decompressor objects across kernel launches.
+Each CPE creates a decompressor on first use and reuses it for subsequent blocks.
+Compressors are cached by compression level and recreated only when the required level changes.
+For level-1 compression, SWBAM reduces match-search work by checking one hash-table candidate at each search position.
+For sufficiently long matches, hash updates cover the first six interior positions and then use a two-byte stride.
+These changes reduce candidate checks and hash-table updates while retaining valid DEFLATE and BGZF output.
+For BAM input, SWBAM combines decompression, parsing, and record processing within one CPE kernel.
+The decoded block is processed directly without a separate kernel launch or MPE-side processing stage between these operations.
+Statistical kernels reuse a scratch \texttt{bam1\_t} record and its data buffer on each CPE.
+BAM transform kernels instead store parsed records in preallocated arenas that are reused across batches, reducing per-record allocation.
+For BAM output, SWBAM combines record serialization and BGZF compression within one CPE kernel.
+Each CPE serializes the records specified by a packing plan into a reusable uncompressed BGZF payload buffer and compresses the payload directly.
+This avoids an intermediate payload copy and a separate kernel launch between serialization and compression.
+When serialized BAM payloads are provided directly, the kernel skips record serialization and compresses the input bytes.
+Compressed output buffers are also reused across batches.
 
-SWBAM applies a similar fusion strategy to BAM output. When the input is already organized as uncompressed BGZF blocks, the CPEs directly compress these blocks. When the input consists of BAM records, SWBAM first serializes the records into BGZF-ready blocks and then performs compression within the same CPE execution. This avoids constructing another complete BAM representation on the MPE between serialization and compression. The output buffers and temporary scratch spaces are reused across batches, further reducing memory management overhead.
-
-The SAM pipelines are also implemented with CPE kernels for the major processing stages. SAM reading first partitions text into record-aligned chunks and uses CPE kernels for text copy/count and record parsing. SAM writing formats batches of BAM records into SAM text on CPEs. Together with the batch-based execution model described above, these kernel-level optimizations move the major parsing, formatting, compression, and decompression work to CPEs while reducing repeated allocation and intermediate processing on the MPE.
+SWBAM also reuses buffers in SAM processing.
+The fast SAM parser writes records into per-chunk arenas and caches recent reference-name lookups within each chunk.
+Records that the fast parser cannot handle are processed by the general parser.
+For SAM output, each CPE formats records directly into its batch text buffer instead of creating a separate string for each record.
+The MPE reserves buffer capacity before formatting and retains enlarged buffers for subsequent batches.
+These optimizations reduce repeated allocation and intermediate data handling in SAM parsing and formatting.
 
 \subsection{Applications Built on SWBAM Library}
 \subsubsection{Streaming BAM processing}
-%什么是流式处理 -> 统计类操作 -> bam2bam -> bam2sam和sam2bam -> 简单总结
-SWBAM implements several streaming BAM and SAM operations that process the input in a single pass without global record reordering. These operations include flag statistics, basic statistics, BAM filtering and rewriting, and format conversion between BAM and SAM. Since the processing of one batch does not depend on distant records, each MPI rank can independently process its assigned input range using the common SWBAM pipelines. Only small final results, such as statistics or output layout information, need to be exchanged among MPI ranks.
+%总结+解释流式处理 -> 统计、过滤/重新、格式转换介绍 -> 与分布式算法的区别 √
+SWBAM provides streaming BAM/SAM operations for statistics, filtering, rewriting, and format conversion.
+These operations process records in input order without global record reordering, allowing each MPI rank to process its assigned input range independently.
+For BAM input, record processing follows a separate BGZF scan that builds the block-span index.
 
-For statistical operations, SWBAM uses the BAM read pipeline with application-specific CPE operators. The flagstat and basic-statistics operators combine BGZF decompression, BAM parsing, and record-level statistics within the CPE kernel. Each batch produces rank-local counters, which are accumulated on the MPE after CPE processing. After all local batches are processed, the rank-local results are combined through MPI reduction to generate the final statistics. This design avoids materializing an additional BAM stream and keeps the main record processing on CPEs.
+Flag statistics use the BAM read pipeline and aggregate results at batch and rank levels.
+CPEs update separate counter arrays, and the MPE-side flagstat operator merges these counters into rank-local totals after each batch.
+An MPI sum reduction combines the rank-local totals on the root rank to produce the final report.
+This operation does not generate an output BAM stream.
+BAM filtering and rewriting connect the BAM read and write pipelines through the MPE-side transform operator.
+The operator selects the filtering or passthrough CPE kernel according to the requested options.
+After each batch, MPE post-processing groups references to retained records into packing plans that satisfy the BGZF payload-size limit.
+The BAM write pipeline consumes these plans and appends the resulting compressed blocks to each rank's local output body.
+Records retain their input order within each rank, and the final file places rank-local bodies in input-range order without coordinate- or QNAME-based sorting.
+Format conversion connects the read pipeline for the input format to the write pipeline for the output format.
+For BAM-to-SAM conversion, the MPE-side conversion operator forwards parsed BAM record references to the SAM write pipeline.
+For SAM-to-BAM conversion, MPE post-processing builds packing plans from parsed SAM records and submits them to the BAM write pipeline.
+Intermediate records remain valid until the downstream pipeline finishes consuming them, allowing the two pipelines to operate on batches without an additional record-level dispatch layer.
 
-BAM filtering and rewriting are implemented by connecting the BAM read and BAM write pipelines. The read-side transform operator performs decompression, parsing, and optional record filtering. The retained records are then organized into record packing plans on the MPE and submitted to the BAM write pipeline, where record serialization and BGZF compression are performed on CPEs. For records that are removed by the filter, no output record is generated. The same pipeline can also operate in passthrough mode when no filtering is required. Each MPI rank produces its own ordered output body, which is later placed at the corresponding position in the final BAM file.
-
-Format conversion is implemented by composing the corresponding read and write pipelines. For BAM-to-SAM conversion, the BAM read pipeline decompresses and parses the input records using the passthrough operator, and the parsed records are passed in batches to the SAM write pipeline for parallel formatting on CPEs. For SAM-to-BAM conversion, the SAM read pipeline first identifies complete SAM records and parses them into BAM records, after which the BAM write pipeline serializes and compresses the records into BGZF blocks. The intermediate records are only kept for the current batch and are released or reused after the downstream pipeline completes its processing. This batch-level composition preserves record order while avoiding an additional record-level dispatch layer between the two pipelines.
-
-Compared with the distributed algorithms described below, these streaming operations require little cross-rank communication. Most computation and data movement are performed locally within each rank, while MPI is mainly used for final statistics aggregation and distributed output organization. Therefore, they directly benefit from the batch-based MPE-CPE pipelines and provide representative applications for evaluating the basic processing efficiency of SWBAM.
+These streaming operations require little inter-rank communication after input partitioning because record processing remains local to each rank.
+In contrast, the distributed algorithms described next require record redistribution or cross-rank state.
 
 \subsubsection{Distributed BAM processing}
-%先总体介绍 -> sort/collate -> fixmate -> markdup
-SWBAM further implements distributed BAM operations that require global data reorganization or cross-record state. Unlike streaming operations, these applications cannot process each MPI rank completely independently because records belonging to the same global order, QNAME group, or duplicate group may be distributed across different ranks. SWBAM therefore reuses the common BAM read and write pipelines for local data processing, while the application layer manages algorithm-specific metadata, MPI communication, and global state. This design keeps BGZF I/O and CPE processing reusable while allowing each application to adopt a distributed algorithm suited to its data dependency.
-
-\paragraph{Sorting and collation}
+% 总结+分布式数据依赖 -> Sorting and collation -> Fixmate -> Duplicate marking
+SWBAM implements distributed BAM operations that require global record reorganization or cross-record state.
+Sorting establishes a global coordinate order, whereas collation groups records by QNAME.
+Fixmate updates mate information for complete QNAME groups, and duplicate marking compares candidates across batches and MPI rank boundaries.
+These applications reuse the common BAM read and write pipelines, while application-specific algorithms manage record redistribution, boundary handling, and cross-rank state.
 
 \begin{figure*}[!t]
 \centering
 \includegraphics[width=\textwidth]{figs/swbam_distributed_reordering.pdf}
-\caption{Distributed sorting and collation. (a) Record redistribution and merging. (b) Coordinate- and QNAME-based partitioning. (c) In-memory and external-run processing.}
+\caption{Distributed sorting and collation.
+(a) Record redistribution and merging.
+(b) Coordinate- and QNAME-based partitioning.
+(c) In-memory and external-run processing.}
 \label{fig:swbam-reordering}
 \end{figure*}
 
-Sorting and collation share the distributed workflow in Fig.~\ref{fig:swbam-reordering}, but use different partitioning keys. For coordinate sorting, SWBAM first uses CPEs to extract the coordinate key and raw BAM data from each record. Each rank sorts its local metadata and selects samples from the ordered records. The samples are collected to determine global splitters, which divide the coordinate space among MPI ranks. Local records are then partitioned according to these splitters and exchanged with their destination ranks. Since the records sent from each source rank are already ordered, the receiving rank performs a k-way merge of the received segments instead of sorting all received records again. The final raw records are directly packed into BGZF payloads and compressed through the common BAM write pipeline. When the data exceed the configured memory limit, SWBAM generates sorted runs and performs bounded data exchange and streaming multi-way merging, allowing the same distributed sorting scheme to operate in external-memory mode.
+Sorting establishes a global coordinate order through sampling, redistribution, and merging (Fig.~\ref{fig:swbam-reordering}).
+CPEs extract coordinate keys and raw BAM records, while the MPE sorts local metadata and selects samples from the ordered records.
+The root rank collects the samples, determines global splitters, and broadcasts them to define coordinate ranges for the MPI ranks.
+Records are then exchanged according to these splitters.
+Because the received segments are individually ordered, each rank performs a $k$-way merge rather than sorting all received records again.
+The merged raw records are packed into BGZF payloads and compressed through the common BAM write pipeline.
+Collation uses QNAME-based partitioning instead of constructing a global coordinate order.
+CPEs extract QNAME hashes, record metadata, and raw BAM records.
+Each hash is assigned to a bin, and each bin is mapped to an owner rank so that records with the same QNAME reach the same rank.
+After local ordering, each rank retains self-owned records and exchanges the remaining records in bounded chunks.
+The receiving rank merges the segments by bin, hash, and full QNAME, grouping records with the same QNAME together without imposing a global lexicographic QNAME order.
+Within each group, records are ordered by READ1/READ2 flag bits and then by original input order.
+Unlike the standard temporary-bin workflow of SAMtools~\cite{danecek2021samtools}, SWBAM supports both in-memory and external-memory collation.
+Sorting also supports in-memory and external-memory execution.
+In external mode, SWBAM generates sorted runs and performs bounded data exchange and streaming multi-way merging under the configured memory limit.
+Figure~\ref{fig:swbam-reordering}(b) illustrates six coordinate ranges and 66 QNAME bins mapped to six ranks.
+The merge fan-in $F$ limits the number of input segments processed per pass; additional passes are performed when necessary before final merging and compression (Fig.~\ref{fig:swbam-reordering}(c)).
 
-Collation follows a similar distributed organization but groups records according to QNAME instead of genomic coordinates. During BAM reading, CPEs extract the QNAME hash, QNAME-related metadata, and raw record data. Records are assigned to bins, and each bin is mapped to an owner rank so that records with the same QNAME are processed by the same rank. After local ordering, self-owned records are retained locally, while records owned by other ranks are exchanged in bounded chunks. The received segments are then merged according to their QNAME order, keeping records from the same QNAME together and preserving the required ordering within a group. Similar to sorting, SWBAM provides both in-memory and external-memory implementations. The external mode stores intermediate runs under the configured memory limit and uses streaming multi-way merging before the results are passed to the BAM write pipeline.
+Fixmate updates mate information for records with the same QNAME.
+The BAM read pipeline supplies records from name-collated input, and the MPE groups consecutive records by QNAME.
+Groups that extend across batch boundaries are retained until subsequent batches complete them.
+The first and last rank-local groups are also deferred because they may extend across MPI rank boundaries.
+Ranks exchange boundary QNAME information to identify group ownership and transfer the corresponding group fragments to their owner ranks.
+For each complete group, a CPE planning kernel determines the required mate-field and tag updates and calculates the output size.
+The MPE computes output offsets from the planned record lengths, and a second CPE kernel rewrites records into disjoint output regions.
+The supported updates include mate coordinates, flags, template length, and the \texttt{MQ}, \texttt{MC}, and \texttt{ms} tags.
+The rewritten records are then serialized and compressed through the common BAM write pipeline.
+Boundary and interior output segments are combined in QNAME-group order.
 
-Figure~\ref{fig:swbam-reordering}(b) illustrates six coordinate ranges for sorting and 66 QNAME bins mapped to six ranks for collation. In external mode, the merge fan-in $F$ bounds the number of input segments per pass; additional passes are used when this limit is exceeded, as shown in Fig.~\ref{fig:swbam-reordering}(c).
-
-\paragraph{Fixmate}
-Fixmate requires records with the same QNAME to be processed as a group and therefore introduces state across batch and rank boundaries. SWBAM reads the name-collated input through the common BAM read pipeline and groups consecutive records with the same QNAME on the MPE. Complete groups are processed immediately, while incomplete groups at batch boundaries are retained until the following batch is available. A QNAME group may also cross an MPI rank boundary. SWBAM identifies these boundary groups and transfers their fragments to a selected owner rank before mate information is updated. For each complete group, a CPE planning kernel determines the required mate-field and tag updates and the output size. The MPE then computes output offsets, and a second CPE kernel rewrites the records in parallel. The current implementation updates mate coordinates, flags, template length, and the \texttt{MQ}, \texttt{MC}, and \texttt{ms} tags required by the supported fixmate mode. The rewritten records are finally serialized and compressed through the common BAM write pipeline.
-
-\paragraph{Duplicate marking}
 \begin{figure}[!t]
-    \centering
-    \includegraphics[width=\columnwidth]{figs/swbam_markdup_single_column_v1.pdf}
-    \caption{Distributed duplicate marking.
-    (a) Boundary probing and cross-rank decisions.
-    (b) Candidate replacement and finalization in the sliding window.}
-    \label{fig:swbam-markdup}
+\centering
+\includegraphics[width=\columnwidth]{figs/swbam_markdup_single_column_v1.pdf}
+\caption{Distributed duplicate marking.
+(a) Boundary probing and cross-rank decisions.
+(b) Candidate replacement and finalization in the sliding window.}
+\label{fig:swbam-markdup}
 \end{figure}
 
-Duplicate marking is implemented for coordinate-ordered BAM data and requires both cross-record comparison and cross-rank coordination. SWBAM first uses the BAM read pipeline to decode and parse input batches, while application-specific CPE processing extracts only the information required for duplicate detection. Candidates are assigned to owner ranks according to their coordinate ranges, so that most candidates remain on the local rank and only candidates belonging to another coordinate range need to be exchanged. Each owner rank maintains separate states for paired and single-read candidates and compares records with the same duplicate key to determine the record to retain.
+Duplicate marking compares candidates across MPI ranks while preserving input record order.
+The BAM read pipeline supplies parsed records, and a dedicated CPE kernel extracts the duplicate keys and scores required for candidate comparison.
+MPE-side logic assigns candidates to coordinate owners and maintains separate states for paired and single-read candidates.
+MPI exchanges candidate metadata and routes decisions back to source ranks, while the original BAM records remain on their source ranks.
+The sliding window retires candidate keys that can no longer match future records.
+For a key coordinate $x$ on the current reference, an interior winner can be finalized as KEEP when
+\[
+x+L\leq p_r,
+\]
+where $p_r$ is the processed alignment-start coordinate on rank $r$, and $L$ is the configured maximum-read-length bound.
+This condition relies on $L$ covering the possible displacement caused by clipping, including hard clipping.
+Advancing to a later reference also expires keys from earlier references.
+Figure~\ref{fig:swbam-markdup}(a) illustrates cross-rank decisions for candidates with the same unclipped $5'$ coordinate but different alignment starts.
+Figure~\ref{fig:swbam-markdup}(b) shows candidate replacement and finalization for forward single-end reads.
+Algorithm~\ref{alg:distributed_markdup} summarizes the processing and output workflow.
 
-Figure~\ref{fig:swbam-markdup}(a) illustrates cross-rank decisions for candidates with the same unclipped $5'$ coordinate but different alignment starts. Candidate metadata are exchanged to select the higher-scoring representative. Figure~\ref{fig:swbam-markdup}(b) shows candidate replacement and finalization for interior forward single-end reads. The numeric key labels indicate the coordinate component $x$; final KEEP is assigned when $x+L\leq p$, where $L$ is the maximum read length and $p$ is the local coordinate progress. Unresolved boundary candidates additionally require safe cross-rank progress. Algorithm~\ref{alg:distributed_markdup} describes the complete processing flow.
-
-%markdup伪代码
 \begin{algorithm}[!t]
 \caption{Distributed duplicate marking on rank $r$}
 \label{alg:distributed_markdup}
 \small
-\hspace*{\algorithmicindent}\textbf{Input:} Coordinate-sorted BAM blocks assigned to rank $r$;
-maximum read length $L$\\
+\hspace*{\algorithmicindent}\textbf{Input:} Rank-local coordinate-sorted BAM blocks; maximum read length $L$\\
 \hspace*{\algorithmicindent}\textbf{Output:} Rank-local duplicate-marked BGZF body
 \begin{algorithmic}[1]
-\State $P_r \gets \Call{ProbeHeadAndTailBlocks}{r,32}$
-\State $G \gets \Call{AllGatherRankStartCoordinates}{ }$
-\State $covered \gets \Call{CheckBoundaryCoverage}{P_r,G,L}$
-\Comment{Check all ranks}
-\If{$covered$}
-    \State $E_r \gets \Call{SelectBoundaryCandidates}{P_r,G,L}$
-    \State $H_r \gets \Call{ResolveBoundaryCandidates}{E_r,G}$
-    \Comment{Exchange metadata and decisions}
-\Else
-    \State $H_r \gets \mathrm{disabled}$
-    \Comment{Retain boundary candidates in the conservative window}
-\EndIf
-
-\State Initialize candidate window $W_r$, decoded-block buffer $Q_r$,
-       and ordered output storage $O_r$
+\State $P_r \gets \Call{ProbeRankEnds}{r,32}$
+\State $G \gets \Call{GatherRankStarts}{P_r}$
+\State $H_r \gets \Call{BuildBoundaryPlan}{P_r,G,L}$
+\Comment{Enable precomputation only when all rank boundaries are covered}
+\State Initialize owner window $W_r$, pending blocks $Q_r$, and ordered output $O_r$
 \State $T \gets \Call{AllReduceMax}{\text{number of local batches}}$
-
 \For{$t=1,\ldots,T$}
-    \State $(B,C_r,p_r) \gets \Call{DecodeAndExtractBatch}{t}$
-    \Comment{Empty after local input ends}
-    \State Add decoded blocks $B$ to $Q_r$ with provisional KEEP states
-    \State Apply precomputed boundary decisions $H_r$ to $Q_r$
-    \State Remove resolved boundary candidates from $C_r$
-
-    \State $(C_r^{\mathrm{local}},C_r^{\mathrm{remote}})
-           \gets \Call{PartitionByCoordinateOwner}{C_r}$
-    \State Mark source records of $C_r^{\mathrm{remote}}$ as pending
-    \State $C_r^{\mathrm{owner}} \gets C_r^{\mathrm{local}}
-           \cup \Call{ExchangeCandidates}{C_r^{\mathrm{remote}}}$
-    \State \Call{UpdateCandidateWindow}
-           {$W_r,C_r^{\mathrm{owner}},p_r,L,Q_r,D_r^{\mathrm{remote}}$}
-    \Comment{Apply local decisions and update pending states}
-    \State $D_r^{\mathrm{received}}
-           \gets \Call{RouteDecisionsToSource}{D_r^{\mathrm{remote}}}$
-    \State Apply $D_r^{\mathrm{received}}$ to pending records in $Q_r$
-    \State \Call{CompressReadyBlocks}{$Q_r,O_r$}
+    \State $(B_r,C_r,p_r) \gets \Call{DecodeAndExtractBatch}{t}$
+    \State \Call{StartPreparedCompression}{}
+    \State $C_r \gets \Call{CaptureAndApplyPlan}{B_r,C_r,Q_r,H_r}$
+    \If{$H_r$ is disabled}
+        \State $S \gets \Call{AllGatherProgressAndEOF}{p_r}$
+    \EndIf
+    \State $C_r^{\mathrm{owner}} \gets \Call{ExchangeByOwner}{C_r,G,Q_r}$
+    \State $D_r \gets \Call{UpdateOwnerWindow}{W_r,C_r^{\mathrm{owner}},p_r,L,Q_r}$
+    \If{$H_r$ is disabled}
+        \State Add \Call{ReleaseSafeBoundaries}{$W_r,G,S,L$} to $D_r$
+    \EndIf
+    \State \Call{RouteAndApplyDecisions}{$D_r,Q_r$}
+    \State \Call{FinishAndPrepareOutput}{$Q_r,O_r$}
 \EndFor
-
 \State Validate coordinate order across ranks
-\State Finalize remaining candidates in $W_r$ as KEEP
-\State Route remaining remote decisions to source ranks
-\State Apply received decisions to $Q_r$
-\State \Call{CompressReadyBlocks}{$Q_r,O_r$} until $Q_r$ is empty
-\State Wait for compression to complete
-\State Finalize $O_r$ in input-block order
-
-\Statex
-\Procedure{CompressReadyBlocks}{$Q_r,O_r$}
-    \While{$Q_r$ contains a finalized block awaiting compression}
-        \State Select the ready block $P$ with the smallest block index
-        \State Apply finalized duplicate decisions to $P$
-        \State Mark $P$ as processing and submit it for compression
-        \State After compression, store the result in $O_r$ by input-block index
-        \State Release decoded data and remove $P$ from $Q_r$
-    \EndWhile
-\EndProcedure
+\State $D_r \gets \Call{FinalizeOwnerWinnersAsKeep}{W_r,Q_r}$
+\State \Call{RouteAndApplyDecisions}{$D_r,Q_r$}
+\State Verify that no source-record decision remains pending
+\State Drain compression and seal $O_r$ in input-block and fragment order
 \end{algorithmic}
 \end{algorithm}
 
-To bound memory usage, SWBAM performs duplicate marking in a one-pass coordinate-streaming manner. Candidates are processed in coordinate order using a sliding window, and candidates that can no longer interact with future records are retired from the active state. Records close to MPI rank boundaries require additional handling because their duplicate partners may reside on neighboring ranks. SWBAM therefore builds a boundary halo around rank partitions and exchanges the required candidate information before final decisions are made. The boundary probe decodes up to 32 BGZF blocks at each end of a rank partition and precomputes boundary decisions only when all probes cover the required halo. Decoded blocks whose duplicate decisions are not yet complete are temporarily retained in a decoded-block buffer. Once all local and remote decisions for a block are available, SWBAM updates the duplicate flags and submits the ready block to the common BAM write pipeline. Ready blocks may be compressed before earlier unresolved blocks; the ordered output storage preserves input-block order in the rank-local output. Decoded block storage is released after compression completes. The common library manages batch scheduling and compression, while the application maintains the sliding window, MPI decisions, boundary state, pending blocks, and block-order index.
+Boundary handling retains candidates until the required cross-rank comparisons are complete.
+SWBAM probes up to 32 BGZF blocks at each end of a rank range and enables boundary precomputation only when all rank probes cover the required halo.
+If coverage is insufficient, a conservative boundary window remains active until the relevant ranks advance beyond the boundary coordinate by $2L$ or exhaust their input.
+In this fallback path, ranks exchange progress and EOF information so that boundary candidates are released only when no relevant remote candidate can remain.
+During each processing round, candidates from the current batch are exchanged and processed before safe boundary release.
+Ranks that finish early continue participating in collective rounds with empty batches.
+Records awaiting remote decisions remain pending after local EOF until their owners' decisions arrive.
+Only blocks with fully resolved duplicate decisions enter compression.
+Compression may complete out of order, but compressed fragments are indexed by input-block and within-block position to preserve the final logical order.
+Decoded buffers remain valid while active compression uses them; unresolved blocks may be staged temporarily under cache pressure.
+The common library manages batch execution and compression, while the application maintains the sliding window, boundary state, MPI decisions, pending blocks, and output-order metadata.
 
 \subsubsection{Deduplication workflow}
-%这四步为什么要按顺序执行 -> 怎么组织起来的
-SWBAM provides an end-to-end deduplication workflow by combining collation, fixmate, coordinate sorting, and duplicate marking. These four stages are executed in sequence because duplicate marking requires mate information and coordinate-ordered input, while mate information is most efficiently updated after records with the same QNAME have been grouped together. The workflow therefore first applies collate to group records by QNAME, then runs fixmate with mate-score calculation enabled, reorders the updated records by genomic coordinate, and finally performs duplicate marking.
+%总结端到端去重流程 -> 解释四个阶段的执行顺序 -> 介绍中间文件与参数管理 √
+SWBAM combines collation, fixmate, coordinate sorting, and duplicate marking into an end-to-end deduplication workflow.
+The stages run in this order because fixmate requires records with the same QNAME to be grouped together, while duplicate marking requires updated mate information and coordinate-sorted input.
+The workflow first groups records by QNAME using collation, then runs fixmate with mate-score calculation enabled, sorts the updated records by genomic coordinate, and finally marks duplicates.
+Each stage uses the corresponding distributed SWBAM application and the common BAM input and output interfaces.
+The output of each stage is written to an intermediate BAM file and passed to the next stage.
+The workflow produces collated, fixmate-updated, and coordinate-sorted intermediate files before generating the final duplicate-marked BAM file.
+Intermediate files can be removed automatically after use or retained for debugging and validation.
+The memory limit and compression settings are propagated to the relevant stages, while sorting and collation can use their external-memory implementations when needed.
 
-Each stage is implemented using the corresponding distributed SWBAM application described above and reuses the common BAM input, processing, and output interfaces. The output of one stage is written as an intermediate BAM file and used as the input of the next stage. Specifically, the workflow generates collated, fixmate-updated, and coordinate-sorted intermediate BAM files before producing the final duplicate-marked BAM file. These intermediate files can be automatically removed after they are no longer needed, or retained for debugging and validation. The memory limit and compression settings are propagated to the corresponding stages, while sort and collate can further use their external-memory implementations when required.
-
-\FloatBarrier
 \section{Results}
 \subsection{Overview}
 We evaluate the performance and scalability of SWBAM through library benchmarks and application tests.
