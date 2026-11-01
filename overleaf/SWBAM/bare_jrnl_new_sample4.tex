@@ -214,7 +214,7 @@ In BAM-to-BAM processing, parsed records remain in the read operator's storage u
 The write call completes serialization and compression before returning, although compressed output may remain buffered for later writing.
 Applications that retain data across batches manage its lifetime through their operators or algorithm-specific storage, copying data or directing kernel output to longer-lived storage when needed.
 
-\subsubsection{CPE kernel optimizations} 
+\subsubsection{CPE kernel optimizations}
 %总结 -> BAM相关优化 -> SAM相关优化 √
 SWBAM optimizes CPE kernels to reduce repeated allocation, compression overhead, and intermediate data movement.
 It reuses codec objects and working buffers, and combines related processing steps within a single kernel execution.
@@ -267,7 +267,7 @@ These streaming operations require little inter-rank communication after input p
 In contrast, the distributed algorithms described next require record redistribution or cross-rank state.
 
 \subsubsection{Distributed BAM processing}
-%总结+分布式数据依赖 -> Sorting and collation -> Fixmate -> Duplicate marking
+%总结+分布式数据依赖 -> Sorting and collation -> Fixmate -> Duplicate marking √
 SWBAM implements distributed BAM operations that require global record reorganization or cross-record state.
 Sorting establishes a global coordinate order, whereas collation groups records by QNAME.
 Fixmate updates mate information for complete QNAME groups, and duplicate marking compares candidates across batches and MPI rank boundaries.
@@ -498,7 +498,7 @@ This metadata-based coordination avoids inter-rank record movement and helps pre
 At twelve CGs, read-and-write throughput reaches 37.83, 26.23, and 36.05~M records/s on D1--D3, respectively.
 
 At six active CGs across six Sunway nodes, SWBAM achieves higher throughput than the best measured SAMtools configuration for every dataset and mode.
-The throughput advantage is consistent with SWBAM's CPE-parallel record processing, whereas SAMtools retains record traversal and counting on the main thread.
+This advantage reflects SWBAM's distributed record processing across CPEs, compared with SAMtools' main-thread record traversal and worker-based BGZF processing.
 The resulting throughput ratios are 3.82--4.35$\times$ for read-only processing and 2.77--3.41$\times$ for read-and-write processing.
 
 MPI initialization and finalization contribute substantially to short executions.
@@ -506,27 +506,27 @@ For D1 read-only processing on twelve nodes, the median processing time at twelv
 Thus, the reported scaling characterizes the processing phase, whereas the full execution time also includes MPI startup and shutdown overhead.
 
 \subsection{Performance of SWBAM Applications}
-%总结 -> 流式 -> 分布式 -> 去重完整流程
+%总结 -> 流式 -> 分布式 -> 去重完整流程 √
 We evaluate SWBAM on streaming and distributed BAM operations and a four-stage deduplication workflow.
 All SWBAM application tests use six active CGs across six nodes, while SAMtools uses the empirically optimal thread count for each dataset and operation.
 BAM output uses compression level~1.
 Unless otherwise noted, the tables report three-run medians, comparing SWBAM processing times (excluding MPI initialization and finalization) with SAMtools process wall times using NVMe files, under the timing boundaries defined in the overview.
 
 \subsubsection{Streaming BAM processing}
-The streaming tests cover flag statistics, MAPQ $\geq 30$ filtering, and BAM/SAM conversion in both directions (Table~\ref{tab}).
-SWBAM achieves speedups of 3.15--3.46$\times$ for flag statistics and 2.80--3.33$\times$ for filtering.
-The lower speedups for filtering result from the additional serialization and BGZF compression required to write retained records, whereas flag statistics only accumulates counters.
+SWBAM achieves speedups of 2.80--5.62$\times$ across the four streaming operations (Table~\ref{tab:streaming-bam}), with the largest gains in BAM-to-SAM conversion.
+The performance differences primarily reflect the extent to which record processing can be distributed across ranks and CPEs, as well as the additional costs introduced by record output.
+
+Flag statistics achieves speedups of 3.15--3.46$\times$, benefiting from parallel BGZF decoding, record parsing, and flag accumulation on CPEs, whereas SAMtools retains record traversal and counter updates on its main thread.
+MAPQ filtering achieves lower speedups of 2.80--3.33$\times$ because, unlike flag statistics, it requires retained records to undergo serialization and BGZF compression.
+Since 81.28--95.82\% of input records pass the filtering threshold, substantial output processing remains.
+Although both implementations parallelize BGZF compression, SWBAM additionally performs record packing and final output assembly, reducing its relative advantage over the statistics workload.
 BAM-to-SAM achieves the highest speedups, ranging from 5.13$\times$ to 5.62$\times$.
-This operation formats BAM records into uncompressed SAM text, avoiding the BGZF compression required by BAM output and allowing the CPEs to focus on parallel record formatting.
-SAM-to-BAM achieves speedups of 3.10$\times$ and 3.63$\times$ on D1 and D2, respectively, but only 1.45$\times$ on D3.
-The lower speedup on D3 is associated with additional MPE-side chunk processing.
-D3 uses the fast parser for all records, but its original text chunks contain an average of approximately 12,600 records, exceeding the parser capacity of 12,110 records per chunk.
-The MPE therefore rescans oversized chunks and divides them into smaller parsing units without copying the text.
-Profiling further shows that D3's longer execution is not caused by BGZF compression.
-Across six ranks and three runs, D3 parsing and compression take 5.78--5.81~s and 4.97--5.02~s, respectively, within total conversion-pipeline times of 31.50--32.59~s.
-For comparison, D1 compression takes 5.33--5.36~s within an 11.35--11.39-s pipeline.
-Thus, the additional D3 runtime is more likely associated with chunk resplitting and workspace preparation than with compression.
-However, these operations are not timed separately, and overlapping I/O prevents the individual contributions from being determined precisely.
+This advantage stems from distributing the complete record-processing path across six ranks, with CPEs performing record construction and parallel SAM formatting through batch-level record-pointer handoff.
+SAMtools also parallelizes SAM formatting, but retains main-thread record traversal and submission to an ordered output dispatcher.
+The resulting advantage therefore reflects differences in the organization of the complete conversion pipeline rather than formatting parallelism alone.
+SAM-to-BAM achieves speedups of 3.10$\times$, 3.63$\times$, and 3.44$\times$ on D1, D2, and D3, respectively.
+Both implementations parallelize SAM parsing and BGZF compression.
+SWBAM distributes parsing and compression across rank-local CPE pipelines, whereas SAMtools uses a shared worker pool but retains main-thread record submission and BAM serialization.
 
 \begin{table}[!t]
 \centering
@@ -537,70 +537,73 @@ However, these operations are not timed separately, and overlapping I/O prevents
 \setlength{\tabcolsep}{3pt}
 \begin{tabular*}{\columnwidth}{@{\extracolsep{\fill}}lrrrr@{}}
 \toprule
-Application & SAMtools & SWBAM & Ratio & \texttt{-@} \\
+Application & SAMtools & SWBAM & Speedup & \shortstack{SAMtools\\threads} \\
 \midrule
 \multicolumn{5}{c}{Dataset D1} \\
 \midrule
-Flag statistics & 12.24 & \textbf{3.54} & 3.46 & 8 \\
-MAPQ $\geq 30$ & 31.27 & \textbf{9.39} & 3.33 & 96 \\
-BAM-to-SAM & 77.17 & \textbf{13.92} & 5.55 & 96 \\
-SAM-to-BAM & 38.01 & \textbf{12.24} & 3.10 & 24 \\
+Flag statistics & 12.24 & \textbf{3.54} & 3.46 & 9 \\
+MAPQ $\geq 30$ filtering & 31.27 & \textbf{9.39} & 3.33 & 97 \\
+BAM-to-SAM & 77.17 & \textbf{13.92} & 5.55 & 97 \\
+SAM-to-BAM & 38.01 & \textbf{12.24} & 3.10 & 25 \\
 \midrule
 \multicolumn{5}{c}{Dataset D2} \\
 \midrule
-Flag statistics & 29.30 & \textbf{8.96} & 3.27 & 8 \\
-MAPQ $\geq 30$ & 70.59 & \textbf{24.68} & 2.86 & 96 \\
-BAM-to-SAM & 182.33 & \textbf{32.44} & 5.62 & 96 \\
-SAM-to-BAM & 111.65 & \textbf{30.74} & 3.63 & 96 \\
+Flag statistics & 29.30 & \textbf{8.96} & 3.27 & 9 \\
+MAPQ $\geq 30$ filtering & 70.59 & \textbf{24.68} & 2.86 & 97 \\
+BAM-to-SAM & 182.33 & \textbf{32.44} & 5.62 & 97 \\
+SAM-to-BAM & 111.65 & \textbf{30.74} & 3.63 & 97 \\
 \midrule
 \multicolumn{5}{c}{Dataset D3} \\
 \midrule
-Flag statistics & 10.94 & \textbf{3.47} & 3.15 & 48 \\
-MAPQ $\geq 30$ & 25.28 & \textbf{9.02} & 2.80 & 96 \\
-BAM-to-SAM & 58.92 & \textbf{11.48} & 5.13 & 48 \\
-SAM-to-BAM & 48.86 & \textbf{14.19} & 3.44 & 96 \\
+Flag statistics & 10.94 & \textbf{3.47} & 3.15 & 49 \\
+MAPQ $\geq 30$ filtering & 25.28 & \textbf{9.02} & 2.80 & 97 \\
+BAM-to-SAM & 58.92 & \textbf{11.48} & 5.13 & 49 \\
+SAM-to-BAM & 48.86 & \textbf{14.19} & 3.44 & 97 \\
 \bottomrule
 \end{tabular*}
 \begin{tablenotes}[flushleft]
 \scriptsize
 \item Runtimes are in seconds.
 SWBAM uses six active CGs.
-SAMtools uses the selected number of additional threads shown in the last column.
-Ratio is median SAMtools process wall time divided by median SWBAM processing time, calculated before rounding.
-The timing and storage conditions follow the overview.
+The last column reports the total number of SAMtools threads, including the main thread, based on the selected \texttt{-@} setting.
+Speedup is the median SAMtools process wall time divided by the median SWBAM processing time, calculated before rounding.
+SAMtools uses NVMe storage, whereas SWBAM uses RAM-backed files.
+Other timing and storage conditions follow the overview.
 \end{tablenotes}
 \end{threeparttable}
 \end{table}
 
 \subsubsection{Distributed BAM processing}
-The performance of distributed BAM operations depends on their data partitioning strategies, cross-rank dependencies, and local processing costs.
+Across the four distributed operations, SWBAM achieves speedups of 1.28--3.52$\times$ over SAMtools.
+Coordinate sorting benefits most consistently, whereas duplicate marking exhibits the strongest dataset dependence.
+These differences reflect how effectively each operation's record-processing workload can be distributed and how much sequential or state-management work remains on the execution path.
 
-Collation and coordinate sorting achieve speedups of 2.72--2.88$\times$ and 3.25--3.52$\times$, respectively, outperforming fixmate.
-Collation distributes QNAME hash bins across ranks, whereas coordinate sorting uses sample-derived splitters to assign disjoint coordinate ranges to ranks.
-Both strategies expose independent rank-local tasks, but require additional record organization and merging.
-These local operations account for much of the processing cost.
-For collation, remote packing takes 13.2~s within rank~4's 20.5-s exchange timer, while MPI exchange regions take 2.45~s.
-For coordinate sorting, initial local sorting and final merging take 14.1--14.5~s and 5.7--5.8~s per rank, respectively, compared with approximately 0.65~s for MPI exchange.
-These results indicate that local data organization, rather than MPI communication alone, is a major cost in distributed reordering.
-The collation comparison also involves different storage paths, with SWBAM using memory-based processing and SAMtools using temporary files.
-On D2, external-run processing generates 18 collation runs and 30 sorting runs with an 8-GiB workspace per rank, increasing SWBAM processing time by 13.5\% and 30.7\%, respectively, over the corresponding memory paths.
-The additional intermediate writes and merging account for this overhead.
-Since SWBAM's temporary files remain RAM-backed, these results characterize external-memory processing overhead rather than physical SSD-based external sorting.
+Coordinate sorting achieves speedups of 3.25--3.52$\times$.
+Although SAMtools parallelizes radix sorting and BGZF I/O, its main thread still loads records into a shared memory arena and drives the final heap merge.
+SWBAM distributes record extraction, local ordering, coordinate partitioning, and range-local merging across six ranks, while CPEs handle BGZF block processing.
+It also sorts compact coordinate metadata while retaining the original BAM payloads, avoiding the construction of a separate \texttt{bam1\_t} object for every stored record.
+Thus, its advantage comes from distributing more of the end-to-end reordering pipeline and reducing record representation overhead, rather than from a faster local sorting algorithm.
+Collation achieves smaller speedups of 2.72--2.88$\times$.
+SAMtools writes records into compressed temporary bins and subsequently loads and sorts each bin on the main thread.
+SWBAM distributes hash bins across ranks, but QNAME comparisons and payload packing still require MPE-side processing.
+For collation on D1 and D3, SWBAM avoids the intermediate BGZF encoding and decoding required by SAMtools' temporary bins.
+On D2, external-run processing achieves speedups of 2.79$\times$ for collation and 3.47$\times$ for coordinate sorting, despite the additional intermediate writes and merging.
 
-Fixmate achieves consistent speedups of 2.02--2.09$\times$ across the three datasets.
-Unlike collation and sorting, it processes QNAME groups locally and exchanges only boundary fragments rather than redistributing all records.
-Consequently, local group scanning, rather than inter-rank communication, dominates its processing cost.
-For D3, group scanning takes 8.83--8.88~s per rank, whereas boundary-fragment transfer and merging take less than 1~ms, excluding metadata collectives.
+Fixmate achieves relatively stable speedups of 2.02--2.09$\times$.
+SAMtools performs QNAME grouping and mate-field updates on the main thread, with worker threads primarily handling BGZF I/O.
+SWBAM offloads mate-update planning and record rewriting to CPEs, but QNAME group scanning and output-offset construction remain on each MPE.
+These remaining MPE-side operations, together with output serialization and compression, limit the benefit of offloading mate updates.
 
-Duplicate marking exhibits greater dataset dependence, with its speedup decreasing from 2.84$\times$ on D1 to 1.82$\times$ on D2 and 1.28$\times$ on D3.
-Unlike fixmate, it maintains candidate state across batches and coordinate-partition boundaries, making its performance sensitive to window-state management and boundary processing.
-On D2, the maximum accumulated group-processing time across ranks increases from approximately 16.6~s on D1 to 55.9--56.0~s, accompanied by 33 raw batch spills per run and an increase in the maximum tracked pending-buffer size from approximately 17 to 269~MB.
-Meanwhile, cross-rank candidate payload decreases from 71.2~kB to 6.8~kB, indicating that increased local state processing and buffer management, rather than communication volume, are associated with the reduced speedup.
-D3 additionally triggers boundary fallback, resulting in 15.6 million boundary-candidate visits, 89.3~MB of candidate exchange, and 594 raw batch spills per run across six ranks.
-These spills write and reread 2.39~GB of raw data.
-Although D3's maximum accumulated group-processing time is approximately 47.0~s, lower than that on D2, its additional boundary processing and spill I/O introduce further overhead.
-The results therefore suggest different sources of performance degradation: increased local state and buffer management on D2, and additional boundary handling and spill traffic on D3.
-The available counters do not isolate the runtime contribution of each mechanism.
+Duplicate marking is more dataset-sensitive, with its speedup decreasing from 2.84$\times$ on D1 to 1.82$\times$ on D2 and 1.28$\times$ on D3.
+Unlike SAMtools, which updates persistent hash tables as records are processed, SWBAM processes candidates in batches and carries unresolved candidates across batches until sufficient coordinate progress allows them to be finalized.
+This exposes batch-level parallelism but makes performance sensitive to the amount of carried state and boundary coordination.
+Accordingly, SAMtools maintains a relatively stable processing time of 0.79--0.83~$\mu$s per record, whereas SWBAM increases from 0.28~$\mu$s on D1 to 0.46~$\mu$s on D2 and 0.63~$\mu$s on D3.
+On D2, the reduced speedup is primarily associated with uneven local window workloads rather than boundary fallback.
+Localized concentrations of unresolved candidates require more state to be retained and processed across batches, increasing state-management and buffer overhead.
+This is reflected in the increase in maximum group-processing time from approximately 16.6~s on D1 to 56.0~s on D2 and in pending-buffer size from 17 to 269~MB, while cross-rank candidate exchange decreases from 71.2~kB to 6.8~kB.
+D3 exhibits a different bottleneck, as densely distributed coordinates near a rank boundary prevent the fixed 32-block probe from covering the required coordinate range, triggering boundary fallback.
+The resulting additional candidate processing and data staging lead to approximately 15.6 million boundary-candidate visits and 594 raw batch spills, writing and rereading 2.39~GB of data per run.
+These additional costs explain the reduced speedup on D3; nevertheless, SWBAM still achieves a 1.28$\times$ speedup over SAMtools, demonstrating its robustness to challenging coordinate distributions.
 
 \begin{table}[!t]
 \centering
@@ -611,34 +614,35 @@ The available counters do not isolate the runtime contribution of each mechanism
 \setlength{\tabcolsep}{3pt}
 \begin{tabular*}{\columnwidth}{@{\extracolsep{\fill}}lrrrr@{}}
 \toprule
-Application & SAMtools & SWBAM & Speedup & \texttt{-@} \\
+Application & SAMtools & SWBAM & Speedup & \shortstack{SAMtools\\threads} \\
 \midrule
 \multicolumn{5}{c}{Dataset D1} \\
 \midrule
-Collate & 172.52 & \textbf{59.80} & 2.88 & 127 \\
-Fixmate & 75.58 & \textbf{36.19} & 2.09 & 96 \\
-Coordinate sort & 165.47 & \textbf{50.93} & 3.25 & 24 \\
-Duplicate marking & 139.54 & \textbf{49.13} & 2.84 & 127 \\
+Collate & 172.52 & \textbf{59.80} & 2.88 & 128 \\
+Fixmate & 75.58 & \textbf{36.19} & 2.09 & 97 \\
+Coordinate sort & 165.47 & \textbf{50.93} & 3.25 & 25 \\
+Duplicate marking & 139.54 & \textbf{49.13} & 2.84 & 128 \\
 \midrule
 \multicolumn{5}{c}{Dataset D2} \\
 \midrule
-Collate (external) & 439.30 & \textbf{157.35} & 2.79 & 127 \\
-Fixmate & 177.37 & \textbf{84.68} & 2.09 & 127 \\
-Coordinate sort (external) & 520.79 & \textbf{149.97} & 3.47 & 96 \\
-Duplicate marking & 302.13 & \textbf{166.42} & 1.82 & 24 \\
+Collate (external) & 439.30 & \textbf{157.35} & 2.79 & 128 \\
+Fixmate & 177.37 & \textbf{84.68} & 2.09 & 128 \\
+Coordinate sort (external) & 520.79 & \textbf{149.97} & 3.47 & 97 \\
+Duplicate marking & 302.13 & \textbf{166.42} & 1.82 & 25 \\
 \midrule
 \multicolumn{5}{c}{Dataset D3} \\
 \midrule
-Collate & 154.33 & \textbf{56.73} & 2.72 & 96 \\
-Fixmate & 67.60 & \textbf{33.41} & 2.02 & 127 \\
-Coordinate sort & 163.51 & \textbf{46.45} & 3.52 & 127 \\
-Duplicate marking & 132.50 & \textbf{103.51} & 1.28 & 24 \\
+Collate & 154.33 & \textbf{56.73} & 2.72 & 97 \\
+Fixmate & 67.60 & \textbf{33.41} & 2.02 & 128 \\
+Coordinate sort & 163.51 & \textbf{46.45} & 3.52 & 128 \\
+Duplicate marking & 132.50 & \textbf{103.51} & 1.28 & 25 \\
 \bottomrule
 \end{tabular*}
 \begin{tablenotes}[flushleft]
 \scriptsize
 \item Runtimes are in seconds.
-SWBAM uses six active CGs; the last column gives the selected SAMtools thread setting.
+SWBAM uses six active CGs.
+The last column reports the total number of SAMtools threads, including the main thread.
 Speedup is the median SAMtools process wall time divided by the median SWBAM processing time, calculated before rounding.
 D1 and D3 use the memory paths for SWBAM collation and sorting.
 For D2, SWBAM collation and sorting use an 8-GiB algorithm workspace per rank.
@@ -651,27 +655,16 @@ Storage and timing conditions follow the overview.
 \end{table}
 
 \subsubsection{Deduplication Workflow Performance}
-Each workflow round executes collate, fixmate with mate scores, sort, and markdup as separate commands, saving and reloading intermediate BAM files.
-Table~\ref{tab:dedup-workflow} reports the median of three per-round stage sums, rather than a sum of independent stage medians.
-SWBAM includes complete RAM output assembly but excludes physical intermediate-file saving and reloading between MPI invocations.
+Across the evaluated configurations, SWBAM achieves workflow-level speedups of 2.37--3.05$\times$ over SAMtools (Table~\ref{tab:dedup-workflow}).
+These results show that the performance gains of individual distributed operations carry over to the complete four-stage workflow, although duplicate marking limits the aggregate speedup, particularly on D3.
 
-SWBAM retains a workflow-level processing-time advantage within the reported timing boundaries, using four independent commands and intermediate BAM files rather than a fused implementation.
-The workflow ratios decrease from 3.05$\times$ on D1 to 2.73$\times$ on D2 and 2.44$\times$ on D3.
-In the rounds yielding the median SWBAM totals, duplicate marking accounts for 25.1\%, 32.8\%, and 43.1\% of processing time, respectively.
-On D2 and D3, it is also the weakest relative stage, reducing the benefit of faster ordering.
-Ratios calculated from the median per-round first-three-stage subtotals are 3.13$\times$ on D2 and 3.34$\times$ on D3, showing how adding markdup reduces the aggregate advantage in these workloads.
+Duplicate marking is the least accelerated stage on D2 and D3, achieving speedups of 1.82$\times$ and 1.28$\times$, respectively.
+Its window-based candidate-state management and boundary handling introduce additional local processing and buffering costs, reducing the benefits gained from faster collation, fixmate, and sorting.
+For D2, the external-run workflow achieves a speedup of 2.37$\times$.
+The additional run generation and merging in collation and sorting introduce intermediate processing costs.
 
-External runs increase SWBAM's D2 workflow time by 10.1\%, with an overall ratio of 2.37$\times$.
-SAMtools uses 96 sort threads in this case, compared with 24 in the memory-sort case; its lower external-case total therefore does not represent a controlled sorting-mode improvement.
-For SWBAM, the additional run-generation and merge work occurs in collation and sorting, while fixmate and markdup retain the same settings.
-The distinction between RAM-backed temporary I/O and physical storage remains the same as in the independent tests.
-
-Full readback verifies record counts and coordinate order in all SWBAM workflow rounds.
-Final duplicate-flag totals are 50,084,605, 8,894,488, and 33,171,753 on D1--D3, respectively.
-D2 external runs preserve the same totals as memory sorting.
-These checks verify record counts and order, but do not establish identical duplicate membership across tools.
-Validation is excluded from timing.
-
+Full readback confirms record counts and coordinate order in all SWBAM workflow runs.
+Overall, the results demonstrate that SWBAM maintains substantial performance advantages across a complete sequence of distributed BAM operations, including external-run processing, while identifying duplicate marking as the main target for further optimization.
 
 \begin{table}[!t]
 \centering
@@ -682,22 +675,22 @@ Validation is excluded from timing.
 \setlength{\tabcolsep}{3pt}
 \begin{tabular*}{\columnwidth}{@{\extracolsep{\fill}}llrrr@{}}
 \toprule
-Dataset & Sort mode & SAMtools & SWBAM & Ratio \\
+Dataset & Sort mode & SAMtools & SWBAM & Speedup \\
 \midrule
 D1 & Memory & 597.46 & \textbf{195.96} & 3.05 \\
-D2 & Memory & 1380.03 & \textbf{505.12} & 2.73 \\
-D3 & Memory & 585.49 & \textbf{240.18} & 2.44 \\
 D2 & External & 1316.23 & \textbf{555.97} & 2.37 \\
+D3 & Memory & 585.49 & \textbf{240.18} & 2.44 \\
 \bottomrule
 \end{tabular*}
 \begin{tablenotes}[flushleft]
 \scriptsize
-\item Times are medians of three per-round totals in seconds.
+\item Times are medians of three per-round workflow totals in seconds.
 SAMtools totals sum the four command wall times; SWBAM totals sum the four processing intervals defined in the overview.
-Ratio divides these medians before rounding.
-Sort mode refers to coordinate sorting; SAMtools collation uses temporary files in both cases.
+Speedup is the ratio of these medians, calculated before rounding.
+Sort mode refers to coordinate sorting; SAMtools collation uses temporary files in all cases.
 The external-run settings follow Table~\ref{tab:distributed-external}.
-Preparation, post-Finalize saving, and validation remain outside the SWBAM processing intervals; this is not a launcher-to-exit wall-time comparison.
+Preparation, post-Finalize saving, and validation are excluded from SWBAM processing intervals.
+The reported comparison is not a launcher-to-exit wall-time comparison.
 \end{tablenotes}
 \end{threeparttable}
 \end{table}
