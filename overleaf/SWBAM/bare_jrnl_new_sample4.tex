@@ -1,11 +1,4 @@
 \documentclass[lettersize,journal]{IEEEtran}
-%\usepackage{amsmath,amsfonts}
-%\usepackage{algorithmic}
-%\usepackage{algorithm}
-%\usepackage{array}
-%\usepackage[caption=false,font=normalsize,labelfont=sf,textfont=sf]{subfig}
-%\usepackage{textcomp}
-%\usepackage{stfloats}
 \usepackage{url}
 \usepackage{verbatim}
 \usepackage{graphicx}
@@ -30,11 +23,6 @@
 \newcommand{\blue}[1]{{\color{blue}#1}}
 \newcommand{\ppp}[1]{{\color{purple}#1}}
 \newcommand{\green}[1]{{\color{green}#1}}
-% \newcommand{\red}[1]{{\color{black}#1}}
-% \newcommand{\yellow}[1]{{\color{yellow}#1}}
-% \newcommand{\ppp}[1]{{\color{purple}#1}}
-% \newcommand{\blue}[1]{{\color{blue}#1}}
-% \newcommand{\black}[1]{{\color{black}#1}}
 
 \newcommand{\tsc}[1]{\textsuperscript{#1}}
 \hyphenation{op-tical net-works semi-conduc-tor IEEE-Xplore}
@@ -42,7 +30,7 @@
 
 \begin{document}
 
-\title{}
+\title{SWBAM: A Scalable Framework for Distributed BAM/SAM Processing on the Sunway Heterogeneous Many-Core Architecture}
 
 \author{\IEEEauthorblockN{Lifeng Yan\tsc{1,†}\quad Zhan Zhao\tsc{1,†}\quad Zekun Yin\tsc{1,*}\quad Tong Zhang\tsc{1} \quad Yang Yang\tsc{1} \\ 
 \quad Fangjin Zhu\tsc{1} \quad Xiaohui Duan\tsc{1} \quad Bertil Schmidt\tsc{2}\quad Weiguo Liu\tsc{1,*}}\\
@@ -55,30 +43,16 @@
     bertil.schmidt@uni-mainz.de\\
     *. Corresponding author \quad †. Co-first authors
 }}
-%\author{IEEE Publication Technology,~\IEEEmembership{Staff,~IEEE,}
-%        % <-this % stops a space
-%\thanks{This paper was produced by the IEEE Publication Technology Group. They are in Piscataway, NJ.}% <-this % stops a space
-%\thanks{Manuscript received April 19, 2021; revised August 16, 2021.}}
-
-% The paper headers
-%\markboth{Journal of \LaTeX\ Class Files,~Vol.~14, No.~8, August~2021}%
-%{Shell \MakeLowercase{\textit{et al.}}: A Sample Article Using IEEEtran.cls for IEEE Journals}
-
-%\IEEEpubid{0000--0000/00\$00.00~\copyright~2021 IEEE}
-% Remember, if you use this you must call \IEEEpubidadjcol in the second
-% column for its text to clear the IEEEpubid mark.
 
 \maketitle
 
 \begin{abstract}
-
+BAM/SAM manipulation is a recurring and computationally demanding task in high-throughput sequencing workflows. Efficiently supporting these operations on heterogeneous many-core systems requires not only parallel BGZF I/O but also coordination of operation-specific dependencies, such as global ordering, QNAME grouping, and duplicate detection, across processing elements and nodes. We present SWBAM, a scalable framework for distributed BAM/SAM processing on the Sunway heterogeneous many-core architecture. SWBAM provides four reusable batch-based MPE–CPE pipelines for BAM/SAM reading and writing, with optimized CPE kernels for BGZF compression, decompression, record parsing, and serialization. By combining record-level operation fusion with composable batch-level pipelines, SWBAM reduces scheduling overhead and intermediate data movement. On this foundation, it implements streaming operations and MPI-based distributed algorithms for coordinate sorting, QNAME collation, mate-information updating, and duplicate marking, forming a complete four-stage deduplication workflow. Experiments on three human and mouse sequencing datasets show 90\%–96\% parallel efficiency when scaling from one to twelve core groups (CGs). Compared with SAMtools, SWBAM achieves 2.80–5.62× speedups for streaming operations, 1.28–3.52× for distributed operations, and 2.37–3.05× for the complete deduplication workflow. These results demonstrate the effectiveness of heterogeneous many-core execution for accelerating large-scale BAM/SAM processing.
 \end{abstract}
 
 \begin{IEEEkeywords}
-
+BAM/SAM processing, heterogeneous many-core architecture, Sunway, distributed processing, high-performance computing, genomic data processing
 \end{IEEEkeywords}
-
-
 
 \section{Introduction}
 %背景 -> 相关工作及局限 -> sunway架构和优势 -> 挑战实现和贡献 √
@@ -703,82 +677,13 @@ The reported comparison is not a launcher-to-exit wall-time comparison.
 \end{table}
 
 \section{Conclusions}
-
+This work presents SWBAM, a distributed BAM/SAM processing framework designed to exploit the heterogeneous many-core architecture of Sunway. By organizing data movement and computation into reusable batch-based MPE--CPE pipelines and extending this execution model to MPI-based applications with operation-specific dependencies, SWBAM unifies efficient record processing with distributed coordination. It supports a broad range of streaming and distributed operations and integrates them into a complete four-stage deduplication workflow. Experimental results demonstrate near-linear scalability for library-level I/O from one to twelve CGs, achieving 90\%--96\% parallel efficiency. Compared with SAMtools, SWBAM achieves speedups of 2.80--5.62$\times$ for streaming operations, 1.28--3.52$\times$ for distributed operations, and 2.37--3.05$\times$ for the complete deduplication workflow. These results demonstrate the effectiveness of architecture-aware heterogeneous execution in accelerating both individual BAM operations and multi-stage processing workflows, providing a reusable foundation for large-scale genomic data processing on many-core systems. Future work will focus on improving duplicate-marking performance under highly irregular coordinate distributions and reducing MPI overhead for short-running workloads.
 
 \section*{Acknowledgments}
 
 
 \bibliographystyle{unsrt}
 \bibliography{ref}
-
-
-%\newpage
-
-% \section{Biography Section}
- 
-% \vspace{-4em}
-
-% \begin{IEEEbiography}[{\includegraphics[width=1in,height=1.25in,clip,keepaspectratio]{figs/Lifeng Yan.png}}]{Lifeng Yan}
-% received his bachelor’s degree from Shandong University in 2021. He is currently pursuing his Ph.D. at the School of Software, Shandong University, in Jinan. His primary research focus is on high-performance computing and bioinformatics, aiming to integrate cutting-edge software and hardware technologies with bioinformatics algorithms for faster large-scale data processing and analysis. 
-% %He has won several first prizes in high-performance computing competitions, including ASC Student Supercomputer Challenge, PAC, and CPC Parallel Application Challenge.
-% \end{IEEEbiography}
-% \vspace{-2.4em}
-
-% \begin{IEEEbiography}
-% [{\includegraphics[width=1in,height=1.25in,clip,keepaspectratio]{figs/Zhan Zhao.png}}]{Zhan Zhao}
-% received his bachelor’s and master’s degrees from the School of Software at Shandong University in 2021 and 2024, respectively. His research focuses on high-performance computing and bioinformatics, with achievements including first place in the National Parallel Application Challenge.
-% \end{IEEEbiography}
-% \vspace{-2.4em}
-
-% \begin{IEEEbiography}
-% [{\includegraphics[width=1in,height=1.25in,clip,keepaspectratio]{figs/Zekun Yin.png}}]{Zekun Yin}
-% is an associate research professor at the School of Software, Shandong University. He received his bachelor’s and Ph.D. degrees from Shandong University in 2014 and 2020, respectively. His major research interests are high-performance computing and its application in life science and geoscience.
-% %He is an expert in the design, implementation, and deployment of parallel bioinformatics algorithms, applications, and libraries on multi- and many-core HPC platforms. 
-% He won the ACM Gordon Bell Prize in 2017 for his research work on the Tangshan earthquake simulation on the Sunway TaihuLight supercomputer.
-% \end{IEEEbiography}
-% \vspace{-2.4em}
-
-% \begin{IEEEbiography}
-% [{\includegraphics[width=1in,height=1.25in,clip,keepaspectratio]{figs/Tong Zhang.png}}]{Tong Zhang}
-% received his bachelor’s and master’s degrees from Shandong University in 2020 and 2023, respectively. He is currently pursuing his Ph.D. at the School of Software, Shandong University, in Jinan. His primary research interests are high-performance computing and its applications in life sciences.
-% \end{IEEEbiography}
-% \vspace{-2.4em}
-
-% \begin{IEEEbiography}
-% [{\includegraphics[width=1in,height=1.25in,clip,keepaspectratio]{figs/Yang Yang.png}}]{Yang Yang}
-% received her bachelor's degree from Shandong University in 2023. She is studying for a master's degree at the School of Software, Shandong University. Her main areas of study and research are high-performance computing and its applications in bioinformatics.
-% \end{IEEEbiography}
-% \vspace{-2.4em}
-
-
-% \begin{IEEEbiography}
-% [{\includegraphics[width=1in,height=1.25in,clip,keepaspectratio]{figs/Fangjin Zhu.png}}]{Fangjin Zhu}
-% received his Ph.D. in Engineering and is currently a lecturer at Shandong University. His research interests encompass intelligent router technologies, swarm intelligence-based routing protocol design, virtual network technologies, computer network multicast algorithms, swarm intelligence optimization algorithms, and reinforcement learning algorithms. He has contributed to national and provincial research projects and has published over 20 papers in SCI/EI journals and conferences, including Computer Communications and IPCCC.
-% \end{IEEEbiography}
-% \vspace{-2.4em}
-
-% \begin{IEEEbiography}
-% [{\includegraphics[width=1in,height=1.25in,clip,keepaspectratio]{figs/Xiaohui Duan.png}}]{Xiaohui Duan}
-% received a Ph.D. degree in computer science from Shandong University. He is currently a research professor at the School of Software, Shandong University. His research interests include HPC in molecular dynamics, earth system applications, and other problems with Sunway supercomputers.
-% \end{IEEEbiography}
-% \vspace{-2.4em}
-
-% \begin{IEEEbiography}
-% [{\includegraphics[width=1in,height=1.25in,clip,keepaspectratio]{figs/Bertil Schmidt.png}}]{Bertil Schmidt}
-% is a tenured full professor and the Chair of Parallel and Distributed Architectures at Johannes Gutenberg University, Germany. His research group has developed various algorithms and tools for bioinformatics, focusing primarily on the analysis of large-scale sequence and short-read datasets, as well as data mining. Dr. Schmidt has received numerous accolades, including the CUDA Research Center Award, CUDA Academic Partnership Award, CUDA Professor Partnership Award, and Best Paper Awards at IEEE ASAP 2009 and IEEE ASAP 2015.
-% \end{IEEEbiography}
-% \vspace{-2.4em}
-
-
-% \begin{IEEEbiography}
-% [{\includegraphics[width=1in,height=1.25in,clip,keepaspectratio]{figs/Weiguo Liu.png}}]{Weiguo Liu}
-% received the bachelor’s and master’s degrees from Xi’an JiaoTong University, China, and the Ph.D. degree from Nanyang Technological University, Singapore. He is currently a full professor and director with the High-performance Computing Lab, Shandong University. His research interests include HPC and data mining. He was nominated as ‘‘Taishan Scholar’’ in Shandong province, and received numerous awards (e.g., ACM Gordon Bell Prize award in SC 2017, Fraunhofer IGD Best Paper award, and CCF HPC China Best Paper Award). 
-% \end{IEEEbiography}
-% \vspace{-2.4em}
-
-% \vfill
-
-
 \end{document}
 
 
