@@ -47,7 +47,15 @@
 \maketitle
 
 \begin{abstract}
-BAM/SAM manipulation is a recurring and computationally demanding task in high-throughput sequencing workflows. Efficiently supporting these operations on heterogeneous many-core systems requires not only parallel BGZF I/O but also coordination of operation-specific dependencies, such as global ordering, QNAME grouping, and duplicate detection, across processing elements and nodes. We present SWBAM, a scalable framework for distributed BAM/SAM processing on the Sunway heterogeneous many-core architecture. SWBAM provides four reusable batch-based MPE–CPE pipelines for BAM/SAM reading and writing, with optimized CPE kernels for BGZF compression, decompression, record parsing, and serialization. By combining record-level operation fusion with composable batch-level pipelines, SWBAM reduces scheduling overhead and intermediate data movement. On this foundation, it implements streaming operations and MPI-based distributed algorithms for coordinate sorting, QNAME collation, mate-information updating, and duplicate marking, forming a complete four-stage deduplication workflow. Experiments on three human and mouse sequencing datasets show 90\%–96\% parallel efficiency when scaling from one to twelve core groups (CGs). Compared with SAMtools, SWBAM achieves 2.80–5.62× speedups for streaming operations, 1.28–3.52× for distributed operations, and 2.37–3.05× for the complete deduplication workflow. These results demonstrate the effectiveness of heterogeneous many-core execution for accelerating large-scale BAM/SAM processing.
+BAM/SAM manipulation is a recurring and computationally demanding task in high-throughput sequencing workflows. 
+Efficiently supporting these operations on heterogeneous many-core systems requires not only parallel BGZF I/O but also coordination of operation-specific dependencies, such as global ordering, QNAME grouping, and duplicate detection, across processing elements and nodes. 
+We present SWBAM, a scalable framework for distributed BAM/SAM processing on the Sunway heterogeneous many-core architecture. 
+SWBAM provides four reusable batch-based MPE–CPE pipelines for BAM/SAM reading and writing, with optimized CPE kernels for BGZF compression, decompression, record parsing, and serialization. 
+By combining record-level operation fusion with composable batch-level pipelines, SWBAM reduces scheduling overhead and intermediate data movement. 
+On this foundation, it implements streaming operations and MPI-based distributed algorithms for coordinate sorting, QNAME collation, mate-information updating, and duplicate marking, forming a complete four-stage deduplication workflow. 
+Experiments on three human and mouse sequencing datasets show 90\%–96\% parallel efficiency when scaling from one to twelve core groups (CGs). 
+Compared with SAMtools, SWBAM achieves 2.80–5.62× speedups for streaming operations, 1.28–3.52× for distributed operations, and 2.37–3.05× for the complete deduplication workflow. 
+These results demonstrate the effectiveness of heterogeneous many-core execution for accelerating large-scale BAM/SAM processing.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -56,22 +64,36 @@ BAM/SAM processing, heterogeneous many-core architecture, Sunway, distributed pr
 
 \section{Introduction}
 %背景 -> 相关工作及局限 -> sunway架构和优势 -> 挑战实现和贡献 √
-The rapid growth of high-throughput sequencing data has continuously increased the computational and I/O demands of genomic data analysis~\cite{amarasinghe2020opportunities,goodwin2016coming,schmidt2017ngs}. Following sequence alignment, the resulting data are commonly stored in the SAM (Sequence Alignment/Map) or its binary counterpart BAM (Binary Alignment/Map) format~\cite{li2009samtools}. These files undergo a series of processing operations, including statistics, filtering, format conversion, sorting, mate information updating, and duplicate marking, before being used in downstream analyses such as variant calling. In typical analysis workflows, large BAM files may therefore be read, reorganized, and rewritten multiple times. As sequencing datasets continue to grow, efficient BAM and SAM processing has become increasingly important for maintaining the throughput of large-scale genomic analysis.
+The rapid growth of high-throughput sequencing data has continuously increased the computational and I/O demands of genomic data analysis~\cite{amarasinghe2020opportunities,goodwin2016coming,schmidt2017ngs}. Following sequence alignment, the resulting data are commonly stored in the SAM (Sequence Alignment/Map) or its binary counterpart BAM (Binary Alignment/Map) format~\cite{li2009samtools}. 
+These files undergo a series of processing operations, including statistics, filtering, format conversion, sorting, mate information updating, and duplicate marking, before being used in downstream analyses such as variant calling. 
+In typical analysis workflows, large BAM files may therefore be read, reorganized, and rewritten multiple times. 
+As sequencing datasets continue to grow, efficient BAM and SAM processing has become increasingly important for maintaining the throughput of large-scale genomic analysis.
 
-SAMtools and HTSlib provide widely used software infrastructure for BAM and SAM processing, supporting operations such as format conversion, sorting, indexing, and duplicate marking~\cite{danecek2021samtools,bonfield2021htslib}. Several tools have further improved the performance of specific BAM operations. Sambamba employs multithreaded processing for common alignment-file operations~\cite{tarasov2015sambamba}, while quickBAM provides parallel access to sorted and indexed BAM files~\cite{pitman2023quickbam}. Our previous work, RabbitBAM, focuses on general BAM I/O on multicore CPU platforms and improves parallel efficiency through pre-parsing, parallel parsing, memory pools, and lock-free queues~\cite{yan2025rabbitbam}. These efforts demonstrate the potential of parallel processing for accelerating BAM operations. However, existing approaches do not directly address the efficient exploitation of heterogeneous many-core architectures or the coordinated execution of diverse BAM operations across distributed processing units.
+SAMtools and HTSlib provide widely used software infrastructure for BAM and SAM processing, supporting operations such as format conversion, sorting, indexing, and duplicate marking~\cite{danecek2021samtools,bonfield2021htslib}. 
+Several tools have further improved the performance of specific BAM operations. 
+Sambamba employs multithreaded processing for common alignment-file operations~\cite{tarasov2015sambamba}, while quickBAM provides parallel access to sorted and indexed BAM files~\cite{pitman2023quickbam}. 
+RabbitBAM focuses on general BAM I/O on multicore CPU platforms and improves parallel efficiency through pre-parsing, parallel parsing, memory pools, and lock-free queues~\cite{yan2025rabbitbam}. These efforts demonstrate the potential of parallel processing for accelerating BAM operations. 
+However, existing approaches do not directly address the efficient exploitation of heterogeneous many-core architectures or the coordinated execution of diverse BAM operations across distributed processing units.
 
-The next-generation Sunway platform offers substantial computational resources through its heterogeneous many-core architecture. The SW26010-Pro processor consists of multiple Core Groups (CGs), each integrating one Management Processing Element (MPE) and 64 Compute Processing Elements (CPEs). The CPEs are organized into an 8 $\times$ 8 array, with each CPE equipped with 256 KB of Local Data Memory (LDM). Hardware-supported Direct Memory Access (DMA) facilitates data transfers between the MPE and CPEs, while Remote Memory Access (RMA) enables efficient data exchange among CPEs~\cite{zhu2021sunway}. This architecture provides complementary opportunities for parallelism: the CPE array can accelerate computation-intensive operations such as BGZF decompression, record parsing, serialization, and compression, while DMA-based data movement supports batch-oriented execution between main memory and CPE local memories. Furthermore, multiple CGs can cooperate through MPI, providing a basis for distributed processing of large BAM datasets. Previous applications, including SWQC and SWBWA, have demonstrated the effectiveness of redesigning bioinformatics workflows to exploit CPE-level parallelism and MPE-CPE cooperation on this architecture~\cite{yan2025swqc,yan2026swbwa}. Nevertheless, efficiently supporting general BAM processing remains challenging because it involves not only data-parallel I/O operations but also application-specific dependencies and coordination across distributed processes.
+The next-generation Sunway platform offers substantial computational resources through its heterogeneous many-core architecture. 
+The SW26010-Pro processor consists of multiple Core Groups (CGs), each integrating one Management Processing Element (MPE) and 64 Compute Processing Elements (CPEs). 
+The CPEs are organized into an 8 $\times$ 8 array, with each CPE equipped with 256 KB of Local Data Memory (LDM). 
+Hardware-supported Direct Memory Access (DMA) facilitates data transfers between the MPE and CPEs, while Remote Memory Access (RMA) enables efficient data exchange among CPEs~\cite{zhu2021sunway}. 
+This architecture provides complementary opportunities for parallelism: the CPE array can accelerate computation-intensive operations such as BGZF decompression, record parsing, serialization, and compression, while DMA-based data movement supports batch-oriented execution between MPE main memory and CPE local memories. 
+Furthermore, multiple CGs can cooperate through MPI, providing a basis for distributed processing of large BAM datasets. 
+Previous applications, including SWQC and SWBWA, have demonstrated the effectiveness of redesigning bioinformatics workflows to exploit CPE-level parallelism and MPE-CPE cooperation on this architecture~\cite{yan2025swqc,yan2026swbwa}. 
+Nevertheless, efficiently supporting general BAM processing remains challenging because it involves not only data-parallel I/O operations but also application-specific dependencies and coordination across distributed processes.
 
 Efficient BAM processing on Sunway faces three main challenges.
 First, conventional BAM libraries expose record-oriented interfaces, whereas fine-grained CPE task dispatch introduces excessive scheduling and synchronization overhead. Efficient execution therefore requires batch-level parallelism and coordinated MPE-CPE execution.
-Second, distributed processing requires scalable input partitioning and output organization, allowing multiple MPI ranks to process independent data regions and generate globally valid outputs without centralizing record payloads.
+Second, distributed processing requires scalable input partitioning and output organization, enabling MPI ranks to process assigned input regions and collectively produce globally valid outputs without gathering all record payloads on a single rank.
 Third, BAM operations exhibit different data dependencies: statistics and filtering are largely batch-independent, whereas sorting requires global ordering, collation and fixmate involve QNAME-based grouping, and duplicate marking requires coordinate-ordered state management across batches and ranks.
 These differences make a unified parallelization strategy difficult.
 To address these challenges, we develop SWBAM, a high-performance BAM/SAM processing framework for the Sunway many-core platform.
 SWBAM provides four batch-based MPE-CPE pipelines for BAM/SAM reading and writing, together with reusable I/O, batch management, scheduling, and output components.
 It also provides optimized CPE kernels for BGZF compression and decompression, BAM/SAM parsing and formatting, and record serialization.
 A key design principle is to combine pipeline flexibility at batch boundaries with efficient record-level execution: pipelines are composed at the batch level, while performance-critical record operations are statically fused within CPE kernels.
-For example, BGZF decompression, BAM parsing, and record-level statistics or filtering can be performed within a single CPE launch, avoiding per-record dispatch and unnecessary intermediate processing.
+For example, BGZF decompression, BAM parsing, and record-level statistics or filtering can be performed within a single CPE launch, avoiding per-record runtime operator dispatch and unnecessary intermediate processing.
 MPE-side batch processing connects these pipelines to support different input-output combinations.
 On top of this library, we implement streaming operations, including statistics, filtering, and BAM/SAM conversion, as well as distributed applications for coordinate sorting, collation, fixmate, and duplicate marking.
 These applications incorporate operation-specific data redistribution and cross-rank coordination.
@@ -80,7 +102,7 @@ The distributed applications are further integrated into a complete four-stage d
 
 The main contributions of this work are as follows:
 \begin{itemize}
-    \item We design SWBAM, a reusable BAM/SAM processing framework for the heterogeneous Sunway many-core architecture, providing four batch-based MPE-CPE pipelines and common processing components.
+    \item We design SWBAM library, a reusable BAM/SAM processing framework for the heterogeneous Sunway many-core architecture, providing four batch-based MPE-CPE pipelines and common processing components.
     \item We develop optimized CPE kernels and a batch-oriented execution model that combines pipeline composition with static fusion of record-level operations, reducing fine-grained scheduling and intermediate processing overhead.
     \item We implement distributed BAM applications, including coordinate sorting, collation, fixmate, and duplicate marking, and integrate them into a complete deduplication workflow. We evaluate the framework at the library, application, and workflow levels on the Sunway platform.
 \end{itemize}
@@ -88,7 +110,7 @@ The main contributions of this work are as follows:
 \section{Methods}
 \subsection{Overview}
 % 总体介绍+库的介绍 -> app的介绍 -> overview图 √
-As shown in Fig.~\ref{fig:swbam_overview}, SWBAM consists of a library and a set of applications that use its processing components.
+As shown in Fig.~\ref{fig:swbam_overview}, SWBAM consists of a library and a set of applications that use its components.
 The library provides common BAM/SAM I/O components for input partitioning and distributed output.
 It also provides four batch-based pipelines for BAM reading, BAM writing, SAM reading, and SAM writing.
 These pipelines use buffer reuse and double buffering to coordinate MPE--CPE execution.
@@ -97,9 +119,9 @@ Where appropriate, record-level operations are combined within CPE kernels.
 CPE kernel optimizations further reduce allocation and data movement overhead in BGZF compression and decompression, BAM/SAM parsing and formatting, and record serialization.
 These optimizations include codec reuse, reusable record buffers, and fused processing.
 
-SWBAM applications reuse the library's processing components and implement algorithms for their specific data dependencies.
+SWBAM applications reuse the library's components and implement algorithms for their specific data dependencies.
 Streaming applications combine the relevant pipelines and operators for statistics, filtering, and BAM/SAM conversion.
-Distributed applications reuse the BAM read and write pipelines, while application-specific algorithms and MPI communication handle record reordering and cross-rank state.
+The distributed applications build on the shared BAM read/write pipelines, using operation-specific algorithms and MPI communication to redistribute and reorder records and coordinate state across ranks.
 Sorting and collation redistribute records by coordinate and QNAME, respectively.
 Fixmate processes QNAME groups across batch and rank boundaries, while duplicate marking maintains a coordinate-ordered candidate window and coordinates duplicate decisions across ranks.
 These operations are combined into a four-stage deduplication workflow: collation, fixmate, coordinate sorting, and duplicate marking.
@@ -111,7 +133,6 @@ These operations are combined into a four-stage deduplication workflow: collatio
 The library provides distributed BAM/SAM I/O, four batch-based MPE--CPE pipelines, and reusable CPE kernels.
 The execution view shows read-side double buffering and block-parallel processing within one core group.
 Applications use these components for streaming operations, distributed algorithms, and a four-stage deduplication workflow with intermediate BAM files.
-H and E denote the BAM header and BGZF EOF block, respectively.
 The shared I/O symbol indicates shared I/O functionality, not in-place updates.
 Timings and data sizes are schematic.}
 \label{fig:swbam_overview}
@@ -142,7 +163,7 @@ In automatic mode, the store switches to a temporary file when an append would e
 After processing, ranks exchange body sizes and use prefix sums to calculate file offsets in rank order.
 Each offset is determined by the header size and the output sizes of all preceding ranks.
 In MPI-IO mode, each rank reads its staged body through a fixed-size buffer and writes it to the assigned file region.
-This avoids gathering complete output bodies on the root rank and limits memory use during final writing.
+This avoids gathering complete output bodies on the root rank, reducing its memory requirements during final output generation.
 The BAM output consists of one header, the rank-local compressed bodies in rank order, and one BGZF EOF block.
 The SAM output consists of one text header followed by the rank-local text bodies.
 File-backed staging allows SWBAM to handle outputs larger than the available staging memory without keeping the entire output in memory.
@@ -171,14 +192,14 @@ Similar overlap is used in SAM processing, depending on the pipeline stages and 
 These strategies reduce idle time and reuse allocated buffers across batches without requiring multiple CPE kernels to execute concurrently within the same core group.
 
 \subsubsection{Pipeline composition and operators}
-% 总结+简单解释流水线和operators -> CPE记录级组合 -> 两个sdk组合示例 -> 介绍数据所有权与生命周期管理 √
+% 总结+简单解释流水线和operators -> CPE记录级组合 -> 流水线组合以及两个sdk组合示例 -> 介绍数据所有权与生命周期管理 √
 SWBAM composes processing at two levels: record-level operations within CPE kernels and batch-level stages through MPE-side post-processing.
 This design reuses common pipeline mechanisms while allowing applications to combine different operations without per-record dispatch overhead.
 The pipeline runtimes manage batch buffers, launch and join CPE kernels, and invoke MPE-side hooks.
 For each batch, an MPE-side operator provides the kernel entry and task-specific parameters, binds data buffers, validates the results, and performs batch-level post-processing.
 These operators are invoked once per batch rather than once per record.
 
-Within CPE kernels, SWBAM combines common BAM record traversal with task-specific operations, including record counting, flag statistics, basic statistics, filtering, and passthrough processing.
+Within CPE kernels, SWBAM combines common BAM record traversal with task-specific operations, including record counting, flag statistics, filtering, and passthrough processing.
 C++ templates determine the record operation when the kernel is compiled.
 At runtime, the MPE selects among prebuilt kernels and passes task-specific options, such as filter parameters.
 The record traversal invokes the selected operation directly, avoiding per-record virtual or function-pointer dispatch.
@@ -187,7 +208,6 @@ Batch-level composition connects pipelines through MPE-side post-processing afte
 For record counting, the BAM read pipeline parses records into reusable \texttt{bam1\_t} objects, and the MPE aggregates the per-block counts.
 For BAM-to-BAM processing, the MPE groups retained records into BGZF packing plans and submits them to the BAM write pipeline for serialization and compression.
 These plans reference existing records and do not copy record payloads or transfer ownership.
-BAM-to-SAM and SAM-to-BAM processing similarly connect the corresponding read and write pipelines.
 
 SWBAM also defines data ownership and lifetime across pipeline stages.
 Pipeline-owned data remain valid only until their buffers are reused or released.
@@ -203,9 +223,9 @@ It reuses codec objects and working buffers, and combines related processing ste
 SWBAM reuses libdeflate compressor and decompressor objects across kernel launches.
 Each CPE creates a decompressor on first use and reuses it for subsequent blocks.
 Compressors are cached by compression level and recreated only when the required level changes.
-For level-1 compression, SWBAM reduces match-search work by checking one hash-table candidate at each search position.
+\red{For level-1 compression, SWBAM reduces match-search work by checking one hash-table candidate at each search position.
 For sufficiently long matches, hash updates cover the first six interior positions and then use a two-byte stride.
-These changes reduce candidate checks and hash-table updates while retaining valid DEFLATE and BGZF output.
+These changes reduce candidate checks and hash-table updates while retaining valid DEFLATE and BGZF output.}
 For BAM input, SWBAM combines decompression, parsing, and record processing within one CPE kernel.
 The decoded block is processed directly without a separate kernel launch or MPE-side processing stage between these operations.
 Statistical kernels reuse a scratch \texttt{bam1\_t} record and its data buffer on each CPE.
@@ -217,8 +237,8 @@ When serialized BAM payloads are provided directly, the kernel skips record seri
 Compressed output buffers are also reused across batches.
 
 SWBAM also reuses buffers in SAM processing.
-The fast SAM parser writes records into per-chunk arenas and caches recent reference-name lookups within each chunk.
-Records that the fast parser cannot handle are processed by the general parser.
+\red{The fast SAM parser writes records into per-chunk arenas and caches recent reference-name lookups within each chunk.
+Records that the fast parser cannot handle are processed by the general parser.}
 For SAM output, each CPE formats records directly into its batch text buffer instead of creating a separate string for each record.
 The MPE reserves buffer capacity before formatting and retains enlarged buffers for subsequent batches.
 These optimizations reduce repeated allocation and intermediate data handling in SAM parsing and formatting.
@@ -273,22 +293,24 @@ The merged raw records are packed into BGZF payloads and compressed through the 
 Collation uses QNAME-based partitioning instead of constructing a global coordinate order.
 CPEs extract QNAME hashes, record metadata, and raw BAM records.
 Each hash is assigned to a bin, and each bin is mapped to an owner rank so that records with the same QNAME reach the same rank.
+Figure~\ref{fig:swbam-reordering}(b) illustrates six coordinate ranges and 66 QNAME bins mapped to six ranks.
 After local ordering, each rank retains self-owned records and exchanges the remaining records in bounded chunks.
 The receiving rank merges the segments by bin, hash, and full QNAME, grouping records with the same QNAME together without imposing a global lexicographic QNAME order.
 Within each group, records are ordered by READ1/READ2 flag bits and then by original input order.
 Unlike the standard temporary-bin workflow of SAMtools~\cite{danecek2021samtools}, SWBAM supports both in-memory and external-memory collation.
 Sorting also supports in-memory and external-memory execution.
 In external mode, SWBAM generates sorted runs and performs bounded data exchange and streaming multi-way merging under the configured memory limit.
-Figure~\ref{fig:swbam-reordering}(b) illustrates six coordinate ranges and 66 QNAME bins mapped to six ranks.
-The merge fan-in $F$ limits the number of input segments processed per pass; additional passes are performed when necessary before final merging and compression (Fig.~\ref{fig:swbam-reordering}(c)).
+The merge fan-in \(F\) specifies the maximum number of sorted segments merged in each pass. 
+If the number of segments exceeds this limit, multiple intermediate merge passes are performed before the final merge and compression (Fig.~\ref{fig:swbam-reordering}(c)).
 
 Fixmate updates mate information for records with the same QNAME.
-The BAM read pipeline supplies records from name-collated input, and the MPE groups consecutive records by QNAME.
-Groups that extend across batch boundaries are retained until subsequent batches complete them.
-The first and last rank-local groups are also deferred because they may extend across MPI rank boundaries.
-Ranks exchange boundary QNAME information to identify group ownership and transfer the corresponding group fragments to their owner ranks.
-For each complete group, a CPE planning kernel determines the required mate-field and tag updates and calculates the output size.
-The MPE computes output offsets from the planned record lengths, and a second CPE kernel rewrites records into disjoint output regions.
+Because the input BAM is name-collated, records with the same QNAME appear consecutively. 
+The MPE scans each batch and groups adjacent records with matching QNAMEs. If a group extends beyond the current batch, it is retained and continued when the next batch is processed. 
+A similar situation occurs at MPI rank boundaries, where the last group of one rank may continue as the first group of another. 
+Each rank therefore temporarily retains its boundary groups and exchanges their QNAMEs with other ranks to identify fragments belonging to the same group. 
+These fragments are then transferred to the designated owner rank for group completion.
+\red{For each complete group, a CPE planning kernel determines the required mate-field and tag updates and calculates the output size.
+The MPE computes output offsets from the planned record lengths, and a second CPE kernel rewrites records into disjoint output regions.}
 The supported updates include mate coordinates, flags, template length, and the \texttt{MQ}, \texttt{MC}, and \texttt{ms} tags.
 The rewritten records are then serialized and compressed through the common BAM write pipeline.
 Boundary and interior output segments are combined in QNAME-group order.
@@ -302,21 +324,42 @@ Boundary and interior output segments are combined in QNAME-group order.
 \label{fig:swbam-markdup}
 \end{figure}
 
-Duplicate marking compares candidates across MPI ranks while preserving input record order.
-The BAM read pipeline supplies parsed records, and a dedicated CPE kernel extracts the duplicate keys and scores required for candidate comparison.
-MPE-side logic assigns candidates to coordinate owners and maintains separate states for paired and single-read candidates.
-MPI exchanges candidate metadata and routes decisions back to source ranks, while the original BAM records remain on their source ranks.
-The sliding window retires candidate keys that can no longer match future records.
-For a key coordinate $x$ on the current reference, an interior winner can be finalized as KEEP when
+%输入处理 -> 通信来源和实现 -> 滑动窗口机制 -> 跨rank处理 -> 输出处理
+Duplicate marking processes coordinate-sorted BAM records in a single pass while preserving their input order. 
+The input is partitioned into disjoint coordinate ranges based on alignment-start coordinates, with each MPI rank processing its assigned range. 
+For each batch, the shared BAM read pipeline decodes and parses records, and a CPE kernel extracts the duplicate key and score of each candidate. 
+
+Since the duplicate key is based on the unclipped $5'$ coordinate rather than the alignment-start coordinate, records sharing the same duplicate key may originate from different rank ranges. 
+Consequently, a candidate's duplicate-key coordinate may fall outside the range assigned to its source rank. 
+The MPE therefore assigns each candidate to the rank responsible for its duplicate-key coordinate, referred to as the owner rank. 
+Candidates whose owner is the source rank are compared locally, while candidates assigned to other ranks require cross-rank metadata exchange. 
+Each owner maintains separate candidate states for paired-end and single-end reads and compares candidates sharing the same duplicate key. 
+The resulting decisions are returned to the source ranks through MPI, while the original BAM records remain on their source ranks. 
+Thus, only candidate metadata and decisions are exchanged, avoiding the redistribution of complete BAM records.
+
+Each owner rank maintains a sliding window of unresolved candidate keys. 
+As coordinate-ordered processing advances, candidate keys that can no longer match future records are retired. 
+For an interior key at coordinate $x$ on the current reference, its winning record can be finalized as KEEP when
 \[
 x+L\leq p_r,
 \]
-where $p_r$ is the processed alignment-start coordinate on rank $r$, and $L$ is the configured maximum-read-length bound.
-This condition relies on $L$ covering the possible displacement caused by clipping, including hard clipping.
-Advancing to a later reference also expires keys from earlier references.
-Figure~\ref{fig:swbam-markdup}(a) illustrates cross-rank decisions for candidates with the same unclipped $5'$ coordinate but different alignment starts.
-Figure~\ref{fig:swbam-markdup}(b) shows candidate replacement and finalization for forward single-end reads.
-Algorithm~\ref{alg:distributed_markdup} summarizes the processing and output workflow.
+where $p_r$ is the latest alignment-start coordinate processed by rank $r$. 
+The bound $L$ must cover the maximum displacement between the alignment start and the unclipped $5'$ coordinate, including hard clipping. 
+It is specified through the command-line option \texttt{-l}. SAMtools uses 300 bp as the default value, and we use the same setting ($L=300$ bp) in all experiments. 
+Advancing to a later reference also expires candidate keys from previous references. 
+Figure~\ref{fig:swbam-markdup}(b) illustrates how a higher-scoring candidate replaces the current winner and is finalized when the window advances.
+
+To handle cross-rank candidates, SWBAM probes up to 32 BGZF blocks at each end of every rank's input range. 
+If the probes cover the required coordinate range at all rank boundaries, SWBAM builds a boundary plan to precompute the necessary cross-rank comparisons. 
+Otherwise, it adopts a conservative fallback that retains boundary candidates until every relevant rank has either advanced at least $2L$ beyond the boundary coordinate or reached EOF. 
+In this fallback mode, ranks exchange their processing progress and EOF status in each collective round. 
+Ranks that finish their local input early continue participating with empty batches, while candidates awaiting remote decisions remain pending until their owners return the results.
+
+Once all records in a block have received their duplicate decisions, the source rank applies the corresponding flags and submits the block for compression. 
+Since compression may complete out of order, SWBAM tracks each compressed fragment by its input-block index and within-block position to preserve the original record order. 
+Decoded buffers remain valid until the corresponding compression tasks complete, and unresolved blocks can be staged temporarily under buffer pressure. 
+The shared BAM write pipeline manages batch execution and compression, while the duplicate-marking application maintains the candidate window, boundary state, pending blocks, MPI decisions, and output-order metadata. 
+Algorithm~\ref{alg:distributed_markdup} summarizes the complete procedure.
 
 \begin{algorithm}[!t]
 \caption{Distributed duplicate marking on rank $r$}
@@ -325,46 +368,70 @@ Algorithm~\ref{alg:distributed_markdup} summarizes the processing and output wor
 \hspace*{\algorithmicindent}\textbf{Input:} Rank-local coordinate-sorted BAM blocks; maximum read length $L$\\
 \hspace*{\algorithmicindent}\textbf{Output:} Rank-local duplicate-marked BGZF body
 \begin{algorithmic}[1]
-\State $P_r \gets \Call{ProbeRankEnds}{r,32}$
-\State $G \gets \Call{GatherRankStarts}{P_r}$
-\State $H_r \gets \Call{BuildBoundaryPlan}{P_r,G,L}$
-\Comment{Enable precomputation only when all rank boundaries are covered}
-\State Initialize owner window $W_r$, pending blocks $Q_r$, and ordered output $O_r$
-\State $T \gets \Call{AllReduceMax}{\text{number of local batches}}$
+\State $(cuts,plan) \gets \Call{PrepareRouting}{r,L}$
+\Comment{Establish owner ranges and initialize boundary handling}
+\State Initialize paired-end and single-end windows $W_r$, pending blocks $Q_r$, and output $O_r$
+\State $T \gets \Call{AllReduceMax}{local batch count}$
 \For{$t=1,\ldots,T$}
     \State $(B_r,C_r,p_r) \gets \Call{DecodeAndExtractBatch}{t}$
     \State \Call{StartPreparedCompression}{}
-    \State $C_r \gets \Call{CaptureAndApplyPlan}{B_r,C_r,Q_r,H_r}$
-    \If{$H_r$ is disabled}
-        \State $S \gets \Call{AllGatherProgressAndEOF}{p_r}$
-    \EndIf
-    \State $C_r^{\mathrm{owner}} \gets \Call{ExchangeByOwner}{C_r,G,Q_r}$
-    \State $D_r \gets \Call{UpdateOwnerWindow}{W_r,C_r^{\mathrm{owner}},p_r,L,Q_r}$
-    \If{$H_r$ is disabled}
-        \State Add \Call{ReleaseSafeBoundaries}{$W_r,G,S,L$} to $D_r$
-    \EndIf
-    \State \Call{RouteAndApplyDecisions}{$D_r,Q_r$}
-    \State \Call{FinishAndPrepareOutput}{$Q_r,O_r$}
+    \State $C_r \gets \Call{ApplyPrecomputed}{B_r,C_r,plan}$
+    \Comment{Apply precomputed decisions and remove handled candidates}
+    \State $C_r^{owner} \gets \Call{RouteCandidates}{C_r,cuts,Q_r}$
+    \Comment{Route candidates by duplicate-key coordinate}
+    \State $D_r \gets \Call{UpdateWindows}{W_r,C_r^{owner},p_r,L,Q_r}$
+    \Comment{Compare candidates and update their states}
+    \State $D_r \gets D_r \cup \Call{ResolveBoundary}{W_r,plan,p_r}$
+    \Comment{Handle remaining cross-rank boundary candidates}
+    \State \Call{ReturnDecisions}{$D_r,Q_r$}
+    \State \Call{AdvanceOutput}{$Q_r,O_r$}
 \EndFor
-\State Validate coordinate order across ranks
-\State $D_r \gets \Call{FinalizeOwnerWinnersAsKeep}{W_r,Q_r}$
-\State \Call{RouteAndApplyDecisions}{$D_r,Q_r$}
-\State Verify that no source-record decision remains pending
-\State Drain compression and seal $O_r$ in input-block and fragment order
+\State $D_r \gets \Call{FinalizeWinners}{W_r,Q_r}$
+\Comment{Keep remaining owner winners}
+\State \Call{ReturnDecisions}{$D_r,Q_r$}
+\State \Call{AdvanceOutput}{$Q_r,O_r$}
+\State \Call{DrainAndSeal}{$O_r$}
 \end{algorithmic}
 \end{algorithm}
 
-Boundary handling retains candidates until the required cross-rank comparisons are complete.
-SWBAM probes up to 32 BGZF blocks at each end of a rank range and enables boundary precomputation only when all rank probes cover the required halo.
-If coverage is insufficient, a conservative boundary window remains active until the relevant ranks advance beyond the boundary coordinate by $2L$ or exhaust their input.
-In this fallback path, ranks exchange progress and EOF information so that boundary candidates are released only when no relevant remote candidate can remain.
-During each processing round, candidates from the current batch are exchanged and processed before safe boundary release.
-Ranks that finish early continue participating in collective rounds with empty batches.
-Records awaiting remote decisions remain pending after local EOF until their owners' decisions arrive.
-Only blocks with fully resolved duplicate decisions enter compression.
-Compression may complete out of order, but compressed fragments are indexed by input-block and within-block position to preserve the final logical order.
-Decoded buffers remain valid while active compression uses them; unresolved blocks may be staged temporarily under cache pressure.
-The common library manages batch execution and compression, while the application maintains the sliding window, boundary state, MPI decisions, pending blocks, and output-order metadata.
+\begin{algorithm}[!t]
+\caption{Distributed duplicate marking on rank $r$}
+\label{alg:distributed_markdup}
+\small
+\hspace*{\algorithmicindent}\textbf{Input:} Rank-local coordinate-sorted BAM blocks; maximum read length $L$\\
+\hspace*{\algorithmicindent}\textbf{Output:} Rank-local duplicate-marked BGZF body
+\begin{algorithmic}[1]
+\State $(cuts,plan) \gets \Call{PrepareRouting}{r,L}$
+\Comment{$cuts$: coordinate partition boundaries; $plan$: boundary information}
+\State Initialize paired-end and single-end windows $W_r$, pending blocks $Q_r$, and output $O_r$
+\Comment{$W_r$: candidate states; $Q_r$: unresolved BAM blocks; $O_r$: output buffer}
+\State $N_{\max} \gets \Call{AllReduceMax}{local BGZF block count}$
+\State $T \gets \lceil N_{\max}/64 \rceil$
+\For{$t=1,\ldots,T$}
+    \State $(B_r,C_r,p_r) \gets \Call{DecodeAndExtractBatch}{t}$
+    \Comment{$B_r$: input blocks; $C_r$: duplicate candidates; $p_r$: latest processed alignment start}
+    \State \Call{StartPreparedCompression}{}
+    \State $C_r \gets \Call{ApplyPrecomputed}{B_r,C_r,plan}$
+    \Comment{Apply precomputed boundary decisions}
+    \State $C_r^{owner} \gets \Call{RouteCandidates}{C_r,cuts,Q_r}$
+    \Comment{$C_r^{owner}$: candidates assigned to rank $r$ for comparison}
+    \State $D_r \gets \Call{UpdateWindows}{W_r,C_r^{owner},p_r,L,Q_r}$
+    \Comment{$D_r$: duplicate decisions generated by rank $r$}
+    \If{$plan$ is disabled}
+        \State $D_r \gets D_r \cup \Call{ResolveBoundary}{W_r,p_r}$
+        \Comment{Resolve remaining cross-rank candidates}
+    \EndIf
+    \State \Call{ReturnDecisions}{$D_r,Q_r$}
+    \State \Call{AdvanceOutput}{$Q_r,O_r$}
+    \Comment{Compress resolved blocks and preserve input order}
+\EndFor
+\State $D_r \gets \Call{FinalizeWinners}{W_r,Q_r}$
+\Comment{Keep remaining owner winners}
+\State \Call{ReturnDecisions}{$D_r,Q_r$}
+\State \Call{AdvanceOutput}{$Q_r,O_r$}
+\State \Call{DrainAndSeal}{$O_r$}
+\end{algorithmic}
+\end{algorithm}
 
 \subsubsection{Deduplication workflow}
 %总结+解释四个阶段的执行顺序+介绍中间文件与参数管理 √
@@ -396,7 +463,7 @@ CG counts and x86 core counts represent different hardware resources.
 \setlength{\tabcolsep}{4pt}
 \begin{tabular}{lcc}
 \toprule
- & SWLS (SWBAM) & AMD EPYC (SAMtools) \\
+ & Sunway server(SWBAM) & AMD server(SAMtools) \\
 \midrule
 CPU      & Sunway & AMD EPYC 7T83 $\times$ 2 \\
 Cores    & 6 MPE + 384 CPE & 128 physical cores \\
@@ -408,41 +475,43 @@ Compiler & SWGCC 7.1.0 & GCC 8.5.0 \\
 \end{tabular}
 \end{table}
 
-Three datasets cover human and mouse sequencing data (Table~\ref{tab:datasets}).
-D1 and D2 are human whole-exome and whole-genome datasets, respectively.
+Three datasets cover human and mouse paired-end sequencing data (Table~\ref{tab:datasets}).
+D1 contains 126-bp human whole-exome reads from sample EA\_N\_1, while D2 contains 150-bp human whole-genome reads from sample HG002.
+We align D1 and D2 to GRCh38 using BWA-MEM 0.7.18 and sort the resulting BAM files by coordinate.
 D3 consists of 100-bp paired-end mouse reads (\textit{Mus musculus}).
 We align D3 to GRCm39 using BWA-MEM 0.7.18 and sort the resulting BAM by coordinate.
-Both tools use the same BAM input for each dataset.
+For each dataset, both platforms use an identical initial coordinate-sorted BAM file, verified by SHA-256 checksums.
 The reported file sizes are compressed sizes in decimal GB.
 
 \begin{table}[!t]
 \centering
-\caption{Input BAM datasets. Sizes are compressed file sizes in decimal GB. Record counts include all BAM records, not read pairs.}
+\caption{Input BAM datasets. Sizes are compressed file sizes in decimal GB. Record counts include all BAM records, not read pairs. Average lengths exclude secondary and supplementary alignments.}
 \label{tab:datasets}
-\small
-\setlength{\tabcolsep}{3pt}
-\begin{tabular}{lllrr}
+\footnotesize
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{@{}lllrrr@{}}
 \toprule
-Dataset & NCBI accession & Species & Records & Size (GB) \\
+Abbr. & NCBI accession & Species & \#Records & \shortstack{Average length} & Size (GB) \\
 \midrule
-D1 & SRR7890919  & Human & 177,798,571 & 9.89 \\
-D2 & SRR12898326 & Human & 365,079,492 & 35.26 \\
-D3 & SRR7768905  & Mouse & 165,373,770 & 14.61 \\
+D1 & SRR7890919  & Human & 177,798,571 & 126 & 9.89 \\
+D2 & SRR12898326 & Human & 365,079,492 & 150 & 35.26 \\
+D3 & SRR7768905  & Mouse & 165,373,770 & 100 & 14.61 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-We report SWBAM processing time and full MPI end-to-end time separately.
+We measure SWBAM processing time and full MPI end-to-end time separately.
 Processing time starts when \texttt{MPI\_Init} returns and ends immediately before \texttt{MPI\_Finalize} is called.
 Full MPI end-to-end time starts immediately before \texttt{MPI\_Init} and ends immediately after \texttt{MPI\_Finalize} returns.
 Both metrics use the maximum elapsed time across ranks and include computation, communication, RAM file I/O, final compression, output assembly, and workspace cleanup.
-SAMtools is measured using process wall time, including buffered NVMe file I/O but without an explicit \texttt{fsync}.
-We report the median of three runs per configuration.
+In our measurements, MPI initialization and finalization incur an approximately 7~s overhead per invocation. 
+This overhead accounts for a decreasing proportion of the total runtime as dataset size increases. 
+Unless otherwise stated, all subsequent SWBAM results report processing time, excluding MPI startup and shutdown overhead.
+SAMtools is measured using process wall time, including buffered NVMe file I/O.
 For each dataset and operation, SAMtools uses the best-performing thread count among the tested settings.
 BAM output uses compression level~1.
 For collation, SWBAM uses 66 logical QNAME hash bins, whereas SAMtools uses 66 temporary bin files (\texttt{-n 66}).
-Validation is excluded from timing.
-Small-input tests compare record fields and tags, while full-output readbacks check record counts and applicable ordering constraints; duplicate-marking outputs are additionally checked for duplicate-flag counts.
+%正确性说明TODO
 
 \subsection{Performance of the SWBAM Library}
 %总结+测试说明 → SAMtools 线程扩展 → SWBAM 核组扩展+读写解释 → 跨平台比较 → MPI 开销 √
@@ -669,7 +738,7 @@ D3 & Memory & 585.49 & \textbf{240.18} & 2.44 \\
 SAMtools totals sum the four command wall times; SWBAM totals sum the four processing intervals defined in the overview.
 Speedup is the ratio of these medians, calculated before rounding.
 Sort mode refers to coordinate sorting; SAMtools collation uses temporary files in all cases.
-The external-run settings follow Table~\ref{tab:distributed-external}.
+The external-run settings follow Table~\ref{tab:dedup-workflow}.
 Preparation, post-Finalize saving, and validation are excluded from SWBAM processing intervals.
 The reported comparison is not a launcher-to-exit wall-time comparison.
 \end{tablenotes}
@@ -677,7 +746,13 @@ The reported comparison is not a launcher-to-exit wall-time comparison.
 \end{table}
 
 \section{Conclusions}
-This work presents SWBAM, a distributed BAM/SAM processing framework designed to exploit the heterogeneous many-core architecture of Sunway. By organizing data movement and computation into reusable batch-based MPE--CPE pipelines and extending this execution model to MPI-based applications with operation-specific dependencies, SWBAM unifies efficient record processing with distributed coordination. It supports a broad range of streaming and distributed operations and integrates them into a complete four-stage deduplication workflow. Experimental results demonstrate near-linear scalability for library-level I/O from one to twelve CGs, achieving 90\%--96\% parallel efficiency. Compared with SAMtools, SWBAM achieves speedups of 2.80--5.62$\times$ for streaming operations, 1.28--3.52$\times$ for distributed operations, and 2.37--3.05$\times$ for the complete deduplication workflow. These results demonstrate the effectiveness of architecture-aware heterogeneous execution in accelerating both individual BAM operations and multi-stage processing workflows, providing a reusable foundation for large-scale genomic data processing on many-core systems. Future work will focus on improving duplicate-marking performance under highly irregular coordinate distributions and reducing MPI overhead for short-running workloads.
+This work presents SWBAM, a distributed BAM/SAM processing framework designed to exploit the heterogeneous many-core architecture of Sunway. 
+By organizing data movement and computation into reusable batch-based MPE--CPE pipelines and extending this execution model to MPI-based applications with operation-specific dependencies, SWBAM unifies efficient record processing with distributed coordination. 
+It supports a broad range of streaming and distributed operations and integrates them into a complete four-stage deduplication workflow. 
+Experimental results demonstrate near-linear scalability for library-level I/O from one to twelve CGs, achieving 90\%--96\% parallel efficiency. 
+Compared with SAMtools, SWBAM achieves speedups of 2.80--5.62$\times$ for streaming operations, 1.28--3.52$\times$ for distributed operations, and 2.37--3.05$\times$ for the complete deduplication workflow. 
+These results demonstrate the effectiveness of architecture-aware heterogeneous execution in accelerating both individual BAM operations and multi-stage processing workflows, providing a reusable foundation for large-scale genomic data processing on many-core systems. 
+Future work will focus on improving duplicate-marking performance under highly irregular coordinate distributions and reducing MPI overhead for short-running workloads.
 
 \section*{Acknowledgments}
 

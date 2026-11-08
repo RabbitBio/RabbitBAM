@@ -1,6 +1,7 @@
 // Exercise the production halo probe and CPE extraction with tiny BAM files.
 #include "../swbam-app/algorithms/markdup/swbam_markdup_mpi.cpp"
 #include <unistd.h>
+#include <zlib.h>
 
 static void Check(bool ok, const char *message) {
     if (ok) return;
@@ -10,6 +11,48 @@ static void Check(bool ok, const char *message) {
             rank, message);
     MPI_Abort(MPI_COMM_WORLD, 2);
     abort();
+}
+
+static std::vector<unsigned char> RunAndDecode(
+        const swbam::BamInputBackend &input,
+        const std::vector<swbam::BgzfBlockSpan> &spans,
+        int rank, int ranks, const MdOnePassBoundaryPlan *plan) {
+    MemWriter storage = {};
+    swbam::MemoryRankBodySink prefix(&storage);
+    swbam_usage::OrderedBody body(&prefix, 16u << 20);
+    MpiMarkdupStats stats = {};
+    uint64_t records = 0;
+    int has = 0, first_tid = -1, first_pos = -1, last_tid = -1, last_pos = -1;
+    Check(MdMarkdupOnePassToSink(input, spans.data(), spans.size(),
+              (long long)rank * spans.size(), rank, ranks, 0, 300,
+              256ull << 20, 1, &body, plan, &records, &has,
+              &first_tid, &first_pos, &last_tid, &last_pos, &stats) == 0 &&
+          body.Flush() == 0 && records == spans.size(), "one-pass fixture output");
+    std::vector<unsigned char> compressed((size_t)body.size());
+    Check(body.ReadAt(0, compressed.data(), compressed.size()) == 0,
+          "ordered fixture readback");
+    std::vector<unsigned char> result;
+    unsigned char decoded[BGZF_MAX_BLOCK_SIZE];
+    size_t offset = 0;
+    while (offset < compressed.size()) {
+        Check(compressed.size() - offset >= 18, "fixture BGZF header");
+        const size_t bytes = (size_t)compressed[offset + 16] +
+            ((size_t)compressed[offset + 17] << 8) + 1;
+        Check(bytes <= compressed.size() - offset, "fixture BGZF length");
+        z_stream stream = {};
+        Check(inflateInit2(&stream, 31) == Z_OK, "fixture inflate init");
+        stream.next_in = compressed.data() + offset;
+        stream.avail_in = (uInt)bytes;
+        stream.next_out = decoded;
+        stream.avail_out = sizeof(decoded);
+        Check(inflate(&stream, Z_FINISH) == Z_STREAM_END &&
+              stream.total_in == bytes, "fixture BGZF inflate and CRC");
+        result.insert(result.end(), decoded, decoded + stream.total_out);
+        Check(inflateEnd(&stream) == Z_OK, "fixture inflate cleanup");
+        offset += bytes;
+    }
+    free(storage.data);
+    return result;
 }
 
 static void TestBoundary(int test, int rank, int ranks, const char *directory) {
@@ -29,18 +72,35 @@ static void TestBoundary(int test, int rank, int ranks, const char *directory) {
     Check(record != nullptr, "fixture record allocation");
     const std::string seq(100, 'A');
     const uint32_t cigar = bam_cigar_gen(100, BAM_CMATCH);
-    for (int block = 0; block < 64; ++block) {
+    const int blocks = test == 2 || test == 3 ? 768 : test == 5 ? 128 : 64;
+    for (int block = 0; block < blocks; ++block) {
         const bool unmapped = test == 1 && rank == ranks - 1 && block >= 32;
-        int position = rank * 10000 + block * 100;
-        if (test == 2 && rank == 1 && block < 32) position = rank * 10000 + block;
-        if (test == 3 && rank == 0 && block >= 32) position = 9990;
+        int position = rank * 10000 + block * (blocks == 64 ? 100 : 10);
+        if (test == 2 && rank == 1 && block < 384) position = rank * 10000 + block;
+        if (test == 3 && rank == 0 && block >= 384) position = 9990;
+        if (test == 4) position = rank == 0 ? 9400 + block * 9 : 10000 + block * 10;
+        if (test == 5) {
+            position = rank == 0 ? 9000 + block * 7 : 10000 + block * 10;
+            if (rank == 1 && block >= 30 && block < 64) position = 10300;
+            if (rank == 0 && block == 126) position = 9889;
+        }
         char name[64];
         snprintf(name, sizeof(name), "r%d-b%d", rank, block);
-        Check(bam_set1(record, strlen(name), name, unmapped ? BAM_FUNMAP : 0,
+        const int flag = unmapped ? BAM_FUNMAP :
+            test == 5 ? BAM_FPAIRED | BAM_FREAD1 | BAM_FMREVERSE : 0;
+        Check(bam_set1(record, strlen(name), name, flag,
                   unmapped ? -1 : 0, unmapped ? -1 : position, 60,
                   unmapped ? 0 : 1, unmapped ? nullptr : &cigar,
-                  -1, -1, 0, seq.size(), seq.c_str(), nullptr, 0) >= 0,
+                  test == 5 ? 0 : -1, test == 5 ? 50000 : -1, 0,
+                  seq.size(), seq.c_str(), nullptr, 0) >= 0,
               "fixture record fields");
+        if (test == 5) {
+            const int32_t mate_score = 3000;
+            Check(bam_aux_append(record, "MC", 'Z', 5, (const uint8_t *)"100M") == 0 &&
+                  bam_aux_append(record, "ms", 'i', sizeof(mate_score),
+                                 (const uint8_t *)&mate_score) == 0,
+                  "paired fixture mate tags");
+        }
         Check(sam_write1(file, header, record) >= 0 && bgzf_flush(file->fp.bgzf) == 0,
               "fixture block write");
     }
@@ -53,15 +113,45 @@ static void TestBoundary(int test, int rank, int ranks, const char *directory) {
     swbam::MemoryBamInput input;
     Check(input.Open(path) == 0, "fixture input");
     std::vector<swbam::BgzfBlockSpan> spans;
-    Check(input.ScanBlocks(&spans) == 0 && spans.size() == 64, "fixture spans");
+    Check(input.ScanBlocks(&spans) == 0 && spans.size() == (size_t)blocks, "fixture spans");
     fprintf(stderr, "[rank %d] boundary fixture case=%d loaded\n", rank, test);
     fflush(stderr);
     MdOnePassBoundaryPlan plan;
     MpiMarkdupStats stats = {};
     Check(MdBuildOnePassBoundaryPlan(input, spans.data(), spans.size(),
-              rank * 64, rank, ranks, 0, 300, 256ull * 1024 * 1024,
+              rank * blocks, rank, ranks, 0, 300, 256ull * 1024 * 1024,
               &plan, &stats) == 0, "boundary probe");
-    Check(plan.enabled == (test < 2), "enabled for valid halos only");
+    Check(plan.enabled == 1, "complete and partial probes both execute the prepass");
+    Check(plan.partial == (test == 2 || test == 3 || test == 5),
+          "fixed probe distinguishes complete coverage from partial coverage");
+    Check(plan.first_probe_end_block == (uint64_t)(rank * blocks + 32) &&
+          plan.last_probe_begin_block == (uint64_t)(rank * blocks + blocks - 32),
+          "probe stays fixed at first/last 32 blocks");
+    if (plan.partial) {
+        Check(plan.conservative && plan.closed_owner_keys.empty(),
+              "partial coverage retains boundary guards and certifies no closed key");
+        for (const auto &decision : plan.decisions)
+            Check(decision.second == kMdOnePassDuplicate, "partial prepass is DUP-only");
+        for (const auto &id : plan.candidates)
+            Check(id.kind != 2, "partial prepass retains all paired markers");
+    }
+    if (test == 5 && rank == 0) {
+        Check(plan.decisions.count((uint64_t)126 << 32) == 0 &&
+              plan.decisions.at((uint64_t)127 << 32) == kMdOnePassDuplicate,
+              "partial paired group retains its winner and finalizes the QNAME loser");
+    }
+    if (test == 4 && rank == 1) {
+        const uint64_t fringe = (uint64_t)(rank * blocks + 25) << 32;
+        Check(plan.decisions.count(fringe) == 0, "fringe winner must not receive final KEEP");
+        const MdBoundaryCandidateId id = {fringe, 1};
+        Check(plan.candidates.count(id) == 0, "fringe winner must remain in the main window");
+    }
+    if (test == 3 || test == 5) {
+        MdOnePassBoundaryPlan fallback;
+        const auto actual = RunAndDecode(input, spans, rank, ranks, &plan);
+        const auto reference = RunAndDecode(input, spans, rank, ranks, &fallback);
+        Check(actual == reference, "partial prepass preserves every output record byte and order");
+    }
     input.Close();
     Check(unlink(path.c_str()) == 0, "fixture cleanup");
     MPI_Barrier(MPI_COMM_WORLD);
@@ -83,7 +173,7 @@ int main(int argc, char **argv) {
     athread_init();
     fprintf(stderr, "[rank %d] boundary regression athread ready\n", rank);
     fflush(stderr);
-    for (int test = 0; test < 4; ++test) TestBoundary(test, rank, ranks, argv[1]);
+    for (int test = 0; test < 6; ++test) TestBoundary(test, rank, ranks, argv[1]);
     athread_halt();
     MPI_Finalize();
     return 0;

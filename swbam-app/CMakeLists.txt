@@ -64,3 +64,19 @@ if(USE_SWLU)
     target_link_libraries(RabbitBAM-MPI PRIVATE ${SWLU_LIBRARY})
 endif()
 install(TARGETS RabbitBAM-MPI RUNTIME DESTINATION bin)
+
+option(SWBAM_BUILD_MARKDUP_HALO_TESTS "Build the MPI/CPE markdup halo regression probe" OFF)
+if(SWBAM_BUILD_MARKDUP_HALO_TESTS)
+    add_executable(swbam-markdup-halo-regression
+        ../tools/markdup_boundary_regression.cpp
+        algorithms/markdup/swbam_markdup_stream_mpi.cpp
+        $<TARGET_OBJECTS:swbam_cpe_algorithm_objects>)
+    target_include_directories(swbam-markdup-halo-regression PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+    target_compile_options(swbam-markdup-halo-regression PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(swbam-markdup-halo-regression PRIVATE -Wl,--gc-sections)
+    target_link_libraries(swbam-markdup-halo-regression PRIVATE swbam::swbam swbam_benchmark_support)
+    add_custom_command(TARGET swbam-markdup-halo-regression POST_BUILD
+        COMMAND /bin/sh -c "printf '\\002' | dd of='$<TARGET_FILE:swbam-markdup-halo-regression>' bs=1 seek=9 count=1 conv=notrunc status=none"
+        VERBATIM)
+endif()

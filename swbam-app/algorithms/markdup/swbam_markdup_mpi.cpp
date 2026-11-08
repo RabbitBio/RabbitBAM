@@ -1,6 +1,7 @@
 #include "swbam_mpi.h"
 #include "markdup-pending-index.h"
 #include "markdup-boundary-progress.h"
+#include "markdup-halo-plan.h"
 #include "bounded-cache.h"
 #include "ordered-body.h"
 #include "swbam/mpi_runtime.h"
@@ -200,15 +201,21 @@ struct MdBoundaryCandidateIdHash {
 
 struct MdOnePassBoundaryPlan {
     int enabled;
+    bool partial;
+    bool conservative;
     uint64_t first_probe_end_block;
     uint64_t last_probe_begin_block;
     std::vector<MdCoordBoundary> boundaries;
+    std::vector<swbam_markdup::HaloInterval> halos;
+    std::vector<MpiMarkdupKeyShared> closed_owner_keys;
+    std::vector<swbam_markdup::HaloInterval> closed_owner_ranges;
     std::unordered_set<MdBoundaryCandidateId,
                        MdBoundaryCandidateIdHash> candidates;
     std::unordered_map<uint64_t, uint8_t> decisions;
 
     MdOnePassBoundaryPlan()
-        : enabled(0), first_probe_end_block(0), last_probe_begin_block(0) {}
+        : enabled(0), partial(false), conservative(false),
+          first_probe_end_block(0), last_probe_begin_block(0) {}
 
     bool MayContainBatch(
             const std::vector<MpiMarkdupCandidateShared> &batch) const {
@@ -2030,32 +2037,6 @@ static bool MdBoundaryDecisionCandidate(
     return !candidate.key.single || !candidate.paired_marker;
 }
 
-static bool MdCoordinateNearBoundary(
-        const MpiMarkdupKeyShared &key,
-        const std::vector<MdCoordBoundary> &boundaries,
-        int64_t max_read_length) {
-    int seen_nonempty = 0;
-    for (size_t r = 0; r < boundaries.size(); ++r) {
-        const MdCoordBoundary &boundary = boundaries[r];
-        if (!boundary.has_records) continue;
-        if (!seen_nonempty) {
-            seen_nonempty = 1;
-            continue;
-        }
-        if (key.this_ref != boundary.first_ref) continue;
-        const int64_t low = boundary.first_coord <
-                INT64_MIN + max_read_length
-            ? INT64_MIN : boundary.first_coord - max_read_length;
-        const int64_t high = boundary.first_coord >
-                INT64_MAX - max_read_length
-            ? INT64_MAX : boundary.first_coord + max_read_length;
-        if (key.this_coord >= low && key.this_coord <= high) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static int MdRouteBoundaryDuplicateOrders(
         std::vector<std::vector<uint64_t> > *duplicates_by_source,
         int rank, int comm_size, MdOnePassBoundaryPlan *plan,
@@ -2135,19 +2116,21 @@ static int MdRouteBoundaryDuplicateOrders(
 static int MdAppendBoundaryCandidates(
         const std::vector<MpiMarkdupCandidateShared> &input_candidates,
         const std::vector<unsigned char> &input_qnames,
-        const std::vector<MdCoordBoundary> &boundaries,
+        const std::vector<int64_t> &positions,
         int max_read_length, MdOnePassBoundaryPlan *plan,
         std::vector<MpiMarkdupCandidateShared> *selected_candidates,
         std::vector<unsigned char> *selected_qnames) {
+    if (positions.size() != input_candidates.size()) return -1;
+    std::unordered_set<MdBoundaryCandidateId, MdBoundaryCandidateIdHash> seen;
     for (size_t i = 0; i < input_candidates.size(); ++i) {
         const MpiMarkdupCandidateShared &input = input_candidates[i];
-        if (!MdCoordinateNearBoundary(
-                input.key, boundaries, max_read_length)) {
+        if (!swbam_markdup::HaloContainsPosition(
+                plan->halos, input.key.this_ref, positions[i])) {
             continue;
         }
         const MdBoundaryCandidateId id =
             MdMakeBoundaryCandidateId(input);
-        if (!plan->candidates.insert(id).second) continue;
+        if (!seen.insert(id).second) continue;
 
         MpiMarkdupCandidateShared candidate = input;
         if (!candidate.key.single) {
@@ -2170,7 +2153,9 @@ static int MdAppendBoundaryCandidates(
         selected_candidates->push_back(candidate);
         if (MdBoundaryDecisionCandidate(candidate)) {
             plan->decisions[candidate.global_order] =
-                (uint8_t)kMdOnePassKeep;
+                !plan->partial && swbam_markdup::HaloCoversKey(
+                    plan->halos, candidate.key, max_read_length)
+                    ? (uint8_t)kMdOnePassKeep : (uint8_t)kMdOnePassUnknown;
         }
     }
     return 0;
@@ -2179,6 +2164,10 @@ static int MdAppendBoundaryCandidates(
 struct MdBoundaryProbeContext {
     size_t first_end;
     size_t last_begin;
+    size_t processed_blocks;
+    long long global_block_begin;
+    size_t memory_limit;
+    bool overflow;
     int first_last_tid;
     int first_last_pos;
     int last_first_tid;
@@ -2186,9 +2175,11 @@ struct MdBoundaryProbeContext {
     bool captured;
     std::vector<MpiMarkdupCandidateShared> candidates;
     std::vector<unsigned char> qnames;
+    std::vector<int64_t> positions;
 
     MdBoundaryProbeContext()
-        : first_end(0), last_begin(0), first_last_tid(-1),
+        : first_end(0), last_begin(0), processed_blocks(0),
+          global_block_begin(0), memory_limit(0), overflow(false), first_last_tid(-1),
           first_last_pos(-1), last_first_tid(-1),
           last_first_pos(-1), captured(false) {}
 };
@@ -2200,35 +2191,58 @@ static int MdCaptureBoundaryProbe(
         MdExtractBatchView *batch) {
     MdBoundaryProbeContext *probe =
         (MdBoundaryProbeContext *)opaque;
-    if (!probe || !candidates || !qnames || probe->captured ||
+    if (!probe || !candidates || !qnames ||
         !batch || !batch->decomp || batch->n_blocks <= 0) {
         return -1;
     }
-    size_t first_end = std::min(
-        probe->first_end, (size_t)batch->n_blocks - 1);
-    for (size_t i = first_end + 1; i > 0; --i) {
-        Bam2BamPara &para = batch->decomp[i - 1];
-        if (para.n_total_records <= 0 || !para.output_records) continue;
-        bam1_t *record = para.output_records[para.n_total_records - 1];
-        if (!record) return -1;
-        probe->first_last_tid = record->core.tid;
-        probe->first_last_pos = record->core.pos;
-        break;
-    }
-    for (size_t i = probe->last_begin;
-         i < (size_t)batch->n_blocks; ++i) {
+    for (size_t i = 0; i < (size_t)batch->n_blocks; ++i) {
         Bam2BamPara &para = batch->decomp[i];
         if (para.n_total_records <= 0 || !para.output_records) continue;
-        bam1_t *record = para.output_records[0];
-        if (!record) return -1;
-        probe->last_first_tid = record->core.tid;
-        probe->last_first_pos = record->core.pos;
-        break;
+        const size_t index = probe->processed_blocks + i;
+        if (index <= probe->first_end) {
+            bam1_t *record = para.output_records[para.n_total_records - 1];
+            if (!record) return -1;
+            probe->first_last_tid = record->core.tid;
+            probe->first_last_pos = record->core.pos;
+        }
+        if (index >= probe->last_begin && probe->last_first_tid == -1) {
+            bam1_t *record = para.output_records[0];
+            if (!record) return -1;
+            probe->last_first_tid = record->core.tid;
+            probe->last_first_pos = record->core.pos;
+        }
     }
-    // The extractor clears batch vectors after this callback. Retain the
-    // single-batch halo payload, including the QNAME storage its offsets use.
-    probe->candidates.swap(*candidates);
-    probe->qnames.swap(*qnames);
+    // Retain metadata only. Decoded records remain owned by the extractor.
+    const size_t retained = (probe->candidates.size() + candidates->size()) *
+        (sizeof(MpiMarkdupCandidateShared) + sizeof(int64_t)) +
+        probe->qnames.size() + qnames->size();
+    if (probe->memory_limit &&
+        (batch->fixed_workspace_bytes >= probe->memory_limit ||
+         retained > (probe->memory_limit - batch->fixed_workspace_bytes) / 3)) {
+        probe->overflow = true;
+        probe->candidates.clear();
+        probe->qnames.clear();
+        probe->positions.clear();
+    }
+    if (!probe->overflow) {
+        const size_t qname_base = probe->qnames.size();
+        probe->qnames.insert(probe->qnames.end(), qnames->begin(), qnames->end());
+        for (size_t i = 0; i < candidates->size(); ++i) {
+            MpiMarkdupCandidateShared candidate = (*candidates)[i];
+            const uint64_t index = (candidate.global_order >> 32) -
+                (uint64_t)probe->global_block_begin - probe->processed_blocks;
+            const uint64_t record_index = candidate.global_order & 0xffffffffull;
+            if (index >= (uint64_t)batch->n_blocks ||
+                record_index >= (uint64_t)batch->decomp[index].n_total_records)
+                return -1;
+            bam1_t *record = batch->decomp[index].output_records[record_index];
+            if (!record) return -1;
+            if (!candidate.key.single) candidate.qname_offset += qname_base;
+            probe->candidates.push_back(candidate);
+            probe->positions.push_back((int64_t)record->core.pos + 1);
+        }
+    }
+    probe->processed_blocks += batch->n_blocks;
     probe->captured = true;
     return 0;
 }
@@ -2245,12 +2259,16 @@ static int MdBuildOnePassBoundaryPlan(
     }
     const double boundary_t0 = GetTime();
     plan->enabled = 0;
+    plan->partial = false;
+    plan->conservative = false;
     plan->boundaries.clear();
+    plan->halos.clear();
+    plan->closed_owner_keys.clear();
+    plan->closed_owner_ranges.clear();
     plan->candidates.clear();
     plan->decisions.clear();
 
-    // Empty ranks are uncommon and complicate a fixed one-batch collective
-    // probe. Keep the existing conservative window for that layout.
+    // Keep the existing conservative window when rank partitions are empty.
     const int local_nonempty = span_count > 0 ? 1 : 0;
     int all_nonempty = 0;
     MPI_Allreduce(&local_nonempty, &all_nonempty, 1, MPI_INT, MPI_MIN,
@@ -2260,160 +2278,172 @@ static int MdBuildOnePassBoundaryPlan(
         return 0;
     }
 
-    const size_t side_blocks = std::min(
-        span_count, (size_t)kMarkdupNB / 2);
-    const size_t last_actual_begin = span_count - side_blocks;
-    plan->first_probe_end_block = (uint64_t)global_block_begin + side_blocks;
-    plan->last_probe_begin_block = (uint64_t)global_block_begin + last_actual_begin;
+    const size_t side_blocks = std::min(span_count, (size_t)kMarkdupNB / 2);
+    int first_has = 0, first_tid = -1, first_pos = -1;
+    int last_tid = -1, last_pos = -1;
     std::vector<swbam::BgzfBlockSpan> probe_spans;
     std::vector<size_t> probe_indices;
-    if (last_actual_begin <= side_blocks) {
-        probe_spans.assign(spans, spans + span_count);
-        probe_indices.resize(span_count);
-        for (size_t i = 0; i < span_count; ++i) probe_indices[i] = i;
-    } else {
-        probe_spans.reserve(side_blocks * 2);
-        probe_indices.reserve(side_blocks * 2);
-        for (size_t i = 0; i < side_blocks; ++i) {
-            probe_spans.push_back(spans[i]);
-            probe_indices.push_back(i);
-        }
-        for (size_t i = last_actual_begin; i < span_count; ++i) {
-            probe_spans.push_back(spans[i]);
-            probe_indices.push_back(i);
-        }
-    }
-    size_t last_probe_begin = 0;
-    while (last_probe_begin < probe_indices.size() &&
-           probe_indices[last_probe_begin] < last_actual_begin) {
-        ++last_probe_begin;
-    }
-    if (last_probe_begin >= probe_indices.size()) return -1;
-
-    std::vector<MpiMarkdupCandidateShared> probe_candidates;
-    std::vector<unsigned char> probe_qnames;
-    uint64_t ignored_records = 0;
-    int first_has = 0;
-    int first_tid = -1;
-    int first_pos = -1;
-    int last_tid = -1;
-    int last_pos = -1;
-    MpiMarkdupStats probe_stats = {};
     MdBoundaryProbeContext probe;
-    probe.first_end = side_blocks - 1;
-    probe.last_begin = last_probe_begin;
-
-    MdInputPass probe_source(
-        &backend, probe_spans.data(), probe_spans.size());
-    int local_ok = MdExtractCandidatesPass(
-        probe_source, global_block_begin, rank, include_fails,
-        memory_limit, &probe_candidates, &probe_qnames,
-        &ignored_records, &first_has, &first_tid, &first_pos,
-        &last_tid, &last_pos, &probe_stats,
-        MdCaptureBoundaryProbe, &probe) == 0;
-    if (!MdAllRanksOk(local_ok)) return -1;
-
-    probe_candidates.swap(probe.candidates);
-    probe_qnames.swap(probe.qnames);
-    local_ok = probe.captured &&
-        probe_candidates.size() == (size_t)(
-            probe_stats.pair_candidates + probe_stats.single_candidates);
-    if (!local_ok) {
-        fprintf(stderr,
-                "[rank %d] ERROR: incomplete markdup boundary probe "
-                "candidates: retained=%zu expected=%lld.\n",
-                rank, probe_candidates.size(),
-                probe_stats.pair_candidates + probe_stats.single_candidates);
-    }
-    if (!MdAllRanksOk(local_ok)) return -1;
-
-    for (size_t i = 0; i < probe_candidates.size(); ++i) {
-        MpiMarkdupCandidateShared &candidate = probe_candidates[i];
-        const uint64_t fake_block = candidate.global_order >> 32;
-        if (fake_block < (uint64_t)global_block_begin) {
-            local_ok = 0;
-            break;
+    int local_ok = 1;
+    {
+        const size_t last_actual_begin = span_count - side_blocks;
+        plan->first_probe_end_block = (uint64_t)global_block_begin + side_blocks;
+        plan->last_probe_begin_block = (uint64_t)global_block_begin + last_actual_begin;
+        if (last_actual_begin <= side_blocks) {
+            probe_spans.assign(spans, spans + span_count);
+            probe_indices.resize(span_count);
+            for (size_t i = 0; i < span_count; ++i) probe_indices[i] = i;
+        } else {
+            probe_spans.reserve(side_blocks * 2);
+            probe_indices.reserve(side_blocks * 2);
+            for (size_t i = 0; i < side_blocks; ++i) {
+                probe_spans.push_back(spans[i]);
+                probe_indices.push_back(i);
+            }
+            for (size_t i = last_actual_begin; i < span_count; ++i) {
+                probe_spans.push_back(spans[i]);
+                probe_indices.push_back(i);
+            }
         }
-        const uint64_t probe_index64 =
-            fake_block - (uint64_t)global_block_begin;
-        if (probe_index64 >= probe_indices.size()) {
-            local_ok = 0;
-            break;
+        size_t last_probe_begin = 0;
+        while (last_probe_begin < probe_indices.size() &&
+               probe_indices[last_probe_begin] < last_actual_begin) {
+            ++last_probe_begin;
         }
-        const uint64_t record_index = candidate.global_order &
-            0xffffffffull;
-        candidate.global_order =
-            ((uint64_t)global_block_begin +
-             (uint64_t)probe_indices[(size_t)probe_index64]) << 32 |
-            record_index;
-    }
-    if (!MdAllRanksOk(local_ok)) return -1;
-    if (MdBuildFirstCoordBoundaries(
-            first_has, first_tid, first_pos, comm_size,
-            &plan->boundaries) != 0) {
-        return -1;
+        if (last_probe_begin >= probe_indices.size()) return -1;
+
+        std::vector<MpiMarkdupCandidateShared> ignored_candidates;
+        std::vector<unsigned char> ignored_qnames;
+        uint64_t ignored_records = 0;
+        MpiMarkdupStats probe_stats = {};
+        const bool whole_rank = probe_indices.size() == span_count;
+        probe.first_end = whole_rank ? span_count - 1 : side_blocks - 1;
+        probe.last_begin = last_probe_begin;
+        probe.global_block_begin = global_block_begin;
+        probe.memory_limit = memory_limit;
+
+        MdInputPass probe_source(
+            &backend, probe_spans.data(), probe_spans.size());
+        local_ok = MdExtractCandidatesPass(
+            probe_source, global_block_begin, rank, include_fails,
+            memory_limit, &ignored_candidates, &ignored_qnames,
+            &ignored_records, &first_has, &first_tid, &first_pos,
+            &last_tid, &last_pos, &probe_stats,
+            MdCaptureBoundaryProbe, &probe) == 0;
+        if (!MdAllRanksOk(local_ok)) return -1;
+
+        local_ok = probe.captured && (probe.overflow ||
+            probe.candidates.size() == (size_t)(
+                probe_stats.pair_candidates + probe_stats.single_candidates));
+        if (!local_ok) {
+            fprintf(stderr,
+                    "[rank %d] ERROR: incomplete markdup boundary probe "
+                    "candidates: retained=%zu expected=%lld.\n",
+                    rank, probe.candidates.size(),
+                    probe_stats.pair_candidates + probe_stats.single_candidates);
+        }
+        if (!MdAllRanksOk(local_ok)) return -1;
+
+        for (size_t i = 0; i < probe.candidates.size(); ++i) {
+            MpiMarkdupCandidateShared &candidate = probe.candidates[i];
+            const uint64_t fake_block = candidate.global_order >> 32;
+            if (fake_block < (uint64_t)global_block_begin) {
+                local_ok = 0;
+                break;
+            }
+            const uint64_t probe_index64 =
+                fake_block - (uint64_t)global_block_begin;
+            if (probe_index64 >= probe_indices.size()) {
+                local_ok = 0;
+                break;
+            }
+            const uint64_t record_index = candidate.global_order &
+                0xffffffffull;
+            candidate.global_order =
+                ((uint64_t)global_block_begin +
+                 (uint64_t)probe_indices[(size_t)probe_index64]) << 32 |
+                record_index;
+        }
+        if (!MdAllRanksOk(local_ok)) return -1;
+        if (MdBuildFirstCoordBoundaries(
+                first_has, first_tid, first_pos, comm_size,
+                &plan->boundaries) != 0) {
+            return -1;
+        }
+
+        int previous_rank = -1;
+        int next_rank = -1;
+        for (int r = rank - 1; r >= 0; --r) {
+            if (plan->boundaries[(size_t)r].has_records) {
+                previous_rank = r;
+                break;
+            }
+        }
+        for (int r = rank + 1; r < comm_size; ++r) {
+            if (plan->boundaries[(size_t)r].has_records) {
+                next_rank = r;
+                break;
+            }
+        }
+
+        // Invalid/unretained metadata cannot support even a partial prepass.
+        // Incomplete coordinate coverage, in contrast, still allows DUP-only
+        // decisions among the candidates that were actually observed.
+        if (!MdAllRanksOk(first_has && first_tid >= 0 && !probe.overflow)) {
+            plan->boundaries.clear();
+            stats->t_boundary_check += GetTime() - boundary_t0;
+            if (rank == 0)
+                printf("MPI BAM markdup boundary halo=fallback pos_halo=1 blocks=%zu "
+                       "reason=unavailable-probe\n", probe_spans.size());
+            return 0;
+        }
+        if (local_ok && !whole_rank && previous_rank >= 0) {
+            const MdCoordBoundary &cut =
+                plan->boundaries[(size_t)rank];
+            const int32_t halo_ref = probe.first_last_tid + 1;
+            const int64_t halo_coord = (int64_t)probe.first_last_pos + 1;
+            const int64_t needed = cut.first_coord >
+                    INT64_MAX - max_read_length
+                ? INT64_MAX : cut.first_coord + max_read_length;
+            local_ok = probe.first_last_tid >= 0 &&
+                MdCompareCoord(halo_ref, halo_coord,
+                               cut.first_ref, needed) > 0;
+        }
+        if (local_ok && !whole_rank && next_rank >= 0) {
+            const MdCoordBoundary &cut =
+                plan->boundaries[(size_t)next_rank];
+            const int32_t halo_ref = probe.last_first_tid + 1;
+            const int64_t halo_coord = (int64_t)probe.last_first_pos + 1;
+            const int64_t needed = cut.first_coord <
+                    INT64_MIN + max_read_length
+                ? INT64_MIN : cut.first_coord - max_read_length;
+            // An unmapped file tail needs no right halo on the final rank.
+            local_ok = probe.last_first_tid >= 0 &&
+                MdCompareCoord(halo_ref, halo_coord,
+                               cut.first_ref, needed) < 0;
+        }
+        int coverage_ok = 0;
+        MPI_Allreduce(&local_ok, &coverage_ok, 1, MPI_INT, MPI_MIN,
+                      MPI_COMM_WORLD);
+        plan->partial = coverage_ok == 0;
     }
 
-    int previous_rank = -1;
-    int next_rank = -1;
-    for (int r = rank - 1; r >= 0; --r) {
-        if (plan->boundaries[(size_t)r].has_records) {
-            previous_rank = r;
-            break;
-        }
+    bool seen_nonempty = false;
+    for (size_t r = 0; r < plan->boundaries.size(); ++r) {
+        const MdCoordBoundary &cut = plan->boundaries[r];
+        if (!cut.has_records || cut.first_ref <= 0) continue;
+        if (!seen_nonempty) { seen_nonempty = true; continue; }
+        swbam_markdup::HaloInterval halo = {cut.first_ref,
+            swbam_markdup::HaloOffset(cut.first_coord, -max_read_length),
+            swbam_markdup::HaloOffset(cut.first_coord, max_read_length)};
+        plan->halos.push_back(halo);
     }
-    for (int r = rank + 1; r < comm_size; ++r) {
-        if (plan->boundaries[(size_t)r].has_records) {
-            next_rank = r;
-            break;
-        }
-    }
-
-    if (!first_has) {
-        local_ok = 0;
-    }
-    if (local_ok && previous_rank >= 0) {
-        const MdCoordBoundary &cut =
-            plan->boundaries[(size_t)rank];
-        const int32_t halo_ref = probe.first_last_tid + 1;
-        const int64_t halo_coord = (int64_t)probe.first_last_pos + 1;
-        const int64_t needed = cut.first_coord >
-                INT64_MAX - max_read_length
-            ? INT64_MAX : cut.first_coord + max_read_length;
-        local_ok = probe.first_last_tid >= 0 &&
-            MdCompareCoord(halo_ref, halo_coord,
-                           cut.first_ref, needed) >= 0;
-    }
-    if (local_ok && next_rank >= 0) {
-        const MdCoordBoundary &cut =
-            plan->boundaries[(size_t)next_rank];
-        const int32_t halo_ref = probe.last_first_tid + 1;
-        const int64_t halo_coord = (int64_t)probe.last_first_pos + 1;
-        const int64_t needed = cut.first_coord <
-                INT64_MIN + max_read_length
-            ? INT64_MIN : cut.first_coord - max_read_length;
-        // An unmapped file tail needs no right halo on the final rank.
-        local_ok = probe.last_first_tid >= 0 &&
-            MdCompareCoord(halo_ref, halo_coord,
-                           cut.first_ref, needed) <= 0;
-    }
-    int coverage_ok = 0;
-    MPI_Allreduce(&local_ok, &coverage_ok, 1, MPI_INT, MPI_MIN,
-                  MPI_COMM_WORLD);
-    if (!coverage_ok) {
-        plan->boundaries.clear();
-        stats->t_boundary_check += GetTime() - boundary_t0;
-        if (rank == 0) {
-            printf("MPI BAM markdup boundary halo=fallback blocks=%zu\n",
-                   probe_spans.size());
-        }
-        return 0;
-    }
+    swbam_markdup::MergeHalos(&plan->halos);
 
     std::vector<MpiMarkdupCandidateShared> selected_candidates;
     std::vector<unsigned char> selected_qnames;
     local_ok = MdAppendBoundaryCandidates(
-        probe_candidates, probe_qnames, plan->boundaries,
+        probe.candidates, probe.qnames, probe.positions,
         max_read_length, plan, &selected_candidates,
         &selected_qnames) == 0;
     if (!MdAllRanksOk(local_ok)) return -1;
@@ -2429,6 +2459,52 @@ static int MdBuildOnePassBoundaryPlan(
             &plan->boundaries, 1) != 0) {
         return -1;
     }
+    int conservative = plan->partial ? 1 : 0;
+    for (size_t i = 0; i < owner_candidates.size(); ++i) {
+        const MpiMarkdupCandidateShared &candidate = owner_candidates[i];
+        // Partial coverage never certifies a final KEEP or a closed marker.
+        if (plan->partial) continue;
+        if (swbam_markdup::HaloCoversKey(plan->halos, candidate.key, max_read_length)) {
+            plan->closed_owner_keys.push_back(candidate.key);
+            continue;
+        }
+        // A partial key can use the ordinary window only when its entire
+        // position support belongs strictly to this rank's coordinate range.
+        int64_t low = 0, high = 0;
+        bool local_support = swbam_markdup::KeyPositionSupport(
+            candidate.key, max_read_length, &low, &high);
+        const MdCoordBoundary &first = plan->boundaries[(size_t)rank];
+        if (rank > 0 && MdCompareCoord(candidate.key.this_ref, low,
+                                      first.first_ref, first.first_coord) <= 0)
+            local_support = false;
+        for (int r = rank + 1; r < comm_size; ++r) {
+            const MdCoordBoundary &next = plan->boundaries[(size_t)r];
+            if (!next.has_records) continue;
+            if (MdCompareCoord(candidate.key.this_ref, high,
+                               next.first_ref, next.first_coord) >= 0)
+                local_support = false;
+            break;
+        }
+        if (!local_support || candidate.source_rank != rank) conservative = 1;
+    }
+    std::sort(plan->closed_owner_keys.begin(), plan->closed_owner_keys.end(), MdKeyLess);
+    plan->closed_owner_keys.erase(std::unique(plan->closed_owner_keys.begin(),
+        plan->closed_owner_keys.end(), MdKeyEqual), plan->closed_owner_keys.end());
+    std::map<int32_t, swbam_markdup::HaloInterval> key_ranges;
+    for (const auto &key : plan->closed_owner_keys) {
+        auto found = key_ranges.find(key.this_ref);
+        if (found == key_ranges.end()) {
+            key_ranges.emplace(key.this_ref, swbam_markdup::HaloInterval{
+                key.this_ref, key.this_coord, key.this_coord});
+        } else {
+            found->second.low = std::min(found->second.low, key.this_coord);
+            found->second.high = std::max(found->second.high, key.this_coord);
+        }
+    }
+    for (const auto &entry : key_ranges) plan->closed_owner_ranges.push_back(entry.second);
+    int any_conservative = 0;
+    MPI_Allreduce(&conservative, &any_conservative, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    plan->conservative = any_conservative != 0;
     std::vector<std::vector<uint64_t> > duplicates_by_source;
     if (MpiMarkdupFindDuplicatesStreamingHash(
             &owner_candidates, owner_qnames, comm_size,
@@ -2437,6 +2513,33 @@ static int MdBuildOnePassBoundaryPlan(
             &duplicates_by_source, rank, comm_size, plan,
             &boundary_stats) != 0) {
         return -1;
+    }
+
+    size_t final_keep = 0, final_dup = 0, pending = 0, marker_pending = 0;
+    for (size_t i = 0; i < probe.candidates.size(); ++i) {
+        const MpiMarkdupCandidateShared &candidate = probe.candidates[i];
+        if (!swbam_markdup::HaloContainsPosition(
+                plan->halos, candidate.key.this_ref, probe.positions[i])) continue;
+        if (!MdBoundaryDecisionCandidate(candidate)) {
+            if (!plan->partial && swbam_markdup::HaloCoversKey(
+                    plan->halos, candidate.key, max_read_length))
+                plan->candidates.insert(MdMakeBoundaryCandidateId(candidate));
+            else ++marker_pending;
+            continue;
+        }
+        const auto found = plan->decisions.find(candidate.global_order);
+        if (found == plan->decisions.end()) return -1;
+        if (found->second == kMdOnePassUnknown) {
+            ++pending;
+            continue;
+        }
+        plan->candidates.insert(MdMakeBoundaryCandidateId(candidate));
+        if (found->second == kMdOnePassDuplicate) ++final_dup;
+        else ++final_keep;
+    }
+    for (auto it = plan->decisions.begin(); it != plan->decisions.end();) {
+        if (it->second == kMdOnePassUnknown) it = plan->decisions.erase(it);
+        else ++it;
     }
 
     stats->pair_duplicates += boundary_stats.pair_duplicates;
@@ -2448,9 +2551,15 @@ static int MdBuildOnePassBoundaryPlan(
     plan->enabled = 1;
     stats->t_boundary_check += GetTime() - boundary_t0;
     if (rank == 0) {
-        printf("MPI BAM markdup boundary halo=enabled blocks=%zu\n",
-               probe_spans.size());
+        printf("MPI BAM markdup boundary halo=%s pos_halo=1 blocks=%zu\n",
+               plan->partial ? "partial" : "enabled", probe_spans.size());
     }
+    fprintf(stderr, "[md-halo rank=%d] enabled=1 partial=%d conservative=%d probe_blocks=%zu "
+            "final_keep=%zu final_dup=%zu pending=%zu marker_pending=%zu "
+            "candidate_bytes=%lld result_bytes=%lld\n", rank, (int)plan->partial,
+            (int)plan->conservative,
+            probe_spans.size(), final_keep, final_dup, pending, marker_pending,
+            boundary_stats.mpi_candidate_bytes, boundary_stats.mpi_result_bytes);
     return 0;
 }
 
@@ -4883,6 +4992,10 @@ struct MdOnePassContext {
     long long launched_output_blocks;
     long long written_output_blocks;
     long long processed_batches;
+    long long initial_candidate_bytes = 0;
+    long long initial_result_bytes = 0;
+    unsigned long long remote_candidates = 0;
+    unsigned long long remote_markers = 0;
     size_t resident_pending = 0;
     size_t spilled_batches = 0;
     std::weak_ptr<swbam_usage::CachedTemporary> spill_file;
@@ -4915,6 +5028,17 @@ struct MdOnePassContext {
 
 static void MdOnePassCleanup(MdOnePassContext *context) {
     if (!context) return;
+    if (context->stats) {
+        fprintf(stderr, "[md-comm rank=%d] halo_enabled=%d conservative=%d "
+                "main_candidates=%llu main_markers=%llu main_candidate_bytes=%lld "
+                "main_result_bytes=%lld\n", context->rank,
+                context->boundary_plan ? context->boundary_plan->enabled : 0,
+                !context->boundary_plan || !context->boundary_plan->enabled ||
+                    context->boundary_plan->conservative ? 1 : 0,
+                context->remote_candidates, context->remote_markers,
+                context->stats->mpi_candidate_bytes - context->initial_candidate_bytes,
+                context->stats->mpi_result_bytes - context->initial_result_bytes);
+    }
     if (context->spilled_batches)
         fprintf(stderr, "[rank %d] markdup deferred payload spill batches=%zu\n",
                 context->rank, context->spilled_batches);
@@ -5197,7 +5321,11 @@ static int MdOnePassObserveRemoteCandidate(
         int owner) {
     MdOnePassContext *context = (MdOnePassContext *)opaque;
     if (!context || owner < 0 || owner >= context->comm_size) return -1;
-    if (candidate.key.single && candidate.paired_marker) return 0;
+    ++context->remote_candidates;
+    if (candidate.key.single && candidate.paired_marker) {
+        ++context->remote_markers;
+        return 0;
+    }
     if (MdOnePassMarkUnknown(context, candidate.ordinal) == 0) return 0;
     fprintf(stderr,
             "[rank %d] ERROR: one-pass cannot pend remote candidate "
@@ -5805,7 +5933,8 @@ static int MdOnePassInitWindow(MdOnePassContext *context) {
     }
     const bool have_boundary_plan =
         context->boundary_plan && context->boundary_plan->enabled;
-    context->use_pending_index = !have_boundary_plan;
+    const bool conservative = !have_boundary_plan || context->boundary_plan->conservative;
+    context->use_pending_index = conservative;
     if (have_boundary_plan) {
         context->boundaries = context->boundary_plan->boundaries;
     } else if (MdBuildFirstCoordBoundaries(
@@ -5817,7 +5946,7 @@ static int MdOnePassInitWindow(MdOnePassContext *context) {
     }
     int window_last_tid = -1;
     int window_last_pos = -1;
-    if (!have_boundary_plan) {
+    if (conservative) {
         for (int r = context->rank + 1; r < context->comm_size; ++r) {
             const MdCoordBoundary &next = context->boundaries[(size_t)r];
             if (!next.has_records) continue;
@@ -5828,8 +5957,8 @@ static int MdOnePassInitWindow(MdOnePassContext *context) {
     }
     context->window = MpiMarkdupStreamingWindowCreate(
         context->comm_size, context->max_read_length,
-        have_boundary_plan ? -1 : *context->range_first_tid,
-        have_boundary_plan ? -1 : *context->range_first_pos,
+        conservative ? *context->range_first_tid : -1,
+        conservative ? *context->range_first_pos : -1,
         window_last_tid, window_last_pos);
     return context->window ? 0 : -1;
 }
@@ -5952,6 +6081,30 @@ static int MdPostProcessOnePassBatch(
     context->stats->qname_bytes += previous_qname_bytes;
     mark("candidate-exchange.done");
 
+    // A late contributor to a closed key invalidates the L-based coverage
+    // certificate. Fail rather than silently keeping a precomputed winner.
+    if (context->boundary_plan && context->boundary_plan->enabled) {
+        const auto &closed = context->boundary_plan->closed_owner_keys;
+        for (const auto &candidate : context->owner_candidates) {
+            if (!swbam_markdup::HaloContainsPosition(
+                    context->boundary_plan->closed_owner_ranges,
+                    candidate.key.this_ref, candidate.key.this_coord)) continue;
+            if (std::binary_search(closed.begin(), closed.end(), candidate.key, MdKeyLess)) {
+                fprintf(stderr, "[rank %d] ERROR: late candidate for a finalized halo key "
+                        "ref=%d coord=%lld source=%d; increase -l or set "
+                        "RABBITBAM_MARKDUP_TWO_PASS=1.\n",
+                        context->rank, candidate.key.this_ref,
+                        (long long)candidate.key.this_coord, candidate.source_rank);
+                local_ok = 0;
+                break;
+            }
+        }
+    }
+    if (!MdAllRanksOk(local_ok)) {
+        MdOnePassFinishOutput(context);
+        return -1;
+    }
+
     mark("window-process.begin");
     local_ok = MpiMarkdupStreamingWindowProcessOptimistic(
         context->window, context->owner_candidates,
@@ -6017,7 +6170,10 @@ static int MdPostProcessOnePassBatch(
             plan.decisions.size() *
                 (sizeof(std::pair<const uint64_t, uint8_t>) +
                  2 * sizeof(void *)) +
-            plan.boundaries.capacity() * sizeof(MdCoordBoundary);
+            plan.boundaries.capacity() * sizeof(MdCoordBoundary) +
+            plan.halos.capacity() * sizeof(swbam_markdup::HaloInterval) +
+            plan.closed_owner_ranges.capacity() * sizeof(swbam_markdup::HaloInterval) +
+            plan.closed_owner_keys.capacity() * sizeof(MpiMarkdupKeyShared);
     }
     local_ok = local_ok && MdOnePassPendingBytes(context, &pending_bytes) == 0 &&
         window_bytes != SIZE_MAX &&
@@ -6124,6 +6280,8 @@ static int MdMarkdupOnePassToSink(
     context.ordered_body = dynamic_cast<swbam_usage::OrderedBody *>(sink);
     if (!context.ordered_body) return -1;
     context.stats = stats;
+    context.initial_candidate_bytes = stats->mpi_candidate_bytes;
+    context.initial_result_bytes = stats->mpi_result_bytes;
     context.boundary_plan = boundary_plan;
     context.compress_level = compress_level;
     context.decisions_by_source.resize((size_t)comm_size);
