@@ -10,6 +10,9 @@ cd "$ROOT"
 [[ ! -e "logs/$PHASE.log" ]]
 command=(bsub -a mpi -b -q q_share -timelimit 01:00:00
     -J "md_pos_halo_$PHASE" -o "$ROOT/logs/$PHASE.log")
+if [[ -n "${BENCH_NODES:-}" ]]; then
+    command+=(-node "$BENCH_NODES")
+fi
 case "$PHASE" in
     regression|regression_final|regression_retry1|regression_paired|regression_partial)
         command+=(-N 1 -np 2 -cgsp 64 -share_size 14000 -cache_size 32

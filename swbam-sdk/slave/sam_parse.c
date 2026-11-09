@@ -2600,6 +2600,16 @@ static inline int mpi_sam_name2id_fast(sam_hdr_t *h, char *beg, char *end,
     int id = bam_name2id(h, beg);
     *end = saved;
     if (id < -1) return 0;
+    // Check the authoritative reference dictionary before accepting a miss.
+    if (id == -1 && h->target_name) {
+        for (int i = 0; i < h->n_targets; ++i) {
+            const char *name = h->target_name[i];
+            if (name && strlen(name) == len && memcmp(name, beg, len) == 0) {
+                id = i;
+                break;
+            }
+        }
+    }
     if (cache && cache_slot >= 0 && cache_slot < 2 && len < sizeof(cache->name[cache_slot])) {
         cache->hdr[cache_slot] = h;
         cache->name_len[cache_slot] = (int)len;

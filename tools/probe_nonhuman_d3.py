@@ -67,7 +67,7 @@ def metrics(log, ranks, records, check="any", kept=None, marked=None):
         raise RuntimeError("markdup differs from samtools duplicate total")
     if check == "sorted" and not re.search(r"^SN\tis sorted:\t1(?:\s|$)", log, re.M):
         raise RuntimeError("full reread reports unsorted output")
-    if check != "markdup" and any(int(row.get(field, 0)) for row in storage
+    if check not in ("markdup", "external") and any(int(row.get(field, 0)) for row in storage
                                   for field in ("temp_read_bytes", "temp_write_bytes")):
         raise RuntimeError("unexpected RAM temp traffic in in-memory probe")
     by_rank = {}
@@ -216,6 +216,10 @@ class Probe:
                    "-J", "d3mouse_" + label, "-o", log_path] + argv + [
                    "--storage", "ram", "--ram-capacity", capacity, "--ram-ranks", str(ranks),
                    "--ram-session", session, "--ram-ready-timeout", "5400"]
+        if getattr(self.args, "nodes", None):
+            command[1:1] = ["-node", self.args.nodes]
+        if getattr(self.args, "job_prefix", None):
+            command[command.index("-J") + 1] = self.args.job_prefix + label
         result_path = self.root / "results.tsv"
         if result_path.exists():
             with result_path.open() as stream:
@@ -277,7 +281,7 @@ class Probe:
                 match = re.search(r"^" + job + r"\s+(\S+)", status, re.M)
                 state = match.group(1) if match else ""
                 failures = 0
-                if state not in ("PEND", "RUN", "EXITING"):
+                if state not in ("PEND", "STARTING", "RUN", "EXITING"):
                     log = fetch_log()
                     if state == "DONE" or (not state and "Job " + job + " has been finished" in log):
                         break
@@ -302,7 +306,7 @@ class Probe:
                 failures += 1
                 if failures >= 5:
                     raise
-            time.sleep(10)
+            time.sleep(getattr(self.args, "poll_seconds", 10))
         else:
             remote(self.args.swls, ["bkill", job])
             raise RuntimeError("probe's own job exceeded 6-hour submission deadline")

@@ -155,6 +155,7 @@ struct MdFlatBestTable {
     }
 
     int ReservePersistent(size_t expected) {
+        if (capacity >= 16 && expected <= (capacity - 16) / 2) return 0;
         const size_t wanted = MdNextTableCapacity(expected);
         if (!wanted) return expected ? -1 : 0;
         if (wanted <= capacity) return 0;
@@ -229,6 +230,121 @@ struct MdFlatBestTable {
             }
             pos = (pos + 1) & mask;
         }
+    }
+
+    int FindOrInsertPersistent(const MpiMarkdupKeyShared &key, uint64_t hash,
+                               size_t initial_best, size_t *slot, int *inserted) {
+        // Below the load threshold, one probe handles both lookup and insert.
+        // At the threshold, check for an existing key before growing the table.
+        if (capacity >= 16 && filled < (capacity - 16) / 2)
+            return FindOrInsert(key, hash, initial_best, slot, inserted);
+        if (FindExisting(key, hash, slot)) {
+            *inserted = 0;
+            return 0;
+        }
+        if (ReservePersistent(filled + 1) != 0) return -1;
+        return FindOrInsert(key, hash, initial_best, slot, inserted);
+    }
+};
+
+// Batch candidates remain alive until carry construction completes. Store a
+// representative index instead of copying every key into the hash table.
+struct MdBatchBestTable {
+    struct Slot {
+        uint64_t hash;
+        size_t representative;
+        size_t best;
+    };
+    Slot *slots = nullptr;
+    unsigned char *generations = nullptr;
+    unsigned char generation = 0;
+    size_t capacity = 0;
+    size_t mask = 0;
+
+    ~MdBatchBestTable() {
+        if (slots) aligned_free_custom((unsigned char *)slots);
+        if (generations) aligned_free_custom(generations);
+    }
+
+    int Prepare(size_t expected, double *alloc_time, double *init_time) {
+        double t0 = GetTime();
+        const size_t wanted = MdNextTableCapacity(expected);
+        if ((expected && !wanted) || wanted > SIZE_MAX / sizeof(Slot)) return -1;
+        if (wanted > capacity) {
+            if (init_time) *init_time += GetTime() - t0;
+            t0 = GetTime();
+            Slot *next = (Slot *)aligned_alloc_custom(64, wanted * sizeof(Slot));
+            unsigned char *next_generations = aligned_alloc_custom(64, wanted);
+            if (alloc_time) *alloc_time += GetTime() - t0;
+            if (!next || !next_generations) {
+                if (next) aligned_free_custom((unsigned char *)next);
+                if (next_generations) aligned_free_custom(next_generations);
+                return -1;
+            }
+            if (slots) aligned_free_custom((unsigned char *)slots);
+            if (generations) aligned_free_custom(generations);
+            slots = next;
+            generations = next_generations;
+            capacity = wanted;
+            mask = capacity - 1;
+            t0 = GetTime();
+            memset(generations, 0, capacity);
+            generation = 0;
+        }
+        // Invalidate old indices without touching every 24-byte slot. Clear
+        // the byte tags only on allocation or after the generation wraps.
+        if (++generation == 0) {
+            if (capacity) memset(generations, 0, capacity);
+            generation = 1;
+        }
+        if (init_time) *init_time += GetTime() - t0;
+        return 0;
+    }
+
+    template <typename CandidateAt>
+    int FindOrInsert(const MpiMarkdupKeyShared &key, uint64_t hash,
+                     size_t index, size_t *slot, int *inserted,
+                     CandidateAt candidate_at) {
+        if (!capacity) return -1;
+        size_t pos = (size_t)hash & mask;
+        for (size_t visited = 0; visited < capacity; ++visited) {
+            Slot &entry = slots[pos];
+            if (generations[pos] != generation) {
+                generations[pos] = generation;
+                entry.hash = hash;
+                entry.representative = index;
+                entry.best = index;
+                *slot = pos;
+                *inserted = 1;
+                return 0;
+            }
+            if (entry.hash == hash &&
+                MdKeyEqualFlat(candidate_at(entry.representative).key, key)) {
+                *slot = pos;
+                *inserted = 0;
+                return 0;
+            }
+            pos = (pos + 1) & mask;
+        }
+        return -1;
+    }
+
+    template <typename CandidateAt>
+    bool FindExisting(const MpiMarkdupKeyShared &key, uint64_t hash,
+                      size_t *slot, CandidateAt candidate_at) const {
+        if (!capacity) return false;
+        size_t pos = (size_t)hash & mask;
+        for (size_t visited = 0; visited < capacity; ++visited) {
+            const Slot &entry = slots[pos];
+            if (generations[pos] != generation) return false;
+            if (entry.hash == hash &&
+                MdKeyEqualFlat(candidate_at(entry.representative).key, key)) {
+                *slot = pos;
+                return true;
+            }
+            pos = (pos + 1) & mask;
+        }
+        return false;
     }
 };
 
@@ -405,11 +521,10 @@ struct MdIncrementalBoundary {
             candidate.key.single ? single_winners : pair_winners;
         size_t slot = 0;
         const uint64_t hash = MdHashKeyFlat(candidate.key);
-        if (!table.FindExisting(candidate.key, hash, &slot)) {
-            if (table.ReservePersistent(table.filled + 1) != 0) return -1;
-            int inserted = 0;
-            if (table.FindOrInsert(candidate.key, hash, winners.size(), &slot, &inserted) != 0)
-                return -1;
+        int inserted = 0;
+        if (table.FindOrInsertPersistent(candidate.key, hash, winners.size(),
+                                         &slot, &inserted) != 0) return -1;
+        if (inserted) {
             winners.emplace_back();
             qname_bytes += winners.back().qname.capacity();
         }
@@ -488,8 +603,8 @@ struct MpiMarkdupStreamingWindow {
     std::vector<unsigned char> boundary_qnames;
     std::vector<MpiMarkdupCandidateShared> next_boundary;
     std::vector<unsigned char> next_boundary_qnames;
-    MdFlatBestTable pair_best;
-    MdFlatBestTable single_best;
+    MdBatchBestTable pair_best;
+    MdBatchBestTable single_best;
     MdFlatBestTable boundary_markers;
     MdIncrementalBoundary first_boundary;
     MdIncrementalBoundary last_boundary;
@@ -559,6 +674,11 @@ static size_t MdFlatTableBytes(const MdFlatBestTable &table) {
         sizeof(uint64_t) + sizeof(size_t) + 1;
     return table.capacity > SIZE_MAX / stride
         ? SIZE_MAX : table.capacity * stride;
+}
+
+static size_t MdFlatTableBytes(const MdBatchBestTable &table) {
+    const size_t stride = sizeof(MdBatchBestTable::Slot) + 1;
+    return table.capacity > SIZE_MAX / stride ? SIZE_MAX : table.capacity * stride;
 }
 
 } // namespace
@@ -730,13 +850,12 @@ static int MdStreamingWindowProcessImpl(
     int status = 0;
     for (size_t i = 0; i < total; ++i) {
         const MpiMarkdupCandidateShared &candidate = candidate_at(i);
-        const uint64_t hash = MdHashKeyFlat(candidate.key);
         size_t slot = 0;
         int inserted = 0;
         if (!candidate.key.single) {
             if (window->pair_best.FindOrInsert(
-                    candidate.key, hash, i, &slot,
-                    &inserted) != 0) {
+                    candidate.key, MdHashKeyFlat(candidate.key), i, &slot,
+                    &inserted, candidate_at) != 0) {
                 status = -1;
                 break;
             }
@@ -750,7 +869,7 @@ static int MdStreamingWindowProcessImpl(
                 window->pair_slots.push_back(slot);
             }
             if (inserted) continue;
-            const size_t old_best = window->pair_best.best[slot];
+            const size_t old_best = window->pair_best.slots[slot].best;
             const MpiMarkdupCandidateShared &best =
                 candidate_at(old_best);
             if (pair_better(i, old_best)) {
@@ -758,7 +877,7 @@ static int MdStreamingWindowProcessImpl(
                     status = -1;
                     break;
                 }
-                window->pair_best.best[slot] = i;
+                window->pair_best.slots[slot].best = i;
                 if (optimistic &&
                     candidate.source_rank != optimistic_local_rank &&
                     !MdWindowKeepKey(window, candidate.key,
@@ -785,8 +904,8 @@ static int MdStreamingWindowProcessImpl(
             continue;
         }
         if (window->single_best.FindOrInsert(
-                candidate.key, hash, i, &slot,
-                &inserted) != 0) {
+                candidate.key, MdHashKeyFlat(candidate.key), i, &slot,
+                &inserted, candidate_at) != 0) {
             status = -1;
             break;
         }
@@ -798,7 +917,7 @@ static int MdStreamingWindowProcessImpl(
             window->single_slots.push_back(slot);
         }
         if (inserted) continue;
-        const size_t old_best = window->single_best.best[slot];
+        const size_t old_best = window->single_best.slots[slot].best;
         const MpiMarkdupCandidateShared &best = candidate_at(old_best);
         if (candidate.score > best.score ||
             (candidate.score == best.score &&
@@ -807,7 +926,7 @@ static int MdStreamingWindowProcessImpl(
                 status = -1;
                 break;
             }
-            window->single_best.best[slot] = i;
+            window->single_best.slots[slot].best = i;
             if (optimistic &&
                 candidate.source_rank != optimistic_local_rank &&
                 !MdWindowKeepKey(window, candidate.key,
@@ -832,20 +951,19 @@ static int MdStreamingWindowProcessImpl(
         window->next_boundary.clear();
         window->next_boundary_qnames.clear();
     }
+    size_t live_qname_bytes = 0;
     auto keep = [&](size_t index) -> int {
         const MpiMarkdupCandidateShared &input = candidate_at(index);
         if (!MdWindowKeepKey(window, input.key,
                              progress_tid, progress_pos)) {
             return emit_keep(input);
         }
-        // A retained fallback candidate was already marked pending when added.
-        if (!(has_boundary && index < carry_count) && mark_pending(input) != 0)
+        // Every carried winner was made pending when first retained.
+        if (index >= carry_count && mark_pending(input) != 0)
             return -1;
         MpiMarkdupCandidateShared candidate = input;
         const bool boundary = has_boundary &&
             MdWindowBoundaryKey(window, input.key);
-        std::vector<unsigned char> &next_qnames = boundary
-            ? window->next_boundary_qnames : window->next_qnames;
         if (!candidate.key.single) {
             const std::vector<unsigned char> &qnames = qnames_at(index);
             if (candidate.qname_offset > qnames.size() ||
@@ -853,17 +971,23 @@ static int MdStreamingWindowProcessImpl(
                     (size_t)candidate.qname_offset) {
                 return -1;
             }
-            const size_t qbase = next_qnames.size();
-            if (candidate.qname_len > 0) {
-                next_qnames.insert(
-                    next_qnames.end(),
-                    qnames.data() +
-                        (size_t)candidate.qname_offset,
-                    qnames.data() +
-                        (size_t)candidate.qname_offset +
-                        candidate.qname_len);
+            // Ordinary carry offsets refer to a stable owned arena. Reuse
+            // their bytes until compaction; only new winners append a name.
+            if (boundary || index >= ordinary_count) {
+                std::vector<unsigned char> &destination = boundary
+                    ? window->next_boundary_qnames : window->carry_qnames;
+                const size_t qbase = destination.size();
+                if (candidate.qname_len > 0) {
+                    destination.insert(destination.end(),
+                        qnames.data() + (size_t)candidate.qname_offset,
+                        qnames.data() + (size_t)candidate.qname_offset + candidate.qname_len);
+                }
+                candidate.qname_offset = (uint64_t)qbase;
             }
-            candidate.qname_offset = (uint64_t)qbase;
+            if (!boundary) {
+                if (candidate.qname_len > SIZE_MAX - live_qname_bytes) return -1;
+                live_qname_bytes += candidate.qname_len;
+            }
         }
         (boundary ? window->next_boundary : window->next_carry).push_back(candidate);
         return 0;
@@ -874,20 +998,20 @@ static int MdStreamingWindowProcessImpl(
         size_t single_slot = 0;
         if (window->single_best.FindExisting(
                 marker.key, MdHashKeyFlat(marker.key),
-                &single_slot) &&
-            window->single_best.best[single_slot] != SIZE_MAX) {
+                &single_slot, candidate_at) &&
+            window->single_best.slots[single_slot].best != SIZE_MAX) {
             const MpiMarkdupCandidateShared &candidate =
-                candidate_at(window->single_best.best[single_slot]);
+                candidate_at(window->single_best.slots[single_slot].best);
             if (emit_duplicate(candidate) != 0) {
                 return -1;
             }
-            window->single_best.best[single_slot] = SIZE_MAX;
+            window->single_best.slots[single_slot].best = SIZE_MAX;
             stats->single_duplicates++;
         }
     }
-    // Fallback interior windows also need only one existence marker per key.
-    // Dense coordinates may span many batches even away from a rank cut.
-    const bool deduplicate_interior = optimistic && has_boundary;
+    // Markers encode existence, not record decisions. Compact them for every
+    // optimistic window, including windows with fully precomputed rank edges.
+    const bool deduplicate_interior = optimistic;
     const bool deduplicate_markers = (update_boundary || deduplicate_interior) &&
         window->marker_carry_indices.size() > 1;
     if (deduplicate_markers && window->boundary_markers.Prepare(
@@ -916,12 +1040,34 @@ static int MdStreamingWindowProcessImpl(
     }
     for (size_t i = 0; i < window->pair_slots.size(); ++i) {
         const size_t slot = window->pair_slots[i];
-        if (keep(window->pair_best.best[slot]) != 0) return -1;
+        if (keep(window->pair_best.slots[slot].best) != 0) return -1;
     }
     for (size_t i = 0; i < window->single_slots.size(); ++i) {
         const size_t slot = window->single_slots[i];
-        if (window->single_best.best[slot] != SIZE_MAX &&
-            keep(window->single_best.best[slot]) != 0) return -1;
+        if (window->single_best.slots[slot].best != SIZE_MAX &&
+            keep(window->single_best.slots[slot].best) != 0) return -1;
+    }
+    // Compact only after all indexed batch lookups have finished. Bound dead
+    // bytes by the live set (or 1 MiB for a small window), not input length.
+    if (live_qname_bytes == 0) {
+        for (auto &candidate : window->next_carry)
+            if (!candidate.key.single) candidate.qname_offset = 0;
+        window->carry_qnames.clear();
+    } else if (window->carry_qnames.size() > 1024 * 1024 &&
+               window->carry_qnames.size() > live_qname_bytes &&
+               window->carry_qnames.size() - live_qname_bytes > live_qname_bytes) {
+        window->next_qnames.reserve(live_qname_bytes);
+        for (auto &candidate : window->next_carry) {
+            if (candidate.key.single) continue;
+            const size_t base = window->next_qnames.size();
+            if (candidate.qname_len) {
+                window->next_qnames.insert(window->next_qnames.end(),
+                    window->carry_qnames.data() + (size_t)candidate.qname_offset,
+                    window->carry_qnames.data() + (size_t)candidate.qname_offset + candidate.qname_len);
+            }
+            candidate.qname_offset = (uint64_t)base;
+        }
+        window->carry_qnames.swap(window->next_qnames);
     }
     size_t working_bytes =
         window->carry.capacity() * sizeof(MpiMarkdupCandidateShared) +
@@ -951,7 +1097,6 @@ static int MdStreamingWindowProcessImpl(
             window->peak_working_bytes, working_bytes);
     }
     window->carry.swap(window->next_carry);
-    window->carry_qnames.swap(window->next_qnames);
     if (update_boundary) {
         window->boundary_carry.swap(window->next_boundary);
         window->boundary_qnames.swap(window->next_boundary_qnames);

@@ -767,7 +767,7 @@ static int MdExtractCandidatesPass(
             }
             status_total += GetTime() - status_t0;
 
-            // 合并 qname 和 candidates 到 local_candidates 中
+            // Append contiguous CPE output, then rebase only pair QNAME offsets.
             double merge_t0 = GetTime();
             const uint64_t qname_base =
                 (uint64_t)local_qnames->size();
@@ -777,13 +777,18 @@ static int MdExtractCandidatesPass(
                     slot->extract[b].qname_arena +
                         slot->extract[b].qname_used);
             }
-            for (int i = 0; i < slot->extract[b].n_candidates; ++i) {
-                MpiMarkdupCandidateShared candidate =
-                    slot->extract[b].candidates[i];
+            const size_t candidate_base = local_candidates->size();
+            const int candidate_count = slot->extract[b].n_candidates;
+            if (candidate_count > 0) {
+                local_candidates->insert(local_candidates->end(),
+                    slot->extract[b].candidates,
+                    slot->extract[b].candidates + candidate_count);
+            }
+            for (size_t i = candidate_base; i < local_candidates->size(); ++i) {
+                MpiMarkdupCandidateShared &candidate = (*local_candidates)[i];
                 if (!candidate.key.single) {
                     candidate.qname_offset += qname_base;
                 }
-                local_candidates->push_back(candidate);
             }
             stats->total_records += slot->decomp[b].n_total_records;
             stats->examined_records += slot->extract[b].examined;
@@ -1587,7 +1592,7 @@ static int MdCoordinateOwnerFast(const MpiMarkdupKeyShared &key,
 static int MdCoordinateOwnerByFirst(
         const MpiMarkdupKeyShared &key,
         const std::vector<MdCoordBoundary> &boundaries,
-        int fallback_rank) {
+        int fallback_rank, int next_rank = -2) {
     // First-coordinate cuts assign every key to one stable rank without
     // needing a full-file pass to discover each rank's final coordinate.
     // Almost every candidate belongs to its source rank. Check that interval
@@ -1599,12 +1604,14 @@ static int MdCoordinateOwnerByFirst(
         if (local.has_records &&
             MdCompareCoord(key.this_ref, key.this_coord,
                            local.first_ref, local.first_coord) >= 0) {
-            int next_rank = -1;
-            for (size_t r = (size_t)fallback_rank + 1;
-                 r < boundaries.size(); ++r) {
-                if (boundaries[r].has_records) {
-                    next_rank = (int)r;
-                    break;
+            if (next_rank == -2) {
+                next_rank = -1;
+                for (size_t r = (size_t)fallback_rank + 1;
+                     r < boundaries.size(); ++r) {
+                    if (boundaries[r].has_records) {
+                        next_rank = (int)r;
+                        break;
+                    }
                 }
             }
             if (next_rank < 0 ||
@@ -1704,10 +1711,19 @@ static int MdExchangeCandidatesByCoordinate(
     int local_ok = 1;
 
     double pack_t0 = GetTime();
+    int next_owner_rank = -1;
+    if (owner_by_first && rank >= 0 && rank < (int)boundaries.size()) {
+        for (size_t r = (size_t)rank + 1; r < boundaries.size(); ++r) {
+            if (boundaries[r].has_records) {
+                next_owner_rank = (int)r;
+                break;
+            }
+        }
+    }
     for (size_t i = 0; i < local_candidates.size(); ++i) {
         const MpiMarkdupCandidateShared &candidate = local_candidates[i];
         const int owner = owner_by_first
-            ? MdCoordinateOwnerByFirst(candidate.key, boundaries, rank)
+            ? MdCoordinateOwnerByFirst(candidate.key, boundaries, rank, next_owner_rank)
             : MdCoordinateOwnerFast(candidate.key, boundaries, rank);
         if (owner < 0 || owner >= comm_size) {
             local_ok = 0;
@@ -6083,7 +6099,8 @@ static int MdPostProcessOnePassBatch(
 
     // A late contributor to a closed key invalidates the L-based coverage
     // certificate. Fail rather than silently keeping a precomputed winner.
-    if (context->boundary_plan && context->boundary_plan->enabled) {
+    if (context->boundary_plan && context->boundary_plan->enabled &&
+        !context->boundary_plan->closed_owner_keys.empty()) {
         const auto &closed = context->boundary_plan->closed_owner_keys;
         for (const auto &candidate : context->owner_candidates) {
             if (!swbam_markdup::HaloContainsPosition(

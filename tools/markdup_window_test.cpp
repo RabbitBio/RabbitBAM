@@ -203,7 +203,7 @@ static void TestOptimistic(bool boundary) {
     assert(states == expected);
     assert(window->carry.empty() && window->boundary_carry.empty());
     if (!boundary) {
-        assert(window->boundary_markers.capacity == 0);
+        assert(window->boundary_markers.capacity > 0);
         assert(window->boundary_carry.capacity() == 0);
     }
     MpiMarkdupStreamingWindowDestroy(window);
@@ -220,8 +220,9 @@ static int CountPending(void *opaque, uint64_t ordinal, int action) {
     return Apply(&calls.states, ordinal, action);
 }
 
-static void TestPendingOnce() {
-    auto *window = MpiMarkdupStreamingWindowCreate(2, 300, 0, 999, -1, -1);
+static void TestPendingOnce(bool boundary) {
+    auto *window = MpiMarkdupStreamingWindowCreate(2, 300,
+        boundary ? 0 : -1, boundary ? 999 : -1, -1, -1);
     assert(window);
     PendingCalls calls;
     MpiMarkdupStats stats = {};
@@ -242,8 +243,10 @@ static void TestPendingOnce() {
     MpiMarkdupStreamingWindowDestroy(window);
 }
 
-static void TestInteriorMarkers(bool observe) {
-    auto *window = MpiMarkdupStreamingWindowCreate(2, 300, 0, 999, 0, 1999);
+static void TestInteriorMarkers(bool observe, bool boundary = true) {
+    auto *window = MpiMarkdupStreamingWindowCreate(2, 300,
+        boundary ? 0 : -1, boundary ? 999 : -1,
+        boundary ? 0 : -1, boundary ? 1999 : -1);
     PendingCalls calls;
     MpiMarkdupStats stats = {}, reference = {};
     std::vector<unsigned char> qnames;
@@ -293,10 +296,12 @@ static void TestInteriorMarkers(bool observe) {
     MpiMarkdupStreamingWindowDestroy(window);
 }
 
-static void TestInteriorMixedReference() {
+static void TestInteriorMixedReference(bool boundary) {
     for (uint32_t seed = 1; seed <= 40; ++seed) {
         uint32_t random = seed;
-        auto *window = MpiMarkdupStreamingWindowCreate(2, 300, 0, 999, 0, 1999);
+        auto *window = MpiMarkdupStreamingWindowCreate(2, 300,
+            boundary ? 0 : -1, boundary ? 999 : -1,
+            boundary ? 0 : -1, boundary ? 1999 : -1);
         PendingCalls calls;
         MpiMarkdupStats stats = {}, reference = {};
         std::vector<MpiMarkdupCandidateShared> all;
@@ -475,6 +480,150 @@ static void TestSafeProgress() {
     assert(swbam_markdup::BoundaryIsComplete(1, 1000, 100, distant, progress));
 }
 
+static void TestBatchTableCollisions() {
+    MdBatchBestTable table;
+    std::vector<MpiMarkdupCandidateShared> candidates;
+    for (unsigned i = 0; i < 48; ++i) {
+        auto candidate = Candidate(i, false);
+        candidate.key.this_coord += i;
+        candidates.push_back(candidate);
+    }
+    const auto at = [&](size_t index) -> const MpiMarkdupCandidateShared & {
+        return candidates[index];
+    };
+    assert(table.Prepare(candidates.size(), nullptr, nullptr) == 0);
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        size_t slot = 0;
+        int inserted = 0;
+        // Force full hash collisions; equality must still inspect the key.
+        assert(table.FindOrInsert(candidates[i].key, 7, i, &slot, &inserted, at) == 0);
+        assert(inserted && table.slots[slot].best == i);
+        if (i % 2 == 0) table.slots[slot].best = SIZE_MAX;
+    }
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        size_t slot = 0;
+        assert(table.FindExisting(candidates[i].key, 7, &slot, at));
+        assert(table.slots[slot].best == (i % 2 ? i : SIZE_MAX));
+    }
+    auto absent = candidates.back();
+    ++absent.key.this_coord;
+    size_t slot = 0;
+    assert(!table.FindExisting(absent.key, 7, &slot, at));
+    assert(table.Prepare(1, nullptr, nullptr) == 0);
+    assert(!table.FindExisting(candidates[0].key, 7, &slot, at));
+    assert(MdFlatTableBytes(table) == table.capacity * (sizeof(MdBatchBestTable::Slot) + 1));
+    for (unsigned batch = 0; batch < 600; ++batch) {
+        assert(table.Prepare(candidates.size(), nullptr, nullptr) == 0);
+        assert(!table.FindExisting(candidates[0].key, 7, &slot, at));
+        const size_t index = batch % candidates.size();
+        int inserted = 0;
+        assert(table.FindOrInsert(candidates[index].key, 7, index,
+            &slot, &inserted, at) == 0 && inserted);
+    }
+}
+
+static void TestPersistentTableGrowth() {
+    MdFlatBestTable table;
+    for (size_t i = 0; i < 128; ++i) {
+        auto candidate = Candidate(i, false);
+        candidate.key.this_coord += i;
+        size_t slot = 0;
+        int inserted = 0;
+        assert(table.FindOrInsertPersistent(candidate.key, 7, i, &slot, &inserted) == 0);
+        assert(inserted && table.best[slot] == i);
+        const size_t capacity = table.capacity;
+        assert(table.FindOrInsertPersistent(candidate.key, 7, 999, &slot, &inserted) == 0);
+        assert(!inserted && table.best[slot] == i && table.capacity == capacity);
+        assert(table.ReservePersistent(table.filled) == 0 && table.capacity == capacity);
+    }
+    for (size_t i = 0; i < 128; ++i) {
+        auto candidate = Candidate(i, false);
+        candidate.key.this_coord += i;
+        size_t slot = 0;
+        assert(table.FindExisting(candidate.key, 7, &slot) && table.best[slot] == i);
+    }
+}
+
+static void TestQnameArenaCompaction() {
+    auto *window = MpiMarkdupStreamingWindowCreate(1, 300, -1, -1, -1, -1);
+    PendingCalls calls;
+    MpiMarkdupStats stats = {}, reference = {};
+    std::vector<std::vector<MpiMarkdupDecisionShared> > decisions(1);
+    std::vector<MpiMarkdupCandidateShared> all;
+    std::vector<unsigned char> all_names;
+    size_t previous_bytes = 0;
+    bool compacted = false;
+    for (unsigned batch = 0; batch < 100; ++batch) {
+        std::vector<MpiMarkdupCandidateShared> candidates;
+        std::vector<unsigned char> names;
+        const auto append = [&](MpiMarkdupCandidateShared candidate, unsigned char name) {
+            candidate.source_rank = 0;
+            candidate.qname_offset = names.size();
+            candidate.qname_len = 200;
+            names.insert(names.end(), candidate.qname_len, name);
+            candidates.push_back(candidate);
+            candidate.qname_offset += all_names.size();
+            all.push_back(candidate);
+            calls.states[candidate.ordinal] = RB_MARKDUP_DECISION_KEEP;
+        };
+        for (unsigned i = 0; i < 128; ++i) {
+            auto candidate = Candidate(batch * 256 + i, false, false);
+            candidate.key.this_coord = 1000 + batch * 400 + i;
+            append(candidate, 'm');
+        }
+        if (batch == 0 || batch == 99) {
+            auto candidate = Candidate(100000 + batch, false, false);
+            candidate.key.this_coord = 200000;
+            candidate.score = 100;
+            append(candidate, batch == 0 ? 'z' : 'a');
+        }
+        all_names.insert(all_names.end(), names.begin(), names.end());
+        assert(MpiMarkdupStreamingWindowProcessOptimistic(window, candidates, names,
+            0, 1127 + batch * 400, 0, CountPending, &calls, &decisions, &stats) == 0);
+        assert(decisions[0].empty());
+        if (window->carry_qnames.size() < previous_bytes) compacted = true;
+        previous_bytes = window->carry_qnames.size();
+    }
+    assert(compacted);
+    assert(MpiMarkdupStreamingWindowFinalizeOptimistic(window, 0, CountPending,
+        &calls, &decisions) == 0);
+    std::vector<std::vector<uint64_t> > duplicates;
+    assert(MpiMarkdupFindDuplicatesStreamingHash(&all, all_names, 1,
+        &duplicates, &reference) == 0);
+    assert((duplicates[0] == std::vector<uint64_t>{100000}));
+    for (const auto &state : calls.states)
+        assert(state.second == (state.first == 100000
+            ? RB_MARKDUP_DECISION_DUPLICATE : RB_MARKDUP_DECISION_KEEP));
+    for (const auto &count : calls.pending_calls) assert(count.second == 1);
+    MpiMarkdupStreamingWindowDestroy(window);
+}
+
+static void TestEmptyQnameCarry() {
+    auto *window = MpiMarkdupStreamingWindowCreate(1, 300, -1, -1, -1, -1);
+    PendingCalls calls;
+    MpiMarkdupStats stats = {};
+    std::vector<std::vector<MpiMarkdupDecisionShared> > decisions(1);
+    auto expired = Candidate(0, false, false);
+    expired.source_rank = 0;
+    expired.qname_len = 8;
+    auto retained = Candidate(1, false, false);
+    retained.source_rank = 0;
+    retained.key.this_coord = 10000;
+    retained.qname_offset = 8;
+    std::vector<unsigned char> names(8, 'x');
+    assert(MpiMarkdupStreamingWindowProcessOptimistic(window, {expired}, names,
+        0, 1000, 0, CountPending, &calls, &decisions, &stats) == 0);
+    assert(MpiMarkdupStreamingWindowProcessOptimistic(window, {retained}, names,
+        0, 1400, 0, CountPending, &calls, &decisions, &stats) == 0);
+    assert(window->carry_qnames.empty() && window->carry.size() == 1);
+    assert(window->carry[0].qname_offset == 0);
+    assert(MpiMarkdupStreamingWindowProcessOptimistic(window, {}, {},
+        0, 1401, 0, CountPending, &calls, &decisions, &stats) == 0);
+    assert(MpiMarkdupStreamingWindowFinalizeOptimistic(window, 0, CountPending,
+        &calls, &decisions) == 0);
+    MpiMarkdupStreamingWindowDestroy(window);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--interior-markers-observe")) {
         TestInteriorMarkers(true);
@@ -486,11 +635,18 @@ int main(int argc, char **argv) {
     TestBoundaryBatches();
     TestOptimistic(true);
     TestOptimistic(false);
-    TestPendingOnce();
+    TestPendingOnce(true);
+    TestPendingOnce(false);
     TestIncrementalReference();
     TestIncrementalRelease();
     TestSafeProgress();
+    TestBatchTableCollisions();
+    TestPersistentTableGrowth();
+    TestQnameArenaCompaction();
+    TestEmptyQnameCarry();
     TestInteriorMarkers(false);
-    TestInteriorMixedReference();
+    TestInteriorMarkers(false, false);
+    TestInteriorMixedReference(true);
+    TestInteriorMixedReference(false);
     puts("markdup window decisions PASS");
 }

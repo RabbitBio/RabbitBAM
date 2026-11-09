@@ -119,9 +119,31 @@ static void TestPartialSelection() {
     assert((duplicates[0] == std::vector<uint64_t>{0, 1}));
 }
 
+static void TestCachedOwnerInterval() {
+    const std::vector<MdCoordBoundary> boundaries = {
+        {1, 1, 100, 1, 300}, {0, 0, 0, 0, 0},
+        {1, 1, 300, 1, 300}, {1, 1, 300, 1, 1000},
+        {1, 2, 10, 2, 200}, {0, 0, 0, 0, 0}};
+    for (int rank = 0; rank < (int)boundaries.size(); ++rank) {
+        int next = -1;
+        for (size_t i = (size_t)rank + 1; i < boundaries.size(); ++i) {
+            if (boundaries[i].has_records) { next = (int)i; break; }
+        }
+        for (int ref = 1; ref <= 3; ++ref) {
+            for (int pos : {1, 10, 99, 100, 299, 300, 301, 1001}) {
+                auto candidate = Candidate(0, pos, 1);
+                candidate.key.this_ref = ref;
+                assert(MdCoordinateOwnerByFirst(candidate.key, boundaries, rank) ==
+                       MdCoordinateOwnerByFirst(candidate.key, boundaries, rank, next));
+            }
+        }
+    }
+}
+
 int main() {
     TestKeySupport();
     TestSelectionAndPending();
     TestPartialSelection();
+    TestCachedOwnerInterval();
     puts("PASS POS halo selection, partial DUP-only prepass, later winner, paired-key roles and retained marker");
 }
