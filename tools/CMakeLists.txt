@@ -1,6 +1,17 @@
 # Workspace-only developer probes. CRC probes inspect the bundled codec internals.
 add_executable(markdup_verify_fast markdup_verify_fast.cpp)
 target_link_libraries(markdup_verify_fast PRIVATE swbam::host)
+add_executable(swbam-bam-correctness-digest sam_correctness_digest.cpp)
+target_compile_definitions(swbam-bam-correctness-digest PRIVATE
+    SWBAM_DIGEST_WITH_HTSLIB SWBAM_DIGEST_PORTABLE_SHA256)
+target_link_libraries(swbam-bam-correctness-digest PRIVATE
+    swbam::host swbam::htslib swbam::deflate z pthread m dl)
+add_library(codec_ratio_probe_slave OBJECT slave_codec_ratio_probe.cpp)
+target_link_libraries(codec_ratio_probe_slave PRIVATE swbam::cpe)
+target_include_directories(codec_ratio_probe_slave PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_executable(swbam-codec-ratio-probe codec_ratio_probe.cpp
+    $<TARGET_OBJECTS:codec_ratio_probe_slave>)
+target_link_libraries(swbam-codec-ratio-probe PRIVATE swbam::swbam)
 add_executable(swbam-mpi-memory-probe mpi_memory_capacity_probe.cpp)
 add_executable(swbam-mpi-memcpy-probe mpi_memcpy_probe.cpp)
 foreach(target swbam-mpi-memory-probe swbam-mpi-memcpy-probe)

@@ -234,9 +234,10 @@ It reuses codec objects and working buffers, and combines related processing ste
 SWBAM reuses libdeflate compressor and decompressor objects across kernel launches.
 Each CPE creates a decompressor on first use and reuses it for subsequent blocks.
 Compressors are cached by compression level and recreated only when the required level changes.
-\red{For level-1 compression, SWBAM reduces match-search work by checking one hash-table candidate at each search position.
+For level-1 compression, SWBAM reduces match-search work by checking one hash-table candidate at each search position.
 For sufficiently long matches, hash updates cover the first six interior positions and then use a two-byte stride.
-These changes reduce candidate checks and hash-table updates while retaining valid DEFLATE and BGZF output.}
+These changes reduce candidate checks and hash-table updates while retaining valid DEFLATE and BGZF output.
+This optimization trades compression ratio for throughput, increasing the compressed BAM size by 2.82\% on average (2.50\%--2.99\% across D1--D3) compared with the original level-1 compressor.
 For BAM input, SWBAM combines decompression, parsing, and record processing within one CPE kernel.
 The decoded block is processed directly without a separate kernel launch or MPE-side processing stage between these operations.
 Statistical kernels reuse a scratch \texttt{bam1\_t} record and its data buffer on each CPE.
@@ -248,8 +249,7 @@ When serialized BAM payloads are provided directly, the kernel skips record seri
 Compressed output buffers are also reused across batches.
 
 SWBAM also reuses buffers in SAM processing.
-\red{The fast SAM parser writes records into per-chunk arenas and caches recent reference-name lookups within each chunk.
-Records that the fast parser cannot handle are processed by the general parser.}
+The fast SAM parser stores parsed records in per-chunk arenas and caches recent reference-name lookups within each chunk.
 For SAM output, each CPE formats records directly into its batch text buffer instead of creating a separate string for each record.
 The MPE reserves buffer capacity before formatting and retains enlarged buffers for subsequent batches.
 These optimizations reduce repeated allocation and intermediate data handling in SAM parsing and formatting.
@@ -320,8 +320,9 @@ The MPE scans each batch and groups adjacent records with matching QNAMEs. If a 
 A similar situation occurs at MPI rank boundaries, where the last group of one rank may continue as the first group of another. 
 Each rank therefore temporarily retains its boundary groups and exchanges their QNAMEs with other ranks to identify fragments belonging to the same group. 
 These fragments are then transferred to the designated owner rank for group completion.
-\red{For each complete group, a CPE planning kernel determines the required mate-field and tag updates and calculates the output size.
-The MPE computes output offsets from the planned record lengths, and a second CPE kernel rewrites records into disjoint output regions.}
+Once all records sharing a QNAME have been gathered, a first CPE kernel determines the mate-related field and tag updates for each record and computes its resulting length.
+Since tag updates may change record lengths, the MPE uses these lengths to assign non-overlapping regions in the output buffer.
+A second CPE kernel then applies the updates and writes the updated records to their assigned regions.
 The supported updates include mate coordinates, flags, template length, and the \texttt{MQ}, \texttt{MC}, and \texttt{ms} tags.
 The rewritten records are then serialized and compressed through the common BAM write pipeline.
 Boundary and interior output segments are combined in QNAME-group order.
@@ -516,7 +517,9 @@ For collation, SWBAM uses 66 logical QNAME hash bins, whereas SAMtools uses 66 t
 For each dataset and operation, we select the configuration with the lowest median runtime over repeated runs by sweeping the number of SAMtools worker threads and jointly tuning RabbitBAM's decompression and compression thread counts, while also evaluating its CPU and memory placement.
 Each configuration is evaluated over three independent runs, and the median runtime is reported.
 The reported cross-platform speedups reflect the respective hardware and storage configurations rather than software-only performance differences.
-%正确性说明TODO
+We validated all SWBAM library and application experiments against SAMtools on D1--D3.
+Record counts and operation-specific statistics matched those of SAMtools. 
+For file-producing operations, record contents and auxiliary tags matched after excluding \texttt{@PG} header entries and accounting for operation-specific ordering differences. Duplicate-marking flags also matched.
 
 \subsection{Performance of the SWBAM Library}
 %测试说明 → SWBAM扩展性分析 → 三种库的性能分析

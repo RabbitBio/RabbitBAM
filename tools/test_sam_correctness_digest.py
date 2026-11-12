@@ -19,6 +19,10 @@ class DigestTest(unittest.TestCase):
         cls.binary = Path(cls.directory.name) / 'digest'
         subprocess.run(['c++', '-std=c++11', '-O2', '-Wall', '-Wextra', '-Werror',
                         str(ROOT/'tools/sam_correctness_digest.cpp'), '-lcrypto', '-o', str(cls.binary)], check=True)
+        cls.portable = Path(cls.directory.name) / 'digest-portable'
+        subprocess.run(['c++', '-std=c++11', '-O2', '-Wall', '-Wextra', '-Werror',
+                        '-DSWBAM_DIGEST_PORTABLE_SHA256', str(ROOT/'tools/sam_correctness_digest.cpp'),
+                        '-o', str(cls.portable)], check=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -58,6 +62,20 @@ class DigestTest(unittest.TestCase):
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertNotEqual(run.returncode, 0)
         self.assertEqual(run.stdout, '')
+
+    def test_portable_sha_matches_openssl(self):
+        for text in (HEADER, HEADER+ROW, HEADER+ROW*1000,
+                     HEADER+ROW.replace('readA\t0\t', 'readA\t1024\t'),
+                     HEADER+ROW.replace('readA', 'long_qname_'+'x'*200)):
+            actual = subprocess.run([str(self.portable)], input=text, universal_newlines=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            self.assertEqual(json.loads(actual.stdout), self.digest(text))
+
+    def test_ranges_require_bam_input(self):
+        run = subprocess.run([str(self.portable),'--range-end','100'],input=HEADER,
+                             universal_newlines=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+        self.assertNotEqual(run.returncode,0)
+        self.assertEqual(run.stdout,'')
 
 
 if __name__ == '__main__':
