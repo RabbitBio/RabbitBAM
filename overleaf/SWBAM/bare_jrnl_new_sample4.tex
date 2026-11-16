@@ -63,10 +63,11 @@ The latter are integrated into an end-to-end deduplication workflow.
 % Compared with SAMtools on a 128-core x86 server, SWBAM running on one Sunway node achieves 2.80–5.62× speedups for streaming operations, 1.28–3.52× for distributed operations, and 2.37–3.05× for the complete deduplication workflow. 
 % Experiments on three human and mouse sequencing datasets demonstrate 90\%–96\% parallel efficiency for BAM I/O across 1–12 CGs, with speedups of 2.80–5.62$\times$ for streaming operations, 1.28–3.52$\times$ for distributed operations, and 2.37–3.05$\times$ for the complete workflow over SAMtools on a 128-core x86 server.
 % Experiments on three human and mouse sequencing datasets show 90\%--96\% parallel efficiency during BAM I/O processing when scaling from 1 to 12 CGs.
-Experiments on three human and mouse sequencing datasets show 90\%--96\% parallel efficiency for the processing interval, excluding MPI initialization and finalization, when scaling from 1 to 12 CGs.
+% Experiments on three human and mouse sequencing datasets show 90\%--96\% parallel efficiency for the processing interval, excluding MPI initialization and finalization, when scaling from 1 to 12 CGs.
+The SWBAM BAM I/O library achieves 90\%--96\% parallel efficiency across three human and mouse sequencing datasets when scaling from 1 to 12 CGs, measured over the processing interval excluding MPI initialization and finalization.
 Compared with SAMtools on a 128-core x86 server, SWBAM using six CGs on a single Sunway node achieves end-to-end speedups of 1.03--4.61$\times$ and 1.33--3.32$\times$ for these two classes of operations, respectively, and 2.27--2.70$\times$ for the complete deduplication workflow.
 % These results demonstrate SWBAM's effectiveness in accelerating diverse BAM/SAM operations on the Sunway architecture.
-SWBAM is freely available at \url{xxxxxxxxxxxxxxxxxxxxxxxx}.
+SWBAM is freely available at \url{https://github.com/WWWZZSS/SWBAM}.
 \end{abstract}
 
 \begin{IEEEkeywords}
@@ -232,6 +233,7 @@ SWBAM optimizes CPE kernels to reduce repeated allocation, compression overhead,
 It reuses codec objects and working buffers, and combines related processing steps within a single kernel execution.
 
 SWBAM reuses libdeflate compressor and decompressor objects across kernel launches.
+The Sunway-adapted implementation of libdeflate allocates these objects in each CPE's local data memory (LDM), thereby reducing main-memory accesses during compression and decompression.
 Each CPE creates a decompressor on first use and reuses it for subsequent blocks.
 Compressors are cached by compression level and recreated only when the required level changes.
 For level-1 compression, SWBAM reduces match-search work by checking one hash-table candidate at each search position.
@@ -515,7 +517,6 @@ For each dataset and operation, SAMtools uses the best-performing thread count a
 BAM output uses compression level~1.
 For collation, SWBAM uses 66 logical QNAME hash bins, whereas SAMtools uses 66 temporary bin files (\texttt{-n 66}).
 For each dataset and operation, we select the configuration with the lowest median runtime over repeated runs by sweeping the number of SAMtools worker threads and jointly tuning RabbitBAM's decompression and compression thread counts, while also evaluating its CPU and memory placement.
-Each configuration is evaluated over three independent runs, and the median runtime is reported.
 The reported cross-platform speedups reflect the respective hardware and storage configurations rather than software-only performance differences.
 We validated all SWBAM library and application experiments against SAMtools on D1--D3.
 Record counts and operation-specific statistics matched those of SAMtools. 
