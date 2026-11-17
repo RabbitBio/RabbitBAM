@@ -1498,10 +1498,13 @@ static int MdBuildCoordBoundaries(
 static int MdBuildFirstCoordBoundaries(
         int range_has_records, int range_first_tid, int range_first_pos,
         int comm_size, std::vector<MdCoordBoundary> *boundaries) {
+    // Unplaced tail records are preserved, but define no coordinate owner range.
+    const int has_coordinate = range_has_records && range_first_tid >= 0 &&
+        range_first_pos >= 0;
     long long local[3] = {
-        (long long)range_has_records,
-        range_has_records ? (long long)range_first_tid + 1 : 0,
-        range_has_records ? (long long)range_first_pos + 1 : 0
+        (long long)has_coordinate,
+        has_coordinate ? (long long)range_first_tid + 1 : 0,
+        has_coordinate ? (long long)range_first_pos + 1 : 0
     };
     std::vector<long long> gathered((size_t)comm_size * 3, 0);
     MPI_Allgather(local, 3, MPI_LONG_LONG, gathered.data(), 3,

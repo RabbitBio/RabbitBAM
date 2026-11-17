@@ -72,28 +72,46 @@ static void TestBoundary(int test, int rank, int ranks, const char *directory) {
     Check(record != nullptr, "fixture record allocation");
     const std::string seq(100, 'A');
     const uint32_t cigar = bam_cigar_gen(100, BAM_CMATCH);
-    const int blocks = test == 2 || test == 3 ? 768 : test == 5 ? 128 : 64;
+    const int blocks = test == 2 || test == 3 ? 768 :
+        test == 5 || test == 8 ? 128 : 64;
     for (int block = 0; block < blocks; ++block) {
-        const bool unmapped = test == 1 && rank == ranks - 1 && block >= 32;
+        const bool unmapped =
+            (test == 1 && rank == ranks - 1 && block >= 32) ||
+            (test == 6 && rank == ranks - 1) || test == 7;
         int position = rank * 10000 + block * (blocks == 64 ? 100 : 10);
         if (test == 2 && rank == 1 && block < 384) position = rank * 10000 + block;
         if (test == 3 && rank == 0 && block >= 384) position = 9990;
-        if (test == 4) position = rank == 0 ? 9400 + block * 9 : 10000 + block * 10;
+        if (test == 4)
+            position = rank == 0 ? 9400 + block * 9 : rank * 10000 + block * 10;
         if (test == 5) {
-            position = rank == 0 ? 9000 + block * 7 : 10000 + block * 10;
+            position = rank == 0 ? 9000 + block * 7 : rank * 10000 + block * 10;
             if (rank == 1 && block >= 30 && block < 64) position = 10300;
             if (rank == 0 && block == 126) position = 9889;
+        }
+        if (test == 8) {
+            position = rank * 10000 + (block == 0 ? 999 :
+                block == 1 ? 4999 : block <= 64 ? 5299 : 6000 + block * 10);
         }
         char name[64];
         snprintf(name, sizeof(name), "r%d-b%d", rank, block);
         const int flag = unmapped ? BAM_FUNMAP :
-            test == 5 ? BAM_FPAIRED | BAM_FREAD1 | BAM_FMREVERSE : 0;
+            test == 5 ? BAM_FPAIRED | BAM_FREAD1 | BAM_FMREVERSE :
+            test == 8 && block != 1 && block != 64 ? BAM_FSECONDARY : 0;
+        const uint32_t limit_cigar[] = {
+            bam_cigar_gen(300, BAM_CHARD_CLIP), bam_cigar_gen(1, BAM_CMATCH)};
+        const bool limit_read = test == 8 && (block == 1 || block == 64);
+        const uint32_t *record_cigar = limit_read
+            ? limit_cigar + (block == 1 ? 1 : 0) : &cigar;
+        const size_t record_cigars = limit_read && block == 64 ? 2 : 1;
+        const size_t record_length = limit_read ? 1 : seq.size();
         Check(bam_set1(record, strlen(name), name, flag,
                   unmapped ? -1 : 0, unmapped ? -1 : position, 60,
-                  unmapped ? 0 : 1, unmapped ? nullptr : &cigar,
+                  unmapped ? 0 : record_cigars, unmapped ? nullptr : record_cigar,
                   test == 5 ? 0 : -1, test == 5 ? 50000 : -1, 0,
-                  seq.size(), seq.c_str(), nullptr, 0) >= 0,
+                  record_length, seq.c_str(), nullptr, 0) >= 0,
               "fixture record fields");
+        if (limit_read)
+            memset(bam_get_qual(record), block == 1 ? 20 : 40, record_length);
         if (test == 5) {
             const int32_t mate_score = 3000;
             Check(bam_aux_append(record, "MC", 'Z', 5, (const uint8_t *)"100M") == 0 &&
@@ -121,9 +139,11 @@ static void TestBoundary(int test, int rank, int ranks, const char *directory) {
     Check(MdBuildOnePassBoundaryPlan(input, spans.data(), spans.size(),
               rank * blocks, rank, ranks, 0, 300, 256ull * 1024 * 1024,
               &plan, &stats) == 0, "boundary probe");
-    Check(plan.enabled == 1, "complete and partial probes both execute the prepass");
-    Check(plan.partial == (test == 2 || test == 3 || test == 5),
-          "fixed probe distinguishes complete coverage from partial coverage");
+    Check(plan.enabled == (test == 6 || test == 7 ? 0 : 1),
+          "unplaced-only ranges fall back without rejecting the input");
+    if (plan.enabled)
+        Check(plan.partial == (test == 2 || test == 3 || test == 5),
+              "fixed probe distinguishes complete coverage from partial coverage");
     Check(plan.first_probe_end_block == (uint64_t)(rank * blocks + 32) &&
           plan.last_probe_begin_block == (uint64_t)(rank * blocks + blocks - 32),
           "probe stays fixed at first/last 32 blocks");
@@ -152,6 +172,28 @@ static void TestBoundary(int test, int rank, int ranks, const char *directory) {
         const auto reference = RunAndDecode(input, spans, rank, ranks, &fallback);
         Check(actual == reference, "partial prepass preserves every output record byte and order");
     }
+    if (test >= 6) {
+        const auto actual = RunAndDecode(input, spans, rank, ranks, &plan);
+        size_t offset = 0, records = 0, duplicates = 0;
+        while (offset < actual.size()) {
+            Check(actual.size() - offset >= 36, "fixture record header");
+            const size_t bytes = (size_t)le_to_u32(actual.data() + offset) + 4;
+            Check(bytes >= 36 && bytes <= actual.size() - offset,
+                  "fixture record length");
+            const uint16_t flag = (uint16_t)(
+                le_to_u32(actual.data() + offset + 16) >> 16);
+            const bool duplicate = (flag & BAM_FDUP) != 0;
+            Check(duplicate == (test == 8 && records == 1),
+                  "exact duplicate member across the key+L batch boundary");
+            if ((test == 6 && rank == ranks - 1) || test == 7)
+                Check((flag & BAM_FUNMAP) != 0, "unmapped tail flags are preserved");
+            duplicates += duplicate;
+            ++records;
+            offset += bytes;
+        }
+        Check(records == (size_t)blocks && duplicates == (test == 8 ? 1u : 0u),
+              "all mapped/unmapped fixture records are preserved");
+    }
     input.Close();
     Check(unlink(path.c_str()) == 0, "fixture cleanup");
     MPI_Barrier(MPI_COMM_WORLD);
@@ -173,7 +215,7 @@ int main(int argc, char **argv) {
     athread_init();
     fprintf(stderr, "[rank %d] boundary regression athread ready\n", rank);
     fflush(stderr);
-    for (int test = 0; test < 6; ++test) TestBoundary(test, rank, ranks, argv[1]);
+    for (int test = 0; test < 9; ++test) TestBoundary(test, rank, ranks, argv[1]);
     athread_halt();
     MPI_Finalize();
     return 0;

@@ -480,6 +480,73 @@ static void TestSafeProgress() {
     assert(swbam_markdup::BoundaryIsComplete(1, 1000, 100, distant, progress));
 }
 
+static void TestExpiryEquality() {
+    for (int single = 0; single <= 1; ++single) {
+        for (int orientation : {2, 3, 5, 7}) {
+            if (single && orientation != 2 && orientation != 3) continue;
+            for (int leftmost : {11, 13}) {
+                auto *window = MpiMarkdupStreamingWindowCreate(
+                    1, 300, -1, -1, -1, -1);
+                assert(window);
+                auto first = Candidate(0, false, single != 0);
+                first.source_rank = 0;
+                first.key.orientation = orientation;
+                first.key.leftmost = single ? 0 : leftmost;
+                first.score = 100;
+                auto better = first;
+                better.ordinal = better.global_order = 1;
+                better.score = 200;
+                assert(!MdWindowExpired(window, first.key, 0, 1298));
+                assert(!MdWindowExpired(window, first.key, 0, 1299));
+                assert(MdWindowExpired(window, first.key, 0, 1300));
+                PendingCalls calls;
+                MpiMarkdupStats stats = {};
+                std::vector<std::vector<MpiMarkdupDecisionShared> > decisions(1);
+                assert(MpiMarkdupStreamingWindowProcessOptimistic(window, {first}, {},
+                    0, 999, 0, CountPending, &calls, &decisions, &stats) == 0);
+                assert(MpiMarkdupStreamingWindowProcessOptimistic(window, {}, {},
+                    0, 1299, 0, CountPending, &calls, &decisions, &stats) == 0);
+                assert(calls.states[0] == RB_MARKDUP_DECISION_PENDING);
+                assert(MpiMarkdupStreamingWindowProcessOptimistic(window, {better}, {},
+                    0, 1299, 0, CountPending, &calls, &decisions, &stats) == 0);
+                assert(calls.states[0] == RB_MARKDUP_DECISION_DUPLICATE);
+                assert(calls.states[1] == RB_MARKDUP_DECISION_PENDING);
+                assert(MpiMarkdupStreamingWindowProcessOptimistic(window, {}, {},
+                    0, 1300, 0, CountPending, &calls, &decisions, &stats) == 0);
+                assert(calls.states[1] == RB_MARKDUP_DECISION_KEEP);
+                assert(decisions[0].empty());
+                MpiMarkdupStreamingWindowDestroy(window);
+            }
+        }
+    }
+    puts("PASS expiry equality: single/pair orientations retain winners across batches");
+}
+
+static void TestMarkerExpiryEquality() {
+    auto *window = MpiMarkdupStreamingWindowCreate(1, 300, -1, -1, -1, -1);
+    assert(window);
+    auto marker = Candidate(0, true);
+    marker.source_rank = 0;
+    auto single = Candidate(1, false);
+    single.source_rank = 0;
+    single.score = 10000;
+    PendingCalls calls;
+    MpiMarkdupStats stats = {};
+    std::vector<std::vector<MpiMarkdupDecisionShared> > decisions(1);
+    assert(MpiMarkdupStreamingWindowProcessOptimistic(window, {marker}, {},
+        0, 999, 0, CountPending, &calls, &decisions, &stats) == 0);
+    assert(MpiMarkdupStreamingWindowProcessOptimistic(window, {}, {},
+        0, 1299, 0, CountPending, &calls, &decisions, &stats) == 0);
+    assert(MpiMarkdupStreamingWindowProcessOptimistic(window, {single}, {},
+        0, 1299, 0, CountPending, &calls, &decisions, &stats) == 0);
+    assert(calls.states.at(1) == RB_MARKDUP_DECISION_DUPLICATE);
+    assert(calls.states.count(0) == 0 && decisions[0].empty());
+    assert(MpiMarkdupStreamingWindowFinalizeOptimistic(window, 0, CountPending,
+        &calls, &decisions) == 0);
+    MpiMarkdupStreamingWindowDestroy(window);
+    puts("PASS expiry equality: paired-presence marker suppresses a later singleton");
+}
+
 static void TestBatchTableCollisions() {
     MdBatchBestTable table;
     std::vector<MpiMarkdupCandidateShared> candidates;
@@ -640,6 +707,8 @@ int main(int argc, char **argv) {
     TestIncrementalReference();
     TestIncrementalRelease();
     TestSafeProgress();
+    TestExpiryEquality();
+    TestMarkerExpiryEquality();
     TestBatchTableCollisions();
     TestPersistentTableGrowth();
     TestQnameArenaCompaction();

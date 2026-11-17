@@ -658,7 +658,8 @@ static bool MdWindowExpired(
     const int64_t progress_coord = (int64_t)progress_pos + 1;
     if (key.this_ref < progress_ref) return true;
     if (key.this_ref > progress_ref) return false;
-    return key.this_coord + window->max_read_length <= progress_coord;
+    // A batch may end midway through records at key+L; retain equality.
+    return key.this_coord + window->max_read_length < progress_coord;
 }
 
 static bool MdWindowKeepKey(
